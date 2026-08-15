@@ -1,0 +1,32 @@
+{
+  "name": "@solvyxtech/molt",
+  "version": "0.2.0",
+  "description": "molt — a tiny multi-provider agent harness with a bill of materials: /bom, hard token budgets, permission gates, and a shell you can shed.",
+  "type": "module",
+  "bin": {
+    "molt": "dist/cli.js"
+  },
+  "scripts": {
+    "start": "tsx src/cli.tsx",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc",
+    "test": "vitest run",
+    "lab": "tsx rnd/shed-lab.mts"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "ink": "^6.0.0",
+    "react": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.0.0",
+    "ink-testing-library": "^4.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^3.0.0"
+  }
+}
