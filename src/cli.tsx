@@ -242,6 +242,21 @@ function printBar(result: BarResult): void {
     }
   }
   process.stdout.write(result.ok ? "\nbar met\n" : "\nbar NOT met\n");
+
+  // Same reasoning as the TUI: the check output speaks to the model, and a
+  // person staring at a refusal they cannot act on needs the other half.
+  const onlyWorkLanded =
+    !result.ok &&
+    result.results.every((r) => r.ok || r.detail === "files-changed") &&
+    result.results.some((r) => !r.ok && r.detail === "files-changed");
+  if (onlyWorkLanded) {
+    process.stdout.write(
+      "\nwork-landed requires a file to have changed in this session. `molt prove` runs\n" +
+        "standalone, so there is no session and no write for it to find — it fails here by\n" +
+        "definition, not because anything is wrong. Run `molt prove --skip session` to check\n" +
+        "the command checks on their own.\n",
+    );
+  }
 }
 
 async function cmdRun(args: Args): Promise<number> {

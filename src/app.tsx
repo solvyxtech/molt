@@ -154,6 +154,24 @@ export function App({
           for (const l of r.output.trim().split("\n").slice(0, 8)) add("fail", `        ${l}`);
         }
       }
+
+      // A check's output is written for the model, which is the party that
+      // can act on it. When the only thing standing between you and an answer
+      // is a check this turn was never going to satisfy, that needs saying to
+      // you, in your terms — otherwise the refusal reads as molt malfunctioning.
+      const onlyWorkLanded =
+        !result.ok &&
+        result.results.every((r) => r.ok || r.detail === "files-changed") &&
+        result.results.some((r) => !r.ok && r.detail === "files-changed");
+      if (onlyWorkLanded) {
+        add(
+          "info",
+          "everything else passed. work-landed requires this turn to have changed a file,\n" +
+            "so a question, a greeting, or read-only work can never satisfy it — that is what\n" +
+            "the README means by 'files-changed fails read-only tasks by design'.\n" +
+            "for a session of questions rather than changes, start molt with --skip session.",
+        );
+      }
     },
     [add],
   );

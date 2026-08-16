@@ -47,6 +47,17 @@
 
 ### Fixed
 
+- **A bar failure said what the check found, not what it meant.** One string
+  served two audiences: it is fed to the model *and* printed to the person,
+  so it was written for neither. `work-landed` reporting "No file was
+  modified in this session" is a fact the model can act on and a non-sequitur
+  to the reader, who sees every other check pass and a refusal they cannot
+  do anything about. The check output now addresses the model, and explicitly
+  forbids the one shortcut that would satisfy it without doing the work —
+  writing a file for the sake of writing one. When `files-changed` is the
+  *only* failure, molt additionally tells the person what it means: that this
+  turn was never going to satisfy it, and that `--skip session` exists. Shown
+  in both the TUI and `molt prove`.
 - **The command palette showed "… N more" and would not scroll to them.** It
   drew `matches.slice(0, 6)` regardless of the selection, so arrowing past the
   sixth row moved a highlight that was off screen, under a label advertising

@@ -275,7 +275,15 @@ function runBuiltin(builtin: BuiltinCheck, ctx: BarContext): { ok: boolean; outp
         ok: false,
         output:
           attempted.length === 0
-            ? "No file was modified in this session. Nothing was done that can be shown."
+            ? // Written for the model, which is the audience that can act on
+              // it. The last clause matters: the only way to satisfy this
+              // check without doing the work is to write a file for the sake
+              // of writing one, and a bar that rewards that is worse than no
+              // bar. Saying so is cheaper than catching the junk file later.
+              "No file was modified in this session, so there is no work to show. " +
+              "If the request needed a code change, make it. If it genuinely needs " +
+              "no file to change, say that plainly and stop — do not write or touch " +
+              "a file to satisfy this check."
             : `${attempted.length} write(s) appear in the record but none landed on disk ` +
               `(denied, errored, or never executed): ${attempted.join(", ")}`,
       };
