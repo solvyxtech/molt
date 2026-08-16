@@ -1,69 +1,69 @@
 /**
- * Theming is molt's core mechanic. A theme is one flat object; every color
- * in the UI resolves through it. Themes can be switched live with
- * `/molt <name>` or overridden entirely by ~/.config/molt/theme.json.
+ * Themes. Cyan by default and deliberately not any vendor's brand colour —
+ * molt should never look like it is pretending to be someone else's tool.
  */
 export type Theme = {
   accent: string;
-  user: string;
-  assistant: string;
-  tool: string;
-  error: string;
-  warn: string;
   dim: string;
+  ghost: string;
+  warn: string;
+  ok: string;
+  fail: string;
+  text: string;
 };
 
 export const THEMES: Record<string, Theme> = {
-  /** Default: light blue / cyan. Deliberately not Anthropic-orange. */
   tidepool: {
-    accent: "#7dd3fc",
-    user: "#22d3ee",
-    assistant: "white",
-    tool: "#94a3b8",
-    error: "#f87171",
-    warn: "#fbbf24",
-    dim: "gray",
+    accent: "#6FE9F7",
+    dim: "#17677A",
+    ghost: "#0E3744",
+    warn: "#D89A3F",
+    ok: "#5FD3A0",
+    fail: "#E06C68",
+    text: "#BDD6DD",
   },
-  ember: {
-    accent: "#f97316",
-    user: "#22d3ee",
-    assistant: "white",
-    tool: "#a3a3a3",
-    error: "#ef4444",
-    warn: "#eab308",
-    dim: "gray",
+  brackish: {
+    accent: "#7FD4A8",
+    dim: "#2F6B54",
+    ghost: "#17392D",
+    warn: "#D8B84F",
+    ok: "#7FD4A8",
+    fail: "#E08A78",
+    text: "#C4DCCE",
   },
-  mantis: {
-    accent: "#4ade80",
-    user: "#a3e635",
-    assistant: "white",
-    tool: "#9ca3af",
-    error: "#f87171",
-    warn: "#facc15",
-    dim: "gray",
+  slate: {
+    accent: "#A8C4DE",
+    dim: "#4A6076",
+    ghost: "#26333F",
+    warn: "#D2A56B",
+    ok: "#93C7A4",
+    fail: "#D98A8A",
+    text: "#C6D3DD",
   },
   mono: {
-    accent: "white",
-    user: "white",
-    assistant: "white",
-    tool: "gray",
-    error: "white",
-    warn: "white",
-    dim: "gray",
+    accent: "#FFFFFF",
+    dim: "#8A8A8A",
+    ghost: "#4A4A4A",
+    warn: "#BDBDBD",
+    ok: "#E0E0E0",
+    fail: "#FFFFFF",
+    text: "#D0D0D0",
   },
 };
 
 export const DEFAULT_THEME = "tidepool";
 
-/** Merge a partial user-supplied theme over a base; ignores junk keys. */
-export function resolveCustomTheme(raw: unknown, base: Theme): Theme {
-  if (!raw || typeof raw !== "object") return base;
-  const out = { ...base };
-  for (const k of Object.keys(base) as (keyof Theme)[]) {
-    const v = (raw as Record<string, unknown>)[k];
-    if (typeof v === "string" && v.length > 0 && v.length < 32) out[k] = v;
-  }
-  return out;
+export function themeNames(): string[] {
+  return Object.keys(THEMES);
 }
 
-export const TAGLINE = "same engine · shed the stock shell";
+export function getTheme(name: string): Theme {
+  return THEMES[name] ?? THEMES[DEFAULT_THEME];
+}
+
+/** Cycle to the next theme — backs `/molt`. */
+export function nextTheme(current: string): string {
+  const names = themeNames();
+  const i = names.indexOf(current);
+  return names[(i + 1) % names.length];
+}

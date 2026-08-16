@@ -1,0 +1,121 @@
+/**
+ * The archive: where shed context is kept.
+ *
+ * Separated from Transcript so the transcript stays pure and the write can
+ * be made to fail on purpose in tests. That matters more than it sounds:
+ * "nothing is ever lost" is only true if a failed disk write cannot take
+ * context with it, and the only way to know is to break the disk on demand.
+ *
+ * Layout:
+ *   .molt/exuviae/0000-<iso>.md   full unabridged shed batches
+ *   .molt/exuviae/index.md        one line each, so the archive is browsable
+ */
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+
+export type ArchiveEntry = {
+  index: number;
+  file: string;
+  iso: string;
+  messages: number;
+  bytes: number;
+  sha256: string;
+  firstAsk: string;
+};
+
+export interface ArchiveLike {
+  write(exuvia: string, messages: number, firstAsk: string): ArchiveEntry;
+  list(): ArchiveEntry[];
+  read(index: number): string;
+  grep?(pattern: string): { index: number; excerpt: string }[];
+  dir: string;
+}
+
+export class Archive implements ArchiveLike {
+  readonly dir: string;
+  private indexPath: string;
+  private seq = 0;
+
+  constructor(root: string) {
+    this.dir = join(root, ".molt", "exuviae");
+    this.indexPath = join(this.dir, "index.md");
+    mkdirSync(this.dir, { recursive: true });
+    this.seq = this.list().length;
+    if (!existsSync(this.indexPath)) {
+      writeFileSync(
+        this.indexPath,
+        "# molt exuviae index\n\nEvery batch of context shed in this project. Nothing here was summarized.\n\n" +
+          "| # | when | msgs | bytes | sha256 | first ask |\n|---|---|---|---|---|---|\n",
+        "utf8",
+      );
+    }
+  }
+
+  write(exuvia: string, messages: number, firstAsk: string): ArchiveEntry {
+    const index = this.seq;
+    const iso = new Date().toISOString();
+    const file = `${String(index).padStart(4, "0")}-${iso.replace(/[:.]/g, "-")}.md`;
+    const bytes = Buffer.byteLength(exuvia, "utf8");
+    const sha256 = createHash("sha256").update(exuvia, "utf8").digest("hex");
+
+    // Write the batch first, then the index. If the batch write throws, the
+    // caller never commits the shed and the index never claims a file that
+    // is not there.
+    writeFileSync(join(this.dir, file), exuvia, "utf8");
+    const ask = firstAsk.replace(/\s+/g, " ").slice(0, 60);
+    appendFileSync(
+      this.indexPath,
+      `| ${index} | ${iso} | ${messages} | ${bytes} | ${sha256.slice(0, 12)} | ${escapePipes(ask)} |\n`,
+      "utf8",
+    );
+
+    this.seq += 1;
+    return { index, file, iso, messages, bytes, sha256, firstAsk: ask };
+  }
+
+  list(): ArchiveEntry[] {
+    if (!existsSync(this.dir)) return [];
+    const files = readdirSync(this.dir)
+      .filter((f) => /^\d{4}-.*\.md$/.test(f))
+      .sort();
+    return files.map((file) => {
+      const body = readFileSync(join(this.dir, file), "utf8");
+      const index = Number(file.slice(0, 4));
+      const messages = (body.match(/^## /gm) ?? []).length;
+      return {
+        index,
+        file,
+        iso: "",
+        messages,
+        bytes: Buffer.byteLength(body, "utf8"),
+        sha256: createHash("sha256").update(body, "utf8").digest("hex"),
+        firstAsk: "",
+      };
+    });
+  }
+
+  read(index: number): string {
+    const entry = this.list().find((e) => e.index === index);
+    if (!entry) throw new Error(`no exuvia ${index} in ${this.dir}`);
+    return readFileSync(join(this.dir, entry.file), "utf8");
+  }
+
+  /** Search archived batches, returning matching sections with their index. */
+  grep(pattern: string): { index: number; excerpt: string }[] {
+    const re = new RegExp(pattern, "i");
+    const hits: { index: number; excerpt: string }[] = [];
+    for (const entry of this.list()) {
+      const body = this.read(entry.index);
+      const sections = body.split(/^## /m).slice(1);
+      for (const s of sections) {
+        if (re.test(s)) hits.push({ index: entry.index, excerpt: "## " + s.trim() });
+      }
+    }
+    return hits;
+  }
+}
+
+function escapePipes(s: string): string {
+  return s.replace(/\|/g, "\\|");
+}

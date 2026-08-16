@@ -1,32 +1,60 @@
 {
-  "name": "@solvyxtech/molt",
-  "version": "0.2.0",
-  "description": "molt — a tiny multi-provider agent harness with a bill of materials: /bom, hard token budgets, permission gates, and a shell you can shed.",
+  "name": "@solvyx/molt",
+  "version": "0.9.0",
+  "description": "A coding agent that can't say \"done\" without proving it.",
+  "keywords": [
+    "ai",
+    "agent",
+    "cli",
+    "coding-agent",
+    "llm",
+    "local-first",
+    "ollama",
+    "verification",
+    "tui"
+  ],
+  "license": "MIT",
+  "author": "Tyler Skelton",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/solvyxtech/molt.git"
+  },
+  "bugs": {
+    "url": "https://github.com/solvyxtech/molt/issues"
+  },
+  "homepage": "https://github.com/solvyxtech/molt#readme",
   "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
   "bin": {
     "molt": "dist/cli.js"
   },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "start": "tsx src/cli.tsx",
-    "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc",
-    "test": "vitest run",
-    "lab": "tsx rnd/shed-lab.mts"
+    "build": "tsc -p tsconfig.build.json && node -e \"require('fs').chmodSync('dist/cli.js', 0o755)\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist-test/test/*.test.js",
+    "test:build": "tsc -p tsconfig.test.json",
+    "pretest": "npm run test:build",
+    "check": "npm run typecheck && npm test",
+    "start": "node dist/cli.js"
   },
-  "engines": {
-    "node": ">=18"
-  },
-  "license": "MIT",
   "dependencies": {
-    "ink": "^6.0.0",
-    "react": "^19.0.0"
+    "ink": "^5.0.1",
+    "react": "^18.3.1",
+    "yaml": "^2.5.1"
   },
   "devDependencies": {
-    "@types/node": "^26.2.0",
-    "@types/react": "^19.0.0",
-    "ink-testing-library": "^4.0.0",
-    "tsx": "^4.0.0",
-    "typescript": "^5.5.0",
-    "vitest": "^3.0.0"
+    "@types/node": "^22.7.4",
+    "@types/react": "^18.3.11",
+    "typescript": "^5.6.2"
   }
 }

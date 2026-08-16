@@ -1,5 +1,11 @@
 node_modules/
 dist/
+dist-test/
+*.tsbuildinfo
+
+# molt's own session artifacts
+.molt/exuviae/
+.molt/receipts/
+
+.DS_Store
 *.log
-.env
-.molt/

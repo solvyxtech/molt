@@ -1,0 +1,454 @@
+/**
+ * The picker moves your session between providers. A selection that resolves
+ * to the wrong row does not just pick the wrong model — it silently bills a
+ * different account and files the receipt under the wrong endpoint. So the
+ * resolution rules, and the mode that hides a pasted key, are pinned here.
+ */
+import assert from "node:assert/strict";
+import { statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { describe, it } from "node:test";
+import { fmtDuration, statusSegments } from "../src/banner.js";
+import {
+  PICKER_ROWS,
+  PROVIDERS,
+  firstSelectable,
+  keyedProviders,
+  modelSources,
+  moveSelection,
+  pickerRows,
+  providerName,
+  readAuth,
+  saveEndpoint,
+  saveKey,
+  storedEndpoint,
+  resolveProvider,
+  windowRows,
+  type ModelChoice,
+} from "../src/providers.js";
+import { workspace } from "./helpers.js";
+
+const choice = (provider: string, id: string): ModelChoice => ({
+  provider,
+  id,
+  url: PROVIDERS[provider]!.url,
+});
+
+describe("resolveProvider", () => {
+  it("accepts a provider name", () => {
+    assert.equal(resolveProvider("anthropic"), "anthropic");
+    assert.equal(resolveProvider("xai"), "xai");
+  });
+
+  it("rejects a provider that takes no key", () => {
+    // ollama is reachable without credentials, so it is not on the login list.
+    assert.equal(resolveProvider("ollama"), null);
+  });
+
+  it("rejects an ordinal — the picker shows no numbers to type", () => {
+    assert.equal(resolveProvider("1"), null);
+    assert.equal(resolveProvider(""), null);
+    assert.equal(resolveProvider("anthropi"), null);
+  });
+
+  it("offers exactly the providers that need a key, and nothing else", () => {
+    // The login list and what /login <name> accepts must be the same set, or
+    // the picker shows a row that typing its name cannot reach.
+    const listed = keyedProviders();
+    assert.deepEqual(
+      listed.filter((n) => resolveProvider(n) === n),
+      listed,
+    );
+    assert.ok(!listed.includes("ollama"));
+  });
+});
+
+describe("pickerRows", () => {
+  it("puts a header above each provider's models, in first-seen order", () => {
+    const rows = pickerRows([
+      choice("xai", "grok-4.6"),
+      choice("anthropic", "claude-opus-5"),
+      choice("xai", "grok-4"),
+    ]);
+    assert.deepEqual(
+      rows.map((r) => (r.kind === "header" ? `#${r.provider}` : r.choice.id)),
+      ["#xai", "grok-4.6", "grok-4", "#anthropic", "claude-opus-5"],
+    );
+  });
+
+  it("starts the highlight on a model, never on a header", () => {
+    const rows = pickerRows([choice("xai", "grok-4.6")]);
+    assert.equal(rows[firstSelectable(rows)]!.kind, "model");
+  });
+
+  it("reports nothing selectable for an empty list", () => {
+    assert.equal(firstSelectable([]), -1);
+  });
+});
+
+describe("moveSelection", () => {
+  const rows = pickerRows([
+    choice("xai", "grok-4.6"),
+    choice("anthropic", "claude-opus-5"),
+    choice("anthropic", "claude-sonnet-5"),
+  ]);
+
+  it("steps over a header rather than landing on it", () => {
+    // rows: #xai, grok-4.6, #anthropic, claude-opus-5, claude-sonnet-5
+    const afterFirst = moveSelection(rows, 1, 1);
+    assert.equal(afterFirst, 3, "should skip the anthropic header");
+    assert.equal(rows[afterFirst]!.kind, "model");
+  });
+
+  it("wraps both ways, always onto a model", () => {
+    const last = moveSelection(rows, 4, 1);
+    assert.equal(rows[last]!.kind, "model");
+    assert.equal(last, 1, "wraps past the leading header to the first model");
+    const back = moveSelection(rows, 1, -1);
+    assert.equal(rows[back]!.kind, "model");
+    assert.equal(back, 4);
+  });
+
+  it("cannot spin forever when no row is selectable", () => {
+    const headersOnly = [{ kind: "header" as const, provider: "xai" }];
+    assert.equal(moveSelection(headersOnly, 0, 1), 0);
+  });
+});
+
+describe("windowRows", () => {
+  const many = pickerRows(
+    Array.from({ length: 40 }, (_, i) => choice("xai", `grok-${i}`)),
+  );
+
+  it("keeps the highlighted row on screen when the list is long", () => {
+    for (const index of [0, 1, 20, many.length - 1]) {
+      const win = windowRows(many, index);
+      assert.ok(
+        win.some((r) => r.i === index),
+        `selection ${index} scrolled off screen`,
+      );
+      assert.ok(win.length <= PICKER_ROWS);
+    }
+  });
+
+  it("carries each row's true index so a scrolled list highlights correctly", () => {
+    const win = windowRows(many, 30);
+    for (const { row, i } of win) assert.equal(many[i], row);
+  });
+
+  it("shows a short list whole", () => {
+    const few = pickerRows([choice("xai", "grok-4.6")]);
+    assert.equal(windowRows(few, 1).length, few.length);
+  });
+});
+
+describe("modelSources", () => {
+  it("offers a keyless provider without a login", () => {
+    assert.ok(modelSources({}).some((s) => s.name === "ollama"));
+  });
+
+  it("offers a keyed provider only once its key exists, and carries the key", () => {
+    assert.ok(!modelSources({}).some((s) => s.name === "xai"));
+    const withKey = modelSources({ xai: "sk-test" }).find((s) => s.name === "xai");
+    assert.equal(withKey?.key, "sk-test");
+  });
+});
+
+describe("credential storage", () => {
+  it("writes auth.json 0600 — a key must not be group- or world-readable", () => {
+    const ws = workspace();
+    try {
+      assert.equal(saveKey("xai", "sk-secret", ws.dir), true);
+      const mode = statSync(join(ws.dir, "auth.json")).mode & 0o777;
+      assert.equal(mode, 0o600, `expected 0600, got ${mode.toString(8)}`);
+      assert.equal(readAuth(ws.dir).xai, "sk-secret");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("keeps other providers' keys when one is added", () => {
+    const ws = workspace();
+    try {
+      saveKey("xai", "sk-xai", ws.dir);
+      saveKey("anthropic", "sk-ant", ws.dir);
+      assert.deepEqual(readAuth(ws.dir), { xai: "sk-xai", anthropic: "sk-ant" });
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("reports failure instead of throwing when the key cannot be persisted", () => {
+    // A directory where a file must go: the write fails, and the caller has
+    // to be able to say "session only" rather than crash mid-login.
+    assert.equal(saveKey("xai", "sk", "/dev/null/nope"), false);
+  });
+
+  it("survives a corrupt auth.json rather than taking the session down", () => {
+    const ws = workspace();
+    try {
+      saveKey("xai", "sk", ws.dir);
+      writeFileSync(join(ws.dir, "auth.json"), "{not json");
+      assert.deepEqual(readAuth(ws.dir), {});
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("carries pricing through, so the meter can show a cost", () => {
+    const ws = workspace();
+    try {
+      writeFileSync(
+        join(ws.dir, "config.json"),
+        JSON.stringify({ baseUrl: PROVIDERS.xai!.url, model: "grok-4.6", priceIn: 0.02, priceOut: 0.06 }),
+      );
+      const e = storedEndpoint(ws.dir);
+      assert.equal(e.priceIn, 0.02);
+      assert.equal(e.priceOut, 0.06);
+      assert.equal(e.model, "grok-4.6");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("ignores an unusable price rather than letting NaN reach the meter", () => {
+    const ws = workspace();
+    try {
+      writeFileSync(
+        join(ws.dir, "config.json"),
+        JSON.stringify({ priceIn: "free", priceOut: -1 }),
+      );
+      const e = storedEndpoint(ws.dir);
+      assert.equal(e.priceIn, undefined);
+      assert.equal(e.priceOut, undefined);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("keeps pricing when /model rewrites the endpoint", () => {
+    // saveEndpoint rewrites config.json on every model switch; prices live in
+    // the same file and must survive it.
+    const ws = workspace();
+    try {
+      writeFileSync(join(ws.dir, "config.json"), JSON.stringify({ priceIn: 0.02, priceOut: 0.06 }));
+      saveEndpoint(PROVIDERS.xai!.url, "grok-4", ws.dir);
+      const e = storedEndpoint(ws.dir);
+      assert.equal(e.model, "grok-4");
+      assert.equal(e.priceIn, 0.02);
+      assert.equal(e.priceOut, 0.06);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("reads back nothing on a fresh machine", () => {
+    const ws = workspace();
+    try {
+      assert.deepEqual(storedEndpoint(ws.dir), {
+        baseUrl: undefined,
+        model: undefined,
+        apiKey: undefined,
+        priceIn: undefined,
+        priceOut: undefined,
+      });
+    } finally {
+      ws.cleanup();
+    }
+  });
+});
+
+describe("status line with no model", () => {
+  it("says so instead of naming a model nobody selected", () => {
+    const text = statusSegments({ provider: "ollama", model: "", sessionTokens: 0 })
+      .map((s) => s.text)
+      .join("");
+    assert.match(text, /no model/);
+    assert.match(text, /\/login/);
+    assert.ok(!text.includes("ollama"), "endpoint is unverified until a model is chosen");
+  });
+
+  it("withholds usage and cost until there is a model to attribute them to", () => {
+    const text = statusSegments({
+      provider: "xai",
+      model: "",
+      sessionTokens: 1234,
+      costUsd: 0.42,
+    })
+      .map((s) => s.text)
+      .join("");
+    assert.ok(!/tok/.test(text), `leaked a token count: ${text}`);
+    assert.ok(!/0\.42|\$/.test(text), `leaked a cost: ${text}`);
+  });
+
+  it("shows the model with its usage once one is selected", () => {
+    const text = statusSegments({ provider: "xai", model: "grok-4.6", sessionTokens: 1234 })
+      .map((s) => s.text)
+      .join("");
+    assert.match(text, /grok-4\.6/);
+    assert.match(text, /tok/);
+  });
+});
+
+describe("the meter", () => {
+  it("puts the cost next to the token count", () => {
+    const text = statusSegments({
+      provider: "xai",
+      model: "grok-4.6",
+      sessionTokens: 18_400,
+      costUsd: 0.07,
+    })
+      .map((s) => s.text)
+      .join("");
+    assert.match(text, /18k tokens · \$0\.07/);
+  });
+
+  it("spells out tokens rather than abbreviating", () => {
+    const text = statusSegments({ provider: "xai", model: "grok-4.6", sessionTokens: 900 })
+      .map((s) => s.text)
+      .join("");
+    assert.match(text, /900 tokens/);
+    assert.ok(!/\btok\b/.test(text), `still abbreviated: ${text}`);
+  });
+
+  it("shows a budget with the cost beside it", () => {
+    const text = statusSegments({
+      provider: "xai",
+      model: "grok-4.6",
+      sessionTokens: 1000,
+      budgetTokens: 50_000,
+      costUsd: 0.0042,
+    })
+      .map((s) => s.text)
+      .join("");
+    assert.match(text, /1\.0k\/50k tokens · \$0\.0042/);
+  });
+
+  it("omits the cost when no pricing is configured", () => {
+    const text = statusSegments({ provider: "xai", model: "grok-4.6", sessionTokens: 1234 })
+      .map((s) => s.text)
+      .join("");
+    assert.ok(!text.includes("$"), `faked a cost with no pricing: ${text}`);
+  });
+});
+
+describe("elapsed time", () => {
+  it("reads at one useful unit, not five digits", () => {
+    assert.equal(fmtDuration(0), "0ms");
+    assert.equal(fmtDuration(340), "340ms");
+    assert.equal(fmtDuration(1000), "1.0s");
+    assert.equal(fmtDuration(2400), "2.4s");
+    assert.equal(fmtDuration(12_000), "12s");
+    assert.equal(fmtDuration(64_000), "1m 04s");
+    assert.equal(fmtDuration(3_600_000), "60m 00s");
+  });
+
+  it("never renders a negative or fractional millisecond", () => {
+    // Clock skew between two Date.now() reads must not print "-1ms".
+    assert.equal(fmtDuration(-5), "0ms");
+    assert.equal(fmtDuration(0.4), "0ms");
+  });
+
+  it("holds a stable width once past a second, so the line does not jitter", () => {
+    // The spinner row redraws ~11×/s; a field that changes width shifts
+    // everything after it on every tick.
+    for (const ms of [1000, 5500, 9900]) assert.equal(fmtDuration(ms).length, 4);
+    for (const ms of [10_000, 30_000, 59_000]) assert.equal(fmtDuration(ms).length, 3);
+  });
+});
+
+describe("cost formatting", () => {
+  it("still resolves a cost below a hundredth of a cent", () => {
+    // The bug: a 998-token turn at $0.02/Mtok is $0.000024, and a fixed four
+    // decimals rendered it "$0.0000" — a meter reading zero while the token
+    // count climbs, which reads as broken pricing rather than a cheap turn.
+    const text = statusSegments({
+      provider: "xai",
+      model: "grok-4.6",
+      sessionTokens: 998,
+      costUsd: 0.00002388,
+    })
+      .map((s) => s.text)
+      .join("");
+    assert.match(text, /\$0\.000024/);
+    assert.ok(!text.includes("$0.0000 "), "flattened a real cost to zero");
+  });
+
+  it("scales precision to the amount", () => {
+    const cost = (usd: number) =>
+      statusSegments({ provider: "p", model: "m", sessionTokens: 1, costUsd: usd })
+        .map((s) => s.text)
+        .join("")
+        .split("· ")
+        .pop();
+    assert.equal(cost(12.5), "$12.50");
+    assert.equal(cost(0.07), "$0.07");
+    assert.equal(cost(0.0042), "$0.0042");
+    assert.equal(cost(0.000024), "$0.000024");
+  });
+
+  it("says 'less than' rather than printing a zero that is not one", () => {
+    const text = statusSegments({
+      provider: "p",
+      model: "m",
+      sessionTokens: 1,
+      costUsd: 0.0000001,
+    })
+      .map((s) => s.text)
+      .join("");
+    assert.match(text, /<\$0\.000001/);
+  });
+
+  it("shows a true zero as zero", () => {
+    const text = statusSegments({
+      provider: "p",
+      model: "m",
+      sessionTokens: 5,
+      costUsd: 0,
+    })
+      .map((s) => s.text)
+      .join("");
+    assert.match(text, /\$0\.00\b/);
+  });
+});
+
+describe("providerName", () => {
+  it("names the provider, not the subdomain", () => {
+    // https://api.x.ai/v1 split on "." gives "api", which is what the status
+    // line was showing — and would read the same for every vendor.
+    assert.equal(providerName(PROVIDERS.xai!.url), "xai");
+    assert.equal(providerName(PROVIDERS.anthropic!.url), "anthropic");
+    assert.equal(providerName(PROVIDERS.ollama!.url), "ollama");
+  });
+
+  it("falls back to the host for an endpoint molt has no preset for", () => {
+    assert.equal(providerName("https://api.together.xyz/v1"), "together");
+    assert.equal(providerName("https://inference.example.com/v1"), "inference");
+  });
+
+  it("does not throw on a malformed url", () => {
+    assert.equal(providerName("not a url"), "custom");
+  });
+});
+
+describe("token formatting", () => {
+  const tokens = (n: number) =>
+    statusSegments({ provider: "p", model: "m", sessionTokens: n })
+      .map((s) => s.text)
+      .join("")
+      .match(/([\d.]+[kM]?) tokens/)?.[1];
+
+  it("scales past a thousand and past a million", () => {
+    assert.equal(tokens(998), "998");
+    assert.equal(tokens(2400), "2.4k");
+    assert.equal(tokens(45_000), "45k");
+    assert.equal(tokens(2_400_000), "2.4M");
+    assert.equal(tokens(12_000_000), "12M");
+  });
+
+  it("does not make the reader finish the arithmetic", () => {
+    // A 1M-token context is ordinary now; "2400k" is not a number anyone
+    // reads at a glance.
+    assert.ok(!tokens(2_400_000)!.endsWith("k"));
+  });
+});

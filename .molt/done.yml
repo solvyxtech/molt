@@ -1,0 +1,36 @@
+# What "done" means in this project.
+#
+# molt will not emit a final answer while any check below fails. Checks are
+# ordinary shell commands, so anything your CI can run, your agent must pass.
+#
+# Delete what does not apply. An empty or missing file disables the proof
+# loop entirely, which molt will warn you about on every launch.
+
+version: 1
+
+checks:
+  # - name: types
+  #   run: npm run typecheck
+  #
+  # - name: tests
+  #   run: npm test
+  #   timeout: 300
+
+  # Builtins molt runs itself, against the full session record —
+  # including context that has already been shed.
+  #
+  #   files-changed   at least one file was actually modified, and every
+  #                   write molt performed is still on disk, byte for byte
+  #   record-intact   the shed archive is complete and readable, so the
+  #                   evidence behind these results can be audited later
+  #
+  # Tags are optional selection labels. molt understands --only and --skip,
+  # so slow checks can live in the file for CI without paying for them on
+  # every completion attempt locally. An untagged check always runs.
+  - name: work-landed
+    builtin: files-changed
+    tags: [fast]
+
+  - name: record-intact
+    builtin: record-intact
+    tags: [fast]

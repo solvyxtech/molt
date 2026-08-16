@@ -1,223 +1,289 @@
-import React, { useCallback, useState } from "react";
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, chmodSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+/**
+ * The TUI.
+ *
+ * Deliberately plain. The interesting part of molt is the loop, and a
+ * terminal interface earns its keep by getting out of the way — showing the
+ * work, the receipts, and the refusals, and nothing else.
+ */
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
-import type { Engine, EngineEvent, Confirm, Bom } from "./engine.js";
-import { reduceEvent, appendCapped, type Line } from "./transcript.js";
-import { THEMES, DEFAULT_THEME, TAGLINE, type Theme } from "./theme.js";
-import { Banner } from "./banner.js";
+import { Banner, fmtDuration } from "./banner.js";
+import { COMMANDS, completionFor, matchCommands, windowAround, wrapIndex } from "./commands.js";
+import { StatusLine } from "./status-line.js";
+import { loadBar, writeDefaultBar, BarError } from "./bar.js";
+import type { Engine } from "./engine.js";
+import {
+  PROVIDERS,
+  defaultConfigDir,
+  firstSelectable,
+  keyedProviders,
+  modelSources,
+  moveSelection,
+  pickerRows,
+  readAuth,
+  resolveProvider,
+  saveEndpoint,
+  saveKey,
+  windowRows,
+  type ModelChoice,
+  type PickerRow,
+} from "./providers.js";
+import { DEFAULT_THEME, getTheme, nextTheme } from "./theme.js";
+import type { BarResult, EngineEvent } from "./types.js";
 
-/** Structural interface so tests can pass a fake engine. */
-export type MoltEngine = Pick<
-  Engine,
-  | "run"
-  | "bom"
-  | "reset"
-  | "setBudget"
-  | "model"
-  | "budgetTokens"
-  | "shed"
-  | "attach"
-  | "probe"
-  | "doctor"
-  | "lastRequestBody"
-  | "setModel"
-  | "setApiKey"
-  | "setBaseUrl"
-  | "listModels"
-  | "baseUrl"
->;
-
-export type ModelChoice = {
-  provider: string;
-  id: string;
-  url: string;
-  key?: string;
+type Line = {
+  id: number;
+  tone: "user" | "agent" | "tool" | "info" | "error" | "ok" | "fail";
+  text: string;
 };
 
-/** Provider presets for /connect and the /login picker. */
-export const PROVIDERS: Record<string, { url: string; needsKey: boolean; hint?: string }> = {
-  ollama: { url: "http://localhost:11434/v1", needsKey: false },
-  openrouter: { url: "https://openrouter.ai/api/v1", needsKey: true },
-  anthropic: {
-    url: "https://api.anthropic.com/v1",
-    needsKey: true,
-    hint: "Console API key (metered) — subscription logins are not permitted in third-party tools",
-  },
-  openai: { url: "https://api.openai.com/v1", needsKey: true },
-  xai: { url: "https://api.x.ai/v1", needsKey: true },
-  groq: { url: "https://api.groq.com/openai/v1", needsKey: true },
-};
+const HELP = [
+  "commands",
+  ...COMMANDS.map((c) => `  ${(c.name + (c.args ? " " + c.args : "")).padEnd(20)}${c.summary}`),
+  "",
+  "  type / to browse · ↑↓ to choose · tab to fill · enter to run",
+].join("\n");
 
-type PendingPermission = {
-  detail: string;
-  resolve: (allowed: boolean) => void;
-};
+/** How many palette rows to show at once. */
+const PALETTE_ROWS = 6;
+
+/**
+ * The working indicator. Braille cells are a single column wide in every
+ * modern terminal font, so the label beside them never shifts as it turns.
+ */
+const SPINNER = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"];
+const SPIN_MS = 90;
 
 export function App({
   engine,
-  initialNotice,
-  customTheme,
-  animateBanner = false,
-  artifactDir = ".molt",
-  configDir = join(homedir(), ".config", "molt"),
+  version,
+  autoShed,
 }: {
-  engine: MoltEngine;
-  initialNotice?: string;
-  customTheme?: Theme;
-  animateBanner?: boolean;
-  /** Where exuviae and wire dumps are written (cwd-relative). */
-  artifactDir?: string;
-  /** Where auth.json / config.json live. */
-  configDir?: string;
+  engine: Engine;
+  version: string;
+  autoShed?: number;
 }) {
   const { exit } = useApp();
-  const [themeName, setThemeName] = useState(
-    customTheme ? "custom" : DEFAULT_THEME,
-  );
-  const theme: Theme =
-    themeName === "custom" && customTheme
-      ? customTheme
-      : (THEMES[themeName] ?? THEMES[DEFAULT_THEME]);
-  const [lines, setLines] = useState<Line[]>(
-    initialNotice ? [{ kind: "info", text: initialNotice }] : [],
-  );
+  const [themeName, setThemeName] = useState(DEFAULT_THEME);
+  const theme = getTheme(themeName);
+
+  const [lines, setLines] = useState<Line[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-  const [pending, setPending] = useState<PendingPermission | null>(null);
-  const [sessionTok, setSessionTok] = useState(0);
+  const [pending, setPending] = useState<{ name: string; detail: string } | null>(null);
+  const [promptChoice, setPromptChoice] = useState(0);
+  const [paletteIndex, setPaletteIndex] = useState(0);
+  const [tokens, setTokens] = useState(0);
+  const [streamText, setStreamText] = useState("");
   const [cost, setCost] = useState<number | undefined>(undefined);
-  const [raceModels, setRaceModels] = useState<string[] | null>(null);
+  const nextId = useRef(0);
+  const resolver = useRef<((ok: boolean) => void) | null>(null);
+
+  // What the model is doing right now, and since when. Held separately from
+  // `busy` because the turn stays busy across several distinct phases.
+  const [activity, setActivity] = useState<{ label: string; since: number } | null>(null);
+  const [frame, setFrame] = useState(0);
+
+  // Picker state. `login-key` is the one mode that must never echo what you
+  // type, so it is a distinct state rather than a flag on a shared one.
   type Mode =
     | { kind: "chat" }
-    | { kind: "login-select" }
+    // Both pickers carry their own highlight index: the arrow keys move it,
+    // enter commits it, and nothing is typed.
+    | { kind: "login-select"; providers: { name: string; hasKey: boolean }[]; index: number }
     | { kind: "login-key"; provider: string }
-    | { kind: "model-select"; choices: ModelChoice[] };
+    | { kind: "model-select"; rows: PickerRow[]; index: number };
   const [mode, setMode] = useState<Mode>({ kind: "chat" });
 
-  const push = useCallback((l: Line) => {
-    setLines((prev) => appendCapped(prev, l));
+  const add = useCallback((tone: Line["tone"], text: string) => {
+    setLines((prev) => [...prev, { id: nextId.current++, tone, text }]);
   }, []);
 
-  const confirm: Confirm = useCallback(
-    (name, detail) =>
+  useEffect(() => {
+    if (!engine.hasBar) {
+      add(
+        "info",
+        "no .molt/done.yml in this project — completions will not be verified. /init to add one.",
+      );
+    }
+    if (autoShed) add("info", `auto-shed above ${autoShed} tokens of history`);
+  }, [add, engine, autoShed]);
+
+  // The spinner only turns while there is work. An idle molt draws nothing
+  // and holds no timer, so it costs a stopped terminal exactly nothing.
+  useEffect(() => {
+    if (!busy) {
+      setFrame(0);
+      return;
+    }
+    const id = setInterval(() => setFrame((f) => f + 1), SPIN_MS);
+    return () => clearInterval(id);
+  }, [busy]);
+
+  /** Name the current phase, restarting the clock only when it actually changes. */
+  const beginActivity = useCallback((label: string) => {
+    setActivity((a) => (a?.label === label ? a : { label, since: Date.now() }));
+  }, []);
+
+  const confirm = useCallback(
+    (name: string, detail: string) =>
       new Promise<boolean>((resolve) => {
-        setPending({ detail: `${name} ${detail}`, resolve });
+        setPending({ name, detail });
+        setPromptChoice(0); // default to allow; deny is one arrow away
+        resolver.current = resolve;
       }),
     [],
   );
 
-  const runTurn = useCallback(
-    async (prompt: string) => {
-      setBusy(true);
-      try {
-        for await (const ev of engine.run(prompt, confirm)) {
-          setLines((prev) => reduceEvent(prev, ev as EngineEvent));
-          if (ev.kind === "usage") {
-            setSessionTok(ev.sessionTokens);
-            setCost(ev.costUsd);
-          }
+  // The palette is derived, never stored — it can never disagree with the
+  // text on screen.
+  const matches = matchCommands(input);
+  const showPalette = matches.length > 0 && !busy && !pending && mode.kind === "chat";
+  const selectedIndex = wrapIndex(paletteIndex, matches.length);
+  const selected = matches[selectedIndex];
+
+  const renderBar = useCallback(
+    (result: BarResult, header: string) => {
+      add(result.ok ? "ok" : "fail", header);
+      for (const r of result.results) {
+        add(
+          r.ok ? "ok" : "fail",
+          `  ${r.ok ? "pass" : "FAIL"}  ${r.name}${r.exitCode !== undefined ? ` (exit ${r.exitCode})` : ""}`,
+        );
+        if (!r.ok) {
+          for (const l of r.output.trim().split("\n").slice(0, 8)) add("fail", `        ${l}`);
         }
-      } catch (err) {
-        push({ kind: "error", text: String(err) });
-      } finally {
-        setBusy(false);
-        setPending(null);
       }
     },
-    [engine, confirm, push],
+    [add],
   );
 
-  const readJson = useCallback((file: string): Record<string, string> => {
-    try {
-      return JSON.parse(readFileSync(join(configDir, file), "utf8"));
-    } catch {
-      return {};
-    }
-  }, [configDir]);
+  const handleEvent = useCallback(
+    (ev: EngineEvent) => {
+      switch (ev.kind) {
+        case "delta":
+          beginActivity("responding");
+          setStreamText((s) => s + ev.text);
+          break;
+        case "cancelled":
+          setStreamText("");
+          add("info", "cancelled — the session is unchanged");
+          break;
+        case "assistant_text":
+          setStreamText("");
+          add("agent", ev.text);
+          break;
+        case "tool_start":
+          beginActivity(ev.name);
+          break;
+        case "tool": {
+          // The duration earns its place next to the call it describes, not
+          // in a summary at the end where it cannot be acted on.
+          const took = ev.durationMs === undefined ? "" : `  ${fmtDuration(ev.durationMs)}`;
+          add("tool", `${ev.name}  ${ev.detail}${ev.note ? `  [${ev.note}]` : ""}${took}`);
+          beginActivity("thinking");
+          break;
+        }
+        case "usage":
+          setTokens(ev.sessionTokens);
+          setCost(ev.costUsd);
+          break;
+        case "proof_start":
+          beginActivity("checking the bar");
+          add("info", `checking ${ev.checks} condition(s) from .molt/done.yml`);
+          break;
+        case "proof_result":
+          renderBar(ev.result, "bar met");
+          break;
+        case "proof_refused":
+          // The claim was refused, so it must leave the screen. Streaming
+          // already painted it; without this the refused text stays in the
+          // buffer and the next attempt's tokens append to it, running
+          // several withheld answers together on one line.
+          setStreamText("");
+          renderBar(ev.result, `completion refused (attempt ${ev.attempt}) — continuing`);
+          break;
+        case "proof_exhausted":
+          setStreamText("");
+          renderBar(ev.result, `bar not met after ${ev.attempts} attempts`);
+          break;
+        case "receipt":
+          add("info", `receipt: ${ev.path}`);
+          break;
+        case "shed":
+          add("info", `shed ${ev.dropped} messages · ${ev.before} → ${ev.after} tokens · ${ev.path}`);
+          break;
+        case "info":
+          add("info", ev.text);
+          break;
+        case "error":
+          add("error", ev.text);
+          break;
+      }
+    },
+    [add, beginActivity, renderBar],
+  );
 
-  const writeJson = useCallback((file: string, data: Record<string, string>, secret = false) => {
-    try {
-      mkdirSync(configDir, { recursive: true });
-      const p = join(configDir, file);
-      writeFileSync(p, JSON.stringify(data, null, 2), "utf8");
-      if (secret) chmodSync(p, 0o600);
-      return true;
-    } catch {
-      return false;
-    }
-  }, [configDir]);
-
+  /** Remember the endpoint so the next bare `molt` starts where this left off. */
   const persistEndpoint = useCallback(() => {
-    writeJson("config.json", {
-      ...readJson("config.json"),
-      baseUrl: engine.baseUrl,
-      model: engine.model,
-    });
-  }, [engine, readJson, writeJson]);
+    if (engine.model) saveEndpoint(engine.baseUrl, engine.model);
+  }, [engine]);
 
-  const doConnect = useCallback((name: string) => {
-    const p = PROVIDERS[name];
-    if (!p) {
-      push({ kind: "info", text: `providers: ${Object.keys(PROVIDERS).join("  ")}` });
-      return;
-    }
-    const storedKey = readJson("auth.json")[name];
-    engine.setBaseUrl(p.url, storedKey);
-    setSessionTok(0);
-    persistEndpoint();
-    const keyMsg = !p.needsKey
-      ? "no key needed"
-      : storedKey
-        ? "using stored key"
-        : "no key stored — /login to add one";
-    push({ kind: "info", text: `connected: ${name} (${p.url}) · ${keyMsg} · /model to pick a model` });
-    if (p.hint) push({ kind: "info", text: `note: ${p.hint}` });
-  }, [engine, push, readJson, persistEndpoint]);
+  const startLogin = useCallback(
+    (arg?: string) => {
+      const stored = readAuth();
+      // `/login xai` skips the picker; a wrong name falls through to it.
+      const direct = arg ? resolveProvider(arg) : null;
+      if (direct) {
+        add("info", `paste API key for ${direct} — input hidden, enter to save, esc to cancel`);
+        const hint = PROVIDERS[direct]?.hint;
+        if (hint) add("info", `note: ${hint}`);
+        setMode({ kind: "login-key", provider: direct });
+        return;
+      }
+      if (arg) add("info", `unknown provider '${arg}'`);
+      add("info", "add a key — choose a provider:");
+      setMode({
+        kind: "login-select",
+        providers: keyedProviders().map((name) => ({ name, hasKey: Boolean(stored[name]) })),
+        index: 0,
+      });
+    },
+    [add],
+  );
 
-  const finishLogin = useCallback((provider: string, key: string) => {
-    setMode({ kind: "chat" });
-    if (!key) {
-      push({ kind: "info", text: "login cancelled" });
-      return;
-    }
-    const p = PROVIDERS[provider];
-    const ok = writeJson("auth.json", { ...readJson("auth.json"), [provider]: key }, true);
-    if (p && engine.baseUrl === p.url) engine.setApiKey(key); // live if it's the active endpoint
-    push({
-      kind: "info",
-      text: `key saved for ${provider}${ok ? ` → ${join(configDir, "auth.json")} (0600)` : " (persist failed — session only)"} · /model to browse its models · /login to add another`,
-    });
-  }, [engine, push, readJson, writeJson, configDir]);
+  const finishLogin = useCallback(
+    (provider: string, key: string) => {
+      setMode({ kind: "chat" });
+      if (!key) {
+        add("info", "login cancelled");
+        return;
+      }
+      const preset = PROVIDERS[provider];
+      const ok = saveKey(provider, key);
+      // Point the session at the provider you just authenticated, so the key
+      // is usable now rather than after a restart.
+      if (preset) {
+        engine.setBaseUrl(preset.url, key, provider);
+        setTokens(0);
+        setCost(undefined);
+      }
+      add(
+        ok ? "ok" : "error",
+        ok
+          ? `key saved for ${provider} → ${defaultConfigDir()}/auth.json (0600) · /model to pick one`
+          : `could not write ${defaultConfigDir()}/auth.json — key held for this session only`,
+      );
+    },
+    [add, engine],
+  );
 
-  const startLogin = useCallback(() => {
-    const stored = readJson("auth.json");
-    const rows = Object.entries(PROVIDERS)
-      .filter(([, p]) => p.needsKey)
-      .map(([name], i) => `  ${i + 1}. ${name}${stored[name] ? "  (key stored — will overwrite)" : ""}`);
-    push({
-      kind: "info",
-      text: `add a key — pick a provider:\n${rows.join("\n")}\ntype a number or name · esc to cancel`,
-    });
-    setMode({ kind: "login-select" });
-  }, [push, readJson]);
-
-  const resolveProvider = useCallback((sel: string): string | null => {
-    const keyed = Object.keys(PROVIDERS).filter((n) => PROVIDERS[n].needsKey);
-    const n = parseInt(sel, 10);
-    if (Number.isFinite(n) && n >= 1 && n <= keyed.length) return keyed[n - 1];
-    return keyed.includes(sel) ? sel : null;
-  }, []);
-
-  /** Aggregate models across every provider you hold a key for (+ local ollama). */
+  /** Aggregate models across every provider you hold a key for. */
   const startModelPicker = useCallback(async () => {
-    const stored = readJson("auth.json");
-    const sources = Object.entries(PROVIDERS)
-      .filter(([name, p]) => !p.needsKey || stored[name])
-      .map(([name, p]) => ({ name, url: p.url, key: stored[name] as string | undefined }));
+    const auth = readAuth();
+    const sources = modelSources(auth);
     if (!sources.length) {
-      push({ kind: "info", text: "no provider keys yet — /login to add one" });
+      add("info", "no provider keys yet — /login to add one");
       return;
     }
     setBusy(true);
@@ -225,433 +291,578 @@ export function App({
       sources.map(async (s) => ({ ...s, r: await engine.listModels(s.url, s.key) })),
     );
     setBusy(false);
+
     const choices: ModelChoice[] = [];
-    const blocks: string[] = [];
-    let shown = 0;
     for (const s of results) {
-      if (!s.r.ok) {
-        if (s.name !== "ollama") blocks.push(`${s.name}: unreachable (${s.r.error})`);
-        continue;
-      }
-      const all = s.r.ids.map((id) => ({ provider: s.name, id, url: s.url, key: s.key }));
-      choices.push(...all);
-      const display = all.slice(0, 12);
-      blocks.push(
-        `${s.name}:\n` +
-          display.map((c) => `  ${++shown}. ${c.id}`).join("\n") +
-          (all.length > display.length ? `\n  …+${all.length - display.length} more (type any full name)` : ""),
-      );
+      if (!s.r.ok) continue;
+      choices.push(...s.r.ids.map((id) => ({ provider: s.name, id, url: s.url, key: s.key })));
+    }
+    // Report unreachable keyed providers — a silently short list reads as
+    // "this provider has no models" when it means "molt could not ask".
+    const failed = results.filter((s) => !s.r.ok && auth[s.name]);
+    for (const s of failed) {
+      add("error", `${s.name}: unreachable (${(s.r as { error: string }).error})`);
     }
     if (!choices.length) {
-      push({ kind: "error", text: "no models found on any keyed provider — /doctor each, or /login again" });
+      add("error", "no models found — check the keys with molt doctor, or /login again");
       return;
     }
-    push({
-      kind: "info",
-      text: `models across your keys:\n${blocks.join("\n")}\ntype a number or full model name · esc to cancel`,
-    });
-    setMode({ kind: "model-select", choices });
-  }, [engine, push, readJson]);
 
-  const pickModel = useCallback((choices: ModelChoice[], sel: string) => {
-    setMode({ kind: "chat" });
-    const visible = choices; // numbers index the shown order across providers
-    const n = parseInt(sel, 10);
-    let c: ModelChoice | undefined;
-    if (Number.isFinite(n) && n >= 1) {
-      // numbering matched display order: first 12 per provider in sequence
-      const numbered: ModelChoice[] = [];
-      const byProv = new Map<string, ModelChoice[]>();
-      for (const ch of choices) {
-        const arr = byProv.get(ch.provider) ?? [];
-        arr.push(ch);
-        byProv.set(ch.provider, arr);
+    // One array drives both the rendering and the selection, so the
+    // highlighted row is always the row that gets chosen.
+    const rows = pickerRows(choices);
+    add("info", "models across your keys:");
+    setMode({ kind: "model-select", rows, index: firstSelectable(rows) });
+  }, [add, engine]);
+
+  const applyModel = useCallback(
+    (c: ModelChoice) => {
+      setMode({ kind: "chat" });
+      // Switching endpoint resets the session: different endpoint, different
+      // world, and a transcript carried across would misattribute the record.
+      if (engine.baseUrl !== c.url) {
+        engine.setBaseUrl(c.url, c.key, c.provider);
+        setTokens(0);
+        setCost(undefined);
       }
-      for (const arr of byProv.values()) numbered.push(...arr.slice(0, 12));
-      c = numbered[n - 1];
-    }
-    c ??= visible.find((ch) => ch.id === sel || `${ch.provider}/${ch.id}` === sel);
-    if (!c) {
-      push({ kind: "info", text: `no match for '${sel}' — /model to list again` });
-      return;
-    }
-    if (engine.baseUrl !== c.url) {
-      engine.setBaseUrl(c.url, c.key);
-      setSessionTok(0);
-    }
-    engine.setModel(c.id);
-    persistEndpoint();
-    push({ kind: "info", text: `model → ${c.provider}/${c.id}` });
-  }, [engine, push, persistEndpoint]);
-
-  const doModel = useCallback((arg?: string) => {
-    if (arg) {
-      engine.setModel(arg);
+      engine.setModel(c.id);
       persistEndpoint();
-      push({ kind: "info", text: `model → ${arg}` });
-      return;
-    }
-    setBusy(true);
-    void engine.listModels().then((r) => {
-      if (r.ok) {
-        const shown = r.ids.slice(0, 24);
-        push({
-          kind: "info",
-          text: `models @ ${engine.baseUrl}:\n  ${shown.join("\n  ")}${r.ids.length > shown.length ? `\n  …+${r.ids.length - shown.length} more` : ""}\nuse: /model <name>`,
-        });
-      } else {
-        push({ kind: "error", text: `model list: ${r.error}` });
-      }
-      setBusy(false);
-    });
-  }, [engine, push, persistEndpoint]);
-
-  const runRace = useCallback(
-    async (prompt: string, models: string[]) => {
-      setBusy(true);
-      try {
-        const results: { m: string; tok: number; ms: number }[] = [];
-        for (const m of models) {
-          push({ kind: "info", text: `── ${m} ──` });
-          const r = await engine.probe(prompt, m);
-          if (!r.ok) {
-            push({ kind: "error", text: `${m}: ${r.error}` });
-            continue;
-          }
-          push({ kind: "assistant", text: r.text || "(empty)" });
-          push({
-            kind: "info",
-            text: `✓ ${r.promptTokens}→${r.completionTokens} tok · ${(r.ms / 1000).toFixed(1)}s`,
-          });
-          results.push({ m, tok: r.promptTokens + r.completionTokens, ms: r.ms });
-        }
-        if (results.length > 1) {
-          const fastest = [...results].sort((a, b) => a.ms - b.ms)[0].m;
-          const leanest = [...results].sort((a, b) => a.tok - b.tok)[0].m;
-          push({
-            kind: "info",
-            text: `race: fastest ${fastest} · leanest ${leanest} · (isolated, tool-less probes)`,
-          });
-        }
-      } finally {
-        setBusy(false);
-        setRaceModels(null);
-      }
+      add("ok", `model → ${c.provider}/${c.id}`);
     },
-    [engine, push],
+    [add, engine, persistEndpoint],
   );
 
-  const doShed = useCallback(() => {
-    const r = engine.shed();
-    if (!r) {
-      push({ kind: "info", text: "nothing to shed yet (kept last 2 exchanges)" });
-      return;
-    }
-    let where = "(archive write failed)";
-    try {
-      const dir = join(resolve(process.cwd(), artifactDir), "exuviae");
-      mkdirSync(dir, { recursive: true });
-      const p = join(dir, `${Date.now()}.md`);
-      writeFileSync(p, r.exuvia, "utf8");
-      where = p;
-    } catch {
-      /* archive is best-effort; context shed still applied */
-    }
-    push({
-      kind: "info",
-      text: `shed ${r.droppedCount} messages · history ${r.beforeTokens}→${r.afterTokens} tok (est) · 0 tokens spent · full copy: ${where}`,
-    });
-  }, [engine, push, artifactDir]);
-
-  const doRegrow = useCallback(() => {
-    try {
-      const dir = join(resolve(process.cwd(), artifactDir), "exuviae");
-      const files = readdirSync(dir).filter((f) => f.endsWith(".md")).sort();
-      if (!files.length) {
-        push({ kind: "info", text: "no exuviae to regrow from" });
-        return;
-      }
-      const p = join(dir, files[files.length - 1]);
-      const text = readFileSync(p, "utf8");
-      engine.attach(text);
-      push({
-        kind: "info",
-        text: `regrew ${files[files.length - 1]} · +${Math.ceil(text.length / 4)} tok (est) re-attached`,
-      });
-    } catch (e) {
-      push({ kind: "error", text: `regrow failed: ${String(e)}` });
-    }
-  }, [engine, push, artifactDir]);
-
-  const doWire = useCallback(() => {
-    const body = engine.lastRequestBody;
-    if (!body) {
-      push({ kind: "info", text: "no request sent yet" });
-      return;
-    }
-    let where = "(write failed)";
-    try {
-      const dir = resolve(process.cwd(), artifactDir);
-      mkdirSync(dir, { recursive: true });
-      const p = join(dir, "wire.json");
-      writeFileSync(p, body, "utf8");
-      where = p;
-    } catch {
-      /* best effort */
-    }
-    push({
-      kind: "info",
-      text: `wire: last request ${Buffer.byteLength(body, "utf8")}B ≈${Math.ceil(body.length / 4)} tok · exact JSON: ${where}`,
-    });
-  }, [engine, push, artifactDir]);
-
-  const printBom = useCallback(() => {
-    const b: Bom = engine.bom();
-    push({
-      kind: "info",
-      text:
-        `bom (est): system ${b.systemTokens} · tool schemas ${b.toolSchemaTokens} · ` +
-        `history ${b.historyTokens} · next request ≈${b.requestTotalEst} tok`,
-    });
-    const cost =
-      b.costUsd !== undefined ? ` · $${b.costUsd.toFixed(4)}` : "";
-    push({
-      kind: "info",
-      text:
-        `session (real): ${b.sessionPromptTokens} in / ${b.sessionCompletionTokens} out${cost}` +
-        (b.budgetTokens ? ` · budget ${b.budgetTokens}` : " · no budget"),
-    });
-  }, [engine, push]);
-
-  const handleCommand = useCallback(
+  const command = useCallback(
     (raw: string): boolean => {
-      const [cmd, arg] = raw.split(/\s+/, 2);
+      const [cmd, ...rest] = raw.trim().split(/\s+/);
+      const arg = rest.join(" ");
       switch (cmd) {
-        case "/quit":
+        case "/help":
+          add("info", HELP);
+          return true;
         case "/exit":
+        case "/quit":
           exit();
           return true;
-        case "/new":
+        case "/molt": {
+          const t = nextTheme(themeName);
+          setThemeName(t);
+          add("info", `theme: ${t}`);
+          return true;
+        }
+        case "/clear":
           engine.reset();
-          setSessionTok(0);
-          push({ kind: "info", text: "new session" });
+          setLines([]);
+          setTokens(0);
           return true;
-        case "/bom":
-          printBom();
+        case "/bom": {
+          const b = engine.bom();
+          add(
+            "info",
+            `system ${b.systemTokens} · tools ${b.toolSchemaTokens} · history ${b.historyTokens} · ` +
+              `request ≈ ${b.requestTotalEst} · session ${b.sessionPromptTokens + b.sessionCompletionTokens}` +
+              (b.budgetTokens ? ` / ${b.budgetTokens}` : ""),
+          );
           return true;
-        case "/connect":
-          doConnect(arg ?? "");
+        }
+        case "/wire":
+          add("info", engine.lastRequestBody ?? "(nothing sent yet)");
+          return true;
+        case "/budget":
+          if (arg === "off" || arg === "") {
+            engine.setBudget(undefined);
+            add("info", "budget cleared");
+          } else {
+            const n = Number(arg);
+            if (!Number.isFinite(n) || n <= 0) add("error", "usage: /budget <tokens|off>");
+            else {
+              engine.setBudget(n);
+              add("info", `budget: ${n} tokens`);
+            }
+          }
           return true;
         case "/login":
-          startLogin();
+          startLogin(arg || undefined);
           return true;
         case "/model":
-          if (arg) doModel(arg);
-          else void startModelPicker();
+          if (!arg) void startModelPicker();
+          else {
+            engine.setModel(arg);
+            persistEndpoint();
+            add("ok", `model → ${arg}`);
+          }
           return true;
-        case "/doctor":
-          setBusy(true);
-          void engine.doctor().then((r) => {
-            push(r.ok ? { kind: "info", text: `doctor: ${r.detail}` }
-                      : { kind: "error", text: `doctor: ${r.detail}` });
-            setBusy(false);
-          });
+        case "/regrow": {
+          if (!arg) {
+            add("error", "usage: /regrow <pattern>");
+            return true;
+          }
+          const r = engine.regrowMatching(arg);
+          if (r.hits === 0) add("info", `nothing in the archive matches /${arg}/`);
+          else
+            add(
+              "info",
+              `re-attached ${r.attached} of ${r.hits} match(es) · +${r.tokens} tokens of context`,
+            );
           return true;
-        case "/shed":
-          doShed();
-          return true;
-        case "/regrow":
-          doRegrow();
-          return true;
-        case "/wire":
-          doWire();
-          return true;
-        case "/race": {
-          const models = raw.split(/\s+/).slice(1);
-          if (models.length >= 2) {
-            setRaceModels(models);
-            push({
-              kind: "info",
-              text: `race armed: ${models.join(" vs ")} — next prompt runs on each`,
-            });
+        }
+        case "/archive": {
+          const archive = engine.archive;
+          if (!archive) {
+            add("info", "no archive configured");
+            return true;
+          }
+          if (arg) {
+            const hits = archive.grep?.(arg) ?? [];
+            if (hits.length === 0) add("info", `nothing matches /${arg}/`);
+            for (const h of hits.slice(0, 5))
+              add("info", `exuvia ${h.index}: ${h.excerpt.slice(0, 200)}`);
+            if (hits.length > 5) add("info", `… and ${hits.length - 5} more`);
           } else {
-            push({ kind: "info", text: "usage: /race <modelA> <modelB> [...]" });
+            const entries = archive.list();
+            if (entries.length === 0) add("info", "nothing shed in this project yet");
+            for (const e of entries)
+              add("info", `  ${String(e.index).padStart(4, "0")}  ${e.messages} msgs  ${e.file}`);
           }
           return true;
         }
-        case "/budget": {
-          const n = arg ? parseInt(arg, 10) : NaN;
-          if (Number.isFinite(n) && n > 0) {
-            engine.setBudget(n);
-            push({ kind: "info", text: `budget set: ${n} tokens (hard stop)` });
-          } else {
-            engine.setBudget(undefined);
-            push({ kind: "info", text: "budget cleared" });
+        case "/receipts": {
+          const rows = engine.receipts?.records() ?? [];
+          if (rows.length === 0) add("info", "no completion attempts recorded yet");
+          for (const r of rows.slice(-10))
+            add(
+              r.verdict === "accepted" ? "ok" : "fail",
+              `  ${r.file}  ${r.verdict}  attempt ${r.attempt}` +
+                (r.failed.length ? `  failed: ${r.failed.join(", ")}` : ""),
+            );
+          return true;
+        }
+        case "/stats": {
+          const st = engine.receipts?.stats();
+          if (!st || st.attempts === 0) {
+            add("info", "no completion attempts recorded yet");
+            return true;
+          }
+          add(
+            "info",
+            `${st.attempts} attempts · ${st.accepted} accepted · ` +
+              `false-claim rate ${(st.falseClaimRate * 100).toFixed(1)}% · ` +
+              `${st.tokensPerVerifiedChange ?? "—"} tokens per verified change`,
+          );
+          return true;
+        }
+        case "/shed": {
+          if (arg === "--explain" || arg === "explain") {
+            const plan = engine.explainShed();
+            if (!plan) {
+              add("info", "nothing worth shedding yet");
+              return true;
+            }
+            add(
+              "info",
+              `would shed ${plan.droppedCount} messages · ${plan.beforeTokens} → ${plan.afterTokens} tokens`,
+            );
+            add("info", "── stays in context (digest) ──");
+            for (const l of plan.digest.split("\n").slice(0, 12)) add("info", `  ${l}`);
+            add("info", "── preserved on disk (exuvia) ──");
+            for (const l of plan.exuvia.split("\n").slice(0, 12)) add("info", `  ${l}`);
+            return true;
+          }
+          try {
+            const s = engine.shed();
+            if (!s) add("info", "nothing worth shedding yet");
+            else
+              add(
+                "info",
+                `shed ${s.dropped} messages · ${s.before} → ${s.after} tokens · archived ${s.path}`,
+              );
+          } catch (e) {
+            add("error", `shed aborted, context untouched: ${String(e)}`);
           }
           return true;
         }
-        case "/molt": {
-          if (arg && (THEMES[arg] || (arg === "custom" && customTheme))) {
-            setThemeName(arg);
-            push({ kind: "info", text: `molted → ${arg}` });
-          } else {
-            const names = [
-              ...Object.keys(THEMES),
-              ...(customTheme ? ["custom"] : []),
-            ].join("  ");
-            push({ kind: "info", text: `themes: ${names}` });
+        case "/init": {
+          const p = writeDefaultBar(engine.cwd);
+          try {
+            engine.setBar(loadBar(engine.cwd));
+            add("info", `wrote ${p}`);
+          } catch (e) {
+            add("error", String(e));
           }
           return true;
         }
-        case "/help":
-          push({
-            kind: "info",
-            text: "/connect <provider> /login /model [name] /doctor /bom /wire /shed /regrow /budget /race /molt /new /quit",
-          });
+        case "/bar": {
+          try {
+            const bar = loadBar(engine.cwd);
+            if (!bar) add("info", "no .molt/done.yml — /init to create one");
+            else
+              for (const c of bar.checks)
+                add("info", `  ${c.name}: ${c.kind === "command" ? c.run : `builtin ${c.builtin}`}`);
+          } catch (e) {
+            add("error", e instanceof BarError ? e.message : String(e));
+          }
           return true;
+        }
+        case "/prove": {
+          const result = engine.proveNow();
+          if (!result) add("info", "no bar to check — /init to create one");
+          else renderBar(result, result.ok ? "bar met" : "bar not met");
+          return true;
+        }
         default:
           return false;
       }
     },
-    [exit, engine, push, printBom, customTheme, doShed, doRegrow, doWire, doConnect, doModel, startLogin, startModelPicker],
+    [add, engine, exit, persistEndpoint, renderBar, startLogin, startModelPicker, themeName],
   );
 
-  useInput((ch, key) => {
-    if (key.ctrl && ch === "c") return exit();
+  const submit = useCallback(
+    async (text: string) => {
+      if (!text.trim()) return;
+      if (text.startsWith("/")) {
+        if (!command(text)) add("error", `unknown command: ${text.split(/\s+/)[0]}`);
+        return;
+      }
+      // Refuse rather than fire a request at an endpoint with no model. The
+      // failure would otherwise surface as an opaque provider error.
+      if (!engine.model) {
+        add("error", "no model selected — /login to add a provider key, then /model to pick one");
+        return;
+      }
+      add("user", text);
+      setBusy(true);
+      beginActivity("thinking");
+      try {
+        for await (const ev of engine.run(text, confirm)) handleEvent(ev);
+      } catch (e) {
+        add("error", String(e));
+      } finally {
+        setBusy(false);
+        setActivity(null);
+      }
+    },
+    [add, beginActivity, command, confirm, engine, handleEvent],
+  );
 
+  useInput((char, key) => {
+    // --- permission prompt: arrows choose, enter commits, no typing ---
     if (pending) {
-      if (ch === "y") {
-        pending.resolve(true);
+      if (key.leftArrow || key.upArrow) {
+        setPromptChoice((i) => wrapIndex(i - 1, 2));
+        return;
+      }
+      if (key.rightArrow || key.downArrow || key.tab) {
+        setPromptChoice((i) => wrapIndex(i + 1, 2));
+        return;
+      }
+      if (key.return) {
+        resolver.current?.(promptChoice === 0);
         setPending(null);
-      } else if (ch === "n" || key.escape) {
-        pending.resolve(false);
+        return;
+      }
+      if (key.escape) {
+        resolver.current?.(false);
+        setPending(null);
+        return;
+      }
+      // y/n still work for anyone with the muscle memory.
+      const c = char.toLowerCase();
+      if (c === "y") {
+        resolver.current?.(true);
+        setPending(null);
+      } else if (c === "n") {
+        resolver.current?.(false);
         setPending(null);
       }
       return;
     }
 
-    if (mode.kind !== "chat") {
-      if (key.return) {
-        const v = input.trim();
-        setInput("");
-        if (mode.kind === "login-select") {
-          const prov = resolveProvider(v);
-          if (!prov) {
-            push({ kind: "info", text: v ? `unknown provider '${v}' — try a number from the list` : "login cancelled" });
-            setMode({ kind: "chat" });
-          } else {
-            push({ kind: "info", text: `paste API key for ${prov} (input hidden) — enter to save, esc to cancel` });
-            setMode({ kind: "login-key", provider: prov });
-          }
-        } else if (mode.kind === "login-key") {
-          finishLogin(mode.provider, v);
-        } else if (mode.kind === "model-select") {
-          if (v) pickModel(mode.choices, v);
-          else setMode({ kind: "chat" });
+    // --- mid-stream: Ctrl-C cancels the turn rather than killing molt ---
+    if (busy) {
+      if (key.ctrl && char === "c") engine.cancel();
+      return;
+    }
+
+    // --- pickers: arrows choose, enter commits, nothing is typed ---
+    if (mode.kind === "login-select" || mode.kind === "model-select") {
+      if (key.escape || (key.ctrl && char === "c")) {
+        setMode({ kind: "chat" });
+        add("info", "cancelled");
+        return;
+      }
+      const back = key.upArrow || (key.shift && key.tab);
+      const forward = key.downArrow || key.tab;
+      if (mode.kind === "login-select") {
+        if (back || forward) {
+          const next = wrapIndex(mode.index + (back ? -1 : 1), mode.providers.length);
+          setMode({ ...mode, index: next });
+          return;
         }
-      } else if (key.escape) {
+        if (key.return) {
+          const provider = mode.providers[mode.index]!.name;
+          add("info", `paste API key for ${provider} — input hidden, enter to save, esc to cancel`);
+          const hint = PROVIDERS[provider]?.hint;
+          if (hint) add("info", `note: ${hint}`);
+          setMode({ kind: "login-key", provider });
+        }
+        return;
+      }
+      if (back || forward) {
+        // moveSelection steps over the provider headers, so the highlight
+        // can only ever land on something selectable.
+        setMode({ ...mode, index: moveSelection(mode.rows, mode.index, back ? -1 : 1) });
+        return;
+      }
+      if (key.return) {
+        const row = mode.rows[mode.index];
+        if (row?.kind === "model") applyModel(row.choice);
+        else setMode({ kind: "chat" });
+      }
+      return;
+    }
+
+    // --- key entry: the one picker step that takes typing, and hides it ---
+    if (mode.kind === "login-key") {
+      if (key.escape || (key.ctrl && char === "c")) {
         setInput("");
         setMode({ kind: "chat" });
-        push({ kind: "info", text: "cancelled" });
-      } else if (key.backspace || key.delete) {
-        setInput((v) => v.slice(0, -1));
-      } else if (!key.ctrl && !key.meta && ch) {
-        setInput((v) => v + ch);
+        add("info", "login cancelled");
+        return;
       }
+      if (key.return) {
+        const value = input.trim();
+        setInput("");
+        // `input` holds the raw key; it never reaches the transcript.
+        finishLogin(mode.provider, value);
+        return;
+      }
+      if (key.backspace || key.delete) {
+        setInput((s) => s.slice(0, -1));
+        return;
+      }
+      if (char && !key.ctrl && !key.meta) setInput((s) => s + char);
       return;
     }
 
-    if (busy) return;
+    if (key.ctrl && char === "c") {
+      exit();
+      return;
+    }
+
+    // --- palette navigation ---
+    if (showPalette) {
+      if (key.upArrow) {
+        setPaletteIndex((i) => wrapIndex(i - 1, matches.length));
+        return;
+      }
+      if (key.downArrow) {
+        setPaletteIndex((i) => wrapIndex(i + 1, matches.length));
+        return;
+      }
+      if (key.tab && selected) {
+        setInput(completionFor(selected));
+        setPaletteIndex(0);
+        return;
+      }
+      if (key.escape) {
+        setInput("");
+        setPaletteIndex(0);
+        return;
+      }
+      if (key.return && selected) {
+        // Enter runs the highlighted command, so nothing has to be typed in
+        // full — but only when the typed text is not already a whole command.
+        const typed = input.trim();
+        const text = typed === selected.name || selected.args ? typed : selected.name;
+        setInput("");
+        setPaletteIndex(0);
+        void submit(selected.args && typed === selected.name ? typed : text);
+        return;
+      }
+    }
 
     if (key.return) {
-      const prompt = input.trim();
+      const text = input;
       setInput("");
-      if (!prompt) return;
-      if (prompt.startsWith("/") && handleCommand(prompt)) return;
-      push({ kind: "user", text: prompt });
-      if (raceModels) {
-        void runRace(prompt, raceModels);
-      } else {
-        void runTurn(prompt);
-      }
-    } else if (key.backspace || key.delete) {
-      setInput((v) => v.slice(0, -1));
-    } else if (!key.ctrl && !key.meta && ch) {
-      setInput((v) => v + ch);
+      setPaletteIndex(0);
+      void submit(text);
+      return;
+    }
+    if (key.backspace || key.delete) {
+      setInput((s) => s.slice(0, -1));
+      setPaletteIndex(0);
+      return;
+    }
+    if (char && !key.ctrl && !key.meta) {
+      setInput((s) => s + char);
+      setPaletteIndex(0);
     }
   });
 
-  const costStr = cost !== undefined ? ` · $${cost.toFixed(4)}` : "";
-  const status = pending
-    ? "waiting on permission gate"
-    : busy
-      ? "thinking…"
-      : `${engine.model} · ${sessionTok} tok${costStr}${engine.budgetTokens ? ` / ${engine.budgetTokens}` : ""} · /help`;
+  const toneColor: Record<Line["tone"], string> = {
+    user: theme.text,
+    agent: theme.accent,
+    tool: theme.dim,
+    info: theme.dim,
+    error: theme.fail,
+    ok: theme.ok,
+    fail: theme.fail,
+  };
 
   return (
-    <Box flexDirection="column" paddingX={1}>
-      <Banner theme={theme} themeName={themeName} animate={animateBanner} />
-      <Text color={theme.dim}>{TAGLINE}</Text>
+    <Box flexDirection="column">
+      <Banner
+        theme={theme}
+        themeName={themeName}
+        animate
+        version={version}
+      />
+
       <Box flexDirection="column" marginTop={1}>
-        {lines.map((l, idx) => {
-          switch (l.kind) {
-            case "user":
-              return (
-                <Text key={idx} color={theme.user} wrap="wrap">
-                  ❯ {l.text}
-                </Text>
-              );
-            case "assistant":
-              return (
-                <Box key={idx} marginBottom={1}>
-                  <Text color={theme.assistant} wrap="wrap">
-                    {l.text}
-                  </Text>
-                </Box>
-              );
-            case "tool":
-              return (
-                <Text key={idx} color={theme.tool}>
-                  ⚙ {l.name} <Text dimColor>{l.detail}</Text>
-                  {l.note ? <Text color={theme.warn}> [{l.note}]</Text> : null}
-                </Text>
-              );
-            case "info":
-              return (
-                <Text key={idx} color={theme.dim}>
-                  {l.text}
-                </Text>
-              );
-            case "error":
-              return (
-                <Text key={idx} color={theme.error}>
-                  ✗ {l.text}
-                </Text>
-              );
-          }
-        })}
+        {lines.map((l) => (
+          <Text key={l.id} color={toneColor[l.tone]}>
+            {l.tone === "user" ? "› " : l.tone === "tool" ? "· " : "  "}
+            {l.text}
+          </Text>
+        ))}
       </Box>
+
+      {streamText ? (
+        <Box marginTop={1}>
+          <Text color={theme.accent}>{streamText}</Text>
+          <Text color={theme.dim}>▌</Text>
+        </Box>
+      ) : null}
+
       {pending ? (
-        <Box
-          borderStyle="round"
-          borderColor={theme.warn}
-          paddingX={1}
-          marginTop={1}
-          flexDirection="column"
-        >
-          <Text color={theme.warn}>allow? {pending.detail}</Text>
-          <Text dimColor>[y] allow · [n/esc] deny</Text>
+        <Box flexDirection="column" marginTop={1}>
+          <Text color={theme.warn}>
+            allow {pending.name}: {pending.detail}
+          </Text>
+          <Box>
+            {["allow", "deny"].map((label, i) => (
+              <Text
+                key={label}
+                color={promptChoice === i ? theme.accent : theme.dim}
+                bold={promptChoice === i}
+              >
+                {promptChoice === i ? " ▸ " : "   "}
+                {label}
+              </Text>
+            ))}
+          </Box>
+          <Text color={theme.ghost}>  ←→ choose · enter confirm · esc deny</Text>
         </Box>
       ) : (
-        <Box marginTop={1}>
-          <Text color={theme.accent}>
-            {busy ? "… " : mode.kind === "login-key" ? "🔑 " : mode.kind !== "chat" ? "# " : "❯ "}
-          </Text>
-          <Text>{mode.kind === "login-key" ? "•".repeat(input.length) : input}</Text>
-          {!busy && <Text color={theme.accent}>█</Text>}
+        <Box flexDirection="column" marginTop={1}>
+          {mode.kind === "login-select" ? (
+            <Box flexDirection="column">
+              {mode.providers.map((p, i) => {
+                const active = i === mode.index;
+                return (
+                  <Box key={p.name}>
+                    <Text color={active ? theme.accent : theme.dim} bold={active}>
+                      {active ? " ▸ " : "   "}
+                      {p.name.padEnd(14)}
+                    </Text>
+                    {p.hasKey && (
+                      <Text color={theme.ghost}>key stored — will overwrite</Text>
+                    )}
+                  </Box>
+                );
+              })}
+              <Text color={theme.ghost}>   ↑↓ choose · enter select · esc cancel</Text>
+            </Box>
+          ) : mode.kind === "model-select" ? (
+            <Box flexDirection="column">
+              {windowRows(mode.rows, mode.index).map(({ row, i }) =>
+                row.kind === "header" ? (
+                  // The provider header carries the same bright colour the
+                  // highlighted row gets, so the grouping reads at a glance.
+                  <Text key={`h${i}`} color={theme.accent} bold>
+                    {"  "}
+                    {row.provider}
+                  </Text>
+                ) : (
+                  <Text
+                    key={`m${i}`}
+                    color={i === mode.index ? theme.accent : theme.dim}
+                    bold={i === mode.index}
+                  >
+                    {i === mode.index ? "   ▸ " : "     "}
+                    {row.choice.id}
+                  </Text>
+                ),
+              )}
+              <Text color={theme.ghost}>   ↑↓ choose · enter select · esc cancel</Text>
+            </Box>
+          ) : (
+            <Box>
+              {busy ? (
+                <>
+                  <Text color={theme.accent}>{SPINNER[frame % SPINNER.length]} </Text>
+                  <Text color={theme.dim}>{activity?.label ?? "working"}</Text>
+                  {activity && (
+                    <Text color={theme.ghost}>
+                      {" \u00b7 "}
+                      {fmtDuration(Date.now() - activity.since)}
+                    </Text>
+                  )}
+                </>
+              ) : (
+                <Text color={theme.dim}>{mode.kind === "login-key" ? "🔑 " : "› "}</Text>
+              )}
+              {/* A pasted key is echoed as dots — it must not survive on screen
+                  or in a scrollback buffer. */}
+              <Text color={theme.text}>
+                {mode.kind === "login-key" ? "•".repeat(input.length) : input}
+              </Text>
+              {!busy && <Text color={theme.accent}>▌</Text>}
+            </Box>
+          )}
+
+          {showPalette && (
+            <Box flexDirection="column" marginTop={0}>
+              {(() => {
+                const win = windowAround(matches, selectedIndex, PALETTE_ROWS);
+                const above = win[0]?.i ?? 0;
+                const below = matches.length - 1 - (win.at(-1)?.i ?? 0);
+                return (
+                  <>
+                    {above > 0 && <Text color={theme.ghost}>   ↑ {above} more</Text>}
+                    {win.map(({ item: c, i }) => {
+                      const active = i === selectedIndex;
+                      return (
+                        <Box key={c.name}>
+                          <Text color={active ? theme.accent : theme.dim} bold={active}>
+                            {active ? " ▸ " : "   "}
+                            {(c.name + (c.args ? " " + c.args : "")).padEnd(20)}
+                          </Text>
+                          <Text color={active ? theme.text : theme.ghost}>{c.summary}</Text>
+                        </Box>
+                      );
+                    })}
+                    {below > 0 && <Text color={theme.ghost}>   ↓ {below} more</Text>}
+                  </>
+                );
+              })()}
+              <Text color={theme.ghost}>   ↑↓ choose · tab fill · enter run · esc clear</Text>
+            </Box>
+          )}
         </Box>
       )}
-      <Text dimColor>{status}</Text>
+
+      <StatusLine
+        theme={theme}
+        busy={busy}
+        status={{
+          provider: engine.provider,
+          model: engine.model,
+          sessionTokens: tokens,
+          costUsd: cost,
+          budgetTokens: engine.budgetTokens,
+        }}
+      />
     </Box>
   );
 }
