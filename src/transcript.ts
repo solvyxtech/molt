@@ -21,6 +21,9 @@
  */
 import { estTokens, type Bom, type Msg } from "./types.js";
 
+export const STALE_FAILURE_PREFIX = "[molt: superseded]";
+export const ELIDED_PREFIX = "[molt: superseded tool result —";
+
 export const DIGEST_HEADER =
   "[molt digest of shed context — mechanical, verbatim excerpts, not a summary]";
 
@@ -202,6 +205,16 @@ export class Transcript {
     ];
   }
 
+  /**
+   * Remove the most recent messages. Used to undo a turn that was cancelled
+   * before it produced anything, so "the session is unchanged" is literally
+   * true rather than nearly true.
+   */
+  rollbackTo(length: number): void {
+    if (length < 0 || length > this.working.length) return;
+    this.working.length = length;
+  }
+
   /** Re-attach previously shed context (or any text) to the working set. */
   regrow(text: string): void {
     this.working.push({
@@ -211,13 +224,85 @@ export class Transcript {
     });
   }
 
-  /** Inject a bar failure so the model can see exactly what is unmet. */
+  /**
+   * Inject a bar failure so the model can see exactly what is unmet.
+   *
+   * Only the LATEST failure matters, and a stale one is resent on every
+   * subsequent request for the rest of the session. So earlier failures are
+   * collapsed to a one-line marker rather than carried in full — the model
+   * still knows a previous attempt was refused, without paying for the
+   * output of a check it has already seen and acted on.
+   */
   pushBarFailure(text: string): void {
+    for (const m of this.working) {
+      if (m.molt?.barFailure && m.content && !m.content.startsWith(STALE_FAILURE_PREFIX)) {
+        const attempt = /attempt (\d+)/.exec(m.content)?.[1] ?? "?";
+        m.content = `${STALE_FAILURE_PREFIX} attempt ${attempt} was refused; its failures are superseded below.`;
+      }
+    }
     this.working.push({
       role: "user",
       content: text,
       molt: { barFailure: true },
     });
+  }
+
+  /**
+   * Drop tool results that later work has made irrelevant.
+   *
+   * A file read and then written is dead weight: the model will never use
+   * the stale contents again, but every subsequent request pays for them.
+   * Same for a path read twice — only the most recent read can be current.
+   *
+   * Mechanical and conservative: only `read_file` results are touched, only
+   * when a later call in the same session supersedes them, and the
+   * replacement says plainly what happened. Nothing is invented and the
+   * full original stays in the record.
+   */
+  elideSupersededReads(): { elided: number; tokensSaved: number } {
+    const supersededBy = new Map<number, string>();
+    const lastRead = new Map<string, number>();
+
+    for (let i = 0; i < this.working.length; i++) {
+      const m = this.working[i];
+      for (const call of m.tool_calls ?? []) {
+        let path = "";
+        try {
+          path = String(
+            (JSON.parse(call.function.arguments || "{}") as { path?: unknown }).path ?? "",
+          );
+        } catch {
+          continue;
+        }
+        if (!path) continue;
+
+        if (call.function.name === "read_file") {
+          const prior = lastRead.get(path);
+          if (prior !== undefined) supersededBy.set(prior, `re-read at step ${i}`);
+          lastRead.set(path, i);
+        } else if (call.function.name === "write_file") {
+          const prior = lastRead.get(path);
+          if (prior !== undefined) supersededBy.set(prior, `overwritten at step ${i}`);
+          lastRead.delete(path);
+        }
+      }
+    }
+
+    let elided = 0;
+    let tokensSaved = 0;
+    for (const [callIdx, reason] of supersededBy) {
+      // The tool result follows its assistant turn.
+      for (let j = callIdx + 1; j < this.working.length; j++) {
+        const m = this.working[j];
+        if (m.role !== "tool") break;
+        if (!m.content || m.content.startsWith(ELIDED_PREFIX)) continue;
+        const before = estTokens(m.content);
+        m.content = `${ELIDED_PREFIX} ${reason}. Full contents remain in the archived record.`;
+        tokensSaved += before - estTokens(m.content);
+        elided++;
+      }
+    }
+    return { elided, tokensSaved };
   }
 }
 

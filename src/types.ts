@@ -66,7 +66,7 @@ export type Check =
       tags: string[];
     };
 
-export type BuiltinCheck = "files-changed" | "record-intact";
+export type BuiltinCheck = "files-changed" | "record-intact" | "claims-grounded";
 
 export type Bar = {
   version: 1;
@@ -102,8 +102,16 @@ export type LedgerEntry = {
   before: string | null;
   /** sha256 molt observed immediately after writing. */
   after: string;
-  /** Index of the message in the full record that performed the write. */
-  atMessage: number;
+  /**
+   * The tool call that performed this write. Used to decide whether the
+   * entry travels with a shed batch.
+   *
+   * Deliberately not a message index: indices shift when shedding replaces a
+   * dropped prefix with a digest, so any index has to be rebased and a
+   * missed rebase silently misfiles evidence. A call id is stable for the
+   * life of the session and matches exactly one message.
+   */
+  callId: string;
 };
 
 export type EngineEvent =

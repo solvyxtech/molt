@@ -76,24 +76,22 @@ export function App({
   const [tokens, setTokens] = useState(0);
   const [streamText, setStreamText] = useState("");
   const [cost, setCost] = useState<number | undefined>(undefined);
-  const nextId = useRef(0);
-  const resolver = useRef<((ok: boolean) => void) | null>(null);
-
-  // What the model is doing right now, and since when. Held separately from
-  // `busy` because the turn stays busy across several distinct phases.
-  const [activity, setActivity] = useState<{ label: string; since: number } | null>(null);
-  const [frame, setFrame] = useState(0);
 
   // Picker state. `login-key` is the one mode that must never echo what you
   // type, so it is a distinct state rather than a flag on a shared one.
   type Mode =
     | { kind: "chat" }
-    // Both pickers carry their own highlight index: the arrow keys move it,
-    // enter commits it, and nothing is typed.
     | { kind: "login-select"; providers: { name: string; hasKey: boolean }[]; index: number }
     | { kind: "login-key"; provider: string }
     | { kind: "model-select"; rows: PickerRow[]; index: number };
   const [mode, setMode] = useState<Mode>({ kind: "chat" });
+
+  // What the model is doing right now, and since when. Held separately from
+  // `busy` because the turn stays busy across several distinct phases.
+  const [activity, setActivity] = useState<{ label: string; since: number } | null>(null);
+  const [frame, setFrame] = useState(0);
+  const nextId = useRef(0);
+  const resolver = useRef<((ok: boolean) => void) | null>(null);
 
   const add = useCallback((tone: Line["tone"], text: string) => {
     setLines((prev) => [...prev, { id: nextId.current++, tone, text }]);
@@ -216,8 +214,7 @@ export function App({
         case "proof_refused":
           // The claim was refused, so it must leave the screen. Streaming
           // already painted it; without this the refused text stays in the
-          // buffer and the next attempt's tokens append to it, running
-          // several withheld answers together on one line.
+          // buffer and the next attempt's tokens append to it.
           setStreamText("");
           renderBar(ev.result, `completion refused (attempt ${ev.attempt}) — continuing`);
           break;
@@ -306,28 +303,24 @@ export function App({
     }
     setBusy(true);
     const results = await Promise.all(
-      sources.map(async (s) => ({ ...s, r: await engine.listModels(s.url, s.key) })),
+      sources.map(async (src) => ({ ...src, r: await engine.listModels(src.url, src.key) })),
     );
     setBusy(false);
 
     const choices: ModelChoice[] = [];
-    for (const s of results) {
-      if (!s.r.ok) continue;
-      choices.push(...s.r.ids.map((id) => ({ provider: s.name, id, url: s.url, key: s.key })));
+    for (const src of results) {
+      if (!src.r.ok) continue;
+      choices.push(...src.r.ids.map((id) => ({ provider: src.name, id, url: src.url, key: src.key })));
     }
     // Report unreachable keyed providers — a silently short list reads as
     // "this provider has no models" when it means "molt could not ask".
-    const failed = results.filter((s) => !s.r.ok && auth[s.name]);
-    for (const s of failed) {
-      add("error", `${s.name}: unreachable (${(s.r as { error: string }).error})`);
+    for (const src of results.filter((x) => !x.r.ok && auth[x.name])) {
+      add("error", `${src.name}: unreachable (${(src.r as { error: string }).error})`);
     }
     if (!choices.length) {
       add("error", "no models found — check the keys with molt doctor, or /login again");
       return;
     }
-
-    // One array drives both the rendering and the selection, so the
-    // highlighted row is always the row that gets chosen.
     const rows = pickerRows(choices);
     add("info", "models across your keys:");
     setMode({ kind: "model-select", rows, index: firstSelectable(rows) });
@@ -556,7 +549,6 @@ export function App({
         add("error", String(e));
       } finally {
         setBusy(false);
-        setActivity(null);
       }
     },
     [add, beginActivity, command, confirm, engine, handleEvent],
@@ -612,8 +604,7 @@ export function App({
       const forward = key.downArrow || key.tab;
       if (mode.kind === "login-select") {
         if (back || forward) {
-          const next = wrapIndex(mode.index + (back ? -1 : 1), mode.providers.length);
-          setMode({ ...mode, index: next });
+          setMode({ ...mode, index: wrapIndex(mode.index + (back ? -1 : 1), mode.providers.length) });
           return;
         }
         if (key.return) {
@@ -655,10 +646,10 @@ export function App({
         return;
       }
       if (key.backspace || key.delete) {
-        setInput((s) => s.slice(0, -1));
+        setInput((v) => v.slice(0, -1));
         return;
       }
-      if (char && !key.ctrl && !key.meta) setInput((s) => s + char);
+      if (char && !key.ctrl && !key.meta) setInput((v) => v + char);
       return;
     }
 
@@ -783,9 +774,7 @@ export function App({
                       {active ? " ▸ " : "   "}
                       {p.name.padEnd(14)}
                     </Text>
-                    {p.hasKey && (
-                      <Text color={theme.ghost}>key stored — will overwrite</Text>
-                    )}
+                    {p.hasKey && <Text color={theme.ghost}>key stored — will overwrite</Text>}
                   </Box>
                 );
               })}
@@ -828,14 +817,16 @@ export function App({
                   )}
                 </>
               ) : (
-                <Text color={theme.dim}>{mode.kind === "login-key" ? "🔑 " : "› "}</Text>
+                <>
+                  <Text color={theme.dim}>{mode.kind === "login-key" ? "🔑 " : "› "}</Text>
+                  {/* A pasted key is echoed as dots — it must not survive on
+                      screen or in a scrollback buffer. */}
+                  <Text color={theme.text}>
+                    {mode.kind === "login-key" ? "•".repeat(input.length) : input}
+                  </Text>
+                  <Text color={theme.accent}>▌</Text>
+                </>
               )}
-              {/* A pasted key is echoed as dots — it must not survive on screen
-                  or in a scrollback buffer. */}
-              <Text color={theme.text}>
-                {mode.kind === "login-key" ? "•".repeat(input.length) : input}
-              </Text>
-              {!busy && <Text color={theme.accent}>▌</Text>}
             </Box>
           )}
 

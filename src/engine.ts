@@ -24,6 +24,7 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, resolve, relative, isAbsolute } from "node:path";
 import type { ArchiveLike } from "./archive.js";
 import { barFingerprint, formatBarFailure, runBar, type BarContext } from "./bar.js";
+import { Journal } from "./journal.js";
 import { Receipts } from "./receipts.js";
 import { readStream } from "./stream.js";
 import { Transcript, toolDetail } from "./transcript.js";
@@ -49,9 +50,17 @@ export const SYSTEM_PROMPT = [
   "with their output, and you must fix the underlying problem and continue.",
   "Do not edit .molt/done.yml to make checks pass. Do not claim work you have",
   "not done — it will be checked against the full session record.",
+  "",
+  "If you are unsure whether something worked, say so and check it rather than",
+  "asserting it. An unverified claim costs the same as a false one.",
 ].join("\n");
 
-export const TOOL_RESULT_MAX_BYTES = 4096;
+/**
+ * Tool results are the bulk of a session's tokens: every result is resent on
+ * every subsequent request. 2048 bytes is roughly 512 tokens each — still
+ * enough to be useful, and truncation is always visible, never silent.
+ */
+export const TOOL_RESULT_MAX_BYTES = 2048;
 export const MAX_STEPS = 32;
 export const MAX_PROOF_ATTEMPTS = 4;
 export const DEFAULT_BASH_TIMEOUT_MS = 60_000;
@@ -122,9 +131,13 @@ export type EngineConfig = {
   bar?: Bar | null;
   archive?: ArchiveLike;
   receipts?: Receipts;
+  /** Append-only hash-chained record of everything this session did. */
+  journal?: Journal;
   maxProofAttempts?: number;
   /** Shed automatically once working history exceeds this many tokens. */
   autoShedAtTokens?: number;
+  /** Drop tool results that later work superseded. On by default. */
+  elideSuperseded?: boolean;
 };
 
 function scrubbedEnv(): NodeJS.ProcessEnv {
@@ -160,6 +173,12 @@ export class Engine {
   /** sha256 of .molt/done.yml as it stood when the session began. */
   private barHash: string | null;
   private inFlight?: AbortController;
+  /**
+   * How many write records this session handed to the archive. Kept in
+   * memory and NOT derived from the archive, so it is an independent
+   * expectation the archive can be checked against.
+   */
+  private archivedWrites = 0;
 
   constructor(cfg: EngineConfig) {
     this.cfg = cfg;
@@ -194,6 +213,9 @@ export class Engine {
   get receipts(): Receipts | undefined {
     return this.cfg.receipts;
   }
+  get journal(): Journal | undefined {
+    return this.cfg.journal;
+  }
 
   setModel(m: string): void {
     this.cfg.model = m;
@@ -220,6 +242,7 @@ export class Engine {
   reset(): void {
     this.transcript = new Transcript(SYSTEM_PROMPT);
     this.ledger = [];
+    this.archivedWrites = 0;
   }
 
   /**
@@ -249,13 +272,33 @@ export class Engine {
     return { ...b, costUsd: this.costUsd(), budgetTokens: this.budgetTokens };
   }
 
-  barContext(): BarContext {
+  /**
+   * Every write this project can still prove: what is live in memory, plus
+   * what the archive preserved from shed context and from earlier sessions.
+   * Deduplicated by path — the earliest `before` with the latest `after`, so
+   * the pair describes the whole effect on that file.
+   */
+  mergedLedger(): LedgerEntry[] {
+    const archived = this.cfg.archive?.ledger?.() ?? [];
+    const byPath = new Map<string, LedgerEntry>();
+    for (const e of [...archived, ...this.ledger]) {
+      const prior = byPath.get(e.path);
+      byPath.set(e.path, prior ? { ...e, before: prior.before } : { ...e });
+    }
+    return [...byPath.values()];
+  }
+
+  barContext(claim?: string): BarContext {
     return {
       cwd: this.cwd,
       record: this.transcript.record(),
-      ledger: this.ledger,
+      ledger: this.mergedLedger(),
+      liveLedger: [...this.ledger],
       archive: this.cfg.archive,
       archivedBatches: this.transcript.shedCount,
+      expectedArchivedWrites: this.archivedWrites,
+      expectedArchiveFiles: Journal.expectedArchives(this.cwd),
+      claim,
     };
   }
 
@@ -275,14 +318,35 @@ export class Engine {
     const plan = this.transcript.planShed(keepExchanges);
     if (!plan) return null;
 
+    // Writes performed during the messages being shed travel with them. After
+    // this, the only record of that work is the archive — which is what makes
+    // "verification runs against preserved history" true rather than merely
+    // architectural.
+    const cut = plan.droppedCount;
+    const departingCalls = new Set(
+      plan.dropped.flatMap((m) => (m.tool_calls ?? []).map((c) => c.id)),
+    );
+    const departing = this.ledger.filter((e) => departingCalls.has(e.callId));
+    const staying = this.ledger.filter((e) => !departingCalls.has(e.callId));
+
+    if (!this.cfg.archive && departing.length > 0) {
+      // Shedding without an archive would destroy write evidence. Refuse
+      // rather than quietly lose the ability to prove earlier work.
+      return null;
+    }
+
     let path = "(not archived)";
     if (this.cfg.archive) {
       const firstAsk = plan.dropped.find((m) => m.role === "user")?.content ?? "";
       // If this throws, we never reach commitShed and nothing is lost.
-      const entry = this.cfg.archive.write(plan.exuvia, plan.droppedCount, firstAsk);
+      const entry = this.cfg.archive.write(plan.exuvia, cut, firstAsk, departing);
       path = entry.file;
+      this.archivedWrites += departing.length;
     }
+
     this.transcript.commitShed(plan);
+
+    this.ledger = staying;
     return {
       before: plan.beforeTokens,
       after: plan.afterTokens,
@@ -339,7 +403,7 @@ export class Engine {
     return this.budgetTokens !== undefined && this.sessionTokens >= this.budgetTokens;
   }
 
-  private runTool(name: string, args: Record<string, unknown>, messageIndex: number): string {
+  private runTool(name: string, args: Record<string, unknown>, callId: string): string {
     switch (name) {
       case "read_file":
         return readFileSync(resolve(this.cwd, String(args.path ?? "")), "utf8");
@@ -356,7 +420,7 @@ export class Engine {
           path: isAbsolute(rel) ? relative(this.cwd, abs) : rel,
           before,
           after,
-          atMessage: messageIndex,
+          callId,
         });
         return `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${rel}`;
       }
@@ -392,7 +456,7 @@ export class Engine {
    * rewrote mid-task is not a bar, so the edit is reported as a failure
    * rather than quietly honoured.
    */
-  private runBarGuarded(): BarResult {
+  private runBarGuarded(claim?: string): BarResult {
     const bar = this.cfg.bar!;
     const t0 = Date.now();
     const now = barFingerprint(this.cwd);
@@ -408,24 +472,32 @@ export class Engine {
           "original checks, or stop and tell the user why the bar is wrong.",
         durationMs: Date.now() - t0,
       };
-      const rest = runBar(bar, this.barContext());
+      const rest = runBar(bar, this.barContext(claim));
       return {
         ok: false,
         results: [tamper, ...rest.results],
         durationMs: Date.now() - t0,
       };
     }
-    return runBar(bar, this.barContext());
+    return runBar(bar, this.barContext(claim));
   }
 
   /** Run the bar without touching the loop — backs the /prove command. */
-  proveNow(): BarResult | null {
+  proveNow(claim?: string): BarResult | null {
     if (!this.cfg.bar) return null;
-    return this.runBarGuarded();
+    return this.runBarGuarded(claim);
   }
 
   async *run(userText: string, confirm: Confirm): AsyncGenerator<EngineEvent> {
+    // Remember where this turn began so a cancellation can leave no trace.
+    const turnStart = this.transcript.length;
+    const log = this.cfg.journal;
     this.transcript.push({ role: "user", content: userText });
+    log?.append("user_message", {
+      chars: userText.length,
+      preview: userText.replace(/\s+/g, " ").slice(0, 120),
+      sha256: createHash("sha256").update(userText, "utf8").digest("hex").slice(0, 16),
+    });
     const fetchFn = this.cfg.fetchFn ?? fetch;
     const maxAttempts = this.cfg.maxProofAttempts ?? MAX_PROOF_ATTEMPTS;
     let proofAttempts = 0;
@@ -439,15 +511,49 @@ export class Engine {
         return;
       }
 
+      // Cheap, mechanical, and strictly a subset of shedding: prune tool
+      // results that later work has made irrelevant before considering the
+      // much heavier option of shedding.
+      if (this.cfg.elideSuperseded !== false) {
+        const pruned = this.transcript.elideSupersededReads();
+        if (pruned.elided > 0) {
+          log?.append("elide", { elided: pruned.elided, tokensSaved: pruned.tokensSaved });
+          yield {
+            kind: "info",
+            text: `pruned ${pruned.elided} superseded tool result(s) · −${pruned.tokensSaved} tokens`,
+          };
+        }
+      }
+
       const auto = this.cfg.autoShedAtTokens;
       if (auto !== undefined && this.transcript.historyTokens() > auto) {
         const shed = this.shed();
-        if (shed) yield { kind: "shed", ...shed };
+        if (shed) {
+          log?.append("shed", {
+            dropped: shed.dropped,
+            before: shed.before,
+            after: shed.after,
+            archive: shed.path,
+            estimated: true,
+          });
+          yield { kind: "shed", ...shed };
+        }
       }
 
       const stream = this.cfg.stream !== false;
       const controller = new AbortController();
       this.inFlight = controller;
+
+      const wire = this.transcript.wire();
+      log?.append("request", {
+        step,
+        messages: wire.length,
+        estTokens: this.bom().requestTotalEst,
+        estimated: true,
+        stream,
+        model: this.cfg.model,
+        endpoint: this.cfg.baseUrl,
+      });
 
       let res: Response;
       try {
@@ -469,9 +575,12 @@ export class Engine {
       } catch (e) {
         this.inFlight = undefined;
         if (controller.signal.aborted) {
+          this.transcript.rollbackTo(turnStart);
+          log?.append("cancelled", { step, rolledBack: true });
           yield { kind: "cancelled" };
           return;
         }
+        log?.append("error", { text: `network: ${String(e)}` });
         yield { kind: "error", text: `network: ${String(e)}` };
         return;
       }
@@ -479,6 +588,7 @@ export class Engine {
       if (!res.ok) {
         this.inFlight = undefined;
         const body = (await res.text().catch(() => "")).slice(0, 300);
+        log?.append("error", { text: `HTTP ${res.status}`, body: body.slice(0, 200) });
         yield { kind: "error", text: `HTTP ${res.status}: ${body}` };
         return;
       }
@@ -504,6 +614,7 @@ export class Engine {
         } catch (e) {
           this.inFlight = undefined;
           if (controller.signal.aborted) {
+            this.transcript.rollbackTo(turnStart);
             yield { kind: "cancelled" };
             return;
           }
@@ -521,6 +632,7 @@ export class Engine {
         } catch {
           this.inFlight = undefined;
           if (controller.signal.aborted) {
+            this.transcript.rollbackTo(turnStart);
             yield { kind: "cancelled" };
             return;
           }
@@ -538,8 +650,20 @@ export class Engine {
         return;
       }
 
+      const reportedUsage =
+        typeof usage?.prompt_tokens === "number" || typeof usage?.completion_tokens === "number";
       const pTok = usage?.prompt_tokens ?? estTokens(JSON.stringify(this.transcript.wire()));
       const cTok = usage?.completion_tokens ?? estTokens(JSON.stringify(msg));
+      log?.append("response", {
+        step,
+        promptTokens: pTok,
+        completionTokens: cTok,
+        // Providers do not always report usage. Say which this is.
+        estimated: !reportedUsage,
+        toolCalls: msg.tool_calls?.length ?? 0,
+        contentChars: (msg.content ?? "").length,
+        finishedWithText: Boolean(msg.content),
+      });
       this.sessionPrompt += pTok;
       this.sessionCompletion += cTok;
       yield {
@@ -557,7 +681,6 @@ export class Engine {
       });
 
       if (msg.tool_calls?.length) {
-        const messageIndex = this.transcript.length - 1;
         for (const call of msg.tool_calls) {
           const name = call.function?.name ?? "unknown";
           let args: Record<string, unknown> = {};
@@ -584,17 +707,26 @@ export class Engine {
             note = "denied";
           } else {
             yield { kind: "tool_start", name, detail };
-            const t0 = Date.now();
+            const toolStartedAt = Date.now();
             try {
-              const t = truncateResult(this.runTool(name, args, messageIndex));
+              const t = truncateResult(this.runTool(name, args, call.id));
               result = t.text;
               note = t.note;
             } catch (e) {
               result = `tool error: ${String(e)}`;
               note = "error";
             }
-            durationMs = Date.now() - t0;
+            durationMs = Date.now() - toolStartedAt;
           }
+          if (needsGate) log?.append("permission", { name, detail, allowed });
+          log?.append("tool_call", { step, name, detail, allowed });
+          log?.append("tool_result", {
+            name,
+            bytes: Buffer.byteLength(result, "utf8"),
+            truncated: Boolean(note?.startsWith("capped")),
+            note,
+            sha256: createHash("sha256").update(result, "utf8").digest("hex").slice(0, 16),
+          });
           yield { kind: "tool", name, detail, note, durationMs };
           this.transcript.push({ role: "tool", tool_call_id: call.id, content: result });
         }
@@ -615,7 +747,23 @@ export class Engine {
 
       proofAttempts += 1;
       yield { kind: "proof_start", checks: this.cfg.bar.checks.length };
-      const result = this.runBarGuarded();
+      const result = this.runBarGuarded(claim);
+      log?.append("bar_run", {
+        attempt: proofAttempts,
+        ok: result.ok,
+        total: result.results.length,
+        passed: result.results.filter((r) => r.ok).length,
+        failed: result.results.filter((r) => !r.ok).map((r) => r.name).join(", "),
+        ms: result.durationMs,
+        checks: result.results.map((r) => ({
+          name: r.name,
+          kind: r.kind,
+          detail: r.detail,
+          ok: r.ok,
+          exitCode: r.exitCode ?? null,
+          ms: r.durationMs,
+        })),
+      });
       const exhausted = !result.ok && proofAttempts >= maxAttempts;
       const verdict = result.ok ? "accepted" : exhausted ? "exhausted" : "refused";
 
@@ -630,16 +778,19 @@ export class Engine {
           sessionTokens: this.sessionTokens,
           shedBatches: this.transcript.shedCount,
         });
+        log?.append("receipt", { verdict, file: receipt.path, attempt: proofAttempts });
         yield { kind: "receipt", path: receipt.path };
       }
 
       if (result.ok) {
+        log?.append("session_end", { reason: "bar met", attempts: proofAttempts });
         yield { kind: "proof_result", result, attempt: proofAttempts };
         if (claim) yield { kind: "assistant_text", text: claim };
         return;
       }
 
       if (exhausted) {
+        log?.append("session_end", { reason: "bar not met", attempts: proofAttempts });
         yield { kind: "proof_exhausted", result, attempts: proofAttempts };
         yield {
           kind: "error",

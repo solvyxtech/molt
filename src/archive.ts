@@ -11,6 +11,7 @@
  *   .molt/exuviae/index.md        one line each, so the archive is browsable
  */
 import { createHash } from "node:crypto";
+import type { LedgerEntry } from "./types.js";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -25,12 +26,26 @@ export type ArchiveEntry = {
 };
 
 export interface ArchiveLike {
-  write(exuvia: string, messages: number, firstAsk: string): ArchiveEntry;
+  write(exuvia: string, messages: number, firstAsk: string, ledger?: LedgerEntry[]): ArchiveEntry;
   list(): ArchiveEntry[];
   read(index: number): string;
   grep?(pattern: string): { index: number; excerpt: string }[];
+  /** Write evidence recovered from every archived batch, including prior sessions. */
+  ledger?(): LedgerEntry[];
   dir: string;
 }
+
+/**
+ * Marker for the write-evidence block embedded in an exuvia.
+ *
+ * This is what makes the archive load-bearing rather than decorative. When
+ * context is shed, the record of which files were written during it goes
+ * with it — so a later completion check has to read the archive to know
+ * whether early work actually landed. Delete an exuvia and the evidence for
+ * that work is genuinely gone, which is exactly the property that lets molt
+ * claim verification runs against preserved history.
+ */
+export const LEDGER_MARKER = "molt-ledger";
 
 export class Archive implements ArchiveLike {
   readonly dir: string;
@@ -52,7 +67,16 @@ export class Archive implements ArchiveLike {
     }
   }
 
-  write(exuvia: string, messages: number, firstAsk: string): ArchiveEntry {
+  write(exuvia: string, messages: number, firstAsk: string, ledger: LedgerEntry[] = []): ArchiveEntry {
+    if (ledger.length > 0) {
+      exuvia +=
+        `\n\n## write evidence\n\n` +
+        `Files molt wrote during the messages above, with the hash before the\n` +
+        `write and the hash molt observed after it. Completion checks read this.\n\n` +
+        "```" + LEDGER_MARKER + "\n" +
+        JSON.stringify(ledger, null, 2) +
+        "\n```\n";
+    }
     const index = this.seq;
     const iso = new Date().toISOString();
     const file = `${String(index).padStart(4, "0")}-${iso.replace(/[:.]/g, "-")}.md`;
@@ -93,6 +117,28 @@ export class Archive implements ArchiveLike {
         firstAsk: "",
       };
     });
+  }
+
+  /**
+   * Every write recorded in every archived batch, oldest first. Spans
+   * sessions: a batch shed yesterday still yields its evidence today.
+   */
+  ledger(): LedgerEntry[] {
+    const out: LedgerEntry[] = [];
+    for (const entry of this.list()) {
+      const body = readFileSync(join(this.dir, entry.file), "utf8");
+      const re = new RegExp("```" + LEDGER_MARKER + "\\n([\\s\\S]*?)\\n```", "g");
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(body)) !== null) {
+        try {
+          const parsed = JSON.parse(m[1]) as LedgerEntry[];
+          if (Array.isArray(parsed)) out.push(...parsed);
+        } catch {
+          // A corrupted block is a missing block. record-intact reports it.
+        }
+      }
+    }
+    return out;
   }
 
   read(index: number): string {

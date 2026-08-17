@@ -83,6 +83,72 @@ replaces. Shedding must shrink or not happen.
 Numbering continues across sessions, so the archive is a project-level record
 rather than a per-session one.
 
+## Shedding carries the evidence
+
+Shedding does not only move messages. Every write molt performed during the
+messages being shed travels with them, embedded in the exuvia as a
+`molt-ledger` block: the path, the hash before the write, and the hash molt
+observed after it.
+
+After a shed, that evidence is **not** duplicated in memory. The archive is
+the only place it exists.
+
+That is what makes "verification runs against preserved history" a fact
+rather than an architecture diagram. Delete an exuvia and a completion check
+fails, naming what can no longer be proven:
+
+```
+FAIL  record-intact
+      The session log records 7 archived batch(es), but 1 is missing from
+      the archive: 0003-2026-08-17T05-25-49-549Z.md. Earlier work in this
+      project can no longer be proven.
+```
+
+Evidence is partitioned by the tool call that produced it, never by a
+message index — indices shift when a shed replaces a dropped prefix with a
+digest, and a missed rebase silently misfiles evidence. A call id is stable
+for the life of a session.
+
+molt refuses to shed at all when no archive is configured and there is write
+evidence to lose. Shedding must shrink context, never the ability to prove
+what happened.
+
+## Three expectations, none supplied by the archive
+
+An integrity check is worthless if the thing being checked also supplies the
+expectation. molt keeps three, in increasing durability:
+
+| expectation | held by | catches |
+|---|---|---|
+| batches shed this session | engine memory | a lost exuvia, even one with no writes in it |
+| write records handed over | engine memory | lost write evidence specifically |
+| archive filenames | the hash-chained session log | a loss noticed in a *later* process, tomorrow |
+
+The archive is per project, not per session. Reopening a project that has
+shed before is normal; the archive holding *less* than was put there is not.
+
+## Cheaper than shedding: elision
+
+Before considering a shed, molt prunes tool results that later work made
+irrelevant — a file read and then written, or a path read twice. Those
+results are replaced with a one-line marker naming what superseded them.
+
+This runs every step, costs nothing, and is strictly less disruptive than
+shedding, because it does not rewrite the context prefix.
+
+## A tension worth knowing about
+
+Shedding rewrites the prefix of the context, and providers cache on exact
+prefix match. So a shed invalidates the cache: on one sample session it cut
+history from 11,480 to 2,971 tokens, but the next request then re-read those
+2,971 tokens uncached.
+
+On a caching provider, shedding mid-task can cost more than it saves. That
+argues for shedding at task boundaries rather than token thresholds. molt
+does not yet model this, and `/bom` reports raw savings rather than
+cache-adjusted ones — treat the numbers as a floor on cost, not a ceiling on
+benefit.
+
 ## Auto-shed
 
 ```bash

@@ -60,12 +60,35 @@ this check out of that project's bar.
 
 #### `record-intact`
 
-Passes when the shed archive on disk matches what the session believes it shed,
-and every archived batch is readable.
+Passes when everything this project shed is still recoverable.
 
-This is the audit check. It proves the evidence behind every other result is
-still there to inspect — which is the difference between a result and a claim
-about a result.
+Shedding moves write evidence out of memory and into the archive, so this is
+the check that keeps the archive honest. It compares what is on disk against
+three expectations the archive cannot itself supply:
+
+- how many batches this session archived (engine memory)
+- how many write records it handed over (engine memory)
+- which archive files the session log recorded (the hash-chained journal,
+  so a loss is caught in a later process too)
+
+Fails when an exuvia was deleted or its evidence block corrupted, naming the
+files that can no longer be proven. Passes trivially in a project that has
+never shed.
+
+#### `claims-grounded`
+
+Passes when every file path the model names in its final answer either exists
+on disk or was written in this project — including writes recorded only in
+the archive.
+
+Catches fabricated file references: an agent naming a module it never created
+and reporting success. Deliberately conservative — a token must look like a
+path with an extension, and URLs are stripped before scanning — because
+over-matching would fail correct work, which is worse than missing a made-up
+reference.
+
+It says nothing to ground rather than passing vacuously when the claim
+mentions no files.
 
 ## Tamper detection
 
