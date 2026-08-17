@@ -28,7 +28,7 @@ export const BAR_FILENAME = "done.yml";
 export const DEFAULT_TIMEOUT_MS = 120_000;
 const OUTPUT_MAX = 2000;
 
-export const BUILTINS: BuiltinCheck[] = ["files-changed", "record-intact"];
+export const BUILTINS: BuiltinCheck[] = ["files-changed", "record-intact", "claims-grounded"];
 
 /**
  * Conventional tags. Not enforced — a bar may use any label — but these are
@@ -43,11 +43,31 @@ export type BarContext = {
   cwd: string;
   /** Full session record, including everything shed. */
   record: Msg[];
-  /** Every write molt actually performed, with before/after hashes. */
+  /**
+   * Every write this project can still prove: live memory plus everything
+   * recovered from the archive. After a shed, entries for early work exist
+   * ONLY in the archive, so this is the merged view checks must use.
+   */
   ledger: LedgerEntry[];
+  /** Only what is still in memory. Used to detect evidence lost with a shed. */
+  liveLedger?: LedgerEntry[];
   archive?: ArchiveLike;
   /** How many batches the transcript believes it has archived. */
   archivedBatches: number;
+  /**
+   * How many write records this session handed to the archive, counted in
+   * memory. Compared against what the archive actually yields — an
+   * expectation the archive cannot itself supply, which is what makes the
+   * comparison meaningful rather than circular.
+   */
+  expectedArchivedWrites?: number;
+  /**
+   * Archive files this project's session logs say exist. Survives process
+   * restart, so a deleted exuvia is caught tomorrow as well as today.
+   */
+  expectedArchiveFiles?: string[];
+  /** The completion claim being judged, when there is one. */
+  claim?: string;
 };
 
 export function barPath(cwd: string): string {
@@ -214,10 +234,12 @@ checks:
   # Builtins molt runs itself, against the full session record —
   # including context that has already been shed.
   #
-  #   files-changed   at least one file was actually modified, and every
-  #                   write molt performed is still on disk, byte for byte
-  #   record-intact   the shed archive is complete and readable, so the
-  #                   evidence behind these results can be audited later
+  #   files-changed    at least one file was actually modified, and every
+  #                    write molt performed is still on disk, byte for byte
+  #   record-intact    write evidence for this session is still recoverable
+  #                    from the archive, so results stay auditable later
+  #   claims-grounded  every file the model names in its final answer either
+  #                    exists or was written here — no invented files
   #
   # Tags are optional selection labels. molt understands --only and --skip,
   # so slow checks can live in the file for CI without paying for them on
@@ -228,6 +250,10 @@ checks:
 
   - name: record-intact
     builtin: record-intact
+    tags: [fast]
+
+  - name: claims-grounded
+    builtin: claims-grounded
     tags: [fast]
 `;
 
@@ -248,6 +274,35 @@ function truncate(s: string, n = OUTPUT_MAX): string {
 function sha256File(p: string): string | null {
   if (!existsSync(p)) return null;
   return createHash("sha256").update(readFileSync(p)).digest("hex");
+}
+
+/**
+ * File paths a completion claim refers to. Deliberately conservative: a
+ * token must look like a path with an extension, or be backtick-quoted.
+ * Over-matching would fail correct work, which is worse than missing a
+ * fabricated reference.
+ */
+export function mentionedPaths(claim: string): string[] {
+  const found = new Set<string>();
+
+  // URLs contain host names and paths that look exactly like file paths.
+  // Remove them wholesale rather than trying to reject them token by token.
+  const text = claim.replace(/\b[a-z][\w+.-]*:\/\/\S+/gi, " ").replace(/\bwww\.\S+/gi, " ");
+
+  const add = (raw: string) => {
+    const cleaned = raw.replace(/^[`'"(\[]+|[`'".,;:)\]]+$/g, "").trim();
+    if (!cleaned || cleaned.length > 200) return;
+    if (!/^[\w./@-]+$/.test(cleaned)) return;
+    if (!/\.[A-Za-z][\w]{0,9}$/.test(cleaned)) return; // needs a file extension
+    if (/^\d+\.\d+$/.test(cleaned)) return; // version numbers
+    if (cleaned.startsWith("http")) return;
+    found.add(cleaned.replace(/^\.\//, ""));
+  };
+
+  for (const m of text.matchAll(/`([^`]+)`/g)) add(m[1]);
+  for (const m of text.matchAll(/[\w./@-]*[\w-]\.[A-Za-z][\w]{0,9}\b/g)) add(m[0]);
+
+  return [...found];
 }
 
 /** Every path the model asked to write, across the entire session record. */
@@ -275,15 +330,7 @@ function runBuiltin(builtin: BuiltinCheck, ctx: BarContext): { ok: boolean; outp
         ok: false,
         output:
           attempted.length === 0
-            ? // Written for the model, which is the audience that can act on
-              // it. The last clause matters: the only way to satisfy this
-              // check without doing the work is to write a file for the sake
-              // of writing one, and a bar that rewards that is worse than no
-              // bar. Saying so is cheaper than catching the junk file later.
-              "No file was modified in this session, so there is no work to show. " +
-              "If the request needed a code change, make it. If it genuinely needs " +
-              "no file to change, say that plainly and stop — do not write or touch " +
-              "a file to satisfy this check."
+            ? "No file was modified in this session. Nothing was done that can be shown."
             : `${attempted.length} write(s) appear in the record but none landed on disk ` +
               `(denied, errored, or never executed): ${attempted.join(", ")}`,
       };
@@ -315,19 +362,59 @@ function runBuiltin(builtin: BuiltinCheck, ctx: BarContext): { ok: boolean; outp
     };
   }
 
+  if (builtin === "claims-grounded") {
+    // The model's own words, checked against what actually happened.
+    // Fabricated file references are a documented failure mode: an agent
+    // names a file it never created and reports success.
+    const claim = ctx.claim ?? "";
+    if (!claim.trim()) {
+      return { ok: true, output: "No textual claim was made; nothing to ground." };
+    }
+
+    const mentioned = mentionedPaths(claim);
+    if (mentioned.length === 0) {
+      return { ok: true, output: "The claim references no files." };
+    }
+
+    const written = new Set(ctx.ledger.map((e) => e.path));
+    const ungrounded: string[] = [];
+    for (const p of mentioned) {
+      if (written.has(p)) continue;
+      if (existsSync(resolve(ctx.cwd, p))) continue;
+      ungrounded.push(p);
+    }
+
+    if (ungrounded.length > 0) {
+      return {
+        ok: false,
+        output:
+          `The completion claim names ${ungrounded.length} file(s) that do not exist and ` +
+          `were never written in this project: ${ungrounded.join(", ")}. ` +
+          `Either create them or stop referring to them.`,
+      };
+    }
+    return {
+      ok: true,
+      output: `${mentioned.length} file reference(s) in the claim all resolve: ${mentioned.join(", ")}`,
+    };
+  }
+
   if (builtin === "record-intact") {
     if (!ctx.archive) {
-      return ctx.archivedBatches === 0
+      return ctx.archivedBatches === 0 && (ctx.expectedArchiveFiles ?? []).length === 0
         ? { ok: true, output: "No context has been shed; nothing to audit." }
         : { ok: false, output: "Context was shed but no archive is configured." };
     }
     const entries = ctx.archive.list();
-    if (entries.length !== ctx.archivedBatches) {
+    // The archive is per PROJECT, not per session: reopening a project that
+    // has shed before is normal and must not fail. What must never happen is
+    // the archive holding LESS than this session put there.
+    if (entries.length < ctx.archivedBatches) {
       return {
         ok: false,
         output:
-          `Archive holds ${entries.length} batch(es) but the session shed ${ctx.archivedBatches}. ` +
-          `The evidence chain is incomplete.`,
+          `This session archived ${ctx.archivedBatches} batch(es) but only ${entries.length} ` +
+          `remain. The evidence chain is incomplete.`,
       };
     }
     for (const e of entries) {
@@ -335,12 +422,48 @@ function runBuiltin(builtin: BuiltinCheck, ctx: BarContext): { ok: boolean; outp
         return { ok: false, output: `Exuvia ${e.file} contains no readable messages.` };
       }
     }
+
+    // The load-bearing part. Shedding moves write evidence out of memory and
+    // into the archive. This session counted what it handed over; the archive
+    // must still yield that much. The expectation comes from memory, not from
+    // the archive, so a deleted or corrupted exuvia cannot hide itself by
+    // also removing the thing it would be compared against.
+    // Cross-session expectation: the journal recorded which exuviae were
+    // written. Those files must still be there, whatever process is asking.
+    const expectedFiles = ctx.expectedArchiveFiles ?? [];
+    if (expectedFiles.length > 0) {
+      const present = new Set(entries.map((e) => e.file));
+      const missing = expectedFiles.filter((f) => !present.has(f));
+      if (missing.length > 0) {
+        return {
+          ok: false,
+          output:
+            `The session log records ${expectedFiles.length} archived batch(es), but ` +
+            `${missing.length} is missing from the archive: ${missing.join(", ")}. ` +
+            `Earlier work in this project can no longer be proven.`,
+        };
+      }
+    }
+
+    const fromArchive = ctx.archive.ledger?.() ?? [];
+    const expected = ctx.expectedArchivedWrites ?? 0;
+    if (fromArchive.length < expected) {
+      return {
+        ok: false,
+        output:
+          `This session archived ${expected} write record(s) but only ${fromArchive.length} ` +
+          `remain recoverable. An exuvia was deleted or corrupted, so earlier work can no ` +
+          `longer be proven.`,
+      };
+    }
+
     return {
       ok: true,
       output:
         entries.length === 0
           ? "No context has been shed; nothing to audit."
-          : `${entries.length} shed batch(es) archived and readable.`,
+          : `${entries.length} shed batch(es) archived and readable · ` +
+            `${fromArchive.length} write(s) still provable from the archive.`,
     };
   }
 

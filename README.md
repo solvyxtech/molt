@@ -2,7 +2,7 @@
 
 **A coding agent that can't say "done" without proving it.**
 
-Every agent harness is built for a model you can trust. molt is built for one you can't.
+Every agent harness is built for a model you can trust. molt is built for any model you don't — which, on current evidence, is all of them.
 
 When the model stops calling tools and says the task is complete, molt treats that as a *claim*, not a result. It runs the checks in your project's `.molt/done.yml`. If any fail, the claim is refused, the real failure output goes back to the model, and the loop continues. The model does not decide when it is finished.
 
@@ -35,17 +35,23 @@ Fixed the refresh path — it was returning before the await.
 
 ## Why this exists
 
-Adoption of AI coding tools is near-universal and trust in their output is not. The mechanism is well understood: models emit completion language as an output pattern regardless of the actual state of the codebase. An agent writes "tests passing" while the suite has syntax errors, because it is predicting what a successful ending looks like.
+Adoption of AI coding tools is near-universal and trust in their output is not. The mechanism is well understood and it is not deception: models emit completion language as an output pattern regardless of the actual state of the codebase. An agent writes "tests passing" while the suite has syntax errors, because it is predicting what a successful ending looks like.
+
+**Intent is irrelevant to the cost.** Whether a model lied or was simply wrong, you shipped a false claim either way. So molt does not try to detect dishonesty — it checks the work.
+
+Frontier models narrow this gap rather than closing it, and a rarer false completion is arguably more dangerous, because rarity is what stops you checking. See [docs/why.md](docs/why.md), which includes a table of confident wrong claims made *by the AI assistant used to build molt*, and how each was caught.
 
 The fix is not a better model. It is a harness that refuses to accept the model's word. That pattern is already described in the harness-engineering literature and reachable today via hand-written Claude Code Stop hooks — molt makes it the default contract instead of a configuration exercise, and ties it to a record the harness itself preserved. See [docs/prior-art.md](docs/prior-art.md) for what came before and exactly what is different here.
 
-molt is **local-first**. It defaults to Ollama on `localhost:11434`, costs nothing to run, and is aimed at people driving open-weight models on their own hardware — where models lie more, context windows are smaller, and supervision cost is the metric that decides whether a tool is usable.
+molt is **local-first by default** — it points at Ollama on `localhost:11434` and costs nothing to run. Local models are the sharpest case: smaller context windows, weaker agentic judgement, and summarization-based compaction that is slow and poor at small parameter counts.
+
+They are not the only case. molt works against any OpenAI-compatible endpoint — xAI, Anthropic's compatibility endpoint, OpenRouter, Groq, Mistral, vLLM, llama.cpp — and on hosted models the token efficiency, the budget stop, and tokens-per-verified-change stop being abstractions and start being invoices.
 
 ## Install
 
 ```bash
-npx @solvyx/molt              # no install
-npm i -g @solvyx/molt         # or keep it
+npx @solvyxtech/molt          # no install
+npm i -g @solvyxtech/molt     # or keep it
 ```
 
 Node 20.11+.
@@ -59,39 +65,11 @@ $EDITOR .molt/done.yml        # say what "done" means here
 molt                          # interactive
 ```
 
-On first run, `/login` picks a provider and takes its key; `/model` then lists
-what those keys can reach, grouped by provider. Both are remembered, so later
-runs start where you left off.
-
-```
-› /model
-models across your keys:
-
-  xai
-     grok-4.6
-     grok-4
-  anthropic
-   ▸ claude-opus-5
-     claude-sonnet-5
-   ↑↓ choose · enter select · esc cancel
-```
-
-Both pickers are driven by the arrow keys — nothing to type, no numbers to
-read off. Provider headers are not selectable; the highlight steps over
-them.
-
-Cost appears beside the token count once molt knows what the tokens cost —
-set `priceIn` / `priceOut` (USD per 1M tokens) in `~/.config/molt/config.json`,
-or pass `--price-in` / `--price-out`. Without pricing the cost is omitted
-rather than guessed.
-
-Keys are written to `~/.config/molt/auth.json` at 0600 — outside the repo, so
-a tool whose whole pitch is an auditable record never commits a credential to
-one. Presets cover ollama, openrouter, anthropic, openai, xai, and groq; any
-other OpenAI-compatible endpoint works with flags:
+Point it anywhere OpenAI-compatible:
 
 ```bash
-molt --url https://api.openrouter.ai/api/v1 --model deepseek/deepseek-r1 --key $OPENROUTER_API_KEY
+molt --url http://localhost:11434/v1 --model qwen2.5-coder:7b
+molt --url https://openrouter.ai/api/v1 --model deepseek/deepseek-r1 --key $OPENROUTER_API_KEY
 ```
 
 Headless, for scripts and CI — exits non-zero when the bar is not met:
@@ -143,7 +121,8 @@ Tags are optional selection labels — `fast`, `slow`, `ci`, `local`, `manual` a
 | builtin | what it proves |
 |---|---|
 | `files-changed` | At least one file was actually modified, and every write molt performed is still on disk byte-for-byte. Catches work that was never done, reverted, or rewritten with identical contents. |
-| `record-intact` | The shed archive is complete and readable, so the evidence behind any result can be audited later. |
+| `record-intact` | Everything this project shed is still recoverable. Compares the archive against three expectations it cannot itself supply — batches shed, write records handed over, and archive filenames recorded in the hash-chained log. Delete an exuvia and this fails, naming what can no longer be proven. |
+| `claims-grounded` | Every file the model names in its final answer either exists or was written here. Catches invented file references, including when the write is recorded only in the archive. |
 
 **The bar cannot be lowered by the work being judged against it.** molt fingerprints `done.yml` at session start and compares before every run. An agent that edits it to make checks pass fails a check called `bar-unmodified`. Instructions are a hope; this is a control.
 
@@ -166,11 +145,40 @@ The denominator on that second one matters and molt prints the caveat itself. A 
 
 See [docs/receipts.md](docs/receipts.md) and [docs/metrics.md](docs/metrics.md).
 
+## Transparency
+
+Everything molt did is on disk, in a form you can check without trusting
+molt's summary of it.
+
+```bash
+molt log        # every request, tool call, permission, and bar run
+molt verify     # recompute the log's hash chain
+```
+
+The session log is append-only and hash-chained: each entry stores the SHA-256
+of the one before it, so altering or deleting a line breaks every hash after it
+and `molt verify` names the entry where the chain broke. That is tamper
+**evidence**, not prevention — anyone with write access can rewrite and
+re-chain a log. What it rules out is a silent edit.
+
+Measured values (exit codes, byte counts, durations, provider-reported usage)
+are distinguished from estimates (request size, token counts when a provider
+reports none), which are marked `~` in output and `"estimated": true` in the
+log. Message content is never logged — only length, a short preview, and a
+digest — because an audit log is exactly the file that quietly accumulates
+credentials.
+
+Costs nothing in tokens: all of it is disk only and never enters a prompt.
+
+See [docs/transparency.md](docs/transparency.md).
+
 ## Shedding
 
 Context compaction in molt is **mechanical**: verbatim excerpts, no model call, no tokens, no hallucination surface. The full unabridged history is archived to `.molt/exuviae/` rather than discarded.
 
-This is not a headline feature. It is the infrastructure the proof loop stands on: when a completion claim references work from forty turns ago, molt checks the preserved record instead of a summary of it. Harnesses that summarize the original away have nothing to check against.
+This is not a headline feature. It is the infrastructure the proof loop stands on — and it is load-bearing rather than decorative. Every write molt performed during shed messages travels **into** the exuvia and is dropped from memory, so the archive becomes the only place that evidence exists. Delete an exuvia and a completion check fails, naming the work that can no longer be proven.
+
+That is what lets molt verify a claim about work from forty turns ago, or from yesterday's session. Harnesses that summarized the original away have nothing to check against.
 
 Shedding is two-phase — the archive write happens *between* planning and committing, so a failed write can never take context with it.
 
@@ -196,8 +204,7 @@ nothing has to be typed in full or looked up.
 /bom               context bill of materials
 /wire              exact JSON of the last request
 /budget <n|off>    hard token ceiling
-/login [provider]  add a provider key
-/model [id]        browse models across your keys, or switch by id
+/model <id>        switch model
 /molt              cycle theme
 /clear             reset the session
 ```
@@ -223,6 +230,14 @@ node rnd/grade.mjs --list  # what it measures
 ```
 
 The test suite includes a 400-transcript fuzz asserting that shedding never produces a request payload a provider would reject, and mutation-tested coverage of the proof gate. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Reading order
+
+- [docs/why.md](docs/why.md) — the gap molt closes, and a worked example of confident wrong claims caught by the habits molt encodes
+- [docs/done-yml.md](docs/done-yml.md) — the completion bar
+- [docs/transparency.md](docs/transparency.md) — what is recorded and how to check it
+- [docs/receipts.md](docs/receipts.md) · [docs/shed.md](docs/shed.md) · [docs/metrics.md](docs/metrics.md)
+- [docs/prior-art.md](docs/prior-art.md) — what came before, credited by name
 
 ## Name
 

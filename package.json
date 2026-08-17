@@ -1,6 +1,6 @@
 {
   "name": "@solvyx/molt",
-  "version": "0.9.0",
+  "version": "1.0.0-rc.3",
   "description": "A coding agent that can't say \"done\" without proving it.",
   "keywords": [
     "ai",

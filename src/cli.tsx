@@ -7,19 +7,18 @@
  * bar is not met, so molt can sit in CI, in a script, or in a benchmark
  * harness without a human watching.
  */
-import { render } from "ink";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { Archive } from "./archive.js";
-import { App } from "./app.js";
 import { fmtDuration } from "./banner.js";
 import { BarError, hasBar, loadBar, selectChecks, writeDefaultBar } from "./bar.js";
 import { Engine } from "./engine.js";
+import { Journal } from "./journal.js";
 import { providerName, storedEndpoint, type StoredEndpoint } from "./providers.js";
 import { Receipts } from "./receipts.js";
 import type { BarResult, EngineEvent } from "./types.js";
 
-const VERSION = "v0.9.0";
+const VERSION = "v1.0.0-rc.3";
 
 const USAGE = `molt ${VERSION} — a coding agent that can't say "done" without proving it.
 
@@ -33,6 +32,8 @@ usage
   molt receipts             list completion attempts (--grep, --show <file>)
   molt archive              list shed batches (--grep, --show <n>, --explain)
   molt stats                false-claim rate and tokens per verified change
+  molt log                  what the model actually did, from the session log
+  molt verify               recompute the log's hash chain
   molt --help
 
 first run
@@ -46,10 +47,9 @@ options
                      no default — /model or --model picks one
   --key <secret>     api key, if the endpoint needs one   (MOLT_API_KEY)
                      /login stores keys in ~/.config/molt/auth.json (0600)
-  --provider <name>  label shown in the status line
   --price-in <n>     USD per 1M prompt tokens      (MOLT_PRICE_IN)
   --price-out <n>    USD per 1M completion tokens  (MOLT_PRICE_OUT)
-                     also read from ~/.config/molt/config.json
+  --provider <name>  label shown in the status line
   --cwd <dir>        project directory (default: current)
   --budget <n>       hard token ceiling for the session
   --auto-shed <n>    shed once history exceeds n tokens
@@ -60,6 +60,8 @@ options
   --only <tags>      run only checks with these tags (comma separated)
   --skip <tags>      skip checks with these tags
   --grep <pattern>   filter receipts or archive entries
+  --session <id>     which session log to read (default: most recent)
+  --raw              print the log as raw JSONL rather than a summary
   --show <id>        print one receipt file or exuvia index
 
 molt reads .molt/done.yml for what "done" means in this project.
@@ -83,6 +85,8 @@ type Args = {
   grep?: string;
   show?: string;
   explain: boolean;
+  session?: string;
+  raw: boolean;
   stream: boolean;
   yes: boolean;
   json: boolean;
@@ -115,6 +119,7 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
     priceOut: num(process.env.MOLT_PRICE_OUT) ?? stored.priceOut,
     cwd: process.cwd(),
     explain: false,
+    raw: false,
     stream: true,
     yes: false,
     json: false,
@@ -175,6 +180,12 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
       case "--explain":
         out.explain = true;
         break;
+      case "--session":
+        out.session = next();
+        break;
+      case "--raw":
+        out.raw = true;
+        break;
       case "--no-stream":
         out.stream = false;
         break;
@@ -214,7 +225,21 @@ function buildEngine(args: Args): Engine {
       process.exit(2);
     }
   }
+  const journal = new Journal(args.cwd);
+  journal.append("session_start", {
+    sessionId: journal.sessionId,
+    molt: VERSION,
+    provider: args.provider ?? providerName(args.url),
+    model: args.model,
+    endpoint: args.url,
+    cwd: args.cwd,
+    bar: bar ? `${bar.checks.length} check(s)` : "none — completions unverified",
+    checks: bar?.checks.map((c) => c.name) ?? [],
+    stream: args.stream,
+  });
+
   return new Engine({
+    journal,
     baseUrl: args.url,
     apiKey: args.key,
     model: args.model,
@@ -243,8 +268,8 @@ function printBar(result: BarResult): void {
   }
   process.stdout.write(result.ok ? "\nbar met\n" : "\nbar NOT met\n");
 
-  // Same reasoning as the TUI: the check output speaks to the model, and a
-  // person staring at a refusal they cannot act on needs the other half.
+  // A check's output speaks to the model; a person staring at a refusal they
+  // cannot act on needs the other half.
   const onlyWorkLanded =
     !result.ok &&
     result.results.every((r) => r.ok || r.detail === "files-changed") &&
@@ -518,6 +543,68 @@ function cmdStats(args: Args): number {
   return 0;
 }
 
+function resolveSession(args: Args): string | null {
+  const files = Journal.sessions(args.cwd);
+  if (files.length === 0) return null;
+  const pick = args.session
+    ? files.find((f) => f.startsWith(args.session!))
+    : files[files.length - 1];
+  return pick ? join(args.cwd, ".molt", "log", pick) : null;
+}
+
+function cmdLog(args: Args): number {
+  const file = resolveSession(args);
+  if (!file) {
+    process.stdout.write("no session log in this project yet\n");
+    return 0;
+  }
+  const entries = Journal.read(file);
+  if (args.json) {
+    process.stdout.write(JSON.stringify(entries, null, 2) + "\n");
+    return 0;
+  }
+  if (args.raw) {
+    for (const e of entries) process.stdout.write(JSON.stringify(e) + "\n");
+    return 0;
+  }
+
+  const check = Journal.verify(file);
+  process.stdout.write(`${file}\n${entries.length} entries · chain ${check.ok ? "intact" : "BROKEN"}\n\n`);
+  for (const line of Journal.summarize(entries)) process.stdout.write(line + "\n");
+  process.stdout.write(
+    "\nEvery line above is recomputed from the log, not narrated. Values marked ~ are\n" +
+      "estimates (chars/4) because the provider did not report usage; everything else\n" +
+      "is measured. `molt verify` recomputes the hash chain. `--raw` prints the JSONL.\n",
+  );
+  return check.ok ? 0 : 1;
+}
+
+function cmdVerify(args: Args): number {
+  const files = Journal.sessions(args.cwd);
+  if (files.length === 0) {
+    process.stdout.write("no session logs to verify\n");
+    return 0;
+  }
+  let bad = 0;
+  for (const f of files) {
+    const path = join(args.cwd, ".molt", "log", f);
+    const r = Journal.verify(path);
+    process.stdout.write(
+      `${r.ok ? "ok  " : "FAIL"}  ${f}  ${r.entries} entries${r.ok ? "" : `\n      ${r.reason}`}\n`,
+    );
+    if (!r.ok) bad++;
+  }
+  process.stdout.write(
+    bad === 0
+      ? `\n${files.length} log(s) verified. Each entry hashes its predecessor, so any\nalteration or deletion breaks the chain from that point on.\n`
+      : `\n${bad} log(s) failed verification.\n`,
+  );
+  process.stdout.write(
+    "\nThis is tamper EVIDENCE, not tamper prevention: anyone with write access can\nrewrite a log and re-chain it. What it rules out is a silent edit.\n",
+  );
+  return bad === 0 ? 0 : 1;
+}
+
 export async function main(argv = process.argv.slice(2)): Promise<number> {
   let args: Args;
   try {
@@ -551,6 +638,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return cmdArchive(args);
     case "stats":
       return cmdStats(args);
+    case "log":
+      return cmdLog(args);
+    case "verify":
+      return cmdVerify(args);
     case "":
       break;
     default:
@@ -565,8 +656,13 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
 
   const engine = buildEngine(args);
   if (args.budget) engine.setBudget(args.budget);
+
+  // Ink and React are loaded only here. Importing them at module top made
+  // `molt prove` pay ~450ms of startup for a UI it never renders, which
+  // matters because the bar wants to live in CI and in git hooks.
+  const [{ render }, { App }] = await Promise.all([import("ink"), import("./app.js")]);
   const { waitUntilExit } = render(
-    <App engine={engine} version={VERSION} autoShed={args.autoShed} />,
+    App({ engine, version: VERSION, autoShed: args.autoShed }),
   );
   await waitUntilExit();
   return 0;

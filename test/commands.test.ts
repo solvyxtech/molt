@@ -124,13 +124,11 @@ describe("windowAround", () => {
   });
 
   it("carries true indices so the right row is highlighted when scrolled", () => {
-    const win = windowAround(items, 12, 6);
-    for (const { item, i } of win) assert.equal(items[i], item);
+    for (const { item, i } of windowAround(items, 12, 6)) assert.equal(items[i], item);
   });
 
   it("does not scroll a list that already fits", () => {
-    const few = items.slice(0, 4);
-    assert.deepEqual(windowAround(few, 3, 6).map((w) => w.i), [0, 1, 2, 3]);
+    assert.deepEqual(windowAround(items.slice(0, 4), 3, 6).map((w) => w.i), [0, 1, 2, 3]);
   });
 
   it("pins to the ends rather than running off them", () => {

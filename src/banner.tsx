@@ -8,16 +8,16 @@
  * One husk splits every four frames. The letter never moves — only the
  * shell around it dissolves — and the cast husk leaves as a wavefront
  * that widens into an arc as it travels out and dissipates. When the
- * water settles, nothing is left but the word:
+ * water settles, nothing is left but the word and the state of the
+ * session:
  *
  *      m   o   l   t
- *      v0.9.0
+ *      ollama · qwen2.5-coder-32b · 0 tok
+ *      v0.5.0
  *
- * Live session state does not belong here. The banner is a splash — it
- * scrolls away as the transcript grows — so anything worth re-reading
- * lives in the status line pinned above the prompt, where it stays put
- * and stays current. Printing it in both places says it twice and lets
- * the copy on screen go stale.
+ * The settle line is live state, not marketing. It answers "am I pointed
+ * at the right endpoint?" before you type — a question worth re-reading
+ * every launch, which a tagline is not.
  *
  * 26 frames at 135 ms ≈ 3.5 s. Everything here is a character grid — no
  * capability a terminal lacks. Frame construction is pure and exported,
@@ -48,7 +48,7 @@ const TRAVEL = 3; // columns a wavefront moves per frame
 const SHED_AT = [2, 6, 10, 14]; // frame each husk splits
 const RIPPLE_LIFETIME = 10; // frames before a wavefront dissipates
 
-/** The version appears only after every wavefront has cleared its row. */
+/** Settle rows appear only after every wavefront has cleared their columns. */
 const VERSION_AT = 21;
 
 const SEP = " \u00b7 "; // middle dot, present in every modern terminal font
@@ -131,20 +131,20 @@ export function fmtDuration(ms: number): string {
  * remains the only bright thing on screen.
  *
  * The usage field is self-suppressing. A cold session has spent nothing,
- * and "0 tokens" is dead weight that trains the eye to skip the whole line —
+ * and "0 tok" is dead weight that trains the eye to skip the whole line —
  * so it appears only once it says something:
  *
  *   in flight        ->  ~4.2k out
- *   budget set       ->  0/50k tokens   (a ceiling is news at zero)
+ *   budget set       ->  0/50k tok      (a ceiling is news at zero)
  *   context known    ->  32k ctx        (capacity, not consumption)
- *   tokens spent     ->  18.4k tokens · $0.07
+ *   tokens spent     ->  18.4k tok · $0.07
  *   nothing known    ->  omitted entirely
  */
 export function statusSegments(s: SessionStatus, maxWidth = COLS): Segment[] {
   // No model selected yet: say so and point at the fix. Usage and cost are
-  // withheld too — they describe a session that has not started, and a
-  // meter reading 0 tokens against no model implies a connection molt has not
-  // made. Same rule as costUsd above: omitted rather than faked.
+  // withheld too — they describe a session that has not started, and a meter
+  // reading 0 tokens against no model implies a connection molt has not made.
+  // Same rule as costUsd: omitted rather than faked.
   if (!s.model) {
     return [
       { text: "no model", tone: "ghost" },
@@ -325,7 +325,9 @@ export function Banner({
     );
   }
 
-  const rows = buildFrame(frame, { version });
+  const rows = buildFrame(frame, {
+    version,
+  });
 
   return (
     <Box flexDirection="column">

@@ -1,120 +1,190 @@
 # Changelog
 
-## 0.9.0 — the login and model picker, restored
+## 1.0.0-rc.3 — the archive earns its claim
+
+An audit found that "verification runs against preserved history" was
+architecture, not function: pass/fail came entirely from an in-memory ledger
+that was never shed, and `record-intact` only checked the archive against
+itself. Deleting the whole archive changed no outcome. This release makes the
+claim literally true.
 
 ### Added
 
-- **`/login`.** Pick a provider, paste a key, and molt stores it in
-  `~/.config/molt/auth.json` at 0600 — outside the repo, so a tool whose
-  whole pitch is an auditable record never writes a credential into one.
-  Presets: ollama, openrouter, anthropic, openai, xai, groq. `/login xai`
-  skips the picker. Key entry is masked and never enters the transcript.
-- **`/model` with no argument** lists every model across the providers you
-  hold a key for, grouped by provider. Picking one from another provider
-  switches the endpoint and resets the session — different endpoint,
-  different world. `/model <id>` still switches directly.
-- **Both pickers are driven by the arrow keys.** `↑↓` to choose, enter to
-  commit, esc to cancel — nothing typed, no ordinals on screen to read off
-  and retype. Provider headers are rendered in the same bright colour the
-  highlighted row gets, and are not selectable: the highlight steps over
-  them, so a header can never be committed. Long lists scroll around the
-  selection, and each drawn row carries its index in the full list, so a
-  scrolled list cannot highlight one row while committing another.
-- **The endpoint is remembered.** The provider and model you settle on are
-  written to `~/.config/molt/config.json`, so a bare `molt` resumes there
-  instead of starting from a guess.
-
-- **A working indicator, and per-tool timing.** While a turn is in flight the
-  prompt row shows a spinner, what the model is doing right now, and how long
-  it has been doing it — `thinking`, `responding`, the name of a running
-  tool, or `checking the bar`. The phase clock restarts only when the phase
-  actually changes, so it answers "is this stuck?" rather than counting the
-  whole turn. Each completed tool call carries its own duration on its line,
-  timed around execution only: waiting on a human to approve a gated tool is
-  not the tool being slow. A new `tool_start` event makes this possible —
-  previously the only tool event fired on completion, so nothing could be
-  said while the work was happening. Headless output carries the durations
-  too, and `--json` gets the new event.
-
-### Changed
-
-- **The banner no longer repeats the session state.** The endpoint and model
-  line under the wordmark said the same thing as the status line pinned above
-  the prompt. The banner is a splash and scrolls away as the transcript
-  grows, so its copy went stale while the pinned one stayed live — printing
-  both meant the wrong one was on screen most of the time. The wordmark now
-  settles to the version alone.
+- **Write evidence travels with shed context.** Every write performed during
+  shed messages is embedded in the exuvia as a `molt-ledger` block — path,
+  hash before, hash after — and **removed from memory**. After a shed, the
+  archive is the only place that evidence exists. Delete an exuvia and a
+  completion check fails, naming the work that can no longer be proven.
+- **Evidence survives across sessions.** A fresh process with an empty
+  in-memory ledger can still prove yesterday's writes.
+- **`claims-grounded` builtin.** Every file path the model names in its final
+  answer must exist or have been written here — catching invented file
+  references, a documented failure mode. Conservative by design: URLs are
+  stripped and a token must look like a path with an extension, because
+  over-matching would fail correct work.
+- **Three independent expectations for `record-intact`**, none supplied by
+  the archive: batches shed this session, write records handed over, and
+  archive filenames recorded in the hash-chained journal. The last survives a
+  process restart, so a deleted exuvia is caught tomorrow as well as today.
+- **molt refuses to shed when no archive is configured and there is write
+  evidence to lose.** Shedding must shrink context, never the ability to
+  prove what happened.
 
 ### Fixed
 
-- **A bar failure said what the check found, not what it meant.** One string
-  served two audiences: it is fed to the model *and* printed to the person,
-  so it was written for neither. `work-landed` reporting "No file was
-  modified in this session" is a fact the model can act on and a non-sequitur
-  to the reader, who sees every other check pass and a refusal they cannot
-  do anything about. The check output now addresses the model, and explicitly
-  forbids the one shortcut that would satisfy it without doing the work —
-  writing a file for the sake of writing one. When `files-changed` is the
-  *only* failure, molt additionally tells the person what it means: that this
-  turn was never going to satisfy it, and that `--skip session` exists. Shown
-  in both the TUI and `molt prove`.
-- **The command palette showed "… N more" and would not scroll to them.** It
-  drew `matches.slice(0, 6)` regardless of the selection, so arrowing past the
-  sixth row moved a highlight that was off screen, under a label advertising
-  rows it would not display — worse than showing nothing, because it told you
-  they existed and then hid them. The palette and the model picker now share
-  one windowing helper (`windowAround`), which keeps the highlight visible,
-  pins at both ends, and reports how many rows are hidden **above and below**
-  rather than only below.
-- **A refused claim stayed on screen and the next one appended to it.** The
-  proof loop deliberately withholds a claim it refused — the engine emits no
-  `assistant_text` — but streaming had already painted the text, and nothing
-  cleared the buffer on refusal. Three refused attempts ran together on one
-  line, and the answer molt had just refused to stand behind was left on
-  screen looking like the answer. The stream buffer is now cleared on
-  `proof_refused` and `proof_exhausted`.
-- **The cost read `$0.0000` on cheap turns.** The arithmetic was right; the
-  formatter was not. A fixed four decimal places flattened everything under
-  $0.0001 to zero, so a 998-token turn at $0.02/Mtok — really $0.000024 —
-  showed a meter stuck at zero while the token count climbed, which reads as
-  broken pricing rather than a cheap turn. Decimals now scale to the amount,
-  and below a millionth of a dollar it says `<$0.000001` rather than printing
-  a zero that is not one.
-- **The status line named the subdomain, not the provider.** `api.x.ai` was
-  split on the first dot and rendered as `api` — the same label every vendor
-  that fronts an API that way would get. The endpoint is now matched against
-  the provider presets, falling back to the host with `api.`/`www.` stripped.
-- **Token counts stop at `k`.** A session on a 1M-token context rendered as
-  `2400k`, which is arithmetic the reader has to finish. Now `2.4M`.
-- **The cost meter was never wired up.** `priceInPerMtok` and
-  `priceOutPerMtok` were read by `Engine.costUsd()` but nothing anywhere set
-  them, so the cost was always `undefined` and never rendered beside the
-  token count. Pricing is now read from `~/.config/molt/config.json`
-  (`priceIn` / `priceOut`, in USD per 1M tokens) and from `--price-in` /
-  `--price-out` or `MOLT_PRICE_IN` / `MOLT_PRICE_OUT`, precedence flag → env
-  → stored. An unusable value is ignored rather than allowed to reach the
-  meter as `NaN`, and prices survive the config rewrite that `/model` does on
-  every switch.
-- **`tok` is spelled `tokens`.** The abbreviation saved three characters on
-  the one line whose whole job is to be read at a glance.
-- **molt no longer names a model it has not checked.** The status line
-  reported `qwen2.5-coder:7b` on a local endpoint whether or not anything
-  was running there, and showed a token count and cost against it. There is
-  now no default model: until one is selected the line reads `no model ·
-  /login`, and usage and cost are withheld rather than shown against a
-  session that has not started. Sending a prompt with no model selected is
-  refused with that instruction instead of failing inside the provider.
-  This is the same rule the code already applied to pricing — *undefined
-  when no pricing is configured, omitted rather than faked.*
+- **`record-intact` broke every reopened project.** It required the archive to
+  hold exactly what the current session shed, but the archive is per project
+  and persists. Any second session in a project that had ever shed would fail.
+  Found by running an end-to-end scenario, not by reading the code.
+- **Ledger entries are keyed by tool-call id, not message index.** Indices
+  shift when a shed replaces a dropped prefix with a digest, so every entry
+  needed rebasing and a missed rebase would silently misfile evidence. The
+  rebasing was also unobservable through the public surface, meaning the test
+  covering it could not fail. Removing the index removed the whole class of
+  bug rather than testing around it.
 
-### Restored
+### Method
 
-- `/login` and the cross-provider model picker existed in 0.5.0 and were
-  lost in the 0.8.0 rewrite. `Engine.setBaseUrl` and `Engine.listModels`
-  survived it as dead code; they are the substrate this is rebuilt on. The
-  selection rules now live in `src/providers.ts`, pure and tested, rather
-  than inline in the TUI — and rendering and selection read one array, so a
-  number can no longer resolve to a row other than the one printed.
+Every mutation in the sweep is now caught. Three survived at first and each
+exposed a genuine gap:
+
+- nothing asserted the live ledger *gives up* what the archive takes on —
+  without that, the archive is optional and the claim is false
+- nothing checked evidence placement across repeated sheds
+- the batch-count check was redundant with the write-count check except for a
+  shed batch containing no writes, which now has its own test, because losing
+  archived conversation is a loss even when no file work was lost
+
+## 1.0.0-rc.2 — any model you don't fully trust
+
+A positioning correction, documented rather than quietly applied.
+
+### Changed
+
+- **The audience is no longer "local models".** It is any model you don't
+  fully trust. Local remains the sharpest case — small context windows,
+  weaker agentic judgement, poor summarization at small parameter counts —
+  but the trust gap it addresses was never local-specific. The most-cited
+  destructive incident in the field involved a frontier model, and Claude
+  Code declaring completion over a failing suite is a frontier-model
+  behaviour.
+- **Intent is explicitly out of scope.** molt does not try to detect
+  dishonesty. Whether a model lied or was merely wrong, the cost is
+  identical, so molt checks the work rather than the motive.
+- README leads with the trust gap in AI-generated code generally, and lists
+  the OpenAI-compatible providers molt already works with.
+
+### Added
+
+- **`docs/why.md`** — why molt exists, where local models fit, how hosted
+  models change the argument, and a worked example: a table of confident,
+  incorrect claims made by the AI assistant used to build this repository,
+  each with what was actually true. Including two claims molt itself made
+  about its own behaviour, and two tests that passed while the code they
+  covered was deliberately sabotaged.
+
+  It is there because a documented failure from the tool that built the
+  project is better evidence than a statistic from a survey — and because a
+  project about refusing false claims should be able to show its own.
+
+## 1.0.0-rc.1 — the record
+
+molt claims things: that a check passed, that a file changed, that context was
+shed. This release makes every one of those claims checkable against an
+artifact molt cannot silently edit.
+
+### Added
+
+- **Hash-chained session log.** `.molt/log/<id>.jsonl` — append-only, one
+  entry per event: session start, user messages, requests, responses, tool
+  calls, tool results, permission decisions, bar runs with per-check exit
+  codes, sheds, elisions, receipts, cancellations, errors. Each entry stores
+  the SHA-256 of the previous one.
+- **`molt log`** — what the model actually did, every line recomputed from
+  entries rather than narrated. `--raw` for the JSONL, `--json` for parsed
+  entries, `--session <id>` to pick one.
+- **`molt verify`** — recomputes the chain and names the exact entry where it
+  broke. Proven against three tampering modes: modifying a bar result,
+  deleting a permission entry, and inserting a forged one.
+- **Estimated vs measured, stated everywhere.** Exit codes, byte counts,
+  durations, file hashes, and provider-reported usage are measured. Request
+  size and token counts absent a usage block are estimates, marked `~` in
+  output and `"estimated": true` in the log.
+- **`docs/transparency.md`** — what is recorded, what is deliberately not,
+  and how to reconstruct any claim end to end.
+
+### Fixed
+
+- **"cancelled — the session is unchanged" was not literally true.** The user
+  turn was pushed before the request, so a cancellation left it behind.
+  Cancelling now rolls the turn back to its starting length; a test asserts
+  the record is byte-identical afterwards. A claim molt makes about itself is
+  held to the same standard as one the model makes.
+
+### Deliberately not logged
+
+Message content. The log records a user message's length, a 120-character
+preview, and a digest — not the text; tool results by byte count and digest,
+not contents. Prompts contain credentials and private code, and a verbose
+audit log is exactly the file that quietly accumulates them. There is a test
+asserting a secret in a prompt never reaches the log.
+
+### Honest limit
+
+The chain is tamper **evidence**, not tamper prevention. Anyone with write
+access can rewrite a log and re-chain it. What it rules out is a silent edit.
+
+### Cost
+
+Zero tokens. All four artifact directories are disk only and never enter a
+prompt. A 16-entry session is 5.2 KB, about 329 bytes per entry.
+
+## 0.9.0 — token efficiency, measured
+
+History is resent on every request, so anything lingering in context is paid
+for repeatedly. Measured on a modelled 12-step task with two refusals:
+**125,839 → 42,633 prompt tokens sent (66% less)**, final history 8,982 →
+2,681 tokens.
+
+Fixed overhead was measured first and deliberately left alone: the system
+prompt is 138 tokens and the tool schema 157, together about 5% of a real
+session. Shrinking them is a rounding error.
+
+### Added
+
+- **Superseded tool-result elision.** A file read and then written is dead
+  weight — the model will never use the stale contents again, but every
+  later request pays for them. Same for a path read twice. Only `read_file`
+  results are touched, only when a later call supersedes them, and the
+  replacement says plainly what happened. Mechanical, idempotent, and the
+  full original stays in the archived record.
+
+### Fixed
+
+- **Stale bar failures were carried forever.** Each refusal appended a full
+  failure message that was resent on every subsequent request, so attempt 3
+  paid for attempts 1 and 2 as well. Earlier failures now collapse to a
+  one-line marker; the model still knows a previous attempt was refused
+  without re-reading output it has already acted on.
+- **Headless startup was 7x slower than it needed to be.** `cli.tsx`
+  imported Ink at module top, so `molt prove` loaded React and the entire
+  TUI without rendering it: 528ms → 88ms after moving to a dynamic import.
+  This matters because the bar wants to live in CI and in git hooks.
+
+### Changed
+
+- `TOOL_RESULT_MAX_BYTES` 4096 → 2048. Tool results dominate history, and
+  truncation has always been visible rather than silent.
+
+### Known tension, not yet addressed
+
+Shedding rewrites the context prefix, which invalidates a provider's cached
+prefix. Measured on a sample session: shedding cut history 11,480 → 2,971
+tokens, but the next request then re-reads those 2,971 uncached. On a
+caching provider, shedding mid-task can cost more than it saves. Auto-shed
+should probably fire at task boundaries rather than token thresholds — but
+that number is arithmetic, not an observation, and it needs measuring
+against a real provider before behaviour changes.
 
 ## 0.8.0 — streaming, and a palette you do not have to memorise
 
