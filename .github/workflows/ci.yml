@@ -1,14 +1,66 @@
 name: ci
+
 on:
-  push: { branches: [main] }
+  push:
+    branches: [main]
   pull_request:
+
 jobs:
-  test:
+  check:
+    name: node ${{ matrix.node }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ["20.11", "22"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: test
+        run: npm test
+
+      # The claim in the README has to survive CI, not just the unit suite.
+      - name: graded scenarios
+        run: |
+          npm run build
+          ./rnd/demo.sh
+
+      # The grader is published as a tool, so it has to keep working.
+      - name: harness grader
+        run: node rnd/grade.mjs --harness molt
+
+  cold-install:
+    name: npx from a clean machine
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20, cache: npm }
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci && npm run build
+      - name: pack and install the tarball
+        run: |
+          npm pack --silent
+          mkdir -p /tmp/cold && cd /tmp/cold
+          npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE"/solvyxtech-molt-*.tgz
+          npx molt --help
+          npx molt init
+          # A fresh project has done nothing, so the bar must NOT pass.
+          if npx molt prove; then
+            echo "molt prove passed in an empty project — the gate is not working"
+            exit 1
+          fi

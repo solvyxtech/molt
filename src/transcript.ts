@@ -1,51 +1,376 @@
 /**
- * Pure transcript logic: engine events → renderable lines.
- * No React, no I/O — fully unit-testable.
+ * The transcript: molt's context window, and the record underneath it.
+ *
+ * Two ideas carry the whole product:
+ *
+ *  1. Shedding is MECHANICAL. Verbatim excerpts, no model call, no tokens,
+ *     no hallucination surface.
+ *  2. Shedding is TWO-PHASE. planShed() computes what would happen and
+ *     mutates nothing. commitShed() applies it — and the caller only
+ *     commits after the archive write has actually landed on disk. A
+ *     failed write can therefore never destroy context, which is the
+ *     property every later proof depends on.
+ *
+ * `record()` returns the full session including everything shed. That is
+ * what makes molt able to verify a claim about work from forty turns ago:
+ * competitors summarized the original away, so they have nothing to check
+ * against.
+ *
+ * No filesystem access here — archiving lives in archive.ts so this whole
+ * module stays pure and testable.
  */
-import type { EngineEvent } from "./engine.js";
+import { estTokens, type Bom, type Msg } from "./types.js";
 
-export type Line =
-  | { kind: "user"; text: string }
-  | { kind: "assistant"; text: string }
-  | { kind: "tool"; name: string; detail: string; note?: string }
-  | { kind: "info"; text: string }
-  | { kind: "error"; text: string };
+export const STALE_FAILURE_PREFIX = "[molt: superseded]";
+export const ELIDED_PREFIX = "[molt: superseded tool result —";
 
-export const TRANSCRIPT_MAX_LINES = 500;
+export const DIGEST_HEADER =
+  "[molt digest of shed context — mechanical, verbatim excerpts, not a summary]";
 
-export function appendCapped(lines: Line[], next: Line): Line[] {
-  const out = [...lines, next];
-  return out.length > TRANSCRIPT_MAX_LINES
-    ? out.slice(out.length - TRANSCRIPT_MAX_LINES)
-    : out;
+/** Characters kept from each excerpted message in a digest. */
+const EXCERPT_CHARS = 300;
+/** Maximum tool-call lines listed in a digest. */
+const MAX_ACTION_LINES = 25;
+/**
+ * When a single request has produced a long tool run, there are no user
+ * turns to cut on. Fall back to keeping this many recent messages.
+ */
+const KEEP_RECENT_MESSAGES = 6;
+/** Never bother shedding fewer than this many messages. */
+const MIN_DROPPED = 2;
+
+export type ShedPlan = {
+  /** Full, unabridged markdown of everything being shed. */
+  exuvia: string;
+  /** The mechanical digest that will replace it in context. */
+  digest: string;
+  /** Messages being removed from the working context. */
+  dropped: Msg[];
+  droppedCount: number;
+  beforeTokens: number;
+  afterTokens: number;
+};
+
+export class Transcript {
+  private system: Msg;
+  private working: Msg[] = [];
+  /** Every message ever shed, oldest batch first. Never truncated. */
+  private archived: Msg[][] = [];
+
+  constructor(systemPrompt: string) {
+    this.system = { role: "system", content: systemPrompt };
+  }
+
+  push(msg: Msg): void {
+    this.working.push(msg);
+  }
+
+  /** Working context including the system prompt. Internal shape. */
+  all(): Msg[] {
+    return [this.system, ...this.working];
+  }
+
+  /**
+   * Messages formatted for the wire: molt's own metadata removed, since
+   * providers reject unknown fields with varying degrees of politeness.
+   */
+  wire(): Omit<Msg, "molt">[] {
+    return this.all().map(({ molt: _molt, ...rest }) => rest);
+  }
+
+  /**
+   * The complete session: everything ever shed, in order, followed by the
+   * current working context. This is the evidence base.
+   */
+  record(): Msg[] {
+    return [this.system, ...this.archived.flat(), ...this.working];
+  }
+
+  /** Number of shed batches archived so far. */
+  get shedCount(): number {
+    return this.archived.length;
+  }
+
+  /** Messages currently in the working context, excluding the system prompt. */
+  get length(): number {
+    return this.working.length;
+  }
+
+  reset(): void {
+    this.working = [];
+    this.archived = [];
+  }
+
+  bom(toolSchemaJson: string, session: { prompt: number; completion: number }): Bom {
+    const historyTokens = this.working.reduce(
+      (n, m) => n + estTokens(m.content ?? "") + estTokens(JSON.stringify(m.tool_calls ?? "")),
+      0,
+    );
+    const systemTokens = estTokens(this.system.content ?? "");
+    const toolSchemaTokens = estTokens(toolSchemaJson);
+    return {
+      systemTokens,
+      toolSchemaTokens,
+      historyTokens,
+      requestTotalEst: systemTokens + toolSchemaTokens + historyTokens,
+      sessionPromptTokens: session.prompt,
+      sessionCompletionTokens: session.completion,
+    };
+  }
+
+  historyTokens(): number {
+    return this.working.reduce(
+      (n, m) => n + estTokens(m.content ?? "") + estTokens(JSON.stringify(m.tool_calls ?? "")),
+      0,
+    );
+  }
+
+  /**
+   * Compute a shed without applying it. Returns null when there is nothing
+   * worth shedding — too few exchanges, or a digest that would grow the
+   * context rather than shrink it.
+   */
+  planShed(keepExchanges = 2): ShedPlan | null {
+    const isDigest = (m: Msg) => m.molt?.digest === true;
+
+    // Digest messages are bookkeeping, not exchanges: they never count
+    // toward keepExchanges and are never the only thing shed.
+    const userIdxs = this.working
+      .map((m, i) => (m.role === "user" && !isDigest(m) ? i : -1))
+      .filter((i) => i >= 0);
+
+    let cutAt: number;
+    if (userIdxs.length > keepExchanges) {
+      cutAt = userIdxs[userIdxs.length - keepExchanges];
+    } else {
+      // A single request can produce dozens of tool calls with no user turn
+      // to cut on — which is exactly when context runs out. Fall back to
+      // keeping the most recent messages instead.
+      const fallback = this.findSafeCut(this.working.length - KEEP_RECENT_MESSAGES);
+      if (fallback === null) return null;
+      cutAt = fallback;
+    }
+
+    const dropped = this.working.slice(0, cutAt);
+    const kept = this.working.slice(cutAt);
+    if (dropped.length < MIN_DROPPED || dropped.every(isDigest)) return null;
+    if (kept.length > 0 && kept[0].role === "tool") return null;
+
+    const beforeTokens = this.historyTokens();
+    const digest = buildDigest(dropped);
+    const exuvia = buildExuvia(dropped, this.archived.length);
+
+    const digestMsg: Msg = {
+      role: "system",
+      content: digest,
+      molt: { digest: true },
+    };
+    const afterTokens = [digestMsg, ...kept].reduce(
+      (n, m) => n + estTokens(m.content ?? "") + estTokens(JSON.stringify(m.tool_calls ?? "")),
+      0,
+    );
+
+    // Shedding must only ever shrink. On tiny sessions the digest can cost
+    // more than the messages it replaces.
+    if (afterTokens >= beforeTokens) return null;
+
+    return { exuvia, digest, dropped, droppedCount: dropped.length, beforeTokens, afterTokens };
+  }
+
+  /**
+   * The largest cut index at or below `limit` that does not orphan a tool
+   * result. A `tool` message must stay with the assistant turn that
+   * requested it — providers reject a payload that opens with a tool
+   * result whose call is missing, and a rejected payload is a dead session.
+   */
+  private findSafeCut(limit: number): number | null {
+    for (let i = Math.min(limit, this.working.length); i >= 0; i--) {
+      if (i >= this.working.length) continue;
+      if (this.working[i].role !== "tool") return i;
+    }
+    return null;
+  }
+
+  /**
+   * Apply a plan produced by planShed(). Call this only after the exuvia
+   * has been durably archived — that ordering is the guarantee.
+   */
+  commitShed(plan: ShedPlan): void {
+    const cut = plan.droppedCount;
+    const dropped = this.working.slice(0, cut);
+    this.archived.push(dropped);
+    this.working = [
+      { role: "system", content: plan.digest, molt: { digest: true } },
+      ...this.working.slice(cut),
+    ];
+  }
+
+  /**
+   * Remove the most recent messages. Used to undo a turn that was cancelled
+   * before it produced anything, so "the session is unchanged" is literally
+   * true rather than nearly true.
+   */
+  rollbackTo(length: number): void {
+    if (length < 0 || length > this.working.length) return;
+    this.working.length = length;
+  }
+
+  /** Re-attach previously shed context (or any text) to the working set. */
+  regrow(text: string): void {
+    this.working.push({
+      role: "user",
+      content: "[molt: context re-attached from the archive]\n" + text,
+      molt: { regrown: true },
+    });
+  }
+
+  /**
+   * Inject a bar failure so the model can see exactly what is unmet.
+   *
+   * Only the LATEST failure matters, and a stale one is resent on every
+   * subsequent request for the rest of the session. So earlier failures are
+   * collapsed to a one-line marker rather than carried in full — the model
+   * still knows a previous attempt was refused, without paying for the
+   * output of a check it has already seen and acted on.
+   */
+  pushBarFailure(text: string): void {
+    for (const m of this.working) {
+      if (m.molt?.barFailure && m.content && !m.content.startsWith(STALE_FAILURE_PREFIX)) {
+        const attempt = /attempt (\d+)/.exec(m.content)?.[1] ?? "?";
+        m.content = `${STALE_FAILURE_PREFIX} attempt ${attempt} was refused; its failures are superseded below.`;
+      }
+    }
+    this.working.push({
+      role: "user",
+      content: text,
+      molt: { barFailure: true },
+    });
+  }
+
+  /**
+   * Drop tool results that later work has made irrelevant.
+   *
+   * A file read and then written is dead weight: the model will never use
+   * the stale contents again, but every subsequent request pays for them.
+   * Same for a path read twice — only the most recent read can be current.
+   *
+   * Mechanical and conservative: only `read_file` results are touched, only
+   * when a later call in the same session supersedes them, and the
+   * replacement says plainly what happened. Nothing is invented and the
+   * full original stays in the record.
+   */
+  elideSupersededReads(): { elided: number; tokensSaved: number } {
+    const supersededBy = new Map<number, string>();
+    const lastRead = new Map<string, number>();
+
+    for (let i = 0; i < this.working.length; i++) {
+      const m = this.working[i];
+      for (const call of m.tool_calls ?? []) {
+        let path = "";
+        try {
+          path = String(
+            (JSON.parse(call.function.arguments || "{}") as { path?: unknown }).path ?? "",
+          );
+        } catch {
+          continue;
+        }
+        if (!path) continue;
+
+        if (call.function.name === "read_file") {
+          const prior = lastRead.get(path);
+          if (prior !== undefined) supersededBy.set(prior, `re-read at step ${i}`);
+          lastRead.set(path, i);
+        } else if (call.function.name === "write_file") {
+          const prior = lastRead.get(path);
+          if (prior !== undefined) supersededBy.set(prior, `overwritten at step ${i}`);
+          lastRead.delete(path);
+        }
+      }
+    }
+
+    let elided = 0;
+    let tokensSaved = 0;
+    for (const [callIdx, reason] of supersededBy) {
+      // The tool result follows its assistant turn.
+      for (let j = callIdx + 1; j < this.working.length; j++) {
+        const m = this.working[j];
+        if (m.role !== "tool") break;
+        if (!m.content || m.content.startsWith(ELIDED_PREFIX)) continue;
+        const before = estTokens(m.content);
+        m.content = `${ELIDED_PREFIX} ${reason}. Full contents remain in the archived record.`;
+        tokensSaved += before - estTokens(m.content);
+        elided++;
+      }
+    }
+    return { elided, tokensSaved };
+  }
 }
 
-export function reduceEvent(lines: Line[], ev: EngineEvent): Line[] {
-  switch (ev.kind) {
-    case "assistant_text":
-      return ev.text.trim()
-        ? appendCapped(lines, { kind: "assistant", text: ev.text })
-        : lines;
-    case "tool":
-      return appendCapped(lines, {
-        kind: "tool",
-        name: ev.name,
-        detail: ev.detail,
-        note: ev.note,
-      });
-    case "usage": {
-      const cost =
-        ev.costUsd !== undefined ? ` · $${ev.costUsd.toFixed(4)}` : "";
-      return appendCapped(lines, {
-        kind: "info",
-        text: `✓ ${ev.promptTokens}→${ev.completionTokens} tok · session ${ev.sessionTokens}${cost}`,
-      });
+/**
+ * A digest is verbatim excerpts, never a paraphrase. Prior digests are
+ * carried forward whole rather than re-excerpted — re-truncating a
+ * truncation is how context silently rots across repeated sheds.
+ */
+export function buildDigest(dropped: Msg[]): string {
+  const cap = (t: string, n = EXCERPT_CHARS) => (t.length > n ? t.slice(0, n) + "…" : t);
+
+  const carried: string[] = [];
+  const asks: string[] = [];
+  const answers: string[] = [];
+  const actions: string[] = [];
+
+  for (const m of dropped) {
+    if (m.molt?.digest && m.content) {
+      // Carry a previous digest through intact.
+      carried.push(m.content.replace(DIGEST_HEADER, "").trim());
+      continue;
     }
-    case "info":
-      return appendCapped(lines, { kind: "info", text: ev.text });
-    case "error":
-      return appendCapped(lines, { kind: "error", text: ev.text });
-    default:
-      return lines; // future event kinds must never crash the UI
+    if (m.role === "user" && m.content) asks.push(cap(m.content));
+    if (m.role === "assistant" && m.content) answers.push(cap(m.content));
+    for (const c of m.tool_calls ?? []) {
+      let detail = "";
+      try {
+        const args = JSON.parse(c.function.arguments || "{}") as Record<string, unknown>;
+        detail = toolDetail(c.function.name, args);
+      } catch {
+        detail = "(unparseable arguments)";
+      }
+      actions.push(`${c.function.name}: ${detail}`);
+    }
   }
+
+  const sections = [
+    DIGEST_HEADER,
+    carried.length ? carried.join("\n\n") : "",
+    asks.length ? "Earlier requests:\n- " + asks.join("\n- ") : "",
+    answers.length ? "Earlier results:\n- " + answers.join("\n- ") : "",
+    actions.length ? "Actions taken:\n- " + actions.slice(0, MAX_ACTION_LINES).join("\n- ") : "",
+  ].filter(Boolean);
+
+  return sections.join("\n\n");
+}
+
+export function buildExuvia(dropped: Msg[], index: number): string {
+  const head = [
+    `# molt exuvia ${String(index).padStart(4, "0")} — ${new Date().toISOString()}`,
+    "",
+    `Full, unabridged history shed from context. ${dropped.length} messages.`,
+    "Re-attach any part with `/regrow`. Nothing here was summarized.",
+    "",
+  ];
+  const body = dropped.map((m) => {
+    const tools = m.tool_calls?.length
+      ? "\n\n```json\n" + JSON.stringify(m.tool_calls, null, 2) + "\n```"
+      : "";
+    const tag = m.molt?.digest ? " (digest)" : m.molt?.regrown ? " (regrown)" : "";
+    return `## ${m.role}${tag}\n\n${m.content ?? ""}${tools}\n`;
+  });
+  return [...head, ...body].join("\n");
+}
+
+export function toolDetail(name: string, args: Record<string, unknown>): string {
+  const raw =
+    name === "bash" ? String(args.command ?? "") : String(args.path ?? JSON.stringify(args));
+  const oneLine = raw.replace(/\s+/g, " ").trim();
+  return [...oneLine].slice(0, 80).join("");
 }

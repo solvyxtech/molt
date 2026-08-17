@@ -1,79 +1,318 @@
 /**
  * molt's visual identity — deliberately anti-figlet.
  *
- * No block capitals. The banner is the lowercase word husked in dim
- * parentheses: (m)(o)(l)(t). On launch — and on every /molt — the husks
- * shed one letter at a time and drift right, ending as ripples:
+ * No block capitals. The word sits in a tidepool as four husked letters:
  *
- *     molt ))))
+ *     (m) (o) (l) (t)
  *
- * The discarded shells ARE the tidepool ripples. Name, theme, and
- * mechanic in nine characters.
+ * One husk splits every four frames. The letter never moves — only the
+ * shell around it dissolves — and the cast husk leaves as a wavefront
+ * that widens into an arc as it travels out and dissipates. When the
+ * water settles, nothing is left but the word and the state of the
+ * session:
+ *
+ *      m   o   l   t
+ *      ollama · qwen2.5-coder-32b · 0 tok
+ *      v0.5.0
+ *
+ * The settle line is live state, not marketing. It answers "am I pointed
+ * at the right endpoint?" before you type — a question worth re-reading
+ * every launch, which a tagline is not.
+ *
+ * 26 frames at 135 ms ≈ 3.5 s. Everything here is a character grid — no
+ * capability a terminal lacks. Frame construction is pure and exported,
+ * so it can be tested without mounting Ink.
  */
-import React, { useEffect, useState } from "react";
-import { Box, Text } from "ink";
+import { useEffect, useState } from "react";
+import { Box, Text, useInput, useStdin, useStdout } from "ink";
 import type { Theme } from "./theme.js";
 
 const WORD = "molt";
-export const FRAME_MS = 120;
-/** Total frames: one per letter shed, plus the settled state. */
-export const TOTAL_FRAMES = WORD.length + 1;
 
-export function bannerFrame(shedCount: number): {
-  segments: { text: string; role: "letter" | "husk" | "ripple" }[];
-} {
-  const segs: { text: string; role: "letter" | "husk" | "ripple" }[] = [];
+export const FRAME_MS = 135;
+export const TOTAL_FRAMES = 26; // 26 × 135ms ≈ 3.5s
+export const SETTLED_FRAME = TOTAL_FRAMES - 1;
+
+/** Below this width the splash is replaced by a one-line wordmark. */
+export const MIN_COLUMNS = 70;
+
+const COLS = 60;
+const ROWS = 7;
+const MID = 3; // the waterline row the word sits on
+
+/** Each letter owns a 3-cell husk plus one cell of gutter. Must stay >= 4. */
+const SLOT = 4;
+const FIELD = WORD.length * SLOT;
+const ORIGIN = FIELD + 2; // husks are cast off just past the word
+const TRAVEL = 3; // columns a wavefront moves per frame
+const SHED_AT = [2, 6, 10, 14]; // frame each husk splits
+const RIPPLE_LIFETIME = 10; // frames before a wavefront dissipates
+
+/** Settle rows appear only after every wavefront has cleared their columns. */
+const STATUS_AT = 21;
+const VERSION_AT = 23;
+
+const SEP = " \u00b7 "; // middle dot, present in every modern terminal font
+
+export type Tone = "accent" | "mid" | "dim" | "ghost";
+export type Segment = { text: string; tone: Tone };
+
+type Cell = { t: string; c: Tone };
+
+export type SessionStatus = {
+  /** Short endpoint name: "ollama", "openrouter", "groq", "local". */
+  provider: string;
+  model: string;
+  sessionTokens: number;
+  /** Undefined when no pricing is configured — omitted rather than faked. */
+  costUsd?: number;
+  budgetTokens?: number;
+  /** Model context window, when the endpoint reports one. */
+  contextTokens?: number;
+  /** Estimated outbound size of an in-flight request. */
+  pendingEst?: number;
+};
+
+export type FrameOptions = {
+  status?: Segment[];
+  version?: string;
+};
+
+function fmtTokens(n: number): string {
+  if (n < 1000) return `${n}`;
+  const k = n / 1000;
+  return `${k < 10 ? k.toFixed(1) : Math.round(k)}k`;
+}
+
+function fmtCost(usd: number): string {
+  return usd > 0 && usd < 0.01 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`;
+}
+
+/**
+ * Build the settle line. The model name carries the accent because it is
+ * the field most worth scanning; everything else stays quiet so the word
+ * remains the only bright thing on screen.
+ *
+ * The usage field is self-suppressing. A cold session has spent nothing,
+ * and "0 tok" is dead weight that trains the eye to skip the whole line —
+ * so it appears only once it says something:
+ *
+ *   in flight        ->  ~4.2k out
+ *   budget set       ->  0/50k tok      (a ceiling is news at zero)
+ *   context known    ->  32k ctx        (capacity, not consumption)
+ *   tokens spent     ->  18.4k tok · $0.07
+ *   nothing known    ->  omitted entirely
+ */
+export function statusSegments(s: SessionStatus, maxWidth = COLS): Segment[] {
+  const usage = (): string | null => {
+    if (s.pendingEst) return `~${fmtTokens(s.pendingEst)} out`;
+    if (s.budgetTokens)
+      return `${fmtTokens(s.sessionTokens)}/${fmtTokens(s.budgetTokens)} tok`;
+    if (s.sessionTokens > 0) return `${fmtTokens(s.sessionTokens)} tok`;
+    if (s.contextTokens) return `${fmtTokens(s.contextTokens)} ctx`;
+    return null;
+  };
+
+  const cost =
+    s.costUsd === undefined || s.sessionTokens === 0 ? null : fmtCost(s.costUsd);
+
+  const tail = [usage(), cost].filter(Boolean).join(SEP);
+
+  // Model names run long (qwen2.5-coder-32b-instruct-q4_K_M). The model
+  // yields first, since provider and cost are short and non-negotiable.
+  const seps = tail ? SEP.length * 2 : SEP.length;
+  const room = Math.max(8, maxWidth - s.provider.length - seps - tail.length);
+  const model =
+    s.model.length > room ? s.model.slice(0, room - 2) + ".." : s.model;
+
+  const segs: Segment[] = [
+    { text: s.provider, tone: "dim" },
+    { text: SEP, tone: "ghost" },
+    { text: model, tone: "mid" },
+  ];
+  if (tail) {
+    segs.push({ text: SEP, tone: "ghost" });
+    segs.push({ text: tail, tone: "dim" });
+  }
+  return segs;
+}
+
+/**
+ * Build one frame as rows of colour-runs. Pure: same input, same output,
+ * no clock and no terminal. Trailing whitespace is trimmed so we never
+ * emit padding a terminal has to repaint.
+ */
+export function buildFrame(frame: number, opts: FrameOptions = {}): Segment[][] {
+  const grid: Cell[][] = Array.from({ length: ROWS }, () =>
+    Array.from({ length: COLS }, () => ({ t: " ", c: "ghost" as Tone })),
+  );
+
+  const put = (r: number, c: number, text: string, tone: Tone) => {
+    if (r < 0 || r >= ROWS) return;
+    for (let i = 0; i < text.length; i++) {
+      const x = c + i;
+      if (x < 0 || x >= COLS) continue;
+      grid[r][x] = { t: text[i], c: tone };
+    }
+  };
+
+  const putSegments = (r: number, c: number, segs: Segment[]) => {
+    let x = c;
+    for (const seg of segs) {
+      put(r, x, seg.text, seg.tone);
+      x += seg.text.length;
+    }
+  };
+
+  // --- the word: letters pinned, husks dissolve around them ---
   for (let i = 0; i < WORD.length; i++) {
-    if (i < shedCount) {
-      segs.push({ text: WORD[i], role: "letter" });
+    const x = i * SLOT;
+    if (frame >= SHED_AT[i]) {
+      put(MID, x + 1, WORD[i], "accent");
     } else {
-      segs.push({ text: `(${WORD[i]})`, role: "husk" });
+      // the husk tenses for one frame before it splits
+      const tense = frame === SHED_AT[i] - 1;
+      put(MID, x, "(", tense ? "mid" : "dim");
+      put(MID, x + 1, WORD[i], tense ? "accent" : "mid");
+      put(MID, x + 2, ")", tense ? "mid" : "dim");
     }
   }
-  if (shedCount > 0) {
-    segs.push({ text: " " + ")".repeat(shedCount), role: "ripple" });
+
+  // --- wavefronts: one per cast husk, fading as they spread ---
+  for (let k = 0; k < WORD.length; k++) {
+    const age = frame - SHED_AT[k];
+    if (age < 0 || age >= RIPPLE_LIFETIME) continue;
+
+    const x0 = ORIGIN + age * TRAVEL;
+    const half = Math.min(3, Math.floor(age * 0.75));
+    const tone: Tone = age < 2 ? "mid" : age < 5 ? "dim" : "ghost";
+
+    for (let dy = -half; dy <= half; dy++) {
+      const x = x0 - Math.round(dy * dy * 0.7); // curvature: an arc, not a bar
+      if (x < ORIGIN - 1 || x >= COLS) continue;
+      put(MID + dy, x, ")", tone);
+    }
   }
-  return { segments: segs };
+
+  // --- settle ---
+  if (opts.status && frame >= STATUS_AT) putSegments(MID + 2, 0, opts.status);
+  if (opts.version && frame >= VERSION_AT) put(MID + 3, 0, opts.version, "ghost");
+
+  // --- compress each row to colour-runs, trimming the tail ---
+  return grid.map((row) => {
+    let last = -1;
+    for (let i = row.length - 1; i >= 0; i--) {
+      if (row[i].t !== " ") {
+        last = i;
+        break;
+      }
+    }
+    if (last < 0) return [];
+
+    const segs: Segment[] = [];
+    for (let i = 0; i <= last; i++) {
+      const prev = segs[segs.length - 1];
+      if (prev && row[i].c === prev.tone) prev.text += row[i].t;
+      else segs.push({ text: row[i].t, tone: row[i].c });
+    }
+    return segs;
+  });
+}
+
+/** One-line wordmark for narrow panes, non-TTY output, and `--no-splash`. */
+export function compactFrame(): Segment[] {
+  return [{ text: WORD, tone: "accent" }];
 }
 
 export function Banner({
   theme,
   themeName,
   animate = false,
+  status,
+  version,
 }: {
   theme: Theme;
   themeName: string;
   animate?: boolean;
+  status?: SessionStatus;
+  version?: string;
 }) {
-  const [shed, setShed] = useState(animate ? 0 : WORD.length);
+  const { stdout } = useStdout();
+  const { isRawModeSupported } = useStdin();
 
-  // Re-molt whenever the theme changes.
+  const columns = stdout?.columns ?? 80;
+  const isTTY = Boolean(stdout?.isTTY);
+  const canAnimate = animate && isTTY && columns >= MIN_COLUMNS;
+
+  const [frame, setFrame] = useState(canAnimate ? 0 : SETTLED_FRAME);
+  const running = canAnimate && frame < SETTLED_FRAME;
+
+  // Re-molt on launch and whenever the theme changes.
   useEffect(() => {
-    if (!animate) {
-      setShed(WORD.length);
+    if (!canAnimate) {
+      setFrame(SETTLED_FRAME);
       return;
     }
-    setShed(0);
+    setFrame(0);
     let n = 0;
-    const t = setInterval(() => {
+    const id = setInterval(() => {
       n += 1;
-      setShed(n);
-      if (n >= WORD.length) clearInterval(t);
+      setFrame(n);
+      if (n >= SETTLED_FRAME) clearInterval(id);
     }, FRAME_MS);
-    return () => clearInterval(t);
-  }, [animate, themeName]);
+    return () => clearInterval(id);
+  }, [canAnimate, themeName]);
 
-  const { segments } = bannerFrame(shed);
+  // Any key skips to the settled frame. Ceremony should never be a toll booth.
+  useInput(() => setFrame(SETTLED_FRAME), {
+    isActive: running && isRawModeSupported,
+  });
+
+  const color: Record<Tone, string> = {
+    accent: theme.accent,
+    mid: theme.accent,
+    dim: theme.dim,
+    ghost: theme.ghost,
+  };
+
+  if (columns < MIN_COLUMNS || !isTTY) {
+    return (
+      <Box>
+        {compactFrame().map((s, i) => (
+          <Text key={i} bold color={color[s.tone]}>
+            {s.text}
+          </Text>
+        ))}
+      </Box>
+    );
+  }
+
+  const rows = buildFrame(frame, {
+    status: status
+      ? statusSegments(status, Math.min(COLS, columns - 1))
+      : undefined,
+    version,
+  });
+
   return (
-    <Box>
-      {segments.map((s, i) => (
-        <Text
-          key={i}
-          bold={s.role === "letter"}
-          color={s.role === "letter" ? theme.accent : theme.dim}
-        >
-          {s.text}
-        </Text>
+    <Box flexDirection="column">
+      {rows.map((segs, r) => (
+        <Box key={r}>
+          {segs.length === 0 ? (
+            <Text> </Text>
+          ) : (
+            segs.map((s, i) => (
+              <Text
+                key={i}
+                bold={s.tone === "accent"}
+                dimColor={s.tone === "ghost"}
+                color={color[s.tone]}
+              >
+                {s.text}
+              </Text>
+            ))
+          )}
+        </Box>
       ))}
     </Box>
   );
