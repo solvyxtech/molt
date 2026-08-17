@@ -1,0 +1,40 @@
+name: False accept
+description: molt accepted a completion it should have refused
+labels: ["false-accept", "priority"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the most valuable bug report this project can receive.
+        A false accept is a failure of molt's central promise.
+  - type: textarea
+    id: bar
+    attributes:
+      label: Your .molt/done.yml
+      render: yaml
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What the agent claimed, and what was actually true
+    validations:
+      required: true
+  - type: textarea
+    id: receipt
+    attributes:
+      label: The receipt from .molt/receipts/
+      description: The accepted one. Redact anything sensitive.
+      render: markdown
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >
+        Ideally a script for rnd/mock-provider.mjs. Deterministic repros
+        get fixed first.
+  - type: input
+    id: model
+    attributes:
+      label: Provider and model
+      placeholder: ollama / qwen2.5-coder:7b
