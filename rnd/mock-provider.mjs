@@ -56,7 +56,12 @@ const SCRIPTS = {
   ],
   reverter: [
     call("write_file", { path: TARGET, content: "fixed\n" }),
-    call("bash", { command: `rm -f ${TARGET}` }),
+    // Moved rather than deleted, because molt now refuses `rm` at every
+    // autonomy level and a headless run refuses what it cannot ask about. The
+    // scenario is "the work is no longer where the claim says it is", and a
+    // rename produces that as well as a deletion did — while still exercising
+    // files-changed rather than the permission gate.
+    call("bash", { command: `mv ${TARGET} ${TARGET}.moved` }),
     say("Done — the fix is in place."),
   ],
 };
