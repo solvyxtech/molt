@@ -1,18 +1,26 @@
 name: ci
 
+# Runner choice is a cost decision as much as a coverage one. macOS bills at
+# ten times the Linux rate, and two macOS jobs on every push were ~20 of every
+# 23 billed minutes — for a signal that has differed from Linux exactly once,
+# when a script assumed GNU coreutils. So Linux runs on every push, and macOS
+# runs where its one real failure mode would actually matter: before a release.
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   check:
-    name: node ${{ matrix.node }} / ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: node ${{ matrix.node }} / ubuntu
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # The floor from package.json engines, and current. Nothing between:
+        # a version that works on both is not going to fail on 21.
         node: ["20.11", "22"]
 
     steps:
@@ -40,6 +48,26 @@ jobs:
       # The grader is published as a tool, so it has to keep working.
       - name: harness grader
         run: node rnd/grade.mjs --harness molt
+
+  macos:
+    name: node 22 / macos (tags and on demand)
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      # The macOS-specific failure this exists to catch: a script reaching for
+      # a GNU coreutils binary that BSD does not ship.
+      - name: graded scenarios
+        run: |
+          npm run build
+          ./rnd/demo.sh
 
   cold-install:
     name: npx from a clean machine
