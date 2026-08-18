@@ -592,8 +592,22 @@ export function App({
       if (!model) return;
       const p = await fetchPricing(engine.baseUrl, model, engine.cfg.apiKey);
       if (!p) {
-        // Publishing nothing is not the same as costing nothing, and it is
-        // not a reason to discard a price someone set by hand.
+        // Nothing published for this model. A price may still stand — but only
+        // if it was recorded FOR this model. Keeping the last model's rate
+        // because the new one publishes none is how a Claude session came to
+        // be billed at grok's $2/$6 and shown a total 40% under the truth,
+        // which is the exact failure this whole meter exists to prevent.
+        const stored = storedEndpoint();
+        if (stored.priceModel !== model && engine.pricing().in !== undefined) {
+          engine.setPricing({});
+          savePricing(model, null);
+          add(
+            "info",
+            `${engine.provider} publishes no price for ${model} — the meter will show tokens ` +
+              `only. The previous model's rate does not carry over. /price <in> <out> to set one.`,
+          );
+          return;
+        }
         if (announce) {
           add("info", `${engine.provider} publishes no price for ${model} — /price <in> <out> to set one`);
         }
@@ -783,13 +797,17 @@ export function App({
         case "/budget":
           if (arg === "off" || arg === "") {
             engine.setBudget(undefined);
-            add("info", "budget cleared");
+            add(
+              "info",
+              "budget cleared — no session budget and no per-turn ceiling. molt will now " +
+                "run a turn to the 32-step guard, which on a large codebase is a real bill.",
+            );
           } else {
             const n = Number(arg);
             if (!Number.isFinite(n) || n <= 0) add("error", "usage: /budget <tokens|off>");
             else {
               engine.setBudget(n);
-              add("info", `budget: ${n} tokens`);
+              add("info", `budget: ${n} tokens — for the session, and for any single turn`);
             }
           }
           return true;

@@ -119,7 +119,10 @@ export const SYSTEM_PROMPT = [
  * Deliberately generous enough for real work and far below "how did this cost
  * a dollar". `/budget` raises or removes it, and the message says so.
  */
-export const DEFAULT_TURN_TOKENS = 200_000;
+export const DEFAULT_TURN_TOKENS = 120_000;
+
+/** Fractions of the ceiling at which molt says something, once each. */
+const CEILING_WARNINGS = [0.5, 0.8];
 
 /**
  * When working history gets compacted, unless told otherwise.
@@ -1271,6 +1274,7 @@ export class Engine {
     }
 
     const turnStartTokens = this.sessionTokens;
+    let warned = 0;
     for (let step = 0; step < MAX_STEPS; step++) {
       // An explicit budget speaks for itself, and speaks first: one knob
       // should not produce two different messages.
@@ -1288,6 +1292,27 @@ export class Engine {
       // refuses to spend rather than what it noticed spending.
       const turnCeiling = this.cfg.maxTurnTokens ?? DEFAULT_TURN_TOKENS;
       const spentThisTurn = this.sessionTokens - turnStartTokens;
+
+      // Said on the way up, not only on arrival. A limit that speaks for the
+      // first time when it stops you is a limit that feels like a surprise
+      // bill, whatever the number on it.
+      while (
+        turnCeiling > 0 &&
+        warned < CEILING_WARNINGS.length &&
+        spentThisTurn >= turnCeiling * CEILING_WARNINGS[warned]!
+      ) {
+        const pct = Math.round(CEILING_WARNINGS[warned]! * 100);
+        warned += 1;
+        yield {
+          kind: "info",
+          text:
+            `${spentThisTurn} tokens this turn` +
+            (this.costUsd() === undefined ? "" : ` · ${fmtUsd(this.costUsd() ?? 0)}`) +
+            ` — ${pct}% of the ${turnCeiling}-token ceiling. /budget <n> raises it, ` +
+            `/budget off removes it.`,
+        };
+      }
+
       if (turnCeiling > 0 && spentThisTurn >= turnCeiling) {
         log?.append("session_end", { reason: "turn ceiling", tokens: spentThisTurn });
         yield {
@@ -1296,7 +1321,8 @@ export class Engine {
             `stopped: this turn has used ${spentThisTurn} tokens` +
             (this.costUsd() === undefined ? "" : ` · ${fmtUsd(this.costUsd() ?? 0)}`) +
             `, past the ${turnCeiling}-token ceiling for a single turn. Nothing was verified. ` +
-            `Narrow the request, or raise the ceiling with /budget.`,
+            `Narrow the request, raise the ceiling with /budget <n>, or remove it entirely ` +
+            `with /budget off.`,
         };
         yield* this.salvage(
           `This turn reached its ${turnCeiling}-token ceiling before you finished.`,

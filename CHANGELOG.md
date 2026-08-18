@@ -105,6 +105,17 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **A price was inherited by the next model.** Switching from grok-4.6 to
+  claude-sonnet-4-6 kept grok's $2/$6, because Anthropic publishes no prices and
+  molt was written to preserve an existing rate rather than blank a meter
+  somebody had configured. So a real session was shown **$0.42 for work that
+  cost about $0.69** — a meter 40% under the truth, which is worse than one
+  showing nothing. A price only stands for the model it was recorded against;
+  otherwise it is cleared, and molt says so.
+- **The turn ceiling only spoke when it stopped you.** It now says something at
+  50% and 80% of the way up, with the spend so far, and the stop names
+  `/budget off` as the way to remove it entirely. Default lowered from 200k
+  tokens to 120k — roughly $0.39 on Claude Sonnet, $0.25 on grok.
 - **`/model` listed no Anthropic models after a successful login.** Their
   compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
   but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
@@ -289,6 +300,17 @@ claim literally true.
 
 ### Fixed
 
+- **A price was inherited by the next model.** Switching from grok-4.6 to
+  claude-sonnet-4-6 kept grok's $2/$6, because Anthropic publishes no prices and
+  molt was written to preserve an existing rate rather than blank a meter
+  somebody had configured. So a real session was shown **$0.42 for work that
+  cost about $0.69** — a meter 40% under the truth, which is worse than one
+  showing nothing. A price only stands for the model it was recorded against;
+  otherwise it is cleared, and molt says so.
+- **The turn ceiling only spoke when it stopped you.** It now says something at
+  50% and 80% of the way up, with the spend so far, and the stop names
+  `/budget off` as the way to remove it entirely. Default lowered from 200k
+  tokens to 120k — roughly $0.39 on Claude Sonnet, $0.25 on grok.
 - **`/model` listed no Anthropic models after a successful login.** Their
   compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
   but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
@@ -493,6 +515,17 @@ artifact molt cannot silently edit.
 
 ### Fixed
 
+- **A price was inherited by the next model.** Switching from grok-4.6 to
+  claude-sonnet-4-6 kept grok's $2/$6, because Anthropic publishes no prices and
+  molt was written to preserve an existing rate rather than blank a meter
+  somebody had configured. So a real session was shown **$0.42 for work that
+  cost about $0.69** — a meter 40% under the truth, which is worse than one
+  showing nothing. A price only stands for the model it was recorded against;
+  otherwise it is cleared, and molt says so.
+- **The turn ceiling only spoke when it stopped you.** It now says something at
+  50% and 80% of the way up, with the spend so far, and the stop names
+  `/budget off` as the way to remove it entirely. Default lowered from 200k
+  tokens to 120k — roughly $0.39 on Claude Sonnet, $0.25 on grok.
 - **`/model` listed no Anthropic models after a successful login.** Their
   compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
   but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
@@ -660,6 +693,17 @@ session. Shrinking them is a rounding error.
 
 ### Fixed
 
+- **A price was inherited by the next model.** Switching from grok-4.6 to
+  claude-sonnet-4-6 kept grok's $2/$6, because Anthropic publishes no prices and
+  molt was written to preserve an existing rate rather than blank a meter
+  somebody had configured. So a real session was shown **$0.42 for work that
+  cost about $0.69** — a meter 40% under the truth, which is worse than one
+  showing nothing. A price only stands for the model it was recorded against;
+  otherwise it is cleared, and molt says so.
+- **The turn ceiling only spoke when it stopped you.** It now says something at
+  50% and 80% of the way up, with the spend so far, and the stop names
+  `/budget off` as the way to remove it entirely. Default lowered from 200k
+  tokens to 120k — roughly $0.39 on Claude Sonnet, $0.25 on grok.
 - **`/model` listed no Anthropic models after a successful login.** Their
   compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
   but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
@@ -829,6 +873,17 @@ against a real provider before behaviour changes.
 
 ### Fixed
 
+- **A price was inherited by the next model.** Switching from grok-4.6 to
+  claude-sonnet-4-6 kept grok's $2/$6, because Anthropic publishes no prices and
+  molt was written to preserve an existing rate rather than blank a meter
+  somebody had configured. So a real session was shown **$0.42 for work that
+  cost about $0.69** — a meter 40% under the truth, which is worse than one
+  showing nothing. A price only stands for the model it was recorded against;
+  otherwise it is cleared, and molt says so.
+- **The turn ceiling only spoke when it stopped you.** It now says something at
+  50% and 80% of the way up, with the spend so far, and the stop names
+  `/budget off` as the way to remove it entirely. Default lowered from 200k
+  tokens to 120k — roughly $0.39 on Claude Sonnet, $0.25 on grok.
 - **`/model` listed no Anthropic models after a successful login.** Their
   compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
   but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
@@ -1032,6 +1087,17 @@ can't say "done" without proving it.**
 
 ### Fixed
 
+- **A price was inherited by the next model.** Switching from grok-4.6 to
+  claude-sonnet-4-6 kept grok's $2/$6, because Anthropic publishes no prices and
+  molt was written to preserve an existing rate rather than blank a meter
+  somebody had configured. So a real session was shown **$0.42 for work that
+  cost about $0.69** — a meter 40% under the truth, which is worse than one
+  showing nothing. A price only stands for the model it was recorded against;
+  otherwise it is cleared, and molt says so.
+- **The turn ceiling only spoke when it stopped you.** It now says something at
+  50% and 80% of the way up, with the spend so far, and the stop names
+  `/budget off` as the way to remove it entirely. Default lowered from 200k
+  tokens to 120k — roughly $0.39 on Claude Sonnet, $0.25 on grok.
 - **`/model` listed no Anthropic models after a successful login.** Their
   compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
   but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a

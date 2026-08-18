@@ -15,6 +15,7 @@ import { Engine } from "../src/engine.js";
 import { Journal } from "../src/journal.js";
 import { MASK, redact, redactData } from "../src/redact.js";
 import { Receipts } from "../src/receipts.js";
+import { needsPriceLookup, savePricing, storedEndpoint } from "../src/providers.js";
 import { parseBar } from "../src/bar.js";
 import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
@@ -234,6 +235,37 @@ describe("receipts", () => {
     } finally {
       ws.cleanup();
     }
+  });
+});
+
+describe("a price belongs to one model", () => {
+  it("is not inherited by the next model", () => {
+    // Reported from use: switching from grok-4.6 to claude-sonnet-4-6 kept
+    // grok's $2/$6 because Anthropic publishes no prices — so a session was
+    // shown $0.42 for something that cost about $0.69. A meter that is 40%
+    // under is worse than one that is blank.
+    const ws = workspace();
+    try {
+      savePricing("grok-4.6", { in: 2, out: 6, cached: 0.5, source: "x.ai" }, ws.dir);
+      const stored = storedEndpoint(ws.dir);
+      assert.equal(stored.priceModel, "grok-4.6");
+
+      // The stamp is what makes the mismatch detectable at all.
+      assert.equal(needsPriceLookup("claude-sonnet-4-6", { in: 2, source: "x.ai" }, stored), true);
+      assert.equal(needsPriceLookup("grok-4.6", { in: 2, source: "x.ai" }, stored), false);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("computes a session at one rate, not a blend", () => {
+    // The arithmetic behind the report: 206k tokens is $0.44 at grok's rates
+    // and $0.69 at Claude Sonnet's. Same tokens, different model, and the
+    // wrong one was on screen.
+    const tokens = 206_295;
+    const at = (i: number, o: number) => ((tokens * 0.97) / 1e6) * i + ((tokens * 0.03) / 1e6) * o;
+    assert.ok(Math.abs(at(2, 6) - 0.44) < 0.02);
+    assert.ok(Math.abs(at(3, 15) - 0.69) < 0.02);
   });
 });
 
