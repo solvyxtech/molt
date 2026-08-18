@@ -182,6 +182,74 @@ describe("the transparency view", () => {
     }
   });
 
+  it("shows the whole result, not a sample of it", async () => {
+    // "I want to see everything happening — the whole point is transparency."
+    // A view that shows five lines of a forty-line result is asking you to
+    // trust the other thirty-five.
+    const ws = workspace();
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const engine = new Engine({
+      baseUrl: "http://provider.test/v1",
+      model: "test-model",
+      provider: "test",
+      cwd: ws.dir,
+      bar: null,
+      stream: false,
+      fetchFn: (async () => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "c1",
+                    type: "function",
+                    function: {
+                      name: "bash",
+                      arguments: JSON.stringify({
+                        command: "printf 'LINE-%s\\n' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20",
+                      }),
+                    },
+                  },
+                ],
+              },
+              finish_reason: "stop",
+            },
+          ],
+          usage: { prompt_tokens: 10, completion_tokens: 2 },
+        }),
+        text: async () => "",
+      })) as unknown as typeof fetch,
+      autonomy: "high",
+    });
+    const app = render(createElement(App, { engine, version: "vtest", verbose: true }), {
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      debug: true,
+      exitOnCtrlC: false,
+      patchConsole: false,
+    });
+    try {
+      await tick();
+      await submit(stdin, "run it");
+      await tick(400);
+      const text = stdout.text;
+      // Every one of the twenty lines reached the screen, not the first five.
+      for (const n of [1, 5, 12, 19, 20]) {
+        assert.match(text, new RegExp(`LINE-${n}\\b`), `line ${n} was truncated away`);
+      }
+    } finally {
+      app.unmount();
+      ws.cleanup();
+    }
+  });
+
   it("reveals what happened before the key was pressed, not only after", async () => {
     // Detail is recorded whether or not anyone is watching. A view that only
     // starts recording when you open it cannot answer "what did it just do?".

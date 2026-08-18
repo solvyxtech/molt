@@ -83,9 +83,16 @@ Four properties make it worth trusting:
 - **Recorded regardless.** Feed lines are written whether or not the view is
   open, so shift+V reveals what already happened rather than starting a
   recording.
-- **Bounded.** It is a panel of fixed height over a transcript that is printed
-  once and never redrawn. A view that grows the region a terminal has to
-  repaint is a view that eventually tears its own output.
+- **Complete.** Not a sample. You see every line of every result, exactly the
+  bytes the model received — capping a result on its way to the person watching
+  means the two of you are looking at different things, which is the one thing
+  a transparency view cannot do.
+- **Bounded on screen, not in content.** The panel is a fixed height, because a
+  live region that grows is a live region a terminal cannot repaint without
+  tearing. The full detail goes into the transcript instead, which is printed
+  once and never redrawn — so your terminal's own scrollback holds all of it,
+  at full width. Opening the view also prints everything recorded before you
+  opened it.
 - **The same facts as the log.** Nothing on screen is derived from anything
   the log does not also record — with the exception that the log stores
   digests where the screen shows content, deliberately (see below).

@@ -419,7 +419,7 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
             process.stdout.write(`      args ${ev.args.replace(/\s+/g, " ")}\n`);
           }
           if (ev.bytes !== undefined) process.stdout.write(`      → ${ev.bytes} bytes\n`);
-          for (const l of (ev.preview ?? "").split("\n").slice(0, 8)) {
+          for (const l of (ev.preview ?? "").split("\n")) {
             if (l.trim()) process.stdout.write(`      │ ${l}\n`);
           }
         }

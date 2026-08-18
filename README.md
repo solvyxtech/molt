@@ -188,6 +188,11 @@ each check's command and duration, and **what every job has cost**.
   job 2 not proven · 4 step(s) · 11k in · 210 out · $0.017 · 3.6s
 ```
 
+Nothing in it is truncated — every line of every result, exactly the bytes the
+model received. The panel itself is a fixed height, because a live region that
+grows tears the terminal; the full detail is printed into the transcript, where
+your own scrollback keeps it.
+
 It is a bounded panel, not an expanding scrollback: the transcript above it is
 printed once and never redrawn, which is what stops a long session from
 tearing itself apart in a terminal that cannot scroll backwards. Detail is

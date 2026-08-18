@@ -9,6 +9,15 @@ a number presented with more confidence than it was earned with.
 
 ### Added
 
+- **The view shows everything now.** Results were capped at 600 characters and
+  five lines on their way to the screen, while the model got the whole thing —
+  so the two of you were looking at different text, which is the one outcome a
+  transparency view cannot have. Every line of every result is shown, exactly
+  the bytes the model received, and a failing check's output is no longer cut
+  off after eight lines. The panel stays a fixed height (a growing live region
+  tears the terminal) and the full detail goes to the transcript, which is
+  printed once and never redrawn — so the terminal's own scrollback keeps it
+  all. Opening the view also prints everything recorded before you opened it.
 - **Word navigation in the prompt.** `alt+←`/`alt+→` move by word and `alt+D`
   deletes the word ahead. `ctrl+W` could already chop a long path in one
   stroke; getting back in front of it took an arrow per character.
