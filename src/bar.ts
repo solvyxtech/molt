@@ -284,6 +284,34 @@ function sha256File(p: string): string | null {
  * check, so the bias here is heavily toward silence: a missed fabrication
  * costs one unnoticed sentence, a false positive costs the whole turn.
  */
+/**
+ * Suffixes that make a token a filename.
+ *
+ * An allowlist, not a pattern, and that direction is deliberate. "Anything
+ * after a dot" also describes `Date.now`, `r.ok`, `String.replace` and
+ * `Journal.protect` — and this check REFUSES WORK when it is wrong, so its
+ * errors have to fall on the side of saying nothing. A file whose extension is
+ * missing here goes unchecked, which costs one unnoticed fabrication. The
+ * reverse cost a real session its completion for writing the word `Date.now()`
+ * in a sentence.
+ */
+const FILE_EXTENSIONS = new Set([
+  // code
+  "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "rb", "go", "rs", "java", "kt",
+  "kts", "swift", "c", "h", "cc", "cpp", "hpp", "cs", "php", "pl", "lua", "r",
+  "scala", "clj", "ex", "exs", "erl", "hs", "ml", "vue", "svelte", "dart", "zig",
+  // shells and config
+  "sh", "bash", "zsh", "fish", "ps1", "bat", "cmd",
+  "json", "yml", "yaml", "toml", "ini", "cfg", "conf", "env", "properties",
+  "lock", "gradle", "mk", "cmake", "dockerfile", "gitignore", "editorconfig",
+  // markup, docs, data
+  "md", "mdx", "rst", "txt", "adoc", "tex", "html", "htm", "xml", "svg",
+  "css", "scss", "sass", "less", "styl",
+  "csv", "tsv", "sql", "jsonl", "ndjson", "proto", "graphql", "gql",
+  // assets that show up in a claim about work
+  "png", "jpg", "jpeg", "gif", "webp", "ico", "pdf", "woff", "woff2", "ttf",
+]);
+
 const NOT_FILENAMES = new Set([
   "e.g", "i.e", "etc", "vs", "cf", "al", "viz", "ibid", "approx", "no", "fig",
   "eq", "ref", "dept", "est", "min", "max", "avg", "sec", "ch", "pp", "vol",
@@ -302,7 +330,12 @@ export function mentionedPaths(claim: string): string[] {
 
   // URLs contain host names and paths that look exactly like file paths.
   // Remove them wholesale rather than trying to reject them token by token.
-  const text = claim.replace(/\b[a-z][\w+.-]*:\/\/\S+/gi, " ").replace(/\bwww\.\S+/gi, " ");
+  const text = claim
+    .replace(/\b[a-z][\w+.-]*:\/\/\S+/gi, " ")
+    .replace(/\bwww\.\S+/gi, " ")
+    // A scheme-relative URL is still a URL, and "//example.com" was being
+    // reported as a missing file.
+    .replace(/\/\/[\w.-]+\.[a-z]{2,}\S*/gi, " ");
 
   const add = (raw: string) => {
     const cleaned = raw.replace(/^[`'"(\[]+|[`'".,;:)\]]+$/g, "").trim();
@@ -312,6 +345,10 @@ export function mentionedPaths(claim: string): string[] {
     if (/^\d+\.\d+$/.test(cleaned)) return; // version numbers
     if (cleaned.startsWith("http")) return;
     if (NOT_FILENAMES.has(cleaned.toLowerCase())) return;
+    // A path is a path whatever it ends in; a bare token has to end in
+    // something that is actually a file extension.
+    const ext = cleaned.slice(cleaned.lastIndexOf(".") + 1).toLowerCase();
+    if (!cleaned.includes("/") && !FILE_EXTENSIONS.has(ext)) return;
     // An earlier version also skipped any short stem with a short extension,
     // which killed "e.g." and "a.ts" alike — so a claim about a real file
     // stopped being checked at all. The named list above is enough; guessing
