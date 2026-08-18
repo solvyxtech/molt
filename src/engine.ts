@@ -725,6 +725,27 @@ export class Engine {
     this.cfg.priceSource = p.source;
   }
 
+  /**
+   * Keep the standing note of this turn current.
+   *
+   * The request, the files changed so far, and the last thing the bar said —
+   * a few hundred tokens that survive every compaction, so a shed costs the
+   * model its notes and not its purpose.
+   */
+  private pinTask(request: string, lastFailure?: string): void {
+    const written = [...new Set(this.ledger.map((e) => e.path))];
+    this.transcript.pin(
+      [
+        "[molt] What this turn is for. This note is never compacted away.",
+        `Request: ${request.replace(/\s+/g, " ").slice(0, 400)}`,
+        written.length ? `Files you have changed: ${written.join(", ")}` : "Files changed so far: none",
+        lastFailure ? `The bar last refused this claim: ${lastFailure}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    );
+  }
+
   /** Everything the meter is made of, at this instant. */
   private meter(): Meter {
     return {
@@ -1207,6 +1228,7 @@ export class Engine {
     let answered = false;
 
     yield { kind: "job_start", job, text: userText };
+    this.pinTask(userText);
 
     for await (const ev of this.runTurn(userText, confirm, job, opts)) {
       switch (ev.kind) {
@@ -1795,6 +1817,7 @@ export class Engine {
           });
           if ((name === "write_file" || name === "edit_file") && allowed) {
             shown.delete(String(args.path ?? ""));
+            this.pinTask(userText);
           }
           called.push(name);
           if (allowed) this.actsSinceBar += 1;
@@ -1991,6 +2014,10 @@ export class Engine {
       }
 
       yield { kind: "proof_refused", result, attempt: proofAttempts };
+      this.pinTask(
+        userText,
+        result.results.filter((r) => !r.ok && !r.advisory).map((r) => r.name).join(", "),
+      );
       this.transcript.pushBarFailure(formatBarFailure(result, proofAttempts, maxAttempts));
     }
 

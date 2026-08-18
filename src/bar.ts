@@ -9,6 +9,7 @@
  * Nothing here asks a model anything. A bar result is an exit code.
  */
 import { execSync } from "node:child_process";
+import { proposeBar, type Detected } from "./detect.js";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -266,12 +267,20 @@ checks:
     tags: [fast]
 `;
 
-export function writeDefaultBar(cwd: string): string {
+/**
+ * Write a starter bar, with this project's own commands in it.
+ *
+ * Returns what it detected so the caller can say so out loud — a generated
+ * file nobody can explain is a file people delete the first time it fails.
+ */
+export function writeDefaultBar(cwd: string): { path: string; detected: Detected[]; existed: boolean } {
   const dir = join(cwd, ".molt");
   mkdirSync(dir, { recursive: true });
   const p = barPath(cwd);
-  if (!existsSync(p)) writeFileSync(p, DEFAULT_BAR, "utf8");
-  return p;
+  if (existsSync(p)) return { path: p, detected: [], existed: true };
+  const { yaml, detected } = proposeBar(cwd);
+  writeFileSync(p, yaml, "utf8");
+  return { path: p, detected, existed: false };
 }
 
 function truncate(s: string, n = OUTPUT_MAX): string {

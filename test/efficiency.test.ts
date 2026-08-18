@@ -58,6 +58,54 @@ describe("stale bar failures", () => {
   });
 });
 
+describe("what survives a compaction", () => {
+  it("keeps the standing note when everything else is shed", () => {
+    // Shedding is lossy by design, and the first thing it loses is intent: the
+    // model reads a digest of its own past and re-derives what it was doing,
+    // usually by re-reading the files it had just finished with. A few hundred
+    // tokens that never shed are cheaper than that, every time.
+    const t = new Transcript("SYS");
+    t.pin("[molt] Request: fix the auth bug\nFiles you have changed: src/auth.ts");
+    for (let i = 0; i < 12; i++) {
+      t.push({ role: "user", content: `turn ${i}` });
+      t.push({ role: "assistant", content: "F".repeat(2000) });
+    }
+
+    const plan = t.planShed();
+    assert.ok(plan, "expected a shed to be available");
+    t.commitShed(plan!);
+
+    const wire = JSON.stringify(t.wire());
+    assert.match(wire, /fix the auth bug/, "the note was shed with everything else");
+    assert.match(wire, /src\/auth\.ts/);
+    // The digest quotes early turns verbatim on purpose, and the most recent
+    // exchanges are kept whole on purpose, so neither absence is the signal.
+    // What the note has to beat is the compaction itself: 6k tokens to 1.8k,
+    // with the note still there.
+    assert.ok(plan!.afterTokens < plan!.beforeTokens / 2, "the shed did not actually shrink anything");
+    assert.equal(plan!.droppedCount, 20);
+  });
+
+  it("does not leave the note behind when a turn is rolled back", () => {
+    // A cancelled turn leaves the session literally unchanged, not nearly
+    // unchanged — which is why the note lives beside the working set rather
+    // than inside it, where it would shift every index a rollback depends on.
+    const t = new Transcript("SYS");
+    const before = JSON.stringify(t.wire());
+    const at = t.length;
+    t.push({ role: "user", content: "something" });
+    t.rollbackTo(at);
+    assert.equal(JSON.stringify(t.wire()), before);
+  });
+
+  it("counts the note as part of what a request costs", () => {
+    const t = new Transcript("SYS");
+    const bare = t.bom("[]", { prompt: 0, completion: 0 }).requestTotalEst;
+    t.pin("x".repeat(400));
+    assert.ok(t.bom("[]", { prompt: 0, completion: 0 }).requestTotalEst > bare);
+  });
+});
+
 describe("superseded tool results", () => {
   function sessionWith(calls: [string, string, Record<string, unknown>?][]): Transcript {
     const t = new Transcript("SYS");

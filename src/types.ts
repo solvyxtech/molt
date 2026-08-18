@@ -35,6 +35,16 @@ export type MsgMeta = {
   regrown?: true;
   /** True for a bar-failure notice injected by the proof loop. */
   barFailure?: true;
+  /**
+   * True for the standing note of what this turn is for.
+   *
+   * Shedding is mechanical and lossy by design, and the thing it loses first
+   * is intent: after a compaction the model reads a digest of its own past and
+   * re-derives what it was doing, usually by re-reading the files it had just
+   * finished with. A few hundred tokens that never get shed are cheaper than
+   * that, every time.
+   */
+  pinned?: true;
 };
 
 export type Bom = {
