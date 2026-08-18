@@ -18,6 +18,20 @@ a number presented with more confidence than it was earned with.
   tears the terminal) and the full detail goes to the transcript, which is
   printed once and never redrawn — so the terminal's own scrollback keeps it
   all. Opening the view also prints everything recorded before you opened it.
+- **Shedding removed a file from context and then molt refused to give it
+  back.** The read-coverage map that stops a model re-reading what it already
+  has did not know about compaction — so after a shed, molt told the model to
+  "scroll up" to messages it had just archived, refused the re-read, and then
+  counted its own refusals as the model going in circles. A reported session
+  spent 29 of its 31 repeat-refusals after the first shed, ran 42 steps, and was
+  killed by the no-progress guard with nothing verified. Coverage is cleared
+  when context is shed, which is the only honest state: the model no longer has
+  what it was shown.
+- **The no-progress stop reported the session's tokens as the turn's.** The
+  message that said "this turn used 1,664,354 tokens" was quoting a
+  three-turn session total, which made a stop look several times worse than it
+  was. It reports the turn's own spend now, and names the session total
+  separately.
 - **The last of the truncation is gone.** A tool line cut the command at eighty
   characters, so the one thing you most need to read — what molt actually ran —
   was the thing being abbreviated. The working line cut what it was working on

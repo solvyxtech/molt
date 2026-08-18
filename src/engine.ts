@@ -1444,6 +1444,14 @@ export class Engine {
       if (auto > 0 && this.transcript.historyTokens() > auto) {
         const shed = this.shed();
         if (shed) {
+          // Shedding removes the file contents from the model's context, so
+          // everything molt believed it had "already been shown" is gone. The
+          // coverage map has to forget with it — otherwise molt tells a model
+          // to scroll up to something it just archived, refuses the re-read,
+          // and calls the resulting stall a loop. A real session spent 29 of
+          // its 31 repeat-refusals after a shed, for exactly this reason.
+          shown.clear();
+          answered.clear();
           log?.append("shed", {
             dropped: shed.dropped,
             before: shed.before,
@@ -1898,8 +1906,9 @@ export class Engine {
             text:
               `stopped: the model spent two steps repeating calls that had already been ` +
               `answered, and no new information came back. This turn used ` +
-              `${this.sessionTokens} tokens. Nothing was verified — try a narrower request, ` +
-              `or shift+V to watch what it is reaching for.`,
+              `${this.sessionTokens - turnStartTokens} tokens of the session's ` +
+              `${this.sessionTokens}. Nothing was verified — try a narrower request, or ` +
+              `shift+V to watch what it is reaching for.`,
           };
           yield* this.salvage(
             "You have spent two steps repeating calls that were already answered.",
