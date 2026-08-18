@@ -119,7 +119,26 @@ export const SYSTEM_PROMPT = [
  * Deliberately generous enough for real work and far below "how did this cost
  * a dollar". `/budget` raises or removes it, and the message says so.
  */
-export const DEFAULT_TURN_TOKENS = 120_000;
+/**
+ * What one turn may spend before molt stops it, unless told otherwise.
+ *
+ * Denominated in money, because tokens are the wrong unit for this and it took
+ * a user pointing at the arithmetic to see it. A token ceiling scales with
+ * context size, so the same limit buys forty steps on a small project and four
+ * on a large one — it punishes depth rather than waste. And it ignores
+ * caching: 228,000 cumulative prompt tokens with 75% cache hits costs about
+ * $0.22, while the token count says $0.68. Charging a budget for tokens the
+ * provider is discounting is charging for work nobody did.
+ *
+ * Waste is caught by the guards that can actually recognise it — repeats,
+ * drifting re-reads, steps that learn nothing. This is only the backstop for
+ * a turn that is genuinely, expensively going somewhere it should not.
+ *
+ * The token fallback applies when no price is known, and is deliberately
+ * generous: without a price, molt cannot tell an expensive turn from a long one.
+ */
+export const DEFAULT_TURN_USD = 1.0;
+export const DEFAULT_TURN_TOKENS = 500_000;
 
 /** Fractions of the ceiling at which molt says something, once each. */
 const CEILING_WARNINGS = [0.5, 0.8];
@@ -311,8 +330,10 @@ export type EngineConfig = {
    * Defaults to DEFAULT_AUTO_SHED_TOKENS; 0 disables it.
    */
   autoShedAtTokens?: number;
-  /** Tokens one turn may spend before molt stops it. 0 disables the ceiling. */
+  /** Tokens one turn may spend when no price is known. 0 disables it. */
   maxTurnTokens?: number;
+  /** USD one turn may spend when a price is known. 0 disables it. */
+  maxTurnUsd?: number;
   /** Drop tool results that later work superseded. On by default. */
   elideSuperseded?: boolean;
   /** How much molt may do without asking. Defaults to asking about everything. */
@@ -553,6 +574,14 @@ export class Engine {
   setBudget(tokens?: number): void {
     this.budgetTokens = tokens;
     this.cfg.maxTurnTokens = tokens === undefined ? 0 : tokens;
+    // Clearing the budget clears the money ceiling too, or "/budget off"
+    // would remove one limit and leave another one nobody mentioned.
+    if (tokens === undefined) this.cfg.maxTurnUsd = 0;
+  }
+
+  /** A per-turn spending ceiling in dollars. 0 removes it. */
+  setTurnBudgetUsd(usd: number): void {
+    this.cfg.maxTurnUsd = usd;
   }
   setBar(bar: Bar | null): void {
     this.cfg.bar = bar;
@@ -1274,6 +1303,7 @@ export class Engine {
     }
 
     const turnStartTokens = this.sessionTokens;
+    const turnStartCost = this.costUsd();
     let warned = 0;
     for (let step = 0; step < MAX_STEPS; step++) {
       // An explicit budget speaks for itself, and speaks first: one knob
@@ -1290,45 +1320,52 @@ export class Engine {
       // Otherwise a ceiling on the turn, not just on the session. Checked
       // before the request rather than after, so the limit is what molt
       // refuses to spend rather than what it noticed spending.
-      const turnCeiling = this.cfg.maxTurnTokens ?? DEFAULT_TURN_TOKENS;
+      // Money where a price is known, tokens only where it is not.
       const spentThisTurn = this.sessionTokens - turnStartTokens;
+      const usdThisTurn =
+        turnStartCost === undefined ? undefined : (this.costUsd() ?? 0) - turnStartCost;
+      const usdCeiling = this.cfg.maxTurnUsd ?? DEFAULT_TURN_USD;
+      const tokenCeiling = this.cfg.maxTurnTokens ?? DEFAULT_TURN_TOKENS;
+      const priced = usdThisTurn !== undefined && usdCeiling > 0;
+      const used = priced ? usdThisTurn : spentThisTurn;
+      const ceiling = priced ? usdCeiling : tokenCeiling;
+      // Named for what it is, and not `shown` — which is the read-coverage map
+      // a few lines down, and which this quietly shadowed until the compiler
+      // said so.
+      const ceilingLine = priced
+        ? `${fmtUsd(usdThisTurn)} of ${fmtUsd(usdCeiling)}`
+        : `${spentThisTurn} of ${tokenCeiling} tokens`;
 
       // Said on the way up, not only on arrival. A limit that speaks for the
       // first time when it stops you is a limit that feels like a surprise
       // bill, whatever the number on it.
       while (
-        turnCeiling > 0 &&
+        ceiling > 0 &&
         warned < CEILING_WARNINGS.length &&
-        spentThisTurn >= turnCeiling * CEILING_WARNINGS[warned]!
+        used >= ceiling * CEILING_WARNINGS[warned]!
       ) {
         const pct = Math.round(CEILING_WARNINGS[warned]! * 100);
         warned += 1;
         yield {
           kind: "info",
-          text:
-            `${spentThisTurn} tokens this turn` +
-            (this.costUsd() === undefined ? "" : ` · ${fmtUsd(this.costUsd() ?? 0)}`) +
-            ` — ${pct}% of the ${turnCeiling}-token ceiling. /budget <n> raises it, ` +
-            `/budget off removes it.`,
+          text: `this turn: ${ceilingLine} — ${pct}% of the ceiling. /budget raises it, /budget off removes it.`,
         };
       }
 
-      if (turnCeiling > 0 && spentThisTurn >= turnCeiling) {
-        log?.append("session_end", { reason: "turn ceiling", tokens: spentThisTurn });
+      if (ceiling > 0 && used >= ceiling) {
+        log?.append("session_end", {
+          reason: "turn ceiling",
+          tokens: spentThisTurn,
+          usd: usdThisTurn ?? null,
+        });
         yield {
           kind: "error",
           text:
-            `stopped: this turn has used ${spentThisTurn} tokens` +
-            (this.costUsd() === undefined ? "" : ` · ${fmtUsd(this.costUsd() ?? 0)}`) +
-            `, past the ${turnCeiling}-token ceiling for a single turn. Nothing was verified. ` +
-            `Narrow the request, raise the ceiling with /budget <n>, or remove it entirely ` +
-            `with /budget off.`,
+            `stopped: this turn has spent ${ceilingLine}, its ceiling for a single turn. Nothing ` +
+            `was verified. Narrow the request, raise it with /budget, or remove it with ` +
+            `/budget off.`,
         };
-        yield* this.salvage(
-          `This turn reached its ${turnCeiling}-token ceiling before you finished.`,
-          fetchFn,
-          log,
-        );
+        yield* this.salvage(`This turn reached its spending ceiling (${ceilingLine}).`, fetchFn, log);
         return;
       }
 

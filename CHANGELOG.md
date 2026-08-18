@@ -112,10 +112,17 @@ a number presented with more confidence than it was earned with.
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
-- **The turn ceiling only spoke when it stopped you.** It now says something at
-  50% and 80% of the way up, with the spend so far, and the stop names
-  `/budget off` as the way to remove it entirely. Default lowered from 200k
-  tokens to 120k — roughly $0.39 on Claude Sonnet, $0.25 on grok.
+- **The turn ceiling was denominated in the wrong unit.** Tokens scale with
+  context size, so the same limit bought forty steps on a small project and
+  four on a large one — it measured depth, not waste. It also ignored caching:
+  228,000 cumulative prompt tokens with 75% cache hits costs about $0.22 while
+  the token count says $0.68, so the budget was charging for tokens the
+  provider was discounting. The ceiling is money now ($1.00 a turn by default),
+  with a generous token fallback (500k) only when no price is known — and it
+  says something at 50% and 80% of the way up rather than speaking for the
+  first time when it stops you. `/budget $2.50` sets it, `/budget off` removes
+  it. Waste is caught by the guards that can recognise waste; this is only a
+  backstop against a turn that is genuinely expensive.
 - **`/model` listed no Anthropic models after a successful login.** Their
   compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
   but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
@@ -307,10 +314,17 @@ claim literally true.
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
-- **The turn ceiling only spoke when it stopped you.** It now says something at
-  50% and 80% of the way up, with the spend so far, and the stop names
-  `/budget off` as the way to remove it entirely. Default lowered from 200k
-  tokens to 120k — roughly $0.39 on Claude Sonnet, $0.25 on grok.
+- **The turn ceiling was denominated in the wrong unit.** Tokens scale with
+  context size, so the same limit bought forty steps on a small project and
+  four on a large one — it measured depth, not waste. It also ignored caching:
+  228,000 cumulative prompt tokens with 75% cache hits costs about $0.22 while
+  the token count says $0.68, so the budget was charging for tokens the
+  provider was discounting. The ceiling is money now ($1.00 a turn by default),
+  with a generous token fallback (500k) only when no price is known — and it
+  says something at 50% and 80% of the way up rather than speaking for the
+  first time when it stops you. `/budget $2.50` sets it, `/budget off` removes
+  it. Waste is caught by the guards that can recognise waste; this is only a
+  backstop against a turn that is genuinely expensive.
 - **`/model` listed no Anthropic models after a successful login.** Their
   compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
   but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
@@ -522,10 +536,17 @@ artifact molt cannot silently edit.
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
-- **The turn ceiling only spoke when it stopped you.** It now says something at
-  50% and 80% of the way up, with the spend so far, and the stop names
-  `/budget off` as the way to remove it entirely. Default lowered from 200k
-  tokens to 120k — roughly $0.39 on Claude Sonnet, $0.25 on grok.
+- **The turn ceiling was denominated in the wrong unit.** Tokens scale with
+  context size, so the same limit bought forty steps on a small project and
+  four on a large one — it measured depth, not waste. It also ignored caching:
+  228,000 cumulative prompt tokens with 75% cache hits costs about $0.22 while
+  the token count says $0.68, so the budget was charging for tokens the
+  provider was discounting. The ceiling is money now ($1.00 a turn by default),
+  with a generous token fallback (500k) only when no price is known — and it
+  says something at 50% and 80% of the way up rather than speaking for the
+  first time when it stops you. `/budget $2.50` sets it, `/budget off` removes
+  it. Waste is caught by the guards that can recognise waste; this is only a
+  backstop against a turn that is genuinely expensive.
 - **`/model` listed no Anthropic models after a successful login.** Their
   compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
   but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
@@ -700,10 +721,17 @@ session. Shrinking them is a rounding error.
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
-- **The turn ceiling only spoke when it stopped you.** It now says something at
-  50% and 80% of the way up, with the spend so far, and the stop names
-  `/budget off` as the way to remove it entirely. Default lowered from 200k
-  tokens to 120k — roughly $0.39 on Claude Sonnet, $0.25 on grok.
+- **The turn ceiling was denominated in the wrong unit.** Tokens scale with
+  context size, so the same limit bought forty steps on a small project and
+  four on a large one — it measured depth, not waste. It also ignored caching:
+  228,000 cumulative prompt tokens with 75% cache hits costs about $0.22 while
+  the token count says $0.68, so the budget was charging for tokens the
+  provider was discounting. The ceiling is money now ($1.00 a turn by default),
+  with a generous token fallback (500k) only when no price is known — and it
+  says something at 50% and 80% of the way up rather than speaking for the
+  first time when it stops you. `/budget $2.50` sets it, `/budget off` removes
+  it. Waste is caught by the guards that can recognise waste; this is only a
+  backstop against a turn that is genuinely expensive.
 - **`/model` listed no Anthropic models after a successful login.** Their
   compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
   but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
@@ -880,10 +908,17 @@ against a real provider before behaviour changes.
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
-- **The turn ceiling only spoke when it stopped you.** It now says something at
-  50% and 80% of the way up, with the spend so far, and the stop names
-  `/budget off` as the way to remove it entirely. Default lowered from 200k
-  tokens to 120k — roughly $0.39 on Claude Sonnet, $0.25 on grok.
+- **The turn ceiling was denominated in the wrong unit.** Tokens scale with
+  context size, so the same limit bought forty steps on a small project and
+  four on a large one — it measured depth, not waste. It also ignored caching:
+  228,000 cumulative prompt tokens with 75% cache hits costs about $0.22 while
+  the token count says $0.68, so the budget was charging for tokens the
+  provider was discounting. The ceiling is money now ($1.00 a turn by default),
+  with a generous token fallback (500k) only when no price is known — and it
+  says something at 50% and 80% of the way up rather than speaking for the
+  first time when it stops you. `/budget $2.50` sets it, `/budget off` removes
+  it. Waste is caught by the guards that can recognise waste; this is only a
+  backstop against a turn that is genuinely expensive.
 - **`/model` listed no Anthropic models after a successful login.** Their
   compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
   but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
@@ -1094,10 +1129,17 @@ can't say "done" without proving it.**
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
-- **The turn ceiling only spoke when it stopped you.** It now says something at
-  50% and 80% of the way up, with the spend so far, and the stop names
-  `/budget off` as the way to remove it entirely. Default lowered from 200k
-  tokens to 120k — roughly $0.39 on Claude Sonnet, $0.25 on grok.
+- **The turn ceiling was denominated in the wrong unit.** Tokens scale with
+  context size, so the same limit bought forty steps on a small project and
+  four on a large one — it measured depth, not waste. It also ignored caching:
+  228,000 cumulative prompt tokens with 75% cache hits costs about $0.22 while
+  the token count says $0.68, so the budget was charging for tokens the
+  provider was discounting. The ceiling is money now ($1.00 a turn by default),
+  with a generous token fallback (500k) only when no price is known — and it
+  says something at 50% and 80% of the way up rather than speaking for the
+  first time when it stops you. `/budget $2.50` sets it, `/budget off` removes
+  it. Waste is caught by the guards that can recognise waste; this is only a
+  backstop against a turn that is genuinely expensive.
 - **`/model` listed no Anthropic models after a successful login.** Their
   compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
   but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
