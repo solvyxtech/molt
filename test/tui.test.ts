@@ -267,6 +267,58 @@ describe("the transparency view", () => {
     }
   });
 
+  it("opens the level picker from an idle prompt, changing nothing until enter", async () => {
+    // The reported problem: shift+A did nothing at the prompt, because a
+    // terminal cannot tell it from the "A" that starts a sentence.
+    const t = await mount();
+    try {
+      t.stdin.press("A");
+      await tick(60);
+      assert.match(t.stdout.lastFrame, /how much molt does without asking/);
+      assert.match(t.stdout.lastFrame, /← now/, "never said which level is in force");
+      assert.equal(t.engine.autonomy, "low", "moved the ceiling before it was confirmed");
+
+      t.stdin.press("\u001B[B"); // down
+      await tick(40);
+      t.stdin.press("\r");
+      await tick(60);
+      assert.equal(t.engine.autonomy, "medium");
+      assert.match(t.stdout.lastFrame, /auto medium/);
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("gives the letter back when the picker was opened by accident", async () => {
+    // Someone typing "Add a test" must not lose the A, and must not have
+    // their permission ceiling moved by a typo.
+    const t = await mount();
+    try {
+      t.stdin.press("A");
+      await tick(40);
+      t.stdin.press("\u001B"); // esc
+      await tick(40);
+      for (const ch of "dd a test") t.stdin.press(ch);
+      await tick(60);
+      assert.match(t.stdout.lastFrame, /Add a test/, "swallowed the letter");
+      assert.equal(t.engine.autonomy, "low", "a cancelled picker changed the level");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("leaves a mid-sentence capital alone", async () => {
+    const t = await mount();
+    try {
+      for (const ch of "fix the Auth bug") t.stdin.press(ch);
+      await tick(60);
+      assert.match(t.stdout.lastFrame, /fix the Auth bug/);
+      assert.ok(!/without asking/.test(t.stdout.lastFrame), "opened the picker mid-sentence");
+    } finally {
+      t.cleanup();
+    }
+  });
+
   it("takes shift+A while the turn is running", async () => {
     const t = await mount({ fetchFn: slowProvider(150) });
     try {

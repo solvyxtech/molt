@@ -13,9 +13,14 @@ a number presented with more confidence than it was earned with.
   every write, as before; medium runs reads, writes inside the project, and
   commands that only report; high runs everything except what cannot be undone.
   The level sits beside the model in the status line the whole time it is in
-  force, cycles with one key while molt is working *and* while it is asking
-  permission, and is also `/autonomy <level>` or `--autonomy <level>`. `--yes`
-  now means high.
+  force, and is also `/autonomy [level]` or `--autonomy <level>`. `--yes` now
+  means high.
+
+  The key works everywhere, but not identically: at an empty prompt it opens a
+  picker that changes nothing until you confirm — a terminal cannot tell
+  `shift+A` from the `A` that starts "Add a test", and a permission ceiling
+  must not move on a typo; escape gives the letter back. While molt is working,
+  or while it is asking permission, it cycles immediately.
 
   The classifier is mechanical and denies by default: a short allowlist of
   reporting commands, judged segment by segment, with redirection, command

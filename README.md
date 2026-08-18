@@ -197,10 +197,15 @@ transparency view that summarizes is one more claim to check.
 
 ### How much it does without asking
 
-**shift+A** cycles the autonomy ceiling — low, medium, high — while molt is
-working and while it is asking you to approve something, which is exactly where
-"stop asking me this" gets decided. The level sits beside the model in the
-status line the whole time it is in force.
+**shift+A** sets the autonomy ceiling — low, medium, high. At an empty prompt
+it opens a picker (nothing changes until you press enter, and esc gives the
+letter back, because a terminal cannot tell `shift+A` from the `A` that starts
+"Add a test"). While molt is working, or while it is asking you to approve
+something — which is exactly where "stop asking me this" gets decided — the
+same key cycles immediately. `ctrl+A` and `/autonomy` work from anywhere.
+
+The level sits beside the model in the status line the whole time it is in
+force.
 
 | level | runs without asking |
 |---|---|

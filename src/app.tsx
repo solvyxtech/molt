@@ -33,6 +33,7 @@ import {
   type PickerRow,
 } from "./providers.js";
 import {
+  AUTONOMY_LEVELS,
   AUTONOMY_SUMMARY,
   DEFAULT_AUTONOMY,
   isAutonomy,
@@ -181,7 +182,8 @@ export function App({
     | { kind: "chat" }
     | { kind: "login-select"; providers: { name: string; hasKey: boolean }[]; index: number }
     | { kind: "login-key"; provider: string }
-    | { kind: "model-select"; rows: PickerRow[]; index: number };
+    | { kind: "model-select"; rows: PickerRow[]; index: number }
+    | { kind: "autonomy-select"; index: number };
   const [mode, setMode] = useState<Mode>({ kind: "chat" });
 
   // What the model is doing right now, and since when. Held separately from
@@ -520,6 +522,20 @@ export function App({
     applyAutonomy(nextAutonomy(engine.autonomy));
   }, [applyAutonomy, engine]);
 
+  /**
+   * Open the level picker.
+   *
+   * At an idle prompt a keystroke has to be safe to press by accident: a
+   * terminal cannot tell shift+A from the "A" that starts "Add a test", so
+   * the key that works there opens a chooser and changes nothing until you
+   * confirm. Escape puts the keystroke back where it came from. While molt is
+   * working, or while it is asking permission, the same key cycles outright —
+   * there is no typing to collide with, and speed is the point.
+   */
+  const openAutonomy = useCallback(() => {
+    setMode({ kind: "autonomy-select", index: AUTONOMY_LEVELS.indexOf(engine.autonomy) });
+  }, [engine]);
+
   const toggleVerbose = useCallback(() => {
     setVerbose((v) => {
       // Said in the feed, not the transcript: a keypress that permanently
@@ -765,16 +781,7 @@ export function App({
         case "/autonomy":
         case "/auto": {
           if (!arg) {
-            add(
-              "info",
-              `autonomy: ${engine.autonomy} — ${AUTONOMY_SUMMARY[engine.autonomy]}\n` +
-                `  low     ${AUTONOMY_SUMMARY.low}\n` +
-                `  medium  ${AUTONOMY_SUMMARY.medium}\n` +
-                `  high    ${AUTONOMY_SUMMARY.high}\n` +
-                "  shift+A cycles while molt is working or while it is asking.\n" +
-                "  Levels decide what molt asks about, not what is possible — a command that\n" +
-                "  runs can do anything you can.",
-            );
+            openAutonomy();
             return true;
           }
           if (!isAutonomy(arg)) {
@@ -970,6 +977,7 @@ export function App({
       applyAutonomy,
       engine,
       exit,
+      openAutonomy,
       persistEndpoint,
       refreshPricing,
       renderBar,
@@ -1087,6 +1095,28 @@ export function App({
       return;
     }
 
+    // --- the autonomy picker: nothing changes until enter ---
+    if (mode.kind === "autonomy-select") {
+      if (key.escape || (key.ctrl && char === "c")) {
+        setMode({ kind: "chat" });
+        // Pressed by accident while starting a sentence: give the letter back
+        // rather than making someone retype the line.
+        setInput((v) => v + "A");
+        return;
+      }
+      const back = key.upArrow || (key.shift && key.tab);
+      const forward = key.downArrow || key.tab;
+      if (back || forward) {
+        setMode({ ...mode, index: wrapIndex(mode.index + (back ? -1 : 1), AUTONOMY_LEVELS.length) });
+        return;
+      }
+      if (key.return) {
+        setMode({ kind: "chat" });
+        applyAutonomy(AUTONOMY_LEVELS[mode.index]!);
+      }
+      return;
+    }
+
     // --- pickers: arrows choose, enter commits, nothing is typed ---
     if (mode.kind === "login-select" || mode.kind === "model-select") {
       if (key.escape || (key.ctrl && char === "c")) {
@@ -1196,6 +1226,14 @@ export function App({
       setPaletteIndex(0);
       return;
     }
+    // shift+A on an empty line opens the level picker. Bound only on an empty
+    // line: mid-sentence a capital letter is a letter, so "fix the Auth bug"
+    // types the way it reads.
+    if (char === "A" && input === "" && !key.ctrl && !key.meta) {
+      openAutonomy();
+      return;
+    }
+
     if (char && !key.ctrl && !key.meta) {
       setInput((s) => s + char);
       setPaletteIndex(0);
@@ -1360,6 +1398,31 @@ export function App({
                 );
               })}
               <Text color={theme.ghost}>   ↑↓ choose · enter select · esc cancel</Text>
+            </Box>
+          ) : mode.kind === "autonomy-select" ? (
+            <Box flexDirection="column">
+              <Text color={theme.dim}>  how much molt does without asking:</Text>
+              {AUTONOMY_LEVELS.map((level, i) => {
+                const active = i === mode.index;
+                return (
+                  <Box key={level}>
+                    <Text color={active ? theme.accent : theme.dim} bold={active}>
+                      {active ? " ▸ " : "   "}
+                      {level.padEnd(8)}
+                    </Text>
+                    <Text color={active ? theme.text : theme.ghost}>
+                      {fit(AUTONOMY_SUMMARY[level])}
+                    </Text>
+                    {level === engine.autonomy && <Text color={theme.ghost}>{"  ← now"}</Text>}
+                  </Box>
+                );
+              })}
+              {/* Said here, every time, because this is the moment someone is
+                  deciding to be asked less. */}
+              <Text color={theme.ghost}>
+                {"   leaving the project and anything irreversible always ask"}
+              </Text>
+              <Text color={theme.ghost}>   ↑↓ choose · enter set · esc cancel</Text>
             </Box>
           ) : mode.kind === "model-select" ? (
             <Box flexDirection="column">
