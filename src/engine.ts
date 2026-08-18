@@ -494,6 +494,8 @@ export class Engine {
    * field that has already been refused burns a round trip per step.
    */
   private streamUsageUnsupported = false;
+  /** Said once: this endpoint is not caching anything. */
+  private warnedNoCache = false;
   /** User turns handled this session. Numbers the jobs the meter reports. */
   private jobCount = 0;
   /**
@@ -1604,6 +1606,26 @@ export class Engine {
         estimated: !reportedUsage,
         billed: typeof billedUsd === "number",
       };
+      // Cumulative prompt tokens are dominated by resending the same
+      // conversation, which is fine when the provider caches it and brutal
+      // when it does not. Said once, when it starts to matter, because it
+      // changes which provider a long session should run on.
+      if (
+        !this.warnedNoCache &&
+        this.sessionCached === 0 &&
+        this.sessionPrompt > 100_000 &&
+        reportedUsage
+      ) {
+        this.warnedNoCache = true;
+        yield {
+          kind: "info",
+          text:
+            `${this.sessionPrompt} prompt tokens so far and none of them cached — this ` +
+            `endpoint re-bills the whole conversation on every step. Providers with ` +
+            `automatic caching charge a fraction of this for the same work.`,
+        };
+      }
+
       const spend: Spend = {
         promptTokens: pTok,
         completionTokens: cTok,

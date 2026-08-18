@@ -112,6 +112,20 @@ a number presented with more confidence than it was earned with.
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
+- **"844k in" read as 844,000 tokens of reading.** It is one conversation
+  resent once per step — thirty steps at a 28k context is 840k billed input,
+  and maybe 30k of distinct content. The session line now shows the live
+  context size beside the cumulative total, and always shows the cached share
+  rather than hiding it when it is zero.
+- **Anthropic's compatibility endpoint caches nothing**, which molt had no way
+  of telling you. Identical prefixes bill identically and its `usage` carries
+  no cached figure — prompt caching there needs `cache_control` breakpoints the
+  OpenAI-compatible schema cannot express. So every step re-bills the whole
+  conversation at full rate: the 844k above is about $2.53 on Claude Sonnet
+  versus roughly $0.74 on a provider that caches automatically. molt now says
+  so, once, when a session passes 100k uncached prompt tokens. Combined with
+  Anthropic publishing no prices, that was the most expensive and least visible
+  configuration available.
 - **The turn ceiling was denominated in the wrong unit.** Tokens scale with
   context size, so the same limit bought forty steps on a small project and
   four on a large one — it measured depth, not waste. It also ignored caching:
@@ -314,6 +328,20 @@ claim literally true.
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
+- **"844k in" read as 844,000 tokens of reading.** It is one conversation
+  resent once per step — thirty steps at a 28k context is 840k billed input,
+  and maybe 30k of distinct content. The session line now shows the live
+  context size beside the cumulative total, and always shows the cached share
+  rather than hiding it when it is zero.
+- **Anthropic's compatibility endpoint caches nothing**, which molt had no way
+  of telling you. Identical prefixes bill identically and its `usage` carries
+  no cached figure — prompt caching there needs `cache_control` breakpoints the
+  OpenAI-compatible schema cannot express. So every step re-bills the whole
+  conversation at full rate: the 844k above is about $2.53 on Claude Sonnet
+  versus roughly $0.74 on a provider that caches automatically. molt now says
+  so, once, when a session passes 100k uncached prompt tokens. Combined with
+  Anthropic publishing no prices, that was the most expensive and least visible
+  configuration available.
 - **The turn ceiling was denominated in the wrong unit.** Tokens scale with
   context size, so the same limit bought forty steps on a small project and
   four on a large one — it measured depth, not waste. It also ignored caching:
@@ -536,6 +564,20 @@ artifact molt cannot silently edit.
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
+- **"844k in" read as 844,000 tokens of reading.** It is one conversation
+  resent once per step — thirty steps at a 28k context is 840k billed input,
+  and maybe 30k of distinct content. The session line now shows the live
+  context size beside the cumulative total, and always shows the cached share
+  rather than hiding it when it is zero.
+- **Anthropic's compatibility endpoint caches nothing**, which molt had no way
+  of telling you. Identical prefixes bill identically and its `usage` carries
+  no cached figure — prompt caching there needs `cache_control` breakpoints the
+  OpenAI-compatible schema cannot express. So every step re-bills the whole
+  conversation at full rate: the 844k above is about $2.53 on Claude Sonnet
+  versus roughly $0.74 on a provider that caches automatically. molt now says
+  so, once, when a session passes 100k uncached prompt tokens. Combined with
+  Anthropic publishing no prices, that was the most expensive and least visible
+  configuration available.
 - **The turn ceiling was denominated in the wrong unit.** Tokens scale with
   context size, so the same limit bought forty steps on a small project and
   four on a large one — it measured depth, not waste. It also ignored caching:
@@ -721,6 +763,20 @@ session. Shrinking them is a rounding error.
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
+- **"844k in" read as 844,000 tokens of reading.** It is one conversation
+  resent once per step — thirty steps at a 28k context is 840k billed input,
+  and maybe 30k of distinct content. The session line now shows the live
+  context size beside the cumulative total, and always shows the cached share
+  rather than hiding it when it is zero.
+- **Anthropic's compatibility endpoint caches nothing**, which molt had no way
+  of telling you. Identical prefixes bill identically and its `usage` carries
+  no cached figure — prompt caching there needs `cache_control` breakpoints the
+  OpenAI-compatible schema cannot express. So every step re-bills the whole
+  conversation at full rate: the 844k above is about $2.53 on Claude Sonnet
+  versus roughly $0.74 on a provider that caches automatically. molt now says
+  so, once, when a session passes 100k uncached prompt tokens. Combined with
+  Anthropic publishing no prices, that was the most expensive and least visible
+  configuration available.
 - **The turn ceiling was denominated in the wrong unit.** Tokens scale with
   context size, so the same limit bought forty steps on a small project and
   four on a large one — it measured depth, not waste. It also ignored caching:
@@ -908,6 +964,20 @@ against a real provider before behaviour changes.
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
+- **"844k in" read as 844,000 tokens of reading.** It is one conversation
+  resent once per step — thirty steps at a 28k context is 840k billed input,
+  and maybe 30k of distinct content. The session line now shows the live
+  context size beside the cumulative total, and always shows the cached share
+  rather than hiding it when it is zero.
+- **Anthropic's compatibility endpoint caches nothing**, which molt had no way
+  of telling you. Identical prefixes bill identically and its `usage` carries
+  no cached figure — prompt caching there needs `cache_control` breakpoints the
+  OpenAI-compatible schema cannot express. So every step re-bills the whole
+  conversation at full rate: the 844k above is about $2.53 on Claude Sonnet
+  versus roughly $0.74 on a provider that caches automatically. molt now says
+  so, once, when a session passes 100k uncached prompt tokens. Combined with
+  Anthropic publishing no prices, that was the most expensive and least visible
+  configuration available.
 - **The turn ceiling was denominated in the wrong unit.** Tokens scale with
   context size, so the same limit bought forty steps on a small project and
   four on a large one — it measured depth, not waste. It also ignored caching:
@@ -1129,6 +1199,20 @@ can't say "done" without proving it.**
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
+- **"844k in" read as 844,000 tokens of reading.** It is one conversation
+  resent once per step — thirty steps at a 28k context is 840k billed input,
+  and maybe 30k of distinct content. The session line now shows the live
+  context size beside the cumulative total, and always shows the cached share
+  rather than hiding it when it is zero.
+- **Anthropic's compatibility endpoint caches nothing**, which molt had no way
+  of telling you. Identical prefixes bill identically and its `usage` carries
+  no cached figure — prompt caching there needs `cache_control` breakpoints the
+  OpenAI-compatible schema cannot express. So every step re-bills the whole
+  conversation at full rate: the 844k above is about $2.53 on Claude Sonnet
+  versus roughly $0.74 on a provider that caches automatically. molt now says
+  so, once, when a session passes 100k uncached prompt tokens. Combined with
+  Anthropic publishing no prices, that was the most expensive and least visible
+  configuration available.
 - **The turn ceiling was denominated in the wrong unit.** Tokens scale with
   context size, so the same limit bought forty steps on a small project and
   four on a large one — it measured depth, not waste. It also ignored caching:
