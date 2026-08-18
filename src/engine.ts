@@ -1616,13 +1616,25 @@ export class Engine {
               const lines = (result.match(/\n/g)?.length ?? 0) + 1;
               const to = from + lines;
               const covered = shown.get(path) ?? [];
-              const already = covered.some((r) => from >= r.from && to <= r.to);
+              // How much of this window is genuinely new. Containment alone is
+              // too strict: a read that overlaps an earlier one by 99% and
+              // runs three lines past it is not contained, and a model
+              // drifting its offset by a few lines a step walked straight
+              // through that test for thirty-two steps.
+              let fresh = 0;
+              for (let line = from; line < to; line++) {
+                if (!covered.some((r) => line >= r.from && line < r.to)) fresh += 1;
+              }
+              const span = Math.max(1, to - from);
+              const already = fresh === 0 || (fresh / span < 0.25 && fresh < 40);
               if (already) {
+                const seen = covered.reduce((n, r) => Math.max(n, r.to), 0);
                 result =
-                  `[molt: you have already been shown lines ${from + 1}-${to} of ${path} in ` +
-                  `this conversation. Scroll up rather than reading them again — nothing has ` +
-                  `changed since. If you need a different part, ask for an offset past what ` +
-                  `you have; if you have what you need, answer.]`;
+                  `[molt: you have already been shown lines ${from + 1}-${to} of ${path}` +
+                  (fresh === 0 ? "" : ` (all but ${fresh} line(s) of it)`) +
+                  `. Scroll up rather than reading it again — nothing has changed since. To ` +
+                  `see a part you do not have, ask for offset=${seen} or later; if you have ` +
+                  `what you need, answer.]`;
                 note = "repeat";
                 repeated += 1;
               } else {
@@ -1864,7 +1876,7 @@ export class Engine {
   }
 
   /** Preflight: is the endpoint reachable, and is the model actually there? */
-  async doctor(): Promise<{ ok: boolean; detail: string }> {
+  async doctor(): Promise<{ ok: boolean; detail: string; modelPresent?: boolean }> {
     const fetchFn = this.cfg.fetchFn ?? fetch;
     const base = this.cfg.baseUrl.replace(/\/$/, "");
     try {
@@ -1874,10 +1886,15 @@ export class Engine {
       if (!res.ok) return { ok: false, detail: `HTTP ${res.status} from ${base}/models` };
       const json = (await res.json().catch(() => null)) as { data?: { id?: string }[] } | null;
       const ids = (json?.data ?? []).map((m) => m.id).filter(Boolean) as string[];
-      if (!ids.length) return { ok: true, detail: `endpoint reachable (${base})` };
+      // No list at all is not evidence against the model; endpoints that hide
+      // /models exist, and refusing them would be a guess dressed as a check.
+      if (!ids.length) return { ok: true, detail: `endpoint reachable (${base}) · model list unavailable` };
       const has = ids.includes(this.cfg.model);
       return {
-        ok: true,
+        // A preflight that passes on a model the endpoint does not have is a
+        // preflight that only fails once the work has already started.
+        ok: has,
+        modelPresent: has,
         detail:
           `endpoint reachable · ${ids.length} models` +
           (has

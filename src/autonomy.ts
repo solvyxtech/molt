@@ -22,7 +22,8 @@
  *     autonomy on a machine that matters is the user's call to make, in the
  *     open, with the level on screen while it works.
  */
-import { isAbsolute, resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 export type Autonomy = "low" | "medium" | "high";
 
@@ -215,12 +216,43 @@ export function isIrreversible(command: string): boolean {
   return IRREVERSIBLE.some((re) => re.test(bare));
 }
 
-/** Is `p` inside `cwd` — the project molt was pointed at? */
+/**
+ * The real location of a path, following symlinks, even if it does not exist
+ * yet.
+ *
+ * A path that does not exist cannot be resolved, so this walks up to the
+ * deepest ancestor that does, resolves that, and re-attaches the rest — which
+ * is what makes a *new* file inside a symlinked directory resolve correctly.
+ */
+function realLocation(p: string): string {
+  const tail: string[] = [];
+  let cur = p;
+  while (!existsSync(cur) && dirname(cur) !== cur) {
+    tail.unshift(basename(cur));
+    cur = dirname(cur);
+  }
+  try {
+    return join(realpathSync(cur), ...tail);
+  } catch {
+    return p;
+  }
+}
+
+/**
+ * Is `p` inside `cwd` — the project molt was pointed at?
+ *
+ * Resolved through symlinks, not just lexically. `resolve()` alone reports
+ * that `escape/secret.txt` is inside the project when `escape` is a link
+ * pointing anywhere at all — so the one boundary no autonomy level is allowed
+ * to imply could be crossed by a link the model itself created with `ln -s`.
+ * Found by probing, like every other hole in this file.
+ */
 export function insideProject(cwd: string, p: unknown): boolean {
   const raw = typeof p === "string" ? p : "";
   if (!raw) return false;
-  const target = isAbsolute(raw) ? resolve(raw) : resolve(cwd, raw);
-  return target === resolve(cwd) || target.startsWith(resolve(cwd) + "/");
+  const target = realLocation(isAbsolute(raw) ? resolve(raw) : resolve(cwd, raw));
+  const root = realLocation(resolve(cwd));
+  return target === root || target.startsWith(root + sep);
 }
 
 /**
@@ -278,7 +310,13 @@ export function gate(
   const needsPath = name === "read_file" || WRITING_TOOLS.has(name);
   const hasPath = typeof path === "string" && path !== "";
   if (pathed && (hasPath || needsPath) && !insideProject(cwd, path)) {
-    return { ask: true, why: `${String(path)} is outside this project` };
+    // A missing path is not "outside the project", it is malformed — and a
+    // model reading "undefined is outside this project" learns nothing about
+    // what it did wrong.
+    return {
+      ask: true,
+      why: hasPath ? `${String(path)} is outside this project` : `${name} was called with no path`,
+    };
   }
 
   if (!KNOWN_TOOLS.has(name)) {

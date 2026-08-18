@@ -9,7 +9,7 @@
  * it was trusted.
  */
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { Engine } from "../src/engine.js";
@@ -213,6 +213,37 @@ describe("the project boundary", () => {
       assert.ok(ask(level, "read_file", { path: "/etc/passwd" }), `${level} read outside`);
       assert.ok(ask(level, "write_file", { path: "../other/x.ts" }), `${level} wrote outside`);
       assert.ok(ask(level, "write_file", { path: "/tmp/x" }), `${level} wrote to /tmp`);
+    }
+  });
+
+  it("is not fooled by a symlink out of the project", () => {
+    // `resolve()` alone is lexical, so `escape/secret.txt` looked inside the
+    // project when `escape` pointed anywhere at all — and the model can make
+    // that link itself with `ln -s`. The one boundary no level may imply was
+    // crossable by a symlink. Found by probing.
+    const inside = workspace();
+    const outside = workspace();
+    try {
+      writeFileSync(join(outside.dir, "secret.txt"), "SENSITIVE\n");
+      symlinkSync(outside.dir, join(inside.dir, "escape"));
+
+      assert.ok(!insideProject(inside.dir, "escape/secret.txt"), "read through a link");
+      assert.ok(!insideProject(inside.dir, "escape/new-file.txt"), "write through a link");
+      for (const level of AUTONOMY_LEVELS) {
+        assert.ok(
+          gate(level, { name: "write_file", args: { path: "escape/owned.txt" }, cwd: inside.dir }).ask,
+          `${level} wrote through a symlink unattended`,
+        );
+        assert.ok(
+          gate(level, { name: "read_file", args: { path: "escape/secret.txt" }, cwd: inside.dir }).ask,
+          `${level} read through a symlink unattended`,
+        );
+      }
+      // A real path inside the project is unaffected.
+      assert.ok(insideProject(inside.dir, "src/app.ts"));
+    } finally {
+      inside.cleanup();
+      outside.cleanup();
     }
   });
 
