@@ -25,15 +25,36 @@ export type StreamDelta = {
   }[];
 };
 
+/**
+ * The usage block, as the OpenAI-compatible providers actually send it.
+ *
+ * `prompt_tokens` alone is not enough to price a turn. Cached prompt tokens
+ * bill at a fraction of the standard rate, so a session that reuses context
+ * — which is every agent session — is over-billed on paper by a meter that
+ * ignores the itemisation. `cost` appears on providers that resell (notably
+ * OpenRouter) and is the only figure here that needs no arithmetic at all.
+ */
+export type Usage = {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number };
+  completion_tokens_details?: { reasoning_tokens?: number };
+  /** USD, as billed by the provider. Present on some, absent on most. */
+  cost?: number;
+};
+
 export type StreamChunk = {
   choices?: { delta?: StreamDelta; finish_reason?: string | null }[];
-  usage?: { prompt_tokens?: number; completion_tokens?: number };
+  usage?: Usage;
 };
 
 export type StreamResult = {
   message: Msg;
   promptTokens?: number;
   completionTokens?: number;
+  cachedTokens?: number;
+  reasoningTokens?: number;
+  costUsd?: number;
   finishReason?: string;
 };
 
@@ -47,15 +68,28 @@ export class StreamAccumulator {
   private calls = new Map<number, { id: string; name: string; args: string }>();
   promptTokens?: number;
   completionTokens?: number;
+  cachedTokens?: number;
+  reasoningTokens?: number;
+  costUsd?: number;
   finishReason?: string;
 
   /** Returns the text added by this chunk, for incremental rendering. */
   push(chunk: StreamChunk): string {
     if (chunk.usage) {
-      if (typeof chunk.usage.prompt_tokens === "number") this.promptTokens = chunk.usage.prompt_tokens;
-      if (typeof chunk.usage.completion_tokens === "number") {
-        this.completionTokens = chunk.usage.completion_tokens;
+      const u = chunk.usage;
+      if (typeof u.prompt_tokens === "number") this.promptTokens = u.prompt_tokens;
+      if (typeof u.completion_tokens === "number") this.completionTokens = u.completion_tokens;
+      // Itemisation arrives in the same frame as the totals, or not at all.
+      // Absent is absent: left undefined rather than defaulted to zero, so a
+      // provider that does not itemise cannot be read as one that cached
+      // nothing.
+      if (typeof u.prompt_tokens_details?.cached_tokens === "number") {
+        this.cachedTokens = u.prompt_tokens_details.cached_tokens;
       }
+      if (typeof u.completion_tokens_details?.reasoning_tokens === "number") {
+        this.reasoningTokens = u.completion_tokens_details.reasoning_tokens;
+      }
+      if (typeof u.cost === "number") this.costUsd = u.cost;
     }
 
     const choice = chunk.choices?.[0];
@@ -108,6 +142,9 @@ export class StreamAccumulator {
       message,
       promptTokens: this.promptTokens,
       completionTokens: this.completionTokens,
+      cachedTokens: this.cachedTokens,
+      reasoningTokens: this.reasoningTokens,
+      costUsd: this.costUsd,
       finishReason: this.finishReason,
     };
   }

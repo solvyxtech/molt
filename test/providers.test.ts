@@ -12,7 +12,13 @@ import { fmtDuration, statusSegments } from "../src/banner.js";
 import {
   PICKER_ROWS,
   PROVIDERS,
+  XAI_PRICE_UNIT,
+  fetchPricing,
   firstSelectable,
+  needsPriceLookup,
+  openrouterPricing,
+  savePricing,
+  xaiPricing,
   keyedProviders,
   modelSources,
   moveSelection,
@@ -251,6 +257,8 @@ describe("credential storage", () => {
         apiKey: undefined,
         priceIn: undefined,
         priceOut: undefined,
+        priceCachedIn: undefined,
+        priceModel: undefined,
       });
     } finally {
       ws.cleanup();
@@ -321,7 +329,7 @@ describe("the meter", () => {
     })
       .map((s) => s.text)
       .join("");
-    assert.match(text, /1\.0k\/50k tokens · \$0\.0042/);
+    assert.match(text, /1\.0k\/50k tokens · 0\.42¢/);
   });
 
   it("omits the cost when no pricing is configured", () => {
@@ -358,45 +366,44 @@ describe("elapsed time", () => {
 });
 
 describe("cost formatting", () => {
-  it("still resolves a cost below a hundredth of a cent", () => {
-    // The bug: a 998-token turn at $0.02/Mtok is $0.000024, and a fixed four
-    // decimals rendered it "$0.0000" — a meter reading zero while the token
-    // count climbs, which reads as broken pricing rather than a cheap turn.
-    const text = statusSegments({
-      provider: "xai",
-      model: "grok-4.6",
-      sessionTokens: 998,
-      costUsd: 0.00002388,
-    })
-      .map((s) => s.text)
-      .join("");
-    assert.match(text, /\$0\.000024/);
-    assert.ok(!text.includes("$0.0000 "), "flattened a real cost to zero");
-  });
-
-  it("scales precision to the amount", () => {
-    const cost = (usd: number) =>
-      statusSegments({ provider: "p", model: "m", sessionTokens: 1, costUsd: usd })
-        .map((s) => s.text)
-        .join("")
-        .split("· ")
-        .pop();
-    assert.equal(cost(12.5), "$12.50");
-    assert.equal(cost(0.07), "$0.07");
-    assert.equal(cost(0.0042), "$0.0042");
-    assert.equal(cost(0.000024), "$0.000024");
-  });
-
-  it("says 'less than' rather than printing a zero that is not one", () => {
-    const text = statusSegments({
+  const cost = (usd: number, estimated = false) =>
+    statusSegments({
       provider: "p",
       model: "m",
       sessionTokens: 1,
-      costUsd: 0.0000001,
+      costUsd: usd,
+      costEstimated: estimated,
     })
       .map((s) => s.text)
-      .join("");
-    assert.match(text, /<\$0\.000001/);
+      .join("")
+      .split("· ")
+      .pop();
+
+  it("changes unit rather than growing a run of zeros", () => {
+    // The bug: sub-cent sums rendered as "$0.000024" — six digits the reader
+    // has to count before the number means anything, in the one field on
+    // screen that has to be legible at a glance.
+    assert.equal(cost(12.5), "$12.50");
+    assert.equal(cost(0.07), "$0.07");
+    assert.equal(cost(0.0042), "0.42¢");
+    assert.equal(cost(0.000024), "<0.01¢");
+    for (const usd of [12.5, 0.07, 0.0042, 0.00024]) {
+      assert.ok(!/000/.test(cost(usd)!), `zero run survived: ${cost(usd)}`);
+    }
+  });
+
+  it("never flattens a real charge to zero", () => {
+    // A meter reading zero while the token count climbs reads as broken
+    // pricing rather than a cheap turn, so the floor says "under", not "none".
+    assert.equal(cost(0.0000001), "<0.01¢");
+    assert.notEqual(cost(0.0000001), "$0.00");
+  });
+
+  it("marks a cost that rests on molt's own token estimate", () => {
+    // A guess and a bill must not render identically in the field people
+    // quote back at each other.
+    assert.equal(cost(0.42, true), "~$0.42");
+    assert.equal(cost(0.42, false), "$0.42");
   });
 
   it("shows a true zero as zero", () => {
@@ -450,5 +457,129 @@ describe("token formatting", () => {
     // A 1M-token context is ordinary now; "2400k" is not a number anyone
     // reads at a glance.
     assert.ok(!tokens(2_400_000)!.endsWith("k"));
+  });
+});
+
+/**
+ * A price molt cannot check is a number it should not show. These pin the
+ * conversion from what each provider publishes to USD per 1M tokens — the
+ * arithmetic that, when wrong, produces a meter that is confidently and
+ * invisibly off by a factor of a hundred.
+ */
+describe("pricing, read from the provider", () => {
+  const xai = {
+    models: [
+      {
+        id: "grok-4.6",
+        aliases: ["grok-4.6-latest"],
+        prompt_text_token_price: 20_000,
+        cached_prompt_text_token_price: 5000,
+        completion_text_token_price: 60_000,
+      },
+    ],
+  };
+
+  it("converts xAI's integers to USD per 1M tokens", () => {
+    const p = xaiPricing(xai, "grok-4.6");
+    assert.equal(p?.in, 2);
+    assert.equal(p?.cached, 0.5);
+    assert.equal(p?.out, 6);
+    assert.equal(XAI_PRICE_UNIT, 10_000);
+  });
+
+  it("matches a model by alias, not only by id", () => {
+    assert.equal(xaiPricing(xai, "grok-4.6-latest")?.in, 2);
+  });
+
+  it("returns null for a model the endpoint does not list", () => {
+    // Better no cost than another model's cost.
+    assert.equal(xaiPricing(xai, "grok-9"), null);
+    assert.equal(xaiPricing({}, "grok-4.6"), null);
+    assert.equal(xaiPricing(null, "grok-4.6"), null);
+  });
+
+  it("scales OpenRouter's per-token strings to per-1M", () => {
+    const p = openrouterPricing(
+      {
+        data: [
+          {
+            id: "anthropic/claude-opus-5",
+            pricing: { prompt: "0.000005", completion: "0.000025", input_cache_read: "0.0000005" },
+          },
+        ],
+      },
+      "anthropic/claude-opus-5",
+    );
+    assert.equal(p?.in, 5);
+    assert.equal(p?.out, 25);
+    assert.equal(p?.cached, 0.5);
+  });
+
+  it("asks each provider at the route that actually publishes prices", async () => {
+    const seen: string[] = [];
+    const fake = (async (url: string) => {
+      seen.push(String(url));
+      return { ok: true, json: async () => xai } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+    const p = await fetchPricing("https://api.x.ai/v1", "grok-4.6", "sk", fake);
+    assert.equal(p?.in, 2);
+    assert.deepEqual(seen, ["https://api.x.ai/v1/language-models"]);
+  });
+
+  it("asks nothing of a provider that publishes nothing", async () => {
+    let called = 0;
+    const fake = (async () => {
+      called++;
+      return { ok: true, json: async () => ({}) } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+    assert.equal(await fetchPricing("http://localhost:11434/v1", "qwen", undefined, fake), null);
+    assert.equal(called, 0, "guessed at a price nobody published");
+  });
+
+  it("survives an endpoint that errors rather than taking the session down", async () => {
+    const fake = (async () => {
+      throw new Error("offline");
+    }) as unknown as typeof fetch;
+    assert.equal(await fetchPricing("https://api.x.ai/v1", "grok-4.6", "sk", fake), null);
+  });
+
+  it("refuses to trust a price that names no model", () => {
+    // The shipped bug: config.json held priceIn/priceOut with nothing saying
+    // which model they were for, so a hand-typed figure that was off by a
+    // hundred was applied to every model, forever, without a lookup.
+    const legacy = { priceIn: 0.02, priceOut: 0.06 };
+    assert.equal(needsPriceLookup("grok-4.6", { in: 0.02, source: "stored" }, legacy), true);
+    assert.equal(
+      needsPriceLookup("grok-4.6", { in: 2, source: "x.ai" }, { ...legacy, priceModel: "grok-4.6" }),
+      false,
+    );
+    // A different model's stored price is not this model's price.
+    assert.equal(
+      needsPriceLookup("grok-4.3", { in: 2, source: "x.ai" }, { ...legacy, priceModel: "grok-4.6" }),
+      true,
+    );
+    // Set by hand wins: it is the escape hatch for endpoints that publish
+    // nothing and for accounts that do not pay list price.
+    assert.equal(needsPriceLookup("gpt-5", { in: 1, source: "set by hand" }, {}), false);
+  });
+
+  it("files a saved price under the model it belongs to", () => {
+    const ws = workspace();
+    try {
+      savePricing("grok-4.6", { in: 2, out: 6, cached: 0.5, source: "test" }, ws.dir);
+      const stored = storedEndpoint(ws.dir);
+      assert.equal(stored.priceIn, 2);
+      assert.equal(stored.priceCachedIn, 0.5);
+      assert.equal(stored.priceModel, "grok-4.6");
+
+      // Clearing must not leave the old model's rate behind to be applied
+      // to the next one.
+      savePricing("grok-4.6", null, ws.dir);
+      assert.equal(storedEndpoint(ws.dir).priceIn, undefined);
+    } finally {
+      ws.cleanup();
+    }
   });
 });

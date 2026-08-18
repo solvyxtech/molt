@@ -37,7 +37,18 @@ export const COMMANDS: Command[] = [
   { name: "/archive", args: "[pattern]", summary: "list or search shed batches", aliases: ["exuviae"] },
   { name: "/bom", summary: "context bill of materials, in tokens" },
   { name: "/wire", summary: "exact JSON of the last request" },
-  { name: "/budget", args: "<n|off>", summary: "hard token ceiling for this session", aliases: ["tokens", "cost"] },
+  { name: "/budget", args: "<n|off>", summary: "hard token ceiling for this session", aliases: ["tokens"] },
+  {
+    name: "/verbose",
+    summary: "show every call, argument, and result (shift+V)",
+    aliases: ["detail", "transparency", "watch", "view"],
+  },
+  {
+    name: "/price",
+    args: "[<in> <out>|refresh|off]",
+    summary: "what this model costs, per 1M tokens",
+    aliases: ["cost", "rate", "pricing"],
+  },
   {
     name: "/login",
     args: "[provider]",

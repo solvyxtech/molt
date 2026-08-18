@@ -115,6 +115,7 @@ export class Transcript {
       requestTotalEst: systemTokens + toolSchemaTokens + historyTokens,
       sessionPromptTokens: session.prompt,
       sessionCompletionTokens: session.completion,
+      sessionCachedTokens: 0,
     };
   }
 

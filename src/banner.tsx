@@ -65,6 +65,12 @@ export type SessionStatus = {
   sessionTokens: number;
   /** Undefined when no pricing is configured — omitted rather than faked. */
   costUsd?: number;
+  /**
+   * True when the cost rests on molt's own token estimate rather than the
+   * provider's count. Rendered as a leading "~": a guess and a bill must
+   * not look alike in the one field people quote back at each other.
+   */
+  costEstimated?: boolean;
   budgetTokens?: number;
   /** Model context window, when the endpoint reports one. */
   contextTokens?: number;
@@ -89,22 +95,28 @@ function fmtTokens(n: number): string {
 }
 
 /**
- * Cost, at enough precision to still be a number.
+ * Cost, in the unit that keeps it a number you can read at a glance.
  *
- * Decimals scale to the magnitude. A fixed 4 places flattened everything
- * under $0.0001 to "$0.0000", which is worse than showing nothing: a meter
- * reading zero while tokens climb looks broken, and the natural conclusion
- * is that the pricing is wrong rather than the formatter. Cheap models and
- * short sessions live down there — a 998-token turn at $0.02/Mtok really
- * does cost $0.000024.
+ * Small sums change unit rather than growing a run of zeros. "$0.000024"
+ * has to be counted digit by digit before it means anything, and counting
+ * is exactly what a glanceable meter must not require — so anything under a
+ * cent is quoted in cents, where the same figure reads "0.0024¢" and the
+ * common case reads "0.24¢".
+ *
+ * Two decimals in each unit is the whole precision budget. More digits
+ * describe a number molt does not know that precisely anyway: the token
+ * counts behind it are the provider's, but the rate is a published list
+ * price that ignores per-account discounts.
  */
-function fmtCost(usd: number): string {
-  if (usd <= 0) return "$0.00";
-  if (usd >= 0.01) return `$${usd.toFixed(2)}`;
-  if (usd >= 0.0001) return `$${usd.toFixed(4)}`;
-  // Below a hundredth of a cent, six places still resolves it. Past that,
-  // say "less than" rather than print a zero that is not one.
-  return usd >= 0.000001 ? `$${usd.toFixed(6)}` : "<$0.000001";
+export function fmtCost(usd: number): string {
+  if (!Number.isFinite(usd) || usd <= 0) return "$0.00";
+  if (usd >= 1) return `$${usd.toFixed(2)}`;
+  if (usd >= 0.01) return `$${usd.toFixed(3).replace(/0$/, "")}`;
+  const cents = usd * 100;
+  if (cents >= 0.01) return `${Number(cents.toFixed(2))}¢`;
+  // Below a hundredth of a cent there is no honest short form. Say "under"
+  // rather than round a real charge down to nothing.
+  return "<0.01¢";
 }
 
 /**
@@ -163,7 +175,9 @@ export function statusSegments(s: SessionStatus, maxWidth = COLS): Segment[] {
   };
 
   const cost =
-    s.costUsd === undefined || s.sessionTokens === 0 ? null : fmtCost(s.costUsd);
+    s.costUsd === undefined || s.sessionTokens === 0
+      ? null
+      : `${s.costEstimated ? "~" : ""}${fmtCost(s.costUsd)}`;
 
   const tail = [usage(), cost].filter(Boolean).join(SEP);
 

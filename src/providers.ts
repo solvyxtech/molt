@@ -94,6 +94,17 @@ export type StoredEndpoint = {
   /** USD per 1M prompt / completion tokens. Undefined means no cost is shown. */
   priceIn?: number;
   priceOut?: number;
+  /** USD per 1M cached prompt tokens, when the provider publishes one. */
+  priceCachedIn?: number;
+  /**
+   * The model those prices belong to.
+   *
+   * Prices are per model, so a stored price is only usable while the stored
+   * model is still the one selected. Without this, switching models kept
+   * billing the session at the old model's rate — a meter that is confidently
+   * wrong, which is worse than one that says nothing.
+   */
+  priceModel?: string;
 };
 
 /** A config value only counts as a price if it is a usable non-negative number. */
@@ -119,7 +130,160 @@ export function storedEndpoint(dir = defaultConfigDir()): StoredEndpoint {
     apiKey: name ? auth[name] : undefined,
     priceIn: price(cfg.priceIn),
     priceOut: price(cfg.priceOut),
+    priceCachedIn: price(cfg.priceCachedIn),
+    priceModel: typeof cfg.priceModel === "string" ? cfg.priceModel : undefined,
   };
+}
+
+/** USD per 1M tokens, and where the figure came from. */
+export type Pricing = {
+  in: number;
+  out: number;
+  /** Cached prompt tokens, when the provider publishes a separate rate. */
+  cached?: number;
+  /** Endpoint the numbers were read from, for /price to name. */
+  source: string;
+};
+
+/**
+ * xAI publishes prices on /language-models as integers.
+ *
+ * The unit is 1e-4 USD per 1M tokens — equivalently, cents per 100M tokens.
+ * grok-4.6 reports 20000 / 60000, i.e. $2.00 in and $6.00 per 1M out, which
+ * is the only reading in the right order of magnitude: /1e6 would price a
+ * frontier model at two cents per million tokens, and /100 at two hundred
+ * dollars. molt shows the resolved figure in /price precisely so a unit
+ * that ever changes is visible rather than silently baked into a total.
+ */
+export const XAI_PRICE_UNIT = 10_000;
+
+type XaiModel = {
+  id?: string;
+  aliases?: string[];
+  prompt_text_token_price?: number;
+  cached_prompt_text_token_price?: number;
+  completion_text_token_price?: number;
+};
+
+export function xaiPricing(json: unknown, model: string): Pricing | null {
+  const models = (json as { models?: XaiModel[] } | null)?.models;
+  if (!Array.isArray(models)) return null;
+  const m = models.find((x) => x.id === model || (x.aliases ?? []).includes(model));
+  const pin = m?.prompt_text_token_price;
+  const pout = m?.completion_text_token_price;
+  if (typeof pin !== "number" || typeof pout !== "number") return null;
+  const cached = m?.cached_prompt_text_token_price;
+  return {
+    in: pin / XAI_PRICE_UNIT,
+    out: pout / XAI_PRICE_UNIT,
+    cached: typeof cached === "number" ? cached / XAI_PRICE_UNIT : undefined,
+    source: "x.ai/v1/language-models",
+  };
+}
+
+type OpenRouterModel = {
+  id?: string;
+  pricing?: { prompt?: string | number; completion?: string | number; input_cache_read?: string | number };
+};
+
+/** OpenRouter quotes USD per single token, as strings. Scale to per-1M. */
+export function openrouterPricing(json: unknown, model: string): Pricing | null {
+  const data = (json as { data?: OpenRouterModel[] } | null)?.data;
+  if (!Array.isArray(data)) return null;
+  const m = data.find((x) => x.id === model);
+  const n = (v: unknown): number | undefined => {
+    const x = typeof v === "number" ? v : Number(v);
+    return Number.isFinite(x) && x >= 0 ? x * 1e6 : undefined;
+  };
+  const pin = n(m?.pricing?.prompt);
+  const pout = n(m?.pricing?.completion);
+  if (pin === undefined || pout === undefined) return null;
+  return { in: pin, out: pout, cached: n(m?.pricing?.input_cache_read), source: "openrouter.ai/api/v1/models" };
+}
+
+/**
+ * Ask the endpoint what it charges for this model.
+ *
+ * Only providers that publish machine-readable prices are asked; the rest
+ * return null and molt shows no cost at all, which is the existing and
+ * correct behaviour. A hardcoded price table would go stale silently and
+ * bill a session at a rate nobody can check — the exact failure this
+ * function exists to remove.
+ */
+export async function fetchPricing(
+  baseUrl: string,
+  model: string,
+  apiKey?: string,
+  fetchFn: typeof fetch = fetch,
+): Promise<Pricing | null> {
+  if (!model) return null;
+  const base = baseUrl.replace(/\/$/, "");
+  const host = (() => {
+    try {
+      return new URL(base).hostname;
+    } catch {
+      return "";
+    }
+  })();
+
+  const route = host.endsWith("x.ai")
+    ? { path: "/language-models", parse: xaiPricing }
+    : host.endsWith("openrouter.ai")
+      ? { path: "/models", parse: openrouterPricing }
+      : null;
+  if (!route) return null;
+
+  try {
+    const res = await fetchFn(`${base}${route.path}`, {
+      headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
+    });
+    if (!res.ok) return null;
+    return route.parse(await res.json(), model);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Should molt go and ask what this model costs?
+ *
+ * No, when the price was set by hand — that is the escape hatch for
+ * endpoints that publish nothing and for accounts on a negotiated rate.
+ * No, when a stored price is already stamped with this exact model.
+ * Yes otherwise, which includes a stored price carrying no model at all:
+ * a rate that cannot be attributed to a model cannot be trusted against
+ * one, and that unattributed number is precisely how a session ends up
+ * metered at a hundredth of the real price.
+ */
+export function needsPriceLookup(
+  model: string,
+  current: { in?: number; source?: string },
+  stored: StoredEndpoint,
+): boolean {
+  if (!model) return false;
+  if (current.source === "set by hand") return false;
+  return !(stored.priceModel === model && current.in !== undefined);
+}
+
+/** Remember what this model costs, so the next run starts already priced. */
+export function savePricing(
+  model: string,
+  p: Pricing | null,
+  dir = defaultConfigDir(),
+): boolean {
+  const cfg = readJson(dir, "config.json");
+  const next: Record<string, unknown> = { ...cfg, priceModel: model };
+  if (p) {
+    next.priceIn = p.in;
+    next.priceOut = p.out;
+    if (p.cached === undefined) delete next.priceCachedIn;
+    else next.priceCachedIn = p.cached;
+  } else {
+    delete next.priceIn;
+    delete next.priceOut;
+    delete next.priceCachedIn;
+  }
+  return writeJson(dir, "config.json", next);
 }
 
 /**
