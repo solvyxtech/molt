@@ -1948,6 +1948,7 @@ export class Engine {
           model: this.cfg.model,
           provider: this.provider,
           sessionTokens: this.sessionTokens,
+          session: this.cfg.journal?.sessionId,
           costUsd: this.costUsd(),
           costEstimated: this.costEstimated,
           shedBatches: this.transcript.shedCount,

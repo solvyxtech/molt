@@ -153,6 +153,39 @@ describe("things that cannot be undone", () => {
     }
   });
 
+  it("asks about an interpreter handed a program on the command line", () => {
+    // Found by molt reviewing its own classifier: `python -c "os.remove(x)"`
+    // deletes a file without the word `rm` appearing anywhere. That is not a
+    // gap in the deny-list — it is the reason a deny-list cannot be the whole
+    // answer. The effect of an -e/-c program is not readable from its text,
+    // which is the same rule that already sends `$(...)` to a prompt.
+    for (const c of [
+      'python3 -c "import os; os.remove(\'x\')"',
+      'node -e "require(\'fs\').unlinkSync(\'x\')"',
+      "ruby -e 'File.delete(1)'",
+      "perl -e 'unlink 1'",
+      'sh -c "rm -rf build"',
+      "bash -c 'anything'",
+    ]) {
+      assert.ok(isIrreversible(c), `an unread program slipped through: ${c}`);
+      assert.ok(bash("high", c), `high ran an unread program: ${c}`);
+    }
+    // Running a script FILE is ordinary work: the program is on disk and the
+    // command says which one.
+    for (const c of ["node script.js", "python3 tool.py", "npm test", "ruby app.rb"]) {
+      assert.ok(!bash("high", c), `high gated an ordinary script run: ${c}`);
+    }
+  });
+
+  it("catches a deletion however the binary is spelled", () => {
+    // The same review claimed these bypassed the list. They do not, and
+    // saying which claims were wrong matters as much as fixing the ones
+    // that were right.
+    for (const c of ["/bin/rm x", "env rm x", "busybox rm x", "command rm x"]) {
+      assert.ok(isIrreversible(c), `missed: ${c}`);
+    }
+  });
+
   it("leaves the reversible half of the shell alone", () => {
     // A list that catches everything is a level nobody would turn on.
     for (const c of [

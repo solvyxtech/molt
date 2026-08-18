@@ -50,8 +50,8 @@ They are not the only case. molt works against any OpenAI-compatible endpoint â€
 ## Install
 
 ```bash
-npx @solvyxtech/molt          # no install
-npm i -g @solvyxtech/molt     # or keep it
+npx @solvyx/molt          # no install
+npm i -g @solvyx/molt     # or keep it
 ```
 
 Node 20.11+.

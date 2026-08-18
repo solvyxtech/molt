@@ -167,6 +167,13 @@ const IRREVERSIBLE = [
   /\bnpm\s+publish\b|\byarn\s+publish\b|\bpnpm\s+publish\b/i,
   // A download piped into an interpreter is an unread program.
   /\|\s*(sh|bash|zsh|python|node)\b/i,
+  // And so is an interpreter handed a program on the command line. `python -c
+  // "os.remove(x)"` deletes a file without the word `rm` appearing anywhere,
+  // which is not a gap in the list below — it is the reason a list cannot be
+  // the whole answer. The effect of an -e/-c program is not readable from the
+  // text, which is the same rule that already sends `$(...)` to a prompt.
+  /\b(python[\d.]*|node|ruby|perl|php|deno|bun|osascript)\b[^|;&]*\s-(c|e|eval)\b/i,
+  /\b(sh|bash|zsh|fish)\b[^|;&]*\s-c\b/i,
   /:\(\)\s*\{/, // fork bomb, and anything else that opens with a function trap
 ];
 
