@@ -157,6 +157,8 @@ export type EngineEvent =
       bytes?: number;
       /** Head of that result, verbatim. Truncated, never summarized. */
       preview?: string;
+      /** True when autonomy let this run without asking. */
+      auto?: boolean;
     }
   | {
       kind: "usage";

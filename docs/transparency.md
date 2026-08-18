@@ -38,7 +38,7 @@ Example:
 04:33:49  receipt refused → .molt/receipts/0000-refused.md
 04:33:49  → request · 4 msgs · ~405 tok · streaming
 04:33:49  ← response · 300 in / 50 out · 1 tool call(s)
-04:33:49  permission granted: write_file fix.txt
+04:33:49  permission granted: write_file fix.txt [autonomy low]
 04:33:49  tool write_file: fix.txt
 04:33:49    24 bytes
 04:33:49  bar PASS 1/1 · 1ms
@@ -59,11 +59,11 @@ in the TUI and headlessly:
   step 2 · read_file, bash · 3.4k in (2.1k cached) · 412 out · $0.0072 · 6.2s
 ```
 
-Press **`v`** while a turn is running to open the live view (`ctrl+V` any
+Press **shift+V** while a turn is running to open the live view (`ctrl+V` any
 time, `/verbose` as a command, `--verbose` headlessly):
 
 ```
-── what the model is doing ──────────────────────────────────  v closes
+── what the model is doing ─────────────────────────────  shift+V closes
   job 3 · rewrite the auth guard · 2 step(s) · 8.0k in (3.0k cached) · 45 out · $0.012 · 4.2s
   · read_file src/auth.ts  12ms
       args {"path":"src/auth.ts"}
@@ -81,7 +81,8 @@ Four properties make it worth trusting:
   received, truncated but never reworded. A view that paraphrases is one more
   claim to check, and molt does not summarize with a model anywhere else.
 - **Recorded regardless.** Feed lines are written whether or not the view is
-  open, so `v` reveals what already happened rather than starting a recording.
+  open, so shift+V reveals what already happened rather than starting a
+  recording.
 - **Bounded.** It is a panel of fixed height over a transcript that is printed
   once and never redrawn. A view that grows the region a terminal has to
   repaint is a view that eventually tears its own output.
@@ -150,6 +151,23 @@ molt distinguishes the two rather than blurring them.
 
 A number without a `~` came from something molt counted. A number with one is
 molt's arithmetic, and it says so.
+
+## Who approved it
+
+Every tool call carries the permission decision that let it through, and
+whether a human was asked at all:
+
+```
+04:33:49  permission granted: write_file fix.txt [autonomy low]
+04:33:50  permission granted (auto): bash grep -rn verify src/ [autonomy medium]
+04:33:52  autonomy medium → high · runs everything except what cannot be undone
+```
+
+`(auto)` means autonomy allowed it without a prompt — the entry an audit most
+needs to be able to find — and the level in force is recorded beside it.
+Changing the level is journalled too, because a record that does not say when
+the ceiling moved cannot explain why a command ran unattended. See
+[autonomy.md](autonomy.md).
 
 ## The hash chain
 

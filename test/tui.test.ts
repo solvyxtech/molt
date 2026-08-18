@@ -17,8 +17,9 @@ import { Engine } from "../src/engine.js";
 import type { Msg } from "../src/types.js";
 import { workspace } from "./helpers.js";
 
-/** What a terminal sends for ctrl+V. */
+/** What a terminal sends for ctrl+V and ctrl+A. */
 const CTRL_V = String.fromCharCode(22);
+const CTRL_A = String.fromCharCode(1);
 
 /**
  * A terminal's input side. Ink reads keys by listening for "readable" and
@@ -154,7 +155,7 @@ describe("the transparency view", () => {
     try {
       void submit(t.stdin, "read the seed");
       await tick(120);
-      assert.match(t.stdout.text, /v to watch/, "never told anyone the view exists");
+      assert.match(t.stdout.text, /shift\+V to watch/, "never told anyone the view exists");
       await tick(600);
     } finally {
       t.cleanup();
@@ -207,37 +208,73 @@ describe("the transparency view", () => {
       // Priced in the same unit the session meter uses, so a step and a
       // total can be read against each other: 1200 in at $2/M plus 30 out at
       // $6/M is $0.0026.
-      assert.match(frame, /\$0\.0026/);
+      assert.match(frame, /\$0\.003/);
     } finally {
       t.cleanup();
     }
   });
 
-  it("takes a bare v while the turn is running, which is when it is asked", async () => {
+  it("takes shift+V while the turn is running, which is when it is asked", async () => {
     // The prompt takes no typing mid-turn, so a letter is free there — and
     // free is what a key has to be to earn the shortest binding.
     const t = await mount({ fetchFn: slowProvider(150) });
     try {
       void submit(t.stdin, "read the seed");
       await tick(80);
-      t.stdin.press("v");
+      t.stdin.press("V");
       await tick(600);
-      assert.match(t.stdout.lastFrame, /what the model is doing/, "v showed nothing");
+      assert.match(t.stdout.lastFrame, /what the model is doing/, "shift+V showed nothing");
     } finally {
       t.cleanup();
     }
   });
 
-  it("does not eat a v typed into a message", async () => {
+  it("does not eat a letter typed into a message", async () => {
     const t = await mount();
     try {
-      for (const ch of "verify this") t.stdin.press(ch);
+      for (const ch of "Verify this") t.stdin.press(ch);
       await tick(60);
-      assert.match(t.stdout.lastFrame, /verify this/, "swallowed a letter someone was typing");
+      assert.match(t.stdout.lastFrame, /Verify this/, "swallowed a letter someone was typing");
       assert.ok(
         !/what the model is doing/.test(t.stdout.lastFrame),
         "opened the view mid-word",
       );
+      assert.ok(!/autonomy:/.test(t.stdout.lastFrame), "moved the autonomy ceiling mid-word");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("shows the autonomy level beside the model, and moves it with a key", async () => {
+    // A ceiling that is not visible while it is in force is not a control.
+    const t = await mount();
+    try {
+      assert.match(t.stdout.lastFrame, /auto low/);
+      t.stdin.press(CTRL_A);
+      await tick(60);
+      assert.match(t.stdout.lastFrame, /auto medium/);
+      assert.match(t.stdout.lastFrame, /autonomy: medium/, "moved the ceiling silently");
+      assert.equal(t.engine.autonomy, "medium");
+      t.stdin.press(CTRL_A);
+      await tick(60);
+      assert.equal(t.engine.autonomy, "high");
+      // Wraps, so one key can also put it back.
+      t.stdin.press(CTRL_A);
+      await tick(60);
+      assert.equal(t.engine.autonomy, "low");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("takes shift+A while the turn is running", async () => {
+    const t = await mount({ fetchFn: slowProvider(150) });
+    try {
+      void submit(t.stdin, "read the seed");
+      await tick(80);
+      t.stdin.press("A");
+      await tick(600);
+      assert.equal(t.engine.autonomy, "medium");
     } finally {
       t.cleanup();
     }
@@ -272,8 +309,8 @@ describe("the transparency view", () => {
       const frame = t.stdout.lastFrame;
       // Each job priced on its own, in the same unit as the session meter:
       // job one made two requests (2.4k in, 60 out), job two made one.
-      assert.match(frame, /job 1 unverified · 2 step\(s\) · 2\.4k in · 60 out · \$0\.0052/);
-      assert.match(frame, /job 2 unverified · 1 step\(s\) · 1\.2k in · 30 out · \$0\.0026/);
+      assert.match(frame, /job 1 unverified · 2 step\(s\) · 2\.4k in · 60 out · \$0\.005/);
+      assert.match(frame, /job 2 unverified · 1 step\(s\) · 1\.2k in · 30 out · \$0\.003/);
     } finally {
       t.cleanup();
     }

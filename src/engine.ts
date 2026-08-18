@@ -24,6 +24,12 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, resolve, relative, isAbsolute } from "node:path";
 import type { ArchiveLike } from "./archive.js";
 import { barFingerprint, formatBarFailure, runBar, type BarContext } from "./bar.js";
+import {
+  AUTONOMY_SUMMARY,
+  DEFAULT_AUTONOMY,
+  gate,
+  type Autonomy,
+} from "./autonomy.js";
 import { Journal } from "./journal.js";
 import { Receipts } from "./receipts.js";
 import { readStream, type Usage } from "./stream.js";
@@ -184,6 +190,8 @@ export type EngineConfig = {
   autoShedAtTokens?: number;
   /** Drop tool results that later work superseded. On by default. */
   elideSuperseded?: boolean;
+  /** How much molt may do without asking. Defaults to asking about everything. */
+  autonomy?: Autonomy;
 };
 
 function scrubbedEnv(): NodeJS.ProcessEnv {
@@ -358,6 +366,25 @@ export class Engine {
 
   get streaming(): boolean {
     return this.cfg.stream !== false;
+  }
+
+  get autonomy(): Autonomy {
+    return this.cfg.autonomy ?? DEFAULT_AUTONOMY;
+  }
+
+  /**
+   * Change how much molt may do without asking.
+   *
+   * Journalled, because it is the one setting that changes what molt is
+   * allowed to do to a machine. A record of a session that does not say when
+   * the ceiling moved cannot explain why a command ran unattended.
+   */
+  setAutonomy(level: Autonomy): void {
+    const from = this.autonomy;
+    this.cfg.autonomy = level;
+    if (from !== level) {
+      this.cfg.journal?.append("autonomy", { from, to: level, means: AUTONOMY_SUMMARY[level] });
+    }
   }
 
   get sessionCachedTokens(): number {
@@ -1107,6 +1134,7 @@ export class Engine {
 
       if (msg.tool_calls?.length) {
         const called: string[] = [];
+        let autoRan = 0;
         for (const call of msg.tool_calls) {
           const name = call.function?.name ?? "unknown";
           let args: Record<string, unknown> = {};
@@ -1116,11 +1144,12 @@ export class Engine {
             /* model sent malformed args; run with empty */
           }
           const detail = toolDetail(name, args);
-          const target = resolve(this.cwd, String(args.path ?? ""));
-          const outsideCwd =
-            name === "read_file" && !target.startsWith(this.cwd + "/") && target !== this.cwd;
-          const needsGate = name === "bash" || name === "write_file" || outsideCwd;
-          const allowed = needsGate ? await confirm(name, detail) : true;
+          // What the current autonomy level says about this exact call. The
+          // decision is mechanical and the reason travels with it, so an
+          // approval prompt can say which rule produced it rather than
+          // asking the same way about everything.
+          const decision = gate(this.autonomy, { name, args, cwd: this.cwd });
+          const allowed = decision.ask ? await confirm(name, `${detail}${decision.why ? ` — ${decision.why}` : ""}`) : true;
 
           let result: string;
           let note: string | undefined;
@@ -1144,7 +1173,17 @@ export class Engine {
             }
             durationMs = Date.now() - toolStartedAt;
           }
-          if (needsGate) log?.append("permission", { name, detail, allowed });
+          // Both branches are recorded. A call that ran without being asked
+          // about is exactly the thing an audit needs to be able to find, and
+          // it is recorded with the level that let it through.
+          log?.append("permission", {
+            name,
+            detail,
+            allowed,
+            asked: decision.ask,
+            autonomy: this.autonomy,
+            ...(decision.why ? { why: decision.why } : {}),
+          });
           log?.append("tool_call", { step, name, detail, allowed });
           log?.append("tool_result", {
             name,
@@ -1155,6 +1194,7 @@ export class Engine {
           });
           called.push(name);
           if (allowed) this.actsSinceBar += 1;
+          if (!decision.ask) autoRan += 1;
           yield {
             kind: "tool",
             name,
@@ -1164,6 +1204,7 @@ export class Engine {
             args: capture(call.function?.arguments ?? ""),
             bytes: Buffer.byteLength(result, "utf8"),
             preview: capture(result),
+            auto: !decision.ask,
           };
           this.transcript.push({ role: "tool", tool_call_id: call.id, content: result });
         }

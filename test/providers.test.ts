@@ -329,7 +329,7 @@ describe("the meter", () => {
     })
       .map((s) => s.text)
       .join("");
-    assert.match(text, /1\.0k\/50k tokens · \$0\.0042/);
+    assert.match(text, /1\.0k\/50k tokens · \$0\.004/);
   });
 
   it("omits the cost when no pricing is configured", () => {
@@ -382,12 +382,14 @@ describe("cost formatting", () => {
   it("keeps the run of zeros short", () => {
     // The first bug: sub-cent sums rendered as "$0.000024" — six digits the
     // reader has to count before the number means anything, in the one field
-    // on screen that has to be legible at a glance.
+    // on screen that has to be legible at a glance. Three decimals is the
+    // whole budget; below that the figure says "under" instead.
     assert.equal(cost(12.5), "$12.50");
     assert.equal(cost(0.07), "$0.070");
-    assert.equal(cost(0.0042), "$0.0042");
+    assert.equal(cost(0.0042), "$0.004");
+    assert.equal(cost(0.0004), "<$0.001");
     for (const usd of [12.5, 0.07, 0.0042, 0.00024]) {
-      assert.ok(!/0000/.test(cost(usd)!), `zero run survived: ${cost(usd)}`);
+      assert.ok(!/000\d/.test(cost(usd)!), `zero run survived: ${cost(usd)}`);
     }
   });
 
@@ -396,7 +398,7 @@ describe("cost formatting", () => {
     // meter read "0.9¢" and then "$0.029" — which looks like it went DOWN.
     // A running total has to be comparable against its own previous value
     // without arithmetic, so the unit is fixed and only the digits move.
-    const series = [0.0009, 0.009, 0.029, 0.061, 0.42, 1.2, 12.5].map((u) => cost(u)!);
+    const series = [0.002, 0.009, 0.029, 0.061, 0.42, 1.2, 12.5].map((u) => cost(u)!);
     for (const s of series) assert.ok(s.startsWith("$"), `changed unit: ${s}`);
     // Monotone as rendered, not just as computed.
     const asNumbers = series.map((s) => Number(s.replace("$", "")));
@@ -408,7 +410,7 @@ describe("cost formatting", () => {
   it("never flattens a real charge to zero", () => {
     // A meter reading zero while the token count climbs reads as broken
     // pricing rather than a cheap turn, so the floor says "under", not "none".
-    assert.equal(cost(0.0000001), "<$0.0001");
+    assert.equal(cost(0.0000001), "<$0.001");
     assert.notEqual(cost(0.0000001), "$0.00");
   });
 
@@ -417,7 +419,7 @@ describe("cost formatting", () => {
     // quote back at each other.
     assert.equal(cost(0.42, true), "~$0.42");
     assert.equal(cost(0.42, false), "$0.42");
-    assert.equal(cost(0.0031, true), "~$0.0031");
+    assert.equal(cost(0.0031, true), "~$0.003");
   });
 
   it("shows a true zero as zero", () => {
