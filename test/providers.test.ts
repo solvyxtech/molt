@@ -12,6 +12,7 @@ import { fmtDuration, statusSegments } from "../src/banner.js";
 import {
   PICKER_ROWS,
   PROVIDERS,
+  authHeaders,
   XAI_PRICE_UNIT,
   fetchPricing,
   firstSelectable,
@@ -432,6 +433,45 @@ describe("cost formatting", () => {
       .map((s) => s.text)
       .join("");
     assert.match(text, /\$0\.00\b/);
+  });
+});
+
+describe("authentication headers", () => {
+  it("sends what each provider actually accepts", () => {
+    // Reported from use: /model showed no Anthropic models after a successful
+    // login. Their compatibility layer takes `Authorization: Bearer` on
+    // /chat/completions but not on /models, which wants x-api-key and a
+    // version — so the key worked for chat and 401'd on the model list.
+    const anthropic = authHeaders("https://api.anthropic.com/v1", "sk-ant-key-value");
+    assert.equal(anthropic["x-api-key"], "sk-ant-key-value");
+    assert.equal(anthropic["anthropic-version"], "2023-06-01");
+    assert.equal(anthropic.authorization, "Bearer sk-ant-key-value");
+
+    // Everyone else gets the common case, and nothing extra.
+    const xai = authHeaders("https://api.x.ai/v1", "xai-key-value");
+    assert.deepEqual(Object.keys(xai), ["authorization"]);
+  });
+
+  it("sends nothing at all without a key", () => {
+    assert.deepEqual(authHeaders("http://localhost:11434/v1", undefined), {});
+    assert.deepEqual(authHeaders("https://api.anthropic.com/v1", ""), {});
+  });
+
+  it("does not throw on a malformed url", () => {
+    assert.deepEqual(Object.keys(authHeaders("not a url", "k")), ["authorization"]);
+  });
+});
+
+describe("the status line with no model", () => {
+  it("points at the step that is actually next", () => {
+    // Telling someone who just logged in to log in is the kind of small lie
+    // that makes a status line stop being read.
+    const say = (hint?: string) =>
+      statusSegments({ provider: "anthropic", model: "", sessionTokens: 0, hint })
+        .map((x) => x.text)
+        .join("");
+    assert.match(say(), /no model · \/login/);
+    assert.match(say("/model"), /no model · \/model/);
   });
 });
 

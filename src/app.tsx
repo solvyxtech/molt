@@ -654,19 +654,26 @@ export function App({
       const preset = PROVIDERS[provider];
       const ok = saveKey(provider, key);
       // Point the session at the provider you just authenticated, so the key
-      // is usable now rather than after a restart.
+      // is usable now rather than after a restart. The model does not travel
+      // with it — it belonged to the endpoint you just left.
       if (preset) {
         engine.setBaseUrl(preset.url, key, provider);
         setTokens(0);
         setCost(undefined);
+        setCostEstimated(false);
       }
       add(
         ok ? "ok" : "error",
         ok
-          ? `key saved for ${provider} → ${defaultConfigDir()}/auth.json (0600) · /model to pick one`
+          ? `key saved for ${provider} → ${defaultConfigDir()}/auth.json (0600)`
           : `could not write ${defaultConfigDir()}/auth.json — key held for this session only`,
       );
+      // Straight into the picker: a provider with no model selected cannot do
+      // anything, and making someone type /model to learn that is a step molt
+      // can take for them.
+      if (preset) void startModelPicker();
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [add, engine],
   );
 
@@ -1624,6 +1631,9 @@ export function App({
           costUsd: cost,
           costEstimated,
           autonomy,
+          // A key already stored means the next step is choosing a model, not
+          // logging in again.
+          hint: Object.keys(readAuth()).length > 0 ? "/model" : "/login",
           budgetTokens: engine.budgetTokens,
         }}
       />
