@@ -312,12 +312,19 @@ export function mentionedPaths(claim: string): string[] {
   return [...found];
 }
 
-/** Every path the model asked to write, across the entire session record. */
+/**
+ * Every path the model asked to change, across the entire session record.
+ *
+ * Both write tools count. When `edit_file` arrived this still looked only for
+ * `write_file`, so a session whose edits all failed reported "no file was
+ * modified" instead of naming the edits that did not land — a correct refusal
+ * with a misleading reason, which is its own kind of wrong.
+ */
 export function claimedWrites(record: Msg[]): string[] {
   const paths: string[] = [];
   for (const m of record) {
     for (const c of m.tool_calls ?? []) {
-      if (c.function.name !== "write_file") continue;
+      if (c.function.name !== "write_file" && c.function.name !== "edit_file") continue;
       try {
         const args = JSON.parse(c.function.arguments || "{}") as Record<string, unknown>;
         if (typeof args.path === "string") paths.push(args.path);

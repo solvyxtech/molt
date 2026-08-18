@@ -107,6 +107,36 @@ export const SYSTEM_PROMPT = [
  * Truncation is always visible, never silent, and a truncated read always
  * says how to continue.
  */
+/**
+ * What one turn may spend before molt stops it, unless told otherwise.
+ *
+ * There was no ceiling, only a 32-step guard — and a session that thrashed
+ * inside those 32 steps spent 661,000 tokens and most of a dollar over
+ * thirteen minutes before anything intervened. Steps are the wrong unit:
+ * a step can cost a hundred tokens or thirty thousand.
+ *
+ * Deliberately generous enough for real work and far below "how did this cost
+ * a dollar". `/budget` raises or removes it, and the message says so.
+ */
+export const DEFAULT_TURN_TOKENS = 200_000;
+
+/**
+ * When working history gets compacted, unless told otherwise.
+ *
+ * Shedding was built for exactly the situation that broke a real session —
+ * reading a whole codebase, where the conversation grows until every step
+ * resends a hundred kilobytes — and it was off by default, so it never ran.
+ * A feature that only works when configured is a feature most sessions do
+ * not have.
+ *
+ * Safe as a default because of where verification reads from: the bar checks
+ * the ledger, the disk, and the archive, never the transcript. Shedding costs
+ * the model some working memory and costs molt's proof nothing, the full
+ * original is preserved in `.molt/exuviae/`, `record-intact` fails if it is
+ * not, and `/regrow` pulls it back by pattern.
+ */
+export const DEFAULT_AUTO_SHED_TOKENS = 60_000;
+
 export const TOOL_RESULT_MAX_BYTES = 8192;
 export const READ_MAX_BYTES = 16_384;
 export const MAX_STEPS = 32;
@@ -272,8 +302,13 @@ export type EngineConfig = {
   /** Append-only hash-chained record of everything this session did. */
   journal?: Journal;
   maxProofAttempts?: number;
-  /** Shed automatically once working history exceeds this many tokens. */
+  /**
+   * Shed automatically once working history exceeds this many tokens.
+   * Defaults to DEFAULT_AUTO_SHED_TOKENS; 0 disables it.
+   */
   autoShedAtTokens?: number;
+  /** Tokens one turn may spend before molt stops it. 0 disables the ceiling. */
+  maxTurnTokens?: number;
   /** Drop tool results that later work superseded. On by default. */
   elideSuperseded?: boolean;
   /** How much molt may do without asking. Defaults to asking about everything. */
@@ -328,6 +363,11 @@ function callKey(name: string, args: Record<string, unknown>): string {
     .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
     .sort();
   return `${name}(${parts.join(",")})`;
+}
+
+/** Dollars, for a message that has to be readable without a formatter. */
+function fmtUsd(usd: number): string {
+  return usd >= 0.1 ? `$${usd.toFixed(2)}` : usd >= 0.001 ? `$${usd.toFixed(3)}` : "<$0.001";
 }
 
 /** A tool argument that should be a non-empty string, or nothing. */
@@ -500,8 +540,15 @@ export class Engine {
     this.cfg.apiKey = k;
     this.cfg.journal?.protect(k);
   }
+  /**
+   * A session ceiling — and, since it is the knob people reach for when a turn
+   * runs away, the turn ceiling too. A budget smaller than the default turn
+   * ceiling would otherwise be unreachable, and a budget larger than it would
+   * be silently overruled.
+   */
   setBudget(tokens?: number): void {
     this.budgetTokens = tokens;
+    this.cfg.maxTurnTokens = tokens === undefined ? 0 : tokens;
   }
   setBar(bar: Bar | null): void {
     this.cfg.bar = bar;
@@ -949,6 +996,88 @@ export class Engine {
   }
 
   /**
+   * Ask for an answer with what has already been paid for.
+   *
+   * Every guard in this loop used to end a turn by returning nothing: the step
+   * guard, the budget, the turn ceiling, the no-progress stop. A session that
+   * read twenty files and hit a limit threw all of it away — maximum cost,
+   * zero value, which is the worst outcome available and the one a user
+   * actually reported.
+   *
+   * So a stopped turn gets one last request with tools disabled. The model
+   * cannot go looking for more; it has to say what it found and what it could
+   * not determine. That answer is NOT a completion claim and does not go
+   * through the bar — it is a report from a turn molt cut short, and it is
+   * labelled as one, because presenting it as verified would be the exact lie
+   * this whole tool exists to refuse.
+   */
+  private async *salvage(
+    reason: string,
+    fetchFn: typeof fetch,
+    log?: Journal,
+  ): AsyncGenerator<EngineEvent> {
+    this.transcript.push({
+      role: "user",
+      content:
+        `[molt] ${reason} You cannot call any more tools. Answer now with what you have ` +
+        `already found: what you learned, and — just as importantly — what you did not get ` +
+        `to and cannot vouch for. Do not claim anything you did not verify.`,
+    });
+    try {
+      const res = await fetchFn(`${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}),
+        },
+        // `tools` must be present even to say "use none of them" — a
+        // tool_choice without a tools array is a 400 on at least xAI, and the
+        // first version of this sent exactly that and swallowed the refusal.
+        body: JSON.stringify({
+          model: this.cfg.model,
+          messages: this.transcript.wire(),
+          tools: TOOLS,
+          tool_choice: "none",
+        }),
+      });
+      if (!res.ok) {
+        // A safety net that fails silently is not a safety net. Say so.
+        const why = await res.text().catch(() => "");
+        log?.append("error", { text: `salvage failed: HTTP ${res.status}`, body: why.slice(0, 200) });
+        yield {
+          kind: "info",
+          text: `could not write a closing summary (HTTP ${res.status}) — the work above is all there is`,
+        };
+        return;
+      }
+      const json = (await res.json()) as {
+        choices?: { message?: Msg }[];
+        usage?: Usage;
+      };
+      const text = json.choices?.[0]?.message?.content ?? "";
+      const pTok = json.usage?.prompt_tokens ?? 0;
+      const cTok = json.usage?.completion_tokens ?? 0;
+      this.sessionPrompt += pTok;
+      this.sessionCompletion += cTok;
+      if (typeof json.usage?.cost === "number") this.sessionBilled += json.usage.cost;
+      else this.unbilledSteps += 1;
+      log?.append("salvage", { reason, promptTokens: pTok, completionTokens: cTok, chars: text.length });
+      if (!text.trim()) return;
+      yield {
+        kind: "info",
+        text:
+          "the answer below was written after molt stopped the turn. It was NOT checked " +
+          "against the bar — treat it as notes, not as a completed task.",
+      };
+      yield { kind: "assistant_text", text: redact(text, this.secrets()) };
+    } catch (e) {
+      // A courtesy that failed must not mask the real stop, but must not
+      // vanish either.
+      log?.append("error", { text: `salvage failed: ${String(e)}` });
+    }
+  }
+
+  /**
    * Close out a turn whose claim was never proven: write the receipt, log
    * the ending, and report it as a failure. Shared by the exhausted path and
    * the one that stops early because nothing changed, so both produce the
@@ -1101,7 +1230,18 @@ export class Engine {
      * fifty cents.
      */
     const answered = new Map<string, { step: number; sha: string }>();
-    /** Consecutive steps in which every call was a repeat with nothing new. */
+    /**
+     * Which lines of which file the model has already been shown this turn.
+     *
+     * Exact-match detection is not enough on its own: asking for line 181 and
+     * then line 182 of the same file returns almost the same bytes under a
+     * different key, which is precisely how a real session walked past the
+     * repeat guard for thirty-two steps. Coverage answers the question that
+     * actually matters — "has this already been shown?" — rather than "is this
+     * byte-identical to something?".
+     */
+    const shown = new Map<string, { from: number; to: number }[]>();
+    /** Consecutive steps in which nothing new came back. */
     let dryStreak = 0;
 
     // A question changes nothing, so a check that demands a change can only
@@ -1120,12 +1260,39 @@ export class Engine {
       }
     }
 
+    const turnStartTokens = this.sessionTokens;
     for (let step = 0; step < MAX_STEPS; step++) {
+      // An explicit budget speaks for itself, and speaks first: one knob
+      // should not produce two different messages.
       if (this.overBudget()) {
         yield {
           kind: "error",
           text: `budget hit (${this.budgetTokens} tokens) — loop stopped. /budget to raise.`,
         };
+        yield* this.salvage(`You have reached the token budget for this session.`, fetchFn, log);
+        return;
+      }
+
+      // Otherwise a ceiling on the turn, not just on the session. Checked
+      // before the request rather than after, so the limit is what molt
+      // refuses to spend rather than what it noticed spending.
+      const turnCeiling = this.cfg.maxTurnTokens ?? DEFAULT_TURN_TOKENS;
+      const spentThisTurn = this.sessionTokens - turnStartTokens;
+      if (turnCeiling > 0 && spentThisTurn >= turnCeiling) {
+        log?.append("session_end", { reason: "turn ceiling", tokens: spentThisTurn });
+        yield {
+          kind: "error",
+          text:
+            `stopped: this turn has used ${spentThisTurn} tokens` +
+            (this.costUsd() === undefined ? "" : ` · ${fmtUsd(this.costUsd() ?? 0)}`) +
+            `, past the ${turnCeiling}-token ceiling for a single turn. Nothing was verified. ` +
+            `Narrow the request, or raise the ceiling with /budget.`,
+        };
+        yield* this.salvage(
+          `This turn reached its ${turnCeiling}-token ceiling before you finished.`,
+          fetchFn,
+          log,
+        );
         return;
       }
 
@@ -1143,8 +1310,8 @@ export class Engine {
         }
       }
 
-      const auto = this.cfg.autoShedAtTokens;
-      if (auto !== undefined && this.transcript.historyTokens() > auto) {
+      const auto = this.cfg.autoShedAtTokens ?? DEFAULT_AUTO_SHED_TOKENS;
+      if (auto > 0 && this.transcript.historyTokens() > auto) {
         const shed = this.shed();
         if (shed) {
           log?.append("shed", {
@@ -1441,6 +1608,29 @@ export class Engine {
             }
             durationMs = Date.now() - toolStartedAt;
 
+            // A read of lines the model has already been shown, whatever
+            // offset it spelled them with.
+            if (name === "read_file" && note !== "error") {
+              const path = String(args.path ?? "");
+              const from = num(args.offset, 0);
+              const lines = (result.match(/\n/g)?.length ?? 0) + 1;
+              const to = from + lines;
+              const covered = shown.get(path) ?? [];
+              const already = covered.some((r) => from >= r.from && to <= r.to);
+              if (already) {
+                result =
+                  `[molt: you have already been shown lines ${from + 1}-${to} of ${path} in ` +
+                  `this conversation. Scroll up rather than reading them again — nothing has ` +
+                  `changed since. If you need a different part, ask for an offset past what ` +
+                  `you have; if you have what you need, answer.]`;
+                note = "repeat";
+                repeated += 1;
+              } else {
+                covered.push({ from, to });
+                shown.set(path, covered);
+              }
+            }
+
             // The same call, returning the same bytes it returned before.
             // Send a pointer instead of the payload: the answer is already in
             // the conversation, and saying so is both cheaper and truer than
@@ -1481,6 +1671,9 @@ export class Engine {
             note,
             sha256: createHash("sha256").update(result, "utf8").digest("hex").slice(0, 16),
           });
+          if ((name === "write_file" || name === "edit_file") && allowed) {
+            shown.delete(String(args.path ?? ""));
+          }
           called.push(name);
           if (allowed) this.actsSinceBar += 1;
           if (!decision.ask) autoRan += 1;
@@ -1508,12 +1701,18 @@ export class Engine {
         // One can be a stumble; two in a row is a loop, and a loop with a
         // token meter attached has to be stopped by molt rather than by the
         // step guard thirty steps later.
-        if (called.length > 0 && repeated === called.length) {
+        // Majority, not unanimity. A step that spends three calls on things it
+        // already had and one on something new is thrashing, and requiring
+        // every single call to be a repeat is how a loop walked past this
+        // guard for thirty-two steps and most of a dollar.
+        if (called.length > 0 && repeated * 2 >= called.length) {
           dryStreak += 1;
           if (dryStreak === 1) {
             yield {
               kind: "info",
-              text: "that step repeated calls molt had already answered — nothing new came back",
+              text:
+                `${repeated} of ${called.length} calls that step were things molt had already ` +
+                `answered — little or nothing new came back`,
             };
           }
         } else {
@@ -1532,9 +1731,14 @@ export class Engine {
             text:
               `stopped: the model spent two steps repeating calls that had already been ` +
               `answered, and no new information came back. This turn used ` +
-              `${this.sessionTokens} tokens. Nothing was claimed and nothing was verified — ` +
-              `try a narrower request, or /verbose to watch what it is reaching for.`,
+              `${this.sessionTokens} tokens. Nothing was verified — try a narrower request, ` +
+              `or shift+V to watch what it is reaching for.`,
           };
+          yield* this.salvage(
+            "You have spent two steps repeating calls that were already answered.",
+            fetchFn,
+            log,
+          );
           return;
         }
         continue; // let the model see tool results
@@ -1652,10 +1856,11 @@ export class Engine {
       kind: "error",
       text:
         `stopped after ${MAX_STEPS} steps (loop guard) · ${this.sessionTokens} tokens` +
-        (this.costUsd() === undefined ? "" : ` · $${(this.costUsd() ?? 0).toFixed(3)}`) +
-        `. Nothing was claimed and nothing was verified. Narrow the request, or set ` +
-        `/budget to put a ceiling on a turn like this.`,
+        (this.costUsd() === undefined ? "" : ` · ${fmtUsd(this.costUsd() ?? 0)}`) +
+        `. Nothing was verified. Narrow the request, or set /budget to put a ceiling on a ` +
+        `turn like this.`,
     };
+    yield* this.salvage(`You have used all ${MAX_STEPS} steps available for this turn.`, fetchFn, log);
   }
 
   /** Preflight: is the endpoint reachable, and is the model actually there? */

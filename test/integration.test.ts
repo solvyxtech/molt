@@ -322,6 +322,64 @@ describe("over a real socket", () => {
     assert.ok((tools[1]!.bytes ?? 0) < (tools[0]!.bytes ?? 0) / 3);
   });
 
+  it("stops a model that walks the same file with shifted offsets", async () => {
+    // The 661,000-token failure, from the other side. Exact-match detection
+    // was defeated by asking for line 181 and then line 182 — almost the same
+    // bytes under a different key. Coverage answers the question that matters:
+    // has this already been shown?
+    const dir = ws();
+    writeDefaultBar(dir);
+    writeFileSync(join(dir, "big.txt"), Array.from({ length: 300 }, (_, i) => `line ${i}`).join("\n"));
+    let n = 0;
+    const { url, received } = await mockProvider({
+      turns: Array.from({ length: 8 }, () => ({
+        // Each turn asks for a window inside what it has already been shown.
+        calls: [{ name: "read_file", args: { path: "big.txt", offset: (n += 1) } }],
+      })),
+    });
+    const engine = engineAt(dir, url);
+    const events = await drain(engine.run("study it", allowAll));
+
+    const err = events.find((e) => e.kind === "error") as { text: string } | undefined;
+    assert.ok(err && /repeating calls|already/.test(err.text), `wrong stop: ${err?.text}`);
+    assert.ok(received.length <= 5, `should stop early, not after ${received.length} steps`);
+    const tools = events.filter((e): e is Extract<EngineEvent, { kind: "tool" }> => e.kind === "tool");
+    assert.ok(
+      tools.some((t) => t.note === "repeat"),
+      "a shifted offset walked straight past the guard",
+    );
+  });
+
+  it("keeps every part of a file it was shown, so it never re-reads one", async () => {
+    // Elision was keyed on the path, so page two deleted page one and the
+    // model had to fetch it again — forever.
+    const dir = ws();
+    writeDefaultBar(dir);
+    // 1000 lines at ~68 bytes each: a 16KB part is roughly 230 lines, so these
+    // offsets walk forward without ever re-asking for a line already shown.
+    writeFileSync(join(dir, "big.txt"), Array.from({ length: 1000 }, (_, i) => `line ${i} ${"y".repeat(60)}`).join("\n"));
+    const { url } = await mockProvider({
+      turns: [
+        { calls: [{ name: "read_file", args: { path: "big.txt" } }] },
+        { calls: [{ name: "read_file", args: { path: "big.txt", offset: 240 } }] },
+        { calls: [{ name: "read_file", args: { path: "big.txt", offset: 480 } }] },
+        { text: "read it" },
+      ],
+    });
+    const engine = engineAt(dir, url);
+    const events = await drain(engine.run("read the whole file", allowAll));
+
+    assert.ok(
+      !events.some((e) => e.kind === "info" && /pruned/.test(e.text)),
+      "pruned a part of the file that nothing had superseded",
+    );
+    const tools = events.filter((e): e is Extract<EngineEvent, { kind: "tool" }> => e.kind === "tool");
+    assert.ok(tools.every((t) => t.note !== "repeat"), "paging forward read as repetition");
+    // And a step back into what was already shown is caught, which is the
+    // other half of the same rule.
+    assert.equal(tools.length, 3);
+  });
+
   it("can read a file bigger than one tool result, a part at a time", async () => {
     // Before paging there was no way to see past the first 2KB of a file, so a
     // model that needed more had exactly one move: ask again, and get the same

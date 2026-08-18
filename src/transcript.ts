@@ -262,31 +262,53 @@ export class Transcript {
    */
   elideSupersededReads(): { elided: number; tokensSaved: number } {
     const supersededBy = new Map<number, string>();
+    /**
+     * Reads still worth keeping, keyed by the exact window they returned.
+     *
+     * Keyed by window and not by path, which is the whole lesson of a session
+     * that spent 661k tokens and thirteen minutes going nowhere. Long files
+     * arrive in parts, so lines 401-440 of a file do not supersede lines 1-40
+     * of it — they complete them. Path-keyed elision treated every page as a
+     * replacement for the last, deleted what the model had just read, and sent
+     * it back to read the same file again, forever. Two features that were
+     * each correct alone.
+     */
     const lastRead = new Map<string, number>();
+    /** Every live read of a path, so a write can invalidate all of them. */
+    const readsOf = new Map<string, string[]>();
 
     for (let i = 0; i < this.working.length; i++) {
       const m = this.working[i];
       for (const call of m.tool_calls ?? []) {
-        let path = "";
+        let args: Record<string, unknown> = {};
         try {
-          path = String(
-            (JSON.parse(call.function.arguments || "{}") as { path?: unknown }).path ?? "",
-          );
+          args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
         } catch {
           continue;
         }
+        const path = String(args.path ?? "");
         if (!path) continue;
 
         if (call.function.name === "read_file") {
-          const prior = lastRead.get(path);
+          // Identical arguments return identical bytes; anything else is a
+          // different part of the file and stands on its own.
+          const window = `${path}@${Number(args.offset ?? 0)}+${String(args.limit ?? "all")}`;
+          const prior = lastRead.get(window);
           if (prior !== undefined) supersededBy.set(prior, `re-read at step ${i}`);
-          lastRead.set(path, i);
+          lastRead.set(window, i);
+          const windows = readsOf.get(path) ?? [];
+          if (!windows.includes(window)) windows.push(window);
+          readsOf.set(path, windows);
         } else if (call.function.name === "write_file" || call.function.name === "edit_file") {
-          // A surgical edit invalidates a read exactly as a rewrite does: what
-          // is in context is no longer what is on disk.
-          const prior = lastRead.get(path);
-          if (prior !== undefined) supersededBy.set(prior, `changed at step ${i}`);
-          lastRead.delete(path);
+          // A change to the file invalidates every part of it that was read,
+          // whichever window it came from: what is in context is no longer
+          // what is on disk.
+          for (const window of readsOf.get(path) ?? []) {
+            const prior = lastRead.get(window);
+            if (prior !== undefined) supersededBy.set(prior, `changed at step ${i}`);
+            lastRead.delete(window);
+          }
+          readsOf.delete(path);
         }
       }
     }
