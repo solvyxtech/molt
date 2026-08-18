@@ -15,6 +15,7 @@ import { Archive } from "../src/archive.js";
 import { loadBar, writeDefaultBar } from "../src/bar.js";
 import { Engine } from "../src/engine.js";
 import { Receipts } from "../src/receipts.js";
+import type { EngineEvent } from "../src/types.js";
 import { allowAll, denyAll, drain, kinds, workspace } from "./helpers.js";
 
 type Turn = { text: string } | { calls: { name: string; args: Record<string, unknown> }[] };
@@ -160,7 +161,7 @@ describe("over a real socket", () => {
     }[]) {
       assert.equal(body.model, "mock-model");
       assert.equal(body.tool_choice, "auto");
-      assert.equal(body.tools.length, 3);
+      assert.equal(body.tools.length, 6);
       for (const m of body.messages) {
         assert.ok(!("molt" in m), "internal metadata must never reach a provider");
         assert.ok(["system", "user", "assistant", "tool"].includes(String(m.role)));
@@ -269,12 +270,147 @@ describe("over a real socket", () => {
       turns: [{ calls: [{ name: "bash", args: { command: "echo loop" } }] }],
     });
     const engine = engineAt(dir, url);
-    engine.setBudget(600); // each mocked turn reports 290 tokens
+    // Each mocked turn reports 290 tokens. 400 stops it on the third check,
+    // before the no-progress guard has seen two dry steps — the two limits are
+    // independent and both have to work.
+    engine.setBudget(400);
 
     const events = await drain(engine.run("spin", allowAll));
     const err = events.find((e) => e.kind === "error") as { text: string } | undefined;
-    assert.ok(err && /budget hit/.test(err.text));
-    assert.ok(received.length <= 4, `budget should cap requests, saw ${received.length}`);
+    assert.ok(err && /budget hit/.test(err.text), `wrong stop: ${err?.text}`);
+    assert.ok(received.length <= 3, `budget should cap requests, saw ${received.length}`);
+  });
+
+  it("stops a model that keeps asking a question it has already answered", async () => {
+    // The reported failure: thirty steps of re-reading the same four files,
+    // stopped only by the step guard, at a real cost of about fifty cents.
+    const dir = ws();
+    writeDefaultBar(dir);
+    writeFileSync(join(dir, "notes.md"), "the same content every time\n");
+    const { url, received } = await mockProvider({
+      turns: [{ calls: [{ name: "read_file", args: { path: "notes.md" } }] }],
+    });
+    const engine = engineAt(dir, url);
+
+    const events = await drain(engine.run("study the notes", allowAll));
+    const err = events.find((e) => e.kind === "error") as { text: string } | undefined;
+
+    assert.ok(err && /repeating calls/.test(err.text), `wrong stop: ${err?.text}`);
+    assert.ok(
+      received.length <= 4,
+      `should stop within a few steps, not ${received.length} (the step guard is 32)`,
+    );
+    // The waste is named while it is happening, not only at the end.
+    assert.ok(events.some((e) => e.kind === "info" && /nothing new came back/.test(e.text)));
+  });
+
+  it("does not resend a result the model already has", async () => {
+    const dir = ws();
+    writeDefaultBar(dir);
+    writeFileSync(join(dir, "notes.md"), "x".repeat(1200) + "\n");
+    const { url } = await mockProvider({
+      turns: [{ calls: [{ name: "read_file", args: { path: "notes.md" } }] }],
+    });
+    const engine = engineAt(dir, url);
+    const events = await drain(engine.run("study the notes", allowAll));
+
+    const tools = events.filter((e): e is Extract<EngineEvent, { kind: "tool" }> => e.kind === "tool");
+    assert.ok(tools.length >= 2, "expected the model to repeat the call");
+    assert.equal(tools[0]!.note, undefined);
+    assert.equal(tools[1]!.note, "repeat", "resent the same payload instead of pointing at it");
+    // A pointer, not a payload: the second result is a fraction of the first.
+    assert.ok((tools[1]!.bytes ?? 0) < (tools[0]!.bytes ?? 0) / 3);
+  });
+
+  it("stops a model that walks the same file with shifted offsets", async () => {
+    // The 661,000-token failure, from the other side. Exact-match detection
+    // was defeated by asking for line 181 and then line 182 — almost the same
+    // bytes under a different key. Coverage answers the question that matters:
+    // has this already been shown?
+    const dir = ws();
+    writeDefaultBar(dir);
+    writeFileSync(join(dir, "big.txt"), Array.from({ length: 300 }, (_, i) => `line ${i}`).join("\n"));
+    let n = 0;
+    const { url, received } = await mockProvider({
+      turns: Array.from({ length: 8 }, () => ({
+        // Each turn asks for a window inside what it has already been shown.
+        calls: [{ name: "read_file", args: { path: "big.txt", offset: (n += 1) } }],
+      })),
+    });
+    const engine = engineAt(dir, url);
+    const events = await drain(engine.run("study it", allowAll));
+
+    const err = events.find((e) => e.kind === "error") as { text: string } | undefined;
+    assert.ok(err && /repeating calls|already/.test(err.text), `wrong stop: ${err?.text}`);
+    assert.ok(received.length <= 5, `should stop early, not after ${received.length} steps`);
+    const tools = events.filter((e): e is Extract<EngineEvent, { kind: "tool" }> => e.kind === "tool");
+    assert.ok(
+      tools.some((t) => t.note === "repeat"),
+      "a shifted offset walked straight past the guard",
+    );
+  });
+
+  it("keeps every part of a file it was shown, so it never re-reads one", async () => {
+    // Elision was keyed on the path, so page two deleted page one and the
+    // model had to fetch it again — forever.
+    const dir = ws();
+    writeDefaultBar(dir);
+    // 1000 lines at ~68 bytes each: a 16KB part is roughly 230 lines, so these
+    // offsets walk forward without ever re-asking for a line already shown.
+    writeFileSync(join(dir, "big.txt"), Array.from({ length: 1000 }, (_, i) => `line ${i} ${"y".repeat(60)}`).join("\n"));
+    const { url } = await mockProvider({
+      turns: [
+        { calls: [{ name: "read_file", args: { path: "big.txt" } }] },
+        { calls: [{ name: "read_file", args: { path: "big.txt", offset: 240 } }] },
+        { calls: [{ name: "read_file", args: { path: "big.txt", offset: 480 } }] },
+        { text: "read it" },
+      ],
+    });
+    const engine = engineAt(dir, url);
+    const events = await drain(engine.run("read the whole file", allowAll));
+
+    assert.ok(
+      !events.some((e) => e.kind === "info" && /pruned/.test(e.text)),
+      "pruned a part of the file that nothing had superseded",
+    );
+    const tools = events.filter((e): e is Extract<EngineEvent, { kind: "tool" }> => e.kind === "tool");
+    assert.ok(tools.every((t) => t.note !== "repeat"), "paging forward read as repetition");
+    // And a step back into what was already shown is caught, which is the
+    // other half of the same rule.
+    assert.equal(tools.length, 3);
+  });
+
+  it("can read a file bigger than one tool result, a part at a time", async () => {
+    // Before paging there was no way to see past the first 2KB of a file, so a
+    // model that needed more had exactly one move: ask again, and get the same
+    // 2KB back. The dead end was the loop.
+    const dir = ws();
+    writeDefaultBar(dir);
+    // 400 lines plus a trailing newline: the terminator must not be counted as
+    // a 401st line, or every offset molt hands back is one past what it means.
+    const lines = Array.from({ length: 400 }, (_, i) => `line ${i} ${"y".repeat(40)}`);
+    writeFileSync(join(dir, "big.txt"), lines.join("\n") + "\n");
+    const { url } = await mockProvider({
+      turns: [
+        { calls: [{ name: "read_file", args: { path: "big.txt" } }] },
+        { calls: [{ name: "read_file", args: { path: "big.txt", offset: 40 } }] },
+        { text: "read it" },
+      ],
+    });
+    const engine = engineAt(dir, url);
+    const events = await drain(engine.run("read the file", allowAll));
+    const tools = events.filter((e): e is Extract<EngineEvent, { kind: "tool" }> => e.kind === "tool");
+
+    // The first part says where it stops and how to continue — and the notice
+    // survives the byte cap, which it did not in the first version: it was
+    // appended after the budget was spent, so truncation cut off the one
+    // sentence that told the model how to get the rest.
+    assert.match(tools[0]!.preview ?? "", /lines 1-\d+ of 400/);
+    assert.ok(!/capped/.test(tools[0]!.note ?? ""), `part was double-truncated: ${tools[0]!.note}`);
+    assert.ok(!/repeat/.test(tools[1]!.note ?? ""), "a later part must not read as a repeat");
+    const second = tools[1]!.preview ?? "";
+    assert.match(second, /lines 41-/, "offset did not move the window");
+    assert.ok(!second.includes("line 0 "), "the second part repeated the first");
   });
 
   it("proves work that was shed out of context forty turns ago", async () => {
@@ -287,7 +423,7 @@ describe("over a real socket", () => {
     const { url } = await mockProvider({
       turns: [
         { calls: [{ name: "write_file", args: { path: "early.ts", content: "export const early = 1;\n" } }] },
-        ...Array.from({ length: 10 }, () => ({ calls: [{ name: "bash", args: { command: `echo ${filler}` } }] })),
+        ...Array.from({ length: 10 }, (_, i) => ({ calls: [{ name: "bash", args: { command: `echo ${i} ${filler}` } }] })),
         { text: "Everything is in place." },
       ],
     });

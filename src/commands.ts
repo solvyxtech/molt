@@ -27,6 +27,12 @@ export type Command = {
 
 export const COMMANDS: Command[] = [
   { name: "/help", summary: "list every command" },
+  {
+    name: "/ask",
+    args: "<question>",
+    summary: "a question, not a change (or start a line with ?)",
+    aliases: ["question", "lookup", "read-only"],
+  },
   { name: "/prove", summary: "run the bar now, without the model" },
   { name: "/bar", summary: "show the checks this project requires" },
   { name: "/init", summary: "write a starter .molt/done.yml" },
@@ -37,7 +43,24 @@ export const COMMANDS: Command[] = [
   { name: "/archive", args: "[pattern]", summary: "list or search shed batches", aliases: ["exuviae"] },
   { name: "/bom", summary: "context bill of materials, in tokens" },
   { name: "/wire", summary: "exact JSON of the last request" },
-  { name: "/budget", args: "<n|off>", summary: "hard token ceiling for this session", aliases: ["tokens", "cost"] },
+  { name: "/budget", args: "<n|off>", summary: "hard token ceiling for this session", aliases: ["tokens"] },
+  {
+    name: "/autonomy",
+    args: "[low|medium|high]",
+    summary: "how much molt does without asking (shift+A)",
+    aliases: ["auto", "permissions", "yes", "approve"],
+  },
+  {
+    name: "/verbose",
+    summary: "watch every call, argument, and result (shift+V)",
+    aliases: ["detail", "transparency", "watch", "view"],
+  },
+  {
+    name: "/price",
+    args: "[<in> <out>|refresh|off]",
+    summary: "what this model costs, per 1M tokens",
+    aliases: ["cost", "rate", "pricing"],
+  },
   {
     name: "/login",
     args: "[provider]",

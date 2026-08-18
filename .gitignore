@@ -6,6 +6,7 @@ dist-test/
 # molt's own session artifacts
 .molt/exuviae/
 .molt/receipts/
+.molt/log/
 
 .DS_Store
 *.log

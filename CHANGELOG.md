@@ -1,5 +1,223 @@
 # Changelog
 
+## 1.0.0-rc.4 — the meter says what it knows, and you set the ceiling
+
+The status line quoted a cost to six decimal places from a price nobody had
+checked, and the TUI showed a spinner where the work was. Both are the same
+failure in a tool whose whole claim is that nothing has to be taken on trust:
+a number presented with more confidence than it was earned with.
+
+### Added
+
+- **Advisory checks.** `advisory: true` on a check in `done.yml` makes a failure
+  information rather than a refusal: it runs, it is reported as `warn`, it is
+  recorded in the receipt, and it does not block a completion. Not every
+  condition worth running is worth refusing over — treating a linter's opinion
+  as a broken contract teaches people to delete the check instead of reading it.
+- **Credentials are masked before anything is written.** The journal already
+  refused to log message content for this reason, and then logged
+  `curl -H "authorization: Bearer sk-live-…"` verbatim in a tool call's detail.
+  Values molt actually holds (the session key) are masked exactly; provider key
+  shapes, bearer headers, private-key blocks, and assignments to something named
+  "secret" are masked by pattern, keeping the field name so the record still
+  says *what* was hidden. Receipts are filtered the same way, because a receipt
+  is a document you hand to someone who does not trust you.
+- **Cost in the record.** Receipts carry what the session had spent when the
+  claim was made, and `molt stats` reports **cost per verified change** beside
+  tokens per verified change — the number molt's own pitch stands or falls by.
+- **A standing probe suite for the autonomy classifier** (81 cases × 8
+  shell variations). Every hole this classifier has had was found by running
+  commands against it, never by reading it, so the probing is now a test that
+  runs in CI.
+- **`list_dir`, `grep`, and `edit_file`.** Three tools became six, which is a
+  change to a stated design rule and so needs its reason in the open: `ls`
+  through `bash` is a string the autonomy classifier has to reason about, and an
+  unfamiliar construction sends it to a prompt — in one real session, a model
+  that could not list a directory started guessing filenames. A tool with no
+  write in it needs no classifier and is never gated at any level; safety by
+  shape beats safety by regex.
+
+  `list_dir` and `grep` skip build and dependency directories (saying which),
+  cap their own output, and refuse to walk outside the project. `edit_file`
+  replaces exact text and refuses rather than guesses: absent text fails, and
+  text appearing more than once fails without `replace_all`, because a write
+  that lands on the wrong occurrence looks exactly like a write that worked.
+  Edits are ledgered like any other write, so `files-changed` and
+  `record-intact` prove them, and a superseded read is elided the same way.
+- **Autonomy levels — `shift+A`.** low (default) asks about every command and
+  every write, as before; medium runs reads, writes inside the project, and
+  commands that only report; high runs everything except what cannot be undone.
+  The level sits beside the model in the status line the whole time it is in
+  force, and is also `/autonomy [level]` or `--autonomy <level>`. `--yes` now
+  means high.
+
+  The key works everywhere, but not identically: at an empty prompt it opens a
+  picker that changes nothing until you confirm — a terminal cannot tell
+  `shift+A` from the `A` that starts "Add a test", and a permission ceiling
+  must not move on a typo; escape gives the letter back. While molt is working,
+  or while it is asking permission, it cycles immediately.
+
+  The classifier is mechanical and denies by default: a short allowlist of
+  reporting commands, judged segment by segment, with redirection, command
+  substitution, leading assignments, and `sudo` disqualified because their
+  effect is not readable from the text. Leaving the project and anything
+  irreversible (`rm -rf`, `git push`, `git reset --hard`, piping a download
+  into a shell, …) ask at every level, including high. Unasked calls are marked
+  `[auto]` on screen and journalled with the level that allowed them, and
+  moving the ceiling is journalled too. It governs what molt asks about, not
+  what is possible — see `docs/autonomy.md`.
+- **The live view — press `shift+V`** while a turn is running (`ctrl+V` any
+  time, or `/verbose`). A bounded panel showing what the model is doing right now, the
+  exact arguments of every tool call, the head of every result, each check's
+  command and duration, and what every job has cost. Feed lines are recorded
+  whether or not the view is open, so the key reveals what already happened
+  rather than starting a recording. Verbatim throughout — a view that
+  paraphrases is one more claim to check.
+- **Per-job accounting.** Every user turn is a job with its own tokens, cost,
+  step count, duration, and outcome (`verified`, `unverified`, `not proven`,
+  `cancelled`), measured as a delta against the session meter rather than by
+  resetting it. Shown in the view, and printed headlessly at the end of a run.
+- **A one-line overview after every step and every verification.** `step 2 ·
+  read_file, bash · 3.4k in (2.1k cached) · 412 out · 6.2s · 0.31¢`, and
+  `2 of 3 checks passed · 4.1s · failed: tests` followed by what happens next.
+  Printed headlessly too, so a CI log records what a run cost step by step.
+- **Prices read from the provider.** `fetchPricing` asks the endpoint that
+  will do the billing (xAI's `/language-models`, OpenRouter's `/models`) and
+  stamps the result with the model it belongs to. `/price` shows the rate and
+  its source, sets one by hand for endpoints that publish none, and `--verbose`
+  is the headless equivalent of the view.
+- **Cached prompt tokens are counted and billed at the cache rate** when the
+  provider publishes one, instead of at the full prompt rate.
+- **Provider-reported cost is used when there is one** (OpenRouter's
+  `usage.cost`), and only when *every* step reported one — a total that blends
+  a billed step with a priced one is neither figure.
+
+- **`/ask`, and a leading `?`.** A question changes nothing, so a bar that
+  requires a change can only ever refuse it — and molt would rather refuse an
+  honest answer than accept an invented file edit. Asking runs the rest of the
+  bar and drops only the checks that need a write, says which it dropped, and
+  records it in the receipt. `molt ask "<question>"` headlessly.
+
+  molt does not infer this. The only party that knows whether "done" meant a
+  change is the person who asked, and the only other candidate — letting the
+  model decide whether its own claim needs proving — is the decision the whole
+  tool exists to take away from it.
+
+### Fixed
+
+- **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
+  on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
+  deleted what the model had just read, and the model went back to read it
+  again. Every step, for thirteen minutes, at $0.93, with no answer. Two
+  features that were each correct alone. Elision now keys on the exact window,
+  and a write still invalidates every part of that file.
+- **Shifted offsets walked past the repeat guard.** Asking for line 181 and then
+  line 182 returns almost the same bytes under a different key, so exact-match
+  detection saw nothing. molt now tracks which lines of which file it has
+  already shown, and a request inside that coverage gets a pointer. The
+  no-progress stop now triggers on a majority of repeats rather than requiring
+  every call in a step to be one.
+- **A stopped turn threw away everything it had paid for.** The step guard, the
+  budget, the turn ceiling, and the no-progress stop all ended a turn with
+  nothing — maximum cost, zero value. A stopped turn now gets one final request
+  with tools disabled, asking for what was found and what could not be
+  determined. That answer is explicitly **not** run through the bar and is
+  labelled as notes rather than a completed task, because presenting it as
+  verified would be the lie this tool exists to refuse.
+- **A per-turn token ceiling** (200k, `/budget` to change) and **shedding on by
+  default** (60k of history). Both existed as options nobody set; the runaway
+  session had neither.
+- **`git stash`, `git config`, and `git tag` were classified read-only** and ran
+  unattended at medium — bare `git stash` moves the working tree, `git config`
+  writes a file, `git tag` creates a ref. Found by a model reading the list and
+  saying so.
+- **`claimedWrites` ignored `edit_file`**, so a session whose edits all failed
+  reported "no file was modified" rather than naming the edits that did not
+  land: a correct refusal with a misleading reason.
+- **An unrecognised tool ran unattended at `high`**, which contradicted the
+  deny-by-default rule stated at the top of the classifier. A level written
+  today cannot consent to a tool added tomorrow; unknown tools now ask at every
+  level. Found by the probe suite on its first run.
+- **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
+  `docs/autonomy.md` both said it ran "everything except what cannot be undone".
+  The deny-list required a flag on `rm`, so deleting one named file was not on
+  it — and neither were `find -exec`, `find -delete`, `truncate`, `tee`, `>`
+  redirection to a path, `git checkout -- `, `git restore`, `git rebase`, or
+  `git stash drop`. All now ask at every level. The documented promise is now
+  "a named list", which is what the code actually implements: found by probing
+  the classifier, which is the only way this kind of gap is found.
+- **A large file could not be read at all, and the dead end looked like a
+  model looping.** `read_file` took a path and nothing else, and every result
+  was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
+  had no mechanism whatsoever to reach the rest. Its only available move was to
+  call `read_file` again and receive the same 2KB. A reported session spent 32
+  steps re-reading four files, was stopped by the step guard, produced no
+  answer, and cost about fifty cents.
+
+  Four changes, each of which was necessary:
+  - `read_file` takes `offset` and `limit`, and a partial result says how many
+    lines remain and the offset that continues it. The dead end becomes a path.
+  - The notice saying how to continue is budgeted *inside* the byte cap. The
+    first version appended it afterwards, so truncation cut off the one
+    sentence that told the model how to proceed — the same dead end, rebuilt
+    one layer up.
+  - Caps are sized per kind of result: 16KB for a file, 8KB for command
+    output. At 2048 bytes for everything, paging through a README took nine
+    round trips, and each round trip resent the whole conversation — the tight
+    cap cost far more tokens than the large read it was avoiding.
+  - A repeated call that returns byte-identical output gets a pointer to the
+    earlier result instead of the payload, and two consecutive steps of nothing
+    but repeats stops the turn with what it spent. The step guard now reports
+    tokens and cost too, rather than a bare "loop guard".
+
+  The same request now finishes in 6 steps for $0.086, verified, instead of 32
+  steps and no answer.
+- **The elision notice invited the loop it was part of.** A superseded read was
+  replaced with "full contents remain in the archived record", which reads to a
+  model as an instruction to go and get them — possible only by re-reading the
+  file. It now points at the newer copy already in the conversation.
+- **`2>/dev/null` counted as a file write**, so ordinary exploration
+  (`ls -la .molt 2>/dev/null`) was refused at medium autonomy and a model that
+  could not list a directory guessed filenames instead. Discards and
+  descriptor redirections are allowed; redirection to a path still asks.
+- **The proof loop re-ran the bar against state nothing had touched.** A model
+  that repeated its claim without calling a tool got the full four attempts,
+  each paying for a complete test suite, and each necessarily reaching the
+  same verdict. molt now stops as soon as an attempt cannot differ from the
+  last, says why, and still writes the receipt. Reported from the field as a
+  loop when asking questions in a repo whose bar requires a write.
+
+- **Streaming responses carry no usage block unless asked, so every cost was a
+  guess.** molt now sends `stream_options: {include_usage: true}` and falls
+  back once, permanently, for servers that reject the field. Streaming is the
+  default, so this was the default path: token counts came from `chars/4` over
+  the wire JSON while the meter rendered them like measurements.
+- **A stored price with no model attached was applied to every model.** The
+  shipped config carried `priceIn`/`priceOut` and nothing saying what they were
+  for; a figure entered once — off by a factor of a hundred, in the case that
+  prompted this — was then used forever, and survived every model switch.
+  Unattributed prices are now re-fetched rather than trusted.
+- **Sub-cent costs rendered as `$0.000024`** — six digits to count in the one
+  field that has to be legible at a glance. Cost is now three decimals at the
+  most (`$0.003`), with `<$0.001` below that rather than a false zero, and a
+  cost resting on molt's own token estimate is prefixed `~` so a guess and a
+  bill do not look alike.
+- **The meter changed unit as it climbed.** Quoting small sums in cents made
+  the session total read `0.9¢` and then `$0.029` — which looks like it went
+  down. Cost is always in dollars now; only the decimals move.
+- **The TUI redrew the entire session on every frame.** A terminal can only
+  erase what is still on screen, so once the output was taller than the window
+  the transcript tore and duplicated — and the more molt had to say, the worse
+  it got. The transcript is now printed once and never redrawn, and every live
+  region (the view, a streaming answer) is bounded and fitted to the window
+  width.
+- **`pruned N superseded tool result(s) · −-17 tokens`.** Eliding a result
+  shorter than the notice explaining its absence dropped content *and* grew
+  the context. Such results are now left alone.
+- **The session meter was not reset by `/clear`.** Token totals and cost
+  carried across a reset session.
+- **Headless output ran the model's last streamed word into molt's next line.**
+
 ## 1.0.0-rc.3 — the archive earns its claim
 
 An audit found that "verification runs against preserved history" was
@@ -30,7 +248,100 @@ claim literally true.
   evidence to lose.** Shedding must shrink context, never the ability to
   prove what happened.
 
+- **`/ask`, and a leading `?`.** A question changes nothing, so a bar that
+  requires a change can only ever refuse it — and molt would rather refuse an
+  honest answer than accept an invented file edit. Asking runs the rest of the
+  bar and drops only the checks that need a write, says which it dropped, and
+  records it in the receipt. `molt ask "<question>"` headlessly.
+
+  molt does not infer this. The only party that knows whether "done" meant a
+  change is the person who asked, and the only other candidate — letting the
+  model decide whether its own claim needs proving — is the decision the whole
+  tool exists to take away from it.
+
 ### Fixed
+
+- **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
+  on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
+  deleted what the model had just read, and the model went back to read it
+  again. Every step, for thirteen minutes, at $0.93, with no answer. Two
+  features that were each correct alone. Elision now keys on the exact window,
+  and a write still invalidates every part of that file.
+- **Shifted offsets walked past the repeat guard.** Asking for line 181 and then
+  line 182 returns almost the same bytes under a different key, so exact-match
+  detection saw nothing. molt now tracks which lines of which file it has
+  already shown, and a request inside that coverage gets a pointer. The
+  no-progress stop now triggers on a majority of repeats rather than requiring
+  every call in a step to be one.
+- **A stopped turn threw away everything it had paid for.** The step guard, the
+  budget, the turn ceiling, and the no-progress stop all ended a turn with
+  nothing — maximum cost, zero value. A stopped turn now gets one final request
+  with tools disabled, asking for what was found and what could not be
+  determined. That answer is explicitly **not** run through the bar and is
+  labelled as notes rather than a completed task, because presenting it as
+  verified would be the lie this tool exists to refuse.
+- **A per-turn token ceiling** (200k, `/budget` to change) and **shedding on by
+  default** (60k of history). Both existed as options nobody set; the runaway
+  session had neither.
+- **`git stash`, `git config`, and `git tag` were classified read-only** and ran
+  unattended at medium — bare `git stash` moves the working tree, `git config`
+  writes a file, `git tag` creates a ref. Found by a model reading the list and
+  saying so.
+- **`claimedWrites` ignored `edit_file`**, so a session whose edits all failed
+  reported "no file was modified" rather than naming the edits that did not
+  land: a correct refusal with a misleading reason.
+- **An unrecognised tool ran unattended at `high`**, which contradicted the
+  deny-by-default rule stated at the top of the classifier. A level written
+  today cannot consent to a tool added tomorrow; unknown tools now ask at every
+  level. Found by the probe suite on its first run.
+- **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
+  `docs/autonomy.md` both said it ran "everything except what cannot be undone".
+  The deny-list required a flag on `rm`, so deleting one named file was not on
+  it — and neither were `find -exec`, `find -delete`, `truncate`, `tee`, `>`
+  redirection to a path, `git checkout -- `, `git restore`, `git rebase`, or
+  `git stash drop`. All now ask at every level. The documented promise is now
+  "a named list", which is what the code actually implements: found by probing
+  the classifier, which is the only way this kind of gap is found.
+- **A large file could not be read at all, and the dead end looked like a
+  model looping.** `read_file` took a path and nothing else, and every result
+  was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
+  had no mechanism whatsoever to reach the rest. Its only available move was to
+  call `read_file` again and receive the same 2KB. A reported session spent 32
+  steps re-reading four files, was stopped by the step guard, produced no
+  answer, and cost about fifty cents.
+
+  Four changes, each of which was necessary:
+  - `read_file` takes `offset` and `limit`, and a partial result says how many
+    lines remain and the offset that continues it. The dead end becomes a path.
+  - The notice saying how to continue is budgeted *inside* the byte cap. The
+    first version appended it afterwards, so truncation cut off the one
+    sentence that told the model how to proceed — the same dead end, rebuilt
+    one layer up.
+  - Caps are sized per kind of result: 16KB for a file, 8KB for command
+    output. At 2048 bytes for everything, paging through a README took nine
+    round trips, and each round trip resent the whole conversation — the tight
+    cap cost far more tokens than the large read it was avoiding.
+  - A repeated call that returns byte-identical output gets a pointer to the
+    earlier result instead of the payload, and two consecutive steps of nothing
+    but repeats stops the turn with what it spent. The step guard now reports
+    tokens and cost too, rather than a bare "loop guard".
+
+  The same request now finishes in 6 steps for $0.086, verified, instead of 32
+  steps and no answer.
+- **The elision notice invited the loop it was part of.** A superseded read was
+  replaced with "full contents remain in the archived record", which reads to a
+  model as an instruction to go and get them — possible only by re-reading the
+  file. It now points at the newer copy already in the conversation.
+- **`2>/dev/null` counted as a file write**, so ordinary exploration
+  (`ls -la .molt 2>/dev/null`) was refused at medium autonomy and a model that
+  could not list a directory guessed filenames instead. Discards and
+  descriptor redirections are allowed; redirection to a path still asks.
+- **The proof loop re-ran the bar against state nothing had touched.** A model
+  that repeated its claim without calling a tool got the full four attempts,
+  each paying for a complete test suite, and each necessarily reaching the
+  same verdict. molt now stops as soon as an attempt cannot differ from the
+  last, says why, and still writes the receipt. Reported from the field as a
+  loop when asking questions in a repo whose bar requires a write.
 
 - **`record-intact` broke every reopened project.** It required the archive to
   hold exactly what the current session shed, but the archive is per project
@@ -113,7 +424,100 @@ artifact molt cannot silently edit.
 - **`docs/transparency.md`** — what is recorded, what is deliberately not,
   and how to reconstruct any claim end to end.
 
+- **`/ask`, and a leading `?`.** A question changes nothing, so a bar that
+  requires a change can only ever refuse it — and molt would rather refuse an
+  honest answer than accept an invented file edit. Asking runs the rest of the
+  bar and drops only the checks that need a write, says which it dropped, and
+  records it in the receipt. `molt ask "<question>"` headlessly.
+
+  molt does not infer this. The only party that knows whether "done" meant a
+  change is the person who asked, and the only other candidate — letting the
+  model decide whether its own claim needs proving — is the decision the whole
+  tool exists to take away from it.
+
 ### Fixed
+
+- **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
+  on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
+  deleted what the model had just read, and the model went back to read it
+  again. Every step, for thirteen minutes, at $0.93, with no answer. Two
+  features that were each correct alone. Elision now keys on the exact window,
+  and a write still invalidates every part of that file.
+- **Shifted offsets walked past the repeat guard.** Asking for line 181 and then
+  line 182 returns almost the same bytes under a different key, so exact-match
+  detection saw nothing. molt now tracks which lines of which file it has
+  already shown, and a request inside that coverage gets a pointer. The
+  no-progress stop now triggers on a majority of repeats rather than requiring
+  every call in a step to be one.
+- **A stopped turn threw away everything it had paid for.** The step guard, the
+  budget, the turn ceiling, and the no-progress stop all ended a turn with
+  nothing — maximum cost, zero value. A stopped turn now gets one final request
+  with tools disabled, asking for what was found and what could not be
+  determined. That answer is explicitly **not** run through the bar and is
+  labelled as notes rather than a completed task, because presenting it as
+  verified would be the lie this tool exists to refuse.
+- **A per-turn token ceiling** (200k, `/budget` to change) and **shedding on by
+  default** (60k of history). Both existed as options nobody set; the runaway
+  session had neither.
+- **`git stash`, `git config`, and `git tag` were classified read-only** and ran
+  unattended at medium — bare `git stash` moves the working tree, `git config`
+  writes a file, `git tag` creates a ref. Found by a model reading the list and
+  saying so.
+- **`claimedWrites` ignored `edit_file`**, so a session whose edits all failed
+  reported "no file was modified" rather than naming the edits that did not
+  land: a correct refusal with a misleading reason.
+- **An unrecognised tool ran unattended at `high`**, which contradicted the
+  deny-by-default rule stated at the top of the classifier. A level written
+  today cannot consent to a tool added tomorrow; unknown tools now ask at every
+  level. Found by the probe suite on its first run.
+- **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
+  `docs/autonomy.md` both said it ran "everything except what cannot be undone".
+  The deny-list required a flag on `rm`, so deleting one named file was not on
+  it — and neither were `find -exec`, `find -delete`, `truncate`, `tee`, `>`
+  redirection to a path, `git checkout -- `, `git restore`, `git rebase`, or
+  `git stash drop`. All now ask at every level. The documented promise is now
+  "a named list", which is what the code actually implements: found by probing
+  the classifier, which is the only way this kind of gap is found.
+- **A large file could not be read at all, and the dead end looked like a
+  model looping.** `read_file` took a path and nothing else, and every result
+  was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
+  had no mechanism whatsoever to reach the rest. Its only available move was to
+  call `read_file` again and receive the same 2KB. A reported session spent 32
+  steps re-reading four files, was stopped by the step guard, produced no
+  answer, and cost about fifty cents.
+
+  Four changes, each of which was necessary:
+  - `read_file` takes `offset` and `limit`, and a partial result says how many
+    lines remain and the offset that continues it. The dead end becomes a path.
+  - The notice saying how to continue is budgeted *inside* the byte cap. The
+    first version appended it afterwards, so truncation cut off the one
+    sentence that told the model how to proceed — the same dead end, rebuilt
+    one layer up.
+  - Caps are sized per kind of result: 16KB for a file, 8KB for command
+    output. At 2048 bytes for everything, paging through a README took nine
+    round trips, and each round trip resent the whole conversation — the tight
+    cap cost far more tokens than the large read it was avoiding.
+  - A repeated call that returns byte-identical output gets a pointer to the
+    earlier result instead of the payload, and two consecutive steps of nothing
+    but repeats stops the turn with what it spent. The step guard now reports
+    tokens and cost too, rather than a bare "loop guard".
+
+  The same request now finishes in 6 steps for $0.086, verified, instead of 32
+  steps and no answer.
+- **The elision notice invited the loop it was part of.** A superseded read was
+  replaced with "full contents remain in the archived record", which reads to a
+  model as an instruction to go and get them — possible only by re-reading the
+  file. It now points at the newer copy already in the conversation.
+- **`2>/dev/null` counted as a file write**, so ordinary exploration
+  (`ls -la .molt 2>/dev/null`) was refused at medium autonomy and a model that
+  could not list a directory guessed filenames instead. Discards and
+  descriptor redirections are allowed; redirection to a path still asks.
+- **The proof loop re-ran the bar against state nothing had touched.** A model
+  that repeated its claim without calling a tool got the full four attempts,
+  each paying for a complete test suite, and each necessarily reaching the
+  same verdict. molt now stops as soon as an attempt cannot differ from the
+  last, says why, and still writes the receipt. Reported from the field as a
+  loop when asking questions in a repo whose bar requires a write.
 
 - **"cancelled — the session is unchanged" was not literally true.** The user
   turn was pushed before the request, so a cancellation left it behind.
@@ -159,7 +563,100 @@ session. Shrinking them is a rounding error.
   replacement says plainly what happened. Mechanical, idempotent, and the
   full original stays in the archived record.
 
+- **`/ask`, and a leading `?`.** A question changes nothing, so a bar that
+  requires a change can only ever refuse it — and molt would rather refuse an
+  honest answer than accept an invented file edit. Asking runs the rest of the
+  bar and drops only the checks that need a write, says which it dropped, and
+  records it in the receipt. `molt ask "<question>"` headlessly.
+
+  molt does not infer this. The only party that knows whether "done" meant a
+  change is the person who asked, and the only other candidate — letting the
+  model decide whether its own claim needs proving — is the decision the whole
+  tool exists to take away from it.
+
 ### Fixed
+
+- **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
+  on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
+  deleted what the model had just read, and the model went back to read it
+  again. Every step, for thirteen minutes, at $0.93, with no answer. Two
+  features that were each correct alone. Elision now keys on the exact window,
+  and a write still invalidates every part of that file.
+- **Shifted offsets walked past the repeat guard.** Asking for line 181 and then
+  line 182 returns almost the same bytes under a different key, so exact-match
+  detection saw nothing. molt now tracks which lines of which file it has
+  already shown, and a request inside that coverage gets a pointer. The
+  no-progress stop now triggers on a majority of repeats rather than requiring
+  every call in a step to be one.
+- **A stopped turn threw away everything it had paid for.** The step guard, the
+  budget, the turn ceiling, and the no-progress stop all ended a turn with
+  nothing — maximum cost, zero value. A stopped turn now gets one final request
+  with tools disabled, asking for what was found and what could not be
+  determined. That answer is explicitly **not** run through the bar and is
+  labelled as notes rather than a completed task, because presenting it as
+  verified would be the lie this tool exists to refuse.
+- **A per-turn token ceiling** (200k, `/budget` to change) and **shedding on by
+  default** (60k of history). Both existed as options nobody set; the runaway
+  session had neither.
+- **`git stash`, `git config`, and `git tag` were classified read-only** and ran
+  unattended at medium — bare `git stash` moves the working tree, `git config`
+  writes a file, `git tag` creates a ref. Found by a model reading the list and
+  saying so.
+- **`claimedWrites` ignored `edit_file`**, so a session whose edits all failed
+  reported "no file was modified" rather than naming the edits that did not
+  land: a correct refusal with a misleading reason.
+- **An unrecognised tool ran unattended at `high`**, which contradicted the
+  deny-by-default rule stated at the top of the classifier. A level written
+  today cannot consent to a tool added tomorrow; unknown tools now ask at every
+  level. Found by the probe suite on its first run.
+- **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
+  `docs/autonomy.md` both said it ran "everything except what cannot be undone".
+  The deny-list required a flag on `rm`, so deleting one named file was not on
+  it — and neither were `find -exec`, `find -delete`, `truncate`, `tee`, `>`
+  redirection to a path, `git checkout -- `, `git restore`, `git rebase`, or
+  `git stash drop`. All now ask at every level. The documented promise is now
+  "a named list", which is what the code actually implements: found by probing
+  the classifier, which is the only way this kind of gap is found.
+- **A large file could not be read at all, and the dead end looked like a
+  model looping.** `read_file` took a path and nothing else, and every result
+  was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
+  had no mechanism whatsoever to reach the rest. Its only available move was to
+  call `read_file` again and receive the same 2KB. A reported session spent 32
+  steps re-reading four files, was stopped by the step guard, produced no
+  answer, and cost about fifty cents.
+
+  Four changes, each of which was necessary:
+  - `read_file` takes `offset` and `limit`, and a partial result says how many
+    lines remain and the offset that continues it. The dead end becomes a path.
+  - The notice saying how to continue is budgeted *inside* the byte cap. The
+    first version appended it afterwards, so truncation cut off the one
+    sentence that told the model how to proceed — the same dead end, rebuilt
+    one layer up.
+  - Caps are sized per kind of result: 16KB for a file, 8KB for command
+    output. At 2048 bytes for everything, paging through a README took nine
+    round trips, and each round trip resent the whole conversation — the tight
+    cap cost far more tokens than the large read it was avoiding.
+  - A repeated call that returns byte-identical output gets a pointer to the
+    earlier result instead of the payload, and two consecutive steps of nothing
+    but repeats stops the turn with what it spent. The step guard now reports
+    tokens and cost too, rather than a bare "loop guard".
+
+  The same request now finishes in 6 steps for $0.086, verified, instead of 32
+  steps and no answer.
+- **The elision notice invited the loop it was part of.** A superseded read was
+  replaced with "full contents remain in the archived record", which reads to a
+  model as an instruction to go and get them — possible only by re-reading the
+  file. It now points at the newer copy already in the conversation.
+- **`2>/dev/null` counted as a file write**, so ordinary exploration
+  (`ls -la .molt 2>/dev/null`) was refused at medium autonomy and a model that
+  could not list a directory guessed filenames instead. Discards and
+  descriptor redirections are allowed; redirection to a path still asks.
+- **The proof loop re-ran the bar against state nothing had touched.** A model
+  that repeated its claim without calling a tool got the full four attempts,
+  each paying for a complete test suite, and each necessarily reaching the
+  same verdict. molt now stops as soon as an attempt cannot differ from the
+  last, says why, and still writes the receipt. Reported from the field as a
+  loop when asking questions in a repo whose bar requires a write.
 
 - **Stale bar failures were carried forever.** Each refusal appended a full
   failure message that was resent on every subsequent request, so attempt 3
@@ -207,7 +704,100 @@ against a real provider before behaviour changes.
   splitting tool arguments at an inconvenient boundary, so the demo and the
   grader exercise the streaming path rather than only the JSON one.
 
+- **`/ask`, and a leading `?`.** A question changes nothing, so a bar that
+  requires a change can only ever refuse it — and molt would rather refuse an
+  honest answer than accept an invented file edit. Asking runs the rest of the
+  bar and drops only the checks that need a write, says which it dropped, and
+  records it in the receipt. `molt ask "<question>"` headlessly.
+
+  molt does not infer this. The only party that knows whether "done" meant a
+  change is the person who asked, and the only other candidate — letting the
+  model decide whether its own claim needs proving — is the decision the whole
+  tool exists to take away from it.
+
 ### Fixed
+
+- **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
+  on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
+  deleted what the model had just read, and the model went back to read it
+  again. Every step, for thirteen minutes, at $0.93, with no answer. Two
+  features that were each correct alone. Elision now keys on the exact window,
+  and a write still invalidates every part of that file.
+- **Shifted offsets walked past the repeat guard.** Asking for line 181 and then
+  line 182 returns almost the same bytes under a different key, so exact-match
+  detection saw nothing. molt now tracks which lines of which file it has
+  already shown, and a request inside that coverage gets a pointer. The
+  no-progress stop now triggers on a majority of repeats rather than requiring
+  every call in a step to be one.
+- **A stopped turn threw away everything it had paid for.** The step guard, the
+  budget, the turn ceiling, and the no-progress stop all ended a turn with
+  nothing — maximum cost, zero value. A stopped turn now gets one final request
+  with tools disabled, asking for what was found and what could not be
+  determined. That answer is explicitly **not** run through the bar and is
+  labelled as notes rather than a completed task, because presenting it as
+  verified would be the lie this tool exists to refuse.
+- **A per-turn token ceiling** (200k, `/budget` to change) and **shedding on by
+  default** (60k of history). Both existed as options nobody set; the runaway
+  session had neither.
+- **`git stash`, `git config`, and `git tag` were classified read-only** and ran
+  unattended at medium — bare `git stash` moves the working tree, `git config`
+  writes a file, `git tag` creates a ref. Found by a model reading the list and
+  saying so.
+- **`claimedWrites` ignored `edit_file`**, so a session whose edits all failed
+  reported "no file was modified" rather than naming the edits that did not
+  land: a correct refusal with a misleading reason.
+- **An unrecognised tool ran unattended at `high`**, which contradicted the
+  deny-by-default rule stated at the top of the classifier. A level written
+  today cannot consent to a tool added tomorrow; unknown tools now ask at every
+  level. Found by the probe suite on its first run.
+- **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
+  `docs/autonomy.md` both said it ran "everything except what cannot be undone".
+  The deny-list required a flag on `rm`, so deleting one named file was not on
+  it — and neither were `find -exec`, `find -delete`, `truncate`, `tee`, `>`
+  redirection to a path, `git checkout -- `, `git restore`, `git rebase`, or
+  `git stash drop`. All now ask at every level. The documented promise is now
+  "a named list", which is what the code actually implements: found by probing
+  the classifier, which is the only way this kind of gap is found.
+- **A large file could not be read at all, and the dead end looked like a
+  model looping.** `read_file` took a path and nothing else, and every result
+  was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
+  had no mechanism whatsoever to reach the rest. Its only available move was to
+  call `read_file` again and receive the same 2KB. A reported session spent 32
+  steps re-reading four files, was stopped by the step guard, produced no
+  answer, and cost about fifty cents.
+
+  Four changes, each of which was necessary:
+  - `read_file` takes `offset` and `limit`, and a partial result says how many
+    lines remain and the offset that continues it. The dead end becomes a path.
+  - The notice saying how to continue is budgeted *inside* the byte cap. The
+    first version appended it afterwards, so truncation cut off the one
+    sentence that told the model how to proceed — the same dead end, rebuilt
+    one layer up.
+  - Caps are sized per kind of result: 16KB for a file, 8KB for command
+    output. At 2048 bytes for everything, paging through a README took nine
+    round trips, and each round trip resent the whole conversation — the tight
+    cap cost far more tokens than the large read it was avoiding.
+  - A repeated call that returns byte-identical output gets a pointer to the
+    earlier result instead of the payload, and two consecutive steps of nothing
+    but repeats stops the turn with what it spent. The step guard now reports
+    tokens and cost too, rather than a bare "loop guard".
+
+  The same request now finishes in 6 steps for $0.086, verified, instead of 32
+  steps and no answer.
+- **The elision notice invited the loop it was part of.** A superseded read was
+  replaced with "full contents remain in the archived record", which reads to a
+  model as an instruction to go and get them — possible only by re-reading the
+  file. It now points at the newer copy already in the conversation.
+- **`2>/dev/null` counted as a file write**, so ordinary exploration
+  (`ls -la .molt 2>/dev/null`) was refused at medium autonomy and a model that
+  could not list a directory guessed filenames instead. Discards and
+  descriptor redirections are allowed; redirection to a path still asks.
+- **The proof loop re-ran the bar against state nothing had touched.** A model
+  that repeated its claim without calling a tool got the full four attempts,
+  each paying for a complete test suite, and each necessarily reaching the
+  same verdict. molt now stops as soon as an attempt cannot differ from the
+  last, says why, and still writes the receipt. Reported from the field as a
+  loop when asking questions in a repo whose bar requires a write.
 
 - **The round-trip test was measuring the wrong thing.** It asserted seeded
   facts were recoverable from the archive *plus* context combined — which
@@ -289,7 +879,100 @@ can't say "done" without proving it.**
 - **`rnd/mock-provider.mjs` and `rnd/demo.sh`** — four scripted model
   personalities with known-correct outcomes, graded automatically.
 
+- **`/ask`, and a leading `?`.** A question changes nothing, so a bar that
+  requires a change can only ever refuse it — and molt would rather refuse an
+  honest answer than accept an invented file edit. Asking runs the rest of the
+  bar and drops only the checks that need a write, says which it dropped, and
+  records it in the receipt. `molt ask "<question>"` headlessly.
+
+  molt does not infer this. The only party that knows whether "done" meant a
+  change is the person who asked, and the only other candidate — letting the
+  model decide whether its own claim needs proving — is the decision the whole
+  tool exists to take away from it.
+
 ### Fixed
+
+- **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
+  on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
+  deleted what the model had just read, and the model went back to read it
+  again. Every step, for thirteen minutes, at $0.93, with no answer. Two
+  features that were each correct alone. Elision now keys on the exact window,
+  and a write still invalidates every part of that file.
+- **Shifted offsets walked past the repeat guard.** Asking for line 181 and then
+  line 182 returns almost the same bytes under a different key, so exact-match
+  detection saw nothing. molt now tracks which lines of which file it has
+  already shown, and a request inside that coverage gets a pointer. The
+  no-progress stop now triggers on a majority of repeats rather than requiring
+  every call in a step to be one.
+- **A stopped turn threw away everything it had paid for.** The step guard, the
+  budget, the turn ceiling, and the no-progress stop all ended a turn with
+  nothing — maximum cost, zero value. A stopped turn now gets one final request
+  with tools disabled, asking for what was found and what could not be
+  determined. That answer is explicitly **not** run through the bar and is
+  labelled as notes rather than a completed task, because presenting it as
+  verified would be the lie this tool exists to refuse.
+- **A per-turn token ceiling** (200k, `/budget` to change) and **shedding on by
+  default** (60k of history). Both existed as options nobody set; the runaway
+  session had neither.
+- **`git stash`, `git config`, and `git tag` were classified read-only** and ran
+  unattended at medium — bare `git stash` moves the working tree, `git config`
+  writes a file, `git tag` creates a ref. Found by a model reading the list and
+  saying so.
+- **`claimedWrites` ignored `edit_file`**, so a session whose edits all failed
+  reported "no file was modified" rather than naming the edits that did not
+  land: a correct refusal with a misleading reason.
+- **An unrecognised tool ran unattended at `high`**, which contradicted the
+  deny-by-default rule stated at the top of the classifier. A level written
+  today cannot consent to a tool added tomorrow; unknown tools now ask at every
+  level. Found by the probe suite on its first run.
+- **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
+  `docs/autonomy.md` both said it ran "everything except what cannot be undone".
+  The deny-list required a flag on `rm`, so deleting one named file was not on
+  it — and neither were `find -exec`, `find -delete`, `truncate`, `tee`, `>`
+  redirection to a path, `git checkout -- `, `git restore`, `git rebase`, or
+  `git stash drop`. All now ask at every level. The documented promise is now
+  "a named list", which is what the code actually implements: found by probing
+  the classifier, which is the only way this kind of gap is found.
+- **A large file could not be read at all, and the dead end looked like a
+  model looping.** `read_file` took a path and nothing else, and every result
+  was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
+  had no mechanism whatsoever to reach the rest. Its only available move was to
+  call `read_file` again and receive the same 2KB. A reported session spent 32
+  steps re-reading four files, was stopped by the step guard, produced no
+  answer, and cost about fifty cents.
+
+  Four changes, each of which was necessary:
+  - `read_file` takes `offset` and `limit`, and a partial result says how many
+    lines remain and the offset that continues it. The dead end becomes a path.
+  - The notice saying how to continue is budgeted *inside* the byte cap. The
+    first version appended it afterwards, so truncation cut off the one
+    sentence that told the model how to proceed — the same dead end, rebuilt
+    one layer up.
+  - Caps are sized per kind of result: 16KB for a file, 8KB for command
+    output. At 2048 bytes for everything, paging through a README took nine
+    round trips, and each round trip resent the whole conversation — the tight
+    cap cost far more tokens than the large read it was avoiding.
+  - A repeated call that returns byte-identical output gets a pointer to the
+    earlier result instead of the payload, and two consecutive steps of nothing
+    but repeats stops the turn with what it spent. The step guard now reports
+    tokens and cost too, rather than a bare "loop guard".
+
+  The same request now finishes in 6 steps for $0.086, verified, instead of 32
+  steps and no answer.
+- **The elision notice invited the loop it was part of.** A superseded read was
+  replaced with "full contents remain in the archived record", which reads to a
+  model as an instruction to go and get them — possible only by re-reading the
+  file. It now points at the newer copy already in the conversation.
+- **`2>/dev/null` counted as a file write**, so ordinary exploration
+  (`ls -la .molt 2>/dev/null`) was refused at medium autonomy and a model that
+  could not list a directory guessed filenames instead. Discards and
+  descriptor redirections are allowed; redirection to a path still asks.
+- **The proof loop re-ran the bar against state nothing had touched.** A model
+  that repeated its claim without calling a tool got the full four attempts,
+  each paying for a complete test suite, and each necessarily reaching the
+  same verdict. molt now stops as soon as an attempt cannot differ from the
+  last, says why, and still writes the receipt. Reported from the field as a
+  loop when asking questions in a repo whose bar requires a write.
 
 - **Shedding could not fire inside a long tool run.** `planShed` only cut on
   user turns, so a single request producing thirty tool calls — exactly when

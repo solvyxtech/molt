@@ -59,10 +59,14 @@ describe("stale bar failures", () => {
 });
 
 describe("superseded tool results", () => {
-  function sessionWith(calls: [string, string][]): Transcript {
+  function sessionWith(calls: [string, string, Record<string, unknown>?][]): Transcript {
     const t = new Transcript("SYS");
-    calls.forEach(([name, path], i) => {
-      t.push({ role: "assistant", content: null, tool_calls: [tc(name, { path }, `c${i}`)] });
+    calls.forEach(([name, path, extra], i) => {
+      t.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [tc(name, { path, ...(extra ?? {}) }, `c${i}`)],
+      });
       t.push({ role: "tool", tool_call_id: `c${i}`, content: "F".repeat(2000) });
     });
     return t;
@@ -82,8 +86,47 @@ describe("superseded tool results", () => {
 
     const results = t.all().filter((m) => m.role === "tool");
     assert.ok(results[0].content!.startsWith(ELIDED_PREFIX));
-    assert.match(results[0].content!, /overwritten at step/);
-    assert.match(results[0].content!, /remain in the archived record/);
+    assert.match(results[0].content!, /changed at step/);
+    // The notice must not send the model back to the file. Earlier wording
+    // ("full contents remain in the archived record") read as an invitation to
+    // go and get them, which a model can only do by re-reading — the exact
+    // loop that made a session re-read four files thirty times.
+    assert.match(results[0].content!, /further down this conversation/);
+    assert.match(results[0].content!, /do not read the file again/i);
+  });
+
+  it("keeps a different part of the same file", () => {
+    // The 661,000-token failure. Long files arrive in parts, and elision was
+    // keyed on the path — so lines 401-440 "superseded" lines 1-40, molt
+    // deleted what the model had just read, and the model went back to read it
+    // again. Every step. For thirteen minutes.
+    const t = sessionWith([
+      ["read_file", "src/engine.ts", { offset: 0 }],
+      ["read_file", "src/engine.ts", { offset: 400 }],
+    ]);
+    const r = t.elideSupersededReads();
+    assert.equal(r.elided, 0, "deleted a part of a file that nothing replaced");
+
+    const results = t.all().filter((m) => m.role === "tool");
+    assert.ok(!results.some((m) => m.content!.startsWith(ELIDED_PREFIX)));
+  });
+
+  it("still drops an identical re-read of the same part", () => {
+    const t = sessionWith([
+      ["read_file", "src/engine.ts", { offset: 400 }],
+      ["read_file", "src/engine.ts", { offset: 400 }],
+    ]);
+    assert.equal(t.elideSupersededReads().elided, 1);
+  });
+
+  it("drops every part once the file is written", () => {
+    // A change invalidates all of it, whichever window it came from.
+    const t = sessionWith([
+      ["read_file", "src/engine.ts", { offset: 0 }],
+      ["read_file", "src/engine.ts", { offset: 400 }],
+      ["write_file", "src/engine.ts"],
+    ]);
+    assert.equal(t.elideSupersededReads().elided, 2);
   });
 
   it("drops an earlier read of a path that was read again", () => {

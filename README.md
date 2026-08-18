@@ -76,6 +76,8 @@ Headless, for scripts and CI — exits non-zero when the bar is not met:
 
 ```bash
 molt run "fix the failing test" --yes
+molt ask "what does the bar check here?"   # a question, not a change
+molt run "..." --autonomy medium           # fewer prompts, same boundaries
 molt prove                    # run the checks now, without the model
 molt run "..." --json         # machine-readable event stream
 molt prove --skip slow        # tag selection, for the inner loop
@@ -89,7 +91,7 @@ molt receipts --grep "tests"      # jump to the evidence behind a claim
 molt archive                      # shed batches, browsable
 molt archive --grep "auth token"  # find something that left context
 molt archive --explain            # digest vs original, side by side
-molt stats                        # false-claim rate, tokens per verified change
+molt stats                        # false-claim rate, tokens and cost per verified change
 ```
 
 ## The bar
@@ -155,6 +157,100 @@ molt log        # every request, tool call, permission, and bar run
 molt verify     # recompute the log's hash chain
 ```
 
+### While it is running
+
+Every step closes with one line saying what it did and what it cost:
+
+```
+· read_file  src/auth.ts  12ms
+  step 2 · read_file, bash · 3.4k in (2.1k cached) · 412 out · $0.0072 · 6.2s
+
+  checking 3 condition(s) from .molt/done.yml: types, tests, work-landed
+  2 of 3 checks passed · 4.1s · failed: tests
+  the failures above go back to the model; it keeps working
+```
+
+Press **shift+V** while molt is working — `ctrl+V` any time, `/verbose` as a
+command, `--verbose` headlessly — to open the live view: what the model is
+doing right now, the exact arguments of each call, the head of each result,
+each check's command and duration, and **what every job has cost**.
+
+```
+── what the model is doing ─────────────────────────────  shift+V closes
+  job 3 · rewrite the auth guard · 2 step(s) · 8.0k in (3.0k cached) · 45 out · $0.012 · 4.2s
+  · read_file src/auth.ts  12ms
+      args {"path":"src/auth.ts"}
+      → 1841 bytes
+      │ import { verify } from "./jwt.js";
+    ↳ session 16k tokens · $0.024 · finish: tool_calls
+
+  job 1 verified · 2 step(s) · 4.8k in · 90 out · $0.0074 · 1.2s
+  job 2 not proven · 4 step(s) · 11k in · 210 out · $0.017 · 3.6s
+```
+
+It is a bounded panel, not an expanding scrollback: the transcript above it is
+printed once and never redrawn, which is what stops a long session from
+tearing itself apart in a terminal that cannot scroll backwards. Detail is
+recorded whether or not the view is open, so shift+V shows what already
+happened rather than starting a recording. Nothing in it is paraphrased — a
+transparency view that summarizes is one more claim to check.
+
+### How much it does without asking
+
+**shift+A** sets the autonomy ceiling — low, medium, high. At an empty prompt
+it opens a picker (nothing changes until you press enter, and esc gives the
+letter back, because a terminal cannot tell `shift+A` from the `A` that starts
+"Add a test"). While molt is working, or while it is asking you to approve
+something — which is exactly where "stop asking me this" gets decided — the
+same key cycles immediately. `ctrl+A` and `/autonomy` work from anywhere.
+
+The level sits beside the model in the status line the whole time it is in
+force.
+
+| level | runs without asking |
+|---|---|
+| **low** (default) | reading a file inside the project, and nothing else |
+| **medium** | reads, writes inside the project, and commands that only report |
+| **high** | everything except a named list of destructive commands, or leaving the project |
+
+The classifier is mechanical and conservative — a short allowlist of commands
+whose purpose is to report, judged segment by segment, with redirection and
+substitution disqualified because their effect is not readable from the text.
+Anything unrecognised asks. `rm -rf`, `sudo`, `git push`, and writing outside
+the project ask at *every* level, including high. A call that ran unasked is
+marked `[auto]` as it happens and journalled with the level that allowed it.
+
+It decides what molt asks about, not what is possible: a command that runs can
+do anything you can. See [docs/autonomy.md](docs/autonomy.md).
+
+### Credentials
+
+Masked before anything is written *or* printed: the log, receipts, the
+transcript on screen, and the model's own answer. Values molt holds (the session
+key) are masked exactly; provider key shapes, bearer headers, JWTs, private-key
+blocks and `secret =` assignments are masked by pattern, keeping the field name
+so the record still says what was hidden. The permission prompt is the
+deliberate exception — you cannot judge a command you cannot read.
+
+### What a turn cost
+
+The bottom line is the **session** meter — provider, model, tokens, price —
+and it only ever climbs. Per-job figures live in the view; a job is a lens on
+the session total, never a reset of it. The unit never changes either: cost is
+always in dollars, because a meter that reads `0.9¢` and then `$0.029` looks
+like it went down.
+
+molt reads the price of the selected model from the endpoint that will do the
+billing (xAI and OpenRouter publish theirs) and stamps it with the model it
+belongs to, so a stored rate can never be applied to a different model. Token
+counts come from the provider's own usage block — including cached prompt
+tokens, which are billed at the cache rate rather than the full one — and
+`stream_options.include_usage` is requested so that streaming, the default,
+does not silently fall back to estimates. When a figure *is* an estimate it is
+marked `~`; when the provider reports the dollar amount itself, that is what
+is shown. `/price` says which, and sets the rate by hand for endpoints that
+publish none.
+
 The session log is append-only and hash-chained: each entry stores the SHA-256
 of the one before it, so altering or deleting a line breaks every hash after it
 and `molt verify` names the entry where the chain broke. That is tamper
@@ -192,6 +288,8 @@ Type `/` to browse. `↑↓` chooses, `tab` fills, `enter` runs, `esc` clears �
 nothing has to be typed in full or looked up.
 
 ```
+/ask <question>    a question, not a change (or start a line with ?)
+/autonomy [level]  how much molt does without asking  (shift+A)
 /prove             run the bar now, without the model
 /bar               show the current bar
 /init              write a starter .molt/done.yml
@@ -204,6 +302,8 @@ nothing has to be typed in full or looked up.
 /bom               context bill of materials
 /wire              exact JSON of the last request
 /budget <n|off>    hard token ceiling
+/verbose           watch every call, argument, and result  (shift+V)
+/price             what this model costs, per 1M tokens
 /model <id>        switch model
 /molt              cycle theme
 /clear             reset the session
@@ -213,8 +313,10 @@ nothing has to be typed in full or looked up.
 
 Being specific about this matters more here than anywhere else.
 
-- **Three tools** — read, write, bash. Everything else is shell. No MCP, no sub-agents, no orchestration.
-- **`files-changed` fails read-only tasks by design.** If a task legitimately changes nothing, leave that check out of your bar.
+- **Six tools, and a reason for the count.** `list_dir` and `grep` to find things, `read_file` to read them, `edit_file` to change exact text, `write_file` for a new file or a full rewrite, `bash` for everything else. No MCP, no sub-agents, no orchestration. It was three until a session showed the cost: `ls` through bash is a *string* the autonomy classifier has to reason about, and an unfamiliar construction sends it to a prompt — so a model that could not list a directory started guessing filenames. A tool that has no write in it needs no guessing, and that is a better kind of safety than a regex over a command line. `read_file` pages through a long file (`offset`/`limit`) and says how to continue; results are capped at 16KB for a file and 8KB for command output, and truncation is always stated.
+- **An edit that refuses rather than guesses.** `edit_file` replaces exact text and fails loudly if it is absent, or ambiguous without `replace_all` — a write that lands on the wrong occurrence looks exactly like a write that worked. Edits are ledgered like any other write, so `files-changed` still proves them.
+- **Work that goes nowhere is stopped, not billed.** A repeated tool call that returns byte-identical output gets a pointer to the earlier result rather than the payload again, and two consecutive steps of nothing but repeats end the turn with what it spent. The bar is not re-run against state the model has not touched.
+- **`files-changed` fails read-only tasks by design.** Ask a question with a leading `?` (or `/ask`, or `molt ask`) and molt runs the rest of the bar without it. molt will not decide this for you: the only party that knows whether "done" meant a change is you, and the only other candidate — asking the model whether its own claim needs proving — is precisely the decision molt exists to take away from it. If a project never verifies writes, leave the check out of your bar.
 - **A passing bar is not proof of correctness.** It proves your declared checks ran and passed against real state. A weak bar proves little — that is your call to make, visibly, in a file you commit.
 - **Not benchmarked against other harnesses yet.** `rnd/grade.mjs` runs scenarios with hidden graders against any agent CLI, and molt scores 4/4 on its own four scenarios — which is worth exactly what a self-run benchmark is worth. Four scenarios supports "harnesses differ measurably", not a ranking. Adapters and scenarios from people who are not me are the thing that makes those numbers mean anything.
 - **No novelty claim.** Every ingredient here exists somewhere else; see [docs/prior-art.md](docs/prior-art.md). What molt claims is behavioural and testable: it refuses to say done without proving it.
@@ -236,6 +338,7 @@ The test suite includes a 400-transcript fuzz asserting that shedding never prod
 - [docs/why.md](docs/why.md) — the gap molt closes, and a worked example of confident wrong claims caught by the habits molt encodes
 - [docs/done-yml.md](docs/done-yml.md) — the completion bar
 - [docs/transparency.md](docs/transparency.md) — what is recorded and how to check it
+- [docs/autonomy.md](docs/autonomy.md) — what runs without asking, and what never does
 - [docs/receipts.md](docs/receipts.md) · [docs/shed.md](docs/shed.md) · [docs/metrics.md](docs/metrics.md)
 - [docs/prior-art.md](docs/prior-art.md) — what came before, credited by name
 

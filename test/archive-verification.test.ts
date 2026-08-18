@@ -42,8 +42,8 @@ const FILLER = "z".repeat(1500);
 async function sessionWithShedWrite(dir: string, target = "early.ts") {
   const provider = scriptedProvider([
     { calls: [{ name: "write_file", args: { path: target, content: "export const early = 1;\n" } }] },
-    ...Array.from({ length: 8 }, () => ({
-      calls: [{ name: "bash", args: { command: `echo ${FILLER}` } }],
+    ...Array.from({ length: 8 }, (_, i) => ({
+      calls: [{ name: "bash", args: { command: `echo ${i} ${FILLER}` } }],
     })),
     { text: `Done. The change is in ${target}.` },
   ]);
@@ -122,7 +122,7 @@ describe("write evidence survives shedding", () => {
     writeBar(dir, "version: 1\nchecks:\n  - name: landed\n    builtin: files-changed\n");
     const provider = scriptedProvider([
       { calls: [{ name: "write_file", args: { path: "a.ts", content: "a\n" } }] },
-      ...Array.from({ length: 6 }, () => ({ calls: [{ name: "bash", args: { command: `echo ${FILLER}` } }] })),
+      ...Array.from({ length: 6 }, (_, i) => ({ calls: [{ name: "bash", args: { command: `echo ${i} ${FILLER}` } }] })),
       { calls: [{ name: "write_file", args: { path: "b.ts", content: "b\n" } }] },
       { text: "Both written." },
     ]);
@@ -473,7 +473,7 @@ describe("cross-session archive integrity", () => {
     const journal = new Journal(dir, "cross-1");
     const provider = scriptedProvider([
       { calls: [{ name: "write_file", args: { path: "early.ts", content: "e\n" } }] },
-      ...Array.from({ length: 8 }, () => ({ calls: [{ name: "bash", args: { command: `echo ${FILLER}` } }] })),
+      ...Array.from({ length: 8 }, (_, i) => ({ calls: [{ name: "bash", args: { command: `echo ${i} ${FILLER}` } }] })),
       { text: "done" },
     ]);
     const engine = new Engine({
@@ -575,7 +575,7 @@ describe("integrity without a journal", () => {
     writeBar(dir, "version: 1\nchecks:\n  - name: intact\n    builtin: record-intact\n");
     const provider = scriptedProvider([
       { calls: [{ name: "write_file", args: { path: "early.ts", content: "e\n" } }] },
-      ...Array.from({ length: 8 }, () => ({ calls: [{ name: "bash", args: { command: `echo ${FILLER}` } }] })),
+      ...Array.from({ length: 8 }, (_, i) => ({ calls: [{ name: "bash", args: { command: `echo ${i} ${FILLER}` } }] })),
       { text: "done" },
     ]);
     const engine = new Engine({

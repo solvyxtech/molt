@@ -9,6 +9,7 @@
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { redact } from "./redact.js";
 import type { BarResult } from "./types.js";
 
 export type Receipt = {
@@ -26,6 +27,8 @@ export type ReceiptRecord = {
   provider: string;
   model: string;
   sessionTokens: number;
+  /** USD spent by the session when this claim was made, when a price is known. */
+  costUsd?: number;
   shedBatches: number;
   barMs: number;
   failed: string[];
@@ -49,17 +52,41 @@ export type Stats = {
   totalTokens: number;
   /** Tokens spent per ACCEPTED completion. Undefined with nothing accepted. */
   tokensPerVerifiedChange?: number;
+  /** USD spent across these sessions, when a price was known. */
+  totalUsd?: number;
+  /**
+   * Dollars per ACCEPTED completion — the number to compare harnesses on, and
+   * the one molt's own pitch stands or falls by. Same denominator caveat as
+   * tokens: per verified change, never per attempt.
+   */
+  usdPerVerifiedChange?: number;
   byModel: Record<string, { attempts: number; accepted: number; refused: number }>;
 };
 
 export class Receipts {
   readonly dir: string;
   private indexPath: string;
+  /**
+   * Values masked before anything is written.
+   *
+   * A receipt is meant to be handed to someone who does not trust you, which
+   * is precisely the document a credential must not be inside. The claim is
+   * model output and the check output is a command's stdout — either can
+   * quote a key that was on screen.
+   */
+  private secrets: (string | undefined)[] = [];
 
   constructor(root: string) {
     this.dir = join(root, ".molt", "receipts");
     mkdirSync(this.dir, { recursive: true });
     this.indexPath = join(this.dir, "index.jsonl");
+  }
+
+  /** Register a value to mask in every receipt from here on. */
+  protect(...values: (string | undefined)[]): void {
+    for (const v of values) {
+      if (v && v.length >= 8 && !this.secrets.includes(v)) this.secrets.push(v);
+    }
   }
 
   write(args: {
@@ -71,6 +98,10 @@ export class Receipts {
     provider: string;
     sessionTokens: number;
     shedBatches: number;
+    /** What the session had cost when this claim was made. */
+    costUsd?: number;
+    /** True when that figure rests on molt's own token estimate. */
+    costEstimated?: boolean;
   }): Receipt {
     const iso = new Date().toISOString();
     const seq = this.count();
@@ -85,6 +116,9 @@ export class Receipts {
       `- provider: ${args.provider}`,
       `- model: ${args.model}`,
       `- session tokens: ${args.sessionTokens}`,
+      ...(args.costUsd === undefined
+        ? []
+        : [`- session cost: ${args.costEstimated ? "~" : ""}$${args.costUsd.toFixed(4)}`]),
       `- shed batches archived: ${args.shedBatches}`,
       `- bar duration: ${args.result.durationMs}ms`,
       "",
@@ -138,7 +172,11 @@ export class Receipts {
       "",
     ];
 
-    writeFileSync(p, [...head, ...rows, ...detail, ...foot].join("\n"), "utf8");
+    // Redacted once, over the whole document, rather than field by field: the
+    // claim, a command, and a check's stdout are three different ways for the
+    // same key to arrive, and a filter with three entry points has three
+    // chances to miss one.
+    writeFileSync(p, redact([...head, ...rows, ...detail, ...foot].join("\n"), this.secrets), "utf8");
 
     const record: ReceiptRecord = {
       seq,
@@ -148,12 +186,13 @@ export class Receipts {
       provider: args.provider,
       model: args.model,
       sessionTokens: args.sessionTokens,
+      ...(args.costUsd === undefined ? {} : { costUsd: args.costUsd }),
       shedBatches: args.shedBatches,
       barMs: args.result.durationMs,
       failed: args.result.results.filter((r) => !r.ok).map((r) => r.name),
       file,
     };
-    appendFileSync(this.indexPath, JSON.stringify(record) + "\n", "utf8");
+    appendFileSync(this.indexPath, redact(JSON.stringify(record), this.secrets) + "\n", "utf8");
 
     return { path: p, attempt: args.attempt, verdict: args.verdict };
   }
@@ -179,6 +218,7 @@ export class Receipts {
     let refused = 0;
     let exhausted = 0;
     let totalTokens = 0;
+    let totalUsd: number | undefined;
 
     for (const r of rows) {
       const m = (byModel[r.model] ??= { attempts: 0, accepted: 0, refused: 0 });
@@ -191,7 +231,10 @@ export class Receipts {
         exhausted += r.verdict === "exhausted" ? 1 : 0;
         m.refused += 1;
       }
+      // A session's totals climb across its own attempts, so the largest
+      // reading for a session is that session's spend, not the sum of its rows.
       totalTokens = Math.max(totalTokens, r.sessionTokens);
+      if (typeof r.costUsd === "number") totalUsd = Math.max(totalUsd ?? 0, r.costUsd);
     }
 
     return {
@@ -202,6 +245,9 @@ export class Receipts {
       falseClaimRate: rows.length ? (refused + exhausted) / rows.length : 0,
       totalTokens,
       tokensPerVerifiedChange: accepted ? Math.round(totalTokens / accepted) : undefined,
+      totalUsd,
+      usdPerVerifiedChange:
+        accepted && totalUsd !== undefined ? totalUsd / accepted : undefined,
       byModel,
     };
   }

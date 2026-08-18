@@ -24,9 +24,24 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, resolve, relative, isAbsolute } from "node:path";
 import type { ArchiveLike } from "./archive.js";
 import { barFingerprint, formatBarFailure, runBar, type BarContext } from "./bar.js";
+import {
+  AUTONOMY_SUMMARY,
+  DEFAULT_AUTONOMY,
+  gate,
+  insideProject,
+  type Autonomy,
+} from "./autonomy.js";
+import { redact } from "./redact.js";
+import {
+  applyEdit,
+  formatListing,
+  formatMatches,
+  grepFiles,
+  walk,
+} from "./files.js";
 import { Journal } from "./journal.js";
 import { Receipts } from "./receipts.js";
-import { readStream } from "./stream.js";
+import { readStream, type Usage } from "./stream.js";
 import { Transcript, toolDetail } from "./transcript.js";
 import {
   estTokens,
@@ -37,13 +52,29 @@ import {
   type Confirm,
   type EngineEvent,
   type LedgerEntry,
+  type JobOutcome,
   type Msg,
+  type Spend,
 } from "./types.js";
+
+/** A reading of the session meter, for measuring one job against. */
+type Meter = {
+  prompt: number;
+  completion: number;
+  cached: number;
+  billed: number;
+  unbilledSteps: number;
+  estimatedSteps: number;
+  costUsd?: number;
+};
 
 export const SYSTEM_PROMPT = [
   "You are molt, a coding agent working in the current directory.",
-  "Use the tools to read files, write files, and run shell commands (grep/find/git via bash).",
   "Read only what you need. Be terse.",
+  "",
+  "Tool results stay in this conversation. Never read a file twice unless you changed",
+  "it — scroll up. If you want a file you already have, you are done gathering: answer,",
+  "or say what is blocking you.",
   "",
   "This project defines what 'done' means in .molt/done.yml. When you finish,",
   "those checks run automatically. If any fail you will be told exactly which,",
@@ -56,11 +87,58 @@ export const SYSTEM_PROMPT = [
 ].join("\n");
 
 /**
- * Tool results are the bulk of a session's tokens: every result is resent on
- * every subsequent request. 2048 bytes is roughly 512 tokens each — still
- * enough to be useful, and truncation is always visible, never silent.
+ * How much of a tool result comes back.
+ *
+ * Tool results are the bulk of a session's tokens, because every one of them
+ * is resent on every subsequent request — which argues for a tight cap. It
+ * argued too well: at 2048 bytes for everything, reading a 17KB README took
+ * nine round trips, and each of those round trips resent the entire
+ * conversation. The tight cap cost more tokens than the large read it was
+ * avoiding, and produced a session that looked exactly like a model looping.
+ *
+ * So the cap is per kind of result, sized to how the result is used:
+ *
+ *  - A file is read to be understood, and paging through one in 2KB slices
+ *    is the expensive way to spend a context window. 16KB is roughly 4k
+ *    tokens, which holds most source files whole.
+ *  - Command output is mostly noise with a signal at one end, and a failing
+ *    suite's first 8KB says what failed.
+ *
+ * Truncation is always visible, never silent, and a truncated read always
+ * says how to continue.
  */
-export const TOOL_RESULT_MAX_BYTES = 2048;
+/**
+ * What one turn may spend before molt stops it, unless told otherwise.
+ *
+ * There was no ceiling, only a 32-step guard — and a session that thrashed
+ * inside those 32 steps spent 661,000 tokens and most of a dollar over
+ * thirteen minutes before anything intervened. Steps are the wrong unit:
+ * a step can cost a hundred tokens or thirty thousand.
+ *
+ * Deliberately generous enough for real work and far below "how did this cost
+ * a dollar". `/budget` raises or removes it, and the message says so.
+ */
+export const DEFAULT_TURN_TOKENS = 200_000;
+
+/**
+ * When working history gets compacted, unless told otherwise.
+ *
+ * Shedding was built for exactly the situation that broke a real session —
+ * reading a whole codebase, where the conversation grows until every step
+ * resends a hundred kilobytes — and it was off by default, so it never ran.
+ * A feature that only works when configured is a feature most sessions do
+ * not have.
+ *
+ * Safe as a default because of where verification reads from: the bar checks
+ * the ledger, the disk, and the archive, never the transcript. Shedding costs
+ * the model some working memory and costs molt's proof nothing, the full
+ * original is preserved in `.molt/exuviae/`, `record-intact` fails if it is
+ * not, and `/regrow` pulls it back by pattern.
+ */
+export const DEFAULT_AUTO_SHED_TOKENS = 60_000;
+
+export const TOOL_RESULT_MAX_BYTES = 8192;
+export const READ_MAX_BYTES = 16_384;
 export const MAX_STEPS = 32;
 export const MAX_PROOF_ATTEMPTS = 4;
 export const DEFAULT_BASH_TIMEOUT_MS = 60_000;
@@ -70,10 +148,16 @@ const TOOLS = [
     type: "function",
     function: {
       name: "read_file",
-      description: "Read a UTF-8 text file.",
+      description:
+        "Read a text file. A long file arrives in parts; the result gives the offset that " +
+        "continues it. Same arguments return the same part.",
       parameters: {
         type: "object",
-        properties: { path: { type: "string" } },
+        properties: {
+          path: { type: "string" },
+          offset: { type: "number", description: "First line, 0-based." },
+          limit: { type: "number", description: "How many lines." },
+        },
         required: ["path"],
       },
     },
@@ -82,7 +166,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "write_file",
-      description: "Create or overwrite a UTF-8 text file.",
+      description: "Create a file, or overwrite one whole. Use edit_file to change part of one.",
       parameters: {
         type: "object",
         properties: { path: { type: "string" }, content: { type: "string" } },
@@ -93,8 +177,59 @@ const TOOLS = [
   {
     type: "function",
     function: {
+      name: "list_dir",
+      description: "List a directory, skipping build and dependency directories.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Default '.'." },
+          depth: { type: "number", description: "Levels down. Default 1." },
+          glob: { type: "string", description: "e.g. '**/*.ts'." },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "grep",
+      description: "Search file contents by regular expression. Returns path:line: text.",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string" },
+          path: { type: "string", description: "Default '.'." },
+          glob: { type: "string", description: "e.g. '**/*.ts'." },
+          ignore_case: { type: "boolean" },
+        },
+        required: ["pattern"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "edit_file",
+      description:
+        "Replace exact text. Copy old_text verbatim from a read; refused if absent, or if " +
+        "ambiguous without replace_all.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          old_text: { type: "string" },
+          new_text: { type: "string" },
+          replace_all: { type: "boolean" },
+        },
+        required: ["path", "old_text", "new_text"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "bash",
-      description: "Run a shell command in the current directory.",
+      description: "Run a shell command here. Use list_dir and grep instead of ls/grep/find.",
       parameters: {
         type: "object",
         properties: { command: { type: "string" } },
@@ -115,6 +250,30 @@ const SECRET_ENV = [
   "MISTRAL_API_KEY",
 ];
 
+/** Per-turn options. Nothing here changes the session's configuration. */
+export type RunOptions = {
+  /**
+   * Treat the turn as a question. Checks that cannot be satisfied without a
+   * file change are not run — a lookup or an explanation can never satisfy
+   * one, and refusing an honest answer for failing to invent work punishes
+   * exactly the behaviour molt is built to encourage.
+   */
+  ask?: boolean;
+};
+
+/**
+ * The bar minus the checks that require a write to pass. Only
+ * `files-changed` is inherently one: every other check reads state that a
+ * read-only turn can still satisfy, so it stays.
+ */
+export function withoutWriteChecks(bar?: Bar | null): Bar | null {
+  if (!bar) return null;
+  return {
+    ...bar,
+    checks: bar.checks.filter((c) => !(c.kind === "builtin" && c.builtin === "files-changed")),
+  };
+}
+
 export type EngineConfig = {
   baseUrl: string;
   apiKey?: string;
@@ -123,6 +282,15 @@ export type EngineConfig = {
   cwd?: string;
   priceInPerMtok?: number;
   priceOutPerMtok?: number;
+  /**
+   * USD per 1M cached prompt tokens. Every provider that caches bills those
+   * tokens at a discount; charging them at the full rate is a wrong number,
+   * not a conservative one. Undefined means "bill them as ordinary prompt
+   * tokens", which is what molt did before it could tell them apart.
+   */
+  priceCachedInPerMtok?: number;
+  /** Where the prices came from — an endpoint, or "set by hand". */
+  priceSource?: string;
   bashTimeoutMs?: number;
   fetchFn?: typeof fetch;
   /** Stream tokens as they generate. On by default; a dead TUI reads as broken. */
@@ -134,10 +302,17 @@ export type EngineConfig = {
   /** Append-only hash-chained record of everything this session did. */
   journal?: Journal;
   maxProofAttempts?: number;
-  /** Shed automatically once working history exceeds this many tokens. */
+  /**
+   * Shed automatically once working history exceeds this many tokens.
+   * Defaults to DEFAULT_AUTO_SHED_TOKENS; 0 disables it.
+   */
   autoShedAtTokens?: number;
+  /** Tokens one turn may spend before molt stops it. 0 disables the ceiling. */
+  maxTurnTokens?: number;
   /** Drop tool results that later work superseded. On by default. */
   elideSuperseded?: boolean;
+  /** How much molt may do without asking. Defaults to asking about everything. */
+  autonomy?: Autonomy;
 };
 
 function scrubbedEnv(): NodeJS.ProcessEnv {
@@ -149,6 +324,120 @@ function scrubbedEnv(): NodeJS.ProcessEnv {
 function sha256Of(p: string): string | null {
   if (!existsSync(p)) return null;
   return createHash("sha256").update(readFileSync(p)).digest("hex");
+}
+
+/**
+ * What a watcher is shown of a tool's arguments or its result.
+ *
+ * Verbatim head, capped. Never a summary — a transparency view that
+ * paraphrases is just another claim to check, and molt does not summarize
+ * with a model anywhere else either.
+ */
+export const CAPTURE_MAX_CHARS = 600;
+
+function capture(s: string): string {
+  return s.length <= CAPTURE_MAX_CHARS ? s : s.slice(0, CAPTURE_MAX_CHARS) + "…";
+}
+
+/**
+ * Name the failing check when the ONLY thing standing between a turn and an
+ * answer is a check that demands a write. Read-only work — a question, a
+ * lookup, an explanation — can never satisfy one, so the refusal needs to
+ * say that in the user's terms rather than read as molt malfunctioning.
+ */
+function failedOnlyWriteChecks(result: BarResult): string | null {
+  const failed = result.results.filter((r) => !r.ok);
+  if (failed.length === 0) return null;
+  return failed.every((r) => r.detail === "files-changed") ? failed.map((r) => r.name).join(", ") : null;
+}
+
+/**
+ * A stable identity for a tool call, so "the same question" is recognised
+ * however the model happens to spell it.
+ */
+function callKey(name: string, args: Record<string, unknown>): string {
+  const parts = Object.entries(args)
+    .filter(([, v]) => v !== undefined && v !== null && v !== "")
+    // An explicit zero offset is the default, and says nothing new.
+    .filter(([k, v]) => !((k === "offset" || k === "limit") && Number(v) === 0))
+    .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
+    .sort();
+  return `${name}(${parts.join(",")})`;
+}
+
+/** Dollars, for a message that has to be readable without a formatter. */
+function fmtUsd(usd: number): string {
+  return usd >= 0.1 ? `$${usd.toFixed(2)}` : usd >= 0.001 ? `$${usd.toFixed(3)}` : "<$0.001";
+}
+
+/** A tool argument that should be a non-empty string, or nothing. */
+function str(v: unknown): string | undefined {
+  return typeof v === "string" && v.trim() !== "" ? v : undefined;
+}
+
+/** A tool argument that should be a non-negative integer, or its default. */
+function num(v: unknown, fallback: number): number {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+/**
+ * One part of a file, and how to get the next.
+ *
+ * The old read_file took a path and nothing else, and every result was cut to
+ * TOOL_RESULT_MAX_BYTES. For a 17KB README that meant the first 2KB and no way
+ * on earth to reach the rest — so a model that needed more had exactly one
+ * move available: call read_file again, and receive the same 2KB. That is not
+ * a model looping. That is a dead end with a retry button, and it cost a real
+ * session thirty steps and fifty cents.
+ *
+ * Paging turns the dead end into a path: every truncated result says how many
+ * lines are left and the offset that continues it.
+ */
+function readPart(abs: string, shown: string, offset: number, limit: number): string {
+  const raw = readFileSync(abs, "utf8").split("\n");
+  // A trailing newline is a terminator, not an empty last line. Counting it
+  // reports 401 lines for a 400-line file, and every offset the model is told
+  // to use is then one past what it means.
+  const lines = raw.length > 1 && raw.at(-1) === "" ? raw.slice(0, -1) : raw;
+  const from = Math.min(offset, lines.length);
+  const until = Math.min(lines.length, from + limit);
+
+  // The label and the continuation notice have to fit inside the same budget
+  // as the content. Filling to the cap and appending them afterwards is how
+  // the first version of this failed: truncateResult then cut the notice off
+  // the end, so the model was handed a part of a file and no way to ask for
+  // the rest — the dead end this function exists to remove, rebuilt one layer
+  // up. The reserve uses the longest form either line can take.
+  const label = `[molt: ${shown} lines ${from + 1}-${lines.length} of ${lines.length}]`;
+  const notice = `[molt: ${lines.length} more line(s). Continue with read_file offset=${lines.length}.]`;
+  const reserve = Buffer.byteLength(label + "\n" + notice + "\n", "utf8");
+  const budget = Math.max(256, READ_MAX_BYTES - reserve);
+
+  const out: string[] = [];
+  let bytes = 0;
+  let i = from;
+  for (; i < until; i++) {
+    const line = lines[i]!;
+    const size = Buffer.byteLength(line, "utf8") + 1;
+    // Always return at least one line, even an enormous one: a caller that
+    // gets nothing back cannot tell "empty" from "too big to send".
+    if (out.length > 0 && bytes + size > budget) break;
+    out.push(line);
+    bytes += size;
+  }
+
+  const whole = from === 0 && i >= lines.length;
+  if (whole) return out.join("\n");
+
+  // A part is labelled, because a model holding lines 40-80 of a file needs to
+  // know that is what it is holding.
+  const head = `[molt: ${shown} lines ${from + 1}-${i} of ${lines.length}]`;
+  const tail =
+    i < lines.length
+      ? `\n[molt: ${lines.length - i} more line(s). Continue with read_file offset=${i}.]`
+      : "";
+  return `${head}\n${out.join("\n")}${tail}`;
 }
 
 function truncateResult(s: string): { text: string; note?: string } {
@@ -167,6 +456,30 @@ export class Engine {
   private ledger: LedgerEntry[] = [];
   private sessionPrompt = 0;
   private sessionCompletion = 0;
+  private sessionCached = 0;
+  /** Sum of the dollar figures the provider itself reported, when it does. */
+  private sessionBilled = 0;
+  /** Steps whose dollar figure the provider did not report. */
+  private unbilledSteps = 0;
+  /** Steps whose token counts molt had to estimate. */
+  private estimatedSteps = 0;
+  /**
+   * Set once a provider rejects `stream_options`. Some OpenAI-compatible
+   * servers 400 on request fields they do not implement, and re-sending a
+   * field that has already been refused burns a round trip per step.
+   */
+  private streamUsageUnsupported = false;
+  /** User turns handled this session. Numbers the jobs the meter reports. */
+  private jobCount = 0;
+  /**
+   * Tool calls the model has been allowed to make since the bar last ran.
+   *
+   * The proof loop's premise is that the model can act on what failed. When
+   * it has acted on nothing, the same bar is about to be run against the
+   * same state — and molt was doing exactly that, four times, at the cost of
+   * a full test suite each round.
+   */
+  private actsSinceBar = 0;
   budgetTokens?: number;
   /** Exact JSON body of the most recent request — the wire, unhidden. */
   lastRequestBody?: string;
@@ -184,6 +497,9 @@ export class Engine {
     this.cfg = cfg;
     this.transcript = new Transcript(SYSTEM_PROMPT);
     this.barHash = barFingerprint(this.cwd);
+    // The key molt was handed is the one secret it can mask exactly.
+    cfg.journal?.protect(cfg.apiKey, process.env.MOLT_API_KEY);
+    cfg.receipts?.protect(cfg.apiKey, process.env.MOLT_API_KEY);
   }
 
   get model(): string {
@@ -222,9 +538,17 @@ export class Engine {
   }
   setApiKey(k?: string): void {
     this.cfg.apiKey = k;
+    this.cfg.journal?.protect(k);
   }
+  /**
+   * A session ceiling — and, since it is the knob people reach for when a turn
+   * runs away, the turn ceiling too. A budget smaller than the default turn
+   * ceiling would otherwise be unreachable, and a budget larger than it would
+   * be silently overruled.
+   */
   setBudget(tokens?: number): void {
     this.budgetTokens = tokens;
+    this.cfg.maxTurnTokens = tokens === undefined ? 0 : tokens;
   }
   setBar(bar: Bar | null): void {
     this.cfg.bar = bar;
@@ -235,6 +559,7 @@ export class Engine {
   setBaseUrl(url: string, apiKey?: string, provider?: string): void {
     this.cfg.baseUrl = url;
     this.cfg.apiKey = apiKey;
+    this.cfg.journal?.protect(apiKey);
     this.cfg.provider = provider;
     this.reset();
   }
@@ -243,6 +568,13 @@ export class Engine {
     this.transcript = new Transcript(SYSTEM_PROMPT);
     this.ledger = [];
     this.archivedWrites = 0;
+    this.sessionPrompt = 0;
+    this.sessionCompletion = 0;
+    this.sessionCached = 0;
+    this.sessionBilled = 0;
+    this.unbilledSteps = 0;
+    this.estimatedSteps = 0;
+    this.jobCount = 0;
   }
 
   /**
@@ -258,10 +590,116 @@ export class Engine {
     return this.cfg.stream !== false;
   }
 
+  /** Values that must not appear on screen or in a file molt writes. */
+  private secrets(): (string | undefined)[] {
+    return [this.cfg.apiKey, process.env.MOLT_API_KEY, process.env.OPENAI_API_KEY];
+  }
+
+  get autonomy(): Autonomy {
+    return this.cfg.autonomy ?? DEFAULT_AUTONOMY;
+  }
+
+  /**
+   * Change how much molt may do without asking.
+   *
+   * Journalled, because it is the one setting that changes what molt is
+   * allowed to do to a machine. A record of a session that does not say when
+   * the ceiling moved cannot explain why a command ran unattended.
+   */
+  setAutonomy(level: Autonomy): void {
+    const from = this.autonomy;
+    this.cfg.autonomy = level;
+    if (from !== level) {
+      this.cfg.journal?.append("autonomy", { from, to: level, means: AUTONOMY_SUMMARY[level] });
+    }
+  }
+
+  get sessionCachedTokens(): number {
+    return this.sessionCached;
+  }
+
+  /** True when any step's tokens were counted by molt rather than the provider. */
+  get costEstimated(): boolean {
+    return this.estimatedSteps > 0;
+  }
+
+  /** True when every step's dollar figure came from the provider itself. */
+  get costBilled(): boolean {
+    return this.sessionBilled > 0 && this.unbilledSteps === 0;
+  }
+
+  /**
+   * What this session has cost so far, in USD.
+   *
+   * Three sources, in descending order of how much molt actually knows:
+   *
+   *   1. The provider billed it. Used only when EVERY step reported a
+   *      figure — a total that mixes billed steps with priced ones is
+   *      neither, and would be wrong in the direction of too small.
+   *   2. Configured prices against reported token counts.
+   *   3. Configured prices against molt's own token estimate, which is why
+   *      `costEstimated` exists and why the meter marks it.
+   *
+   * Cached prompt tokens are billed at the cache rate when one is known.
+   * They are already inside `sessionPrompt`, so they are subtracted out
+   * before the standard rate is applied rather than counted twice.
+   */
   costUsd(): number | undefined {
-    const { priceInPerMtok: pin, priceOutPerMtok: pout } = this.cfg;
+    if (this.costBilled) return this.sessionBilled;
+    const { priceInPerMtok: pin, priceOutPerMtok: pout, priceCachedInPerMtok: pcache } = this.cfg;
     if (pin === undefined || pout === undefined) return undefined;
-    return (this.sessionPrompt / 1e6) * pin + (this.sessionCompletion / 1e6) * pout;
+    const cached = pcache === undefined ? 0 : Math.min(this.sessionCached, this.sessionPrompt);
+    const fresh = this.sessionPrompt - cached;
+    return (fresh / 1e6) * pin + (cached / 1e6) * (pcache ?? pin) + (this.sessionCompletion / 1e6) * pout;
+  }
+
+  /** The prices in force, and where they came from. Backs /price. */
+  pricing(): { in?: number; out?: number; cached?: number; source?: string } {
+    return {
+      in: this.cfg.priceInPerMtok,
+      out: this.cfg.priceOutPerMtok,
+      cached: this.cfg.priceCachedInPerMtok,
+      source: this.cfg.priceSource,
+    };
+  }
+
+  setPricing(p: { in?: number; out?: number; cached?: number; source?: string }): void {
+    this.cfg.priceInPerMtok = p.in;
+    this.cfg.priceOutPerMtok = p.out;
+    this.cfg.priceCachedInPerMtok = p.cached;
+    this.cfg.priceSource = p.source;
+  }
+
+  /** Everything the meter is made of, at this instant. */
+  private meter(): Meter {
+    return {
+      prompt: this.sessionPrompt,
+      completion: this.sessionCompletion,
+      cached: this.sessionCached,
+      billed: this.sessionBilled,
+      unbilledSteps: this.unbilledSteps,
+      estimatedSteps: this.estimatedSteps,
+      costUsd: this.costUsd(),
+    };
+  }
+
+  /** What has been spent since a snapshot, and how much of it molt knows. */
+  private spendSince(before: Meter): Spend {
+    const billedHere = this.sessionBilled - before.billed;
+    const wasBilled = this.unbilledSteps === before.unbilledSteps && billedHere > 0;
+    const now = this.costUsd();
+    return {
+      promptTokens: this.sessionPrompt - before.prompt,
+      completionTokens: this.sessionCompletion - before.completion,
+      cachedTokens: this.sessionCached - before.cached,
+      costUsd: wasBilled
+        ? billedHere
+        : now === undefined
+          ? undefined
+          : now - (before.costUsd ?? 0),
+      estimated: this.estimatedSteps > before.estimatedSteps,
+      billed: wasBilled,
+    };
   }
 
   bom(): Bom {
@@ -269,7 +707,13 @@ export class Engine {
       prompt: this.sessionPrompt,
       completion: this.sessionCompletion,
     });
-    return { ...b, costUsd: this.costUsd(), budgetTokens: this.budgetTokens };
+    return {
+      ...b,
+      sessionCachedTokens: this.sessionCached,
+      costUsd: this.costUsd(),
+      costEstimated: this.costEstimated,
+      budgetTokens: this.budgetTokens,
+    };
   }
 
   /**
@@ -406,7 +850,12 @@ export class Engine {
   private runTool(name: string, args: Record<string, unknown>, callId: string): string {
     switch (name) {
       case "read_file":
-        return readFileSync(resolve(this.cwd, String(args.path ?? "")), "utf8");
+        return readPart(
+          resolve(this.cwd, String(args.path ?? "")),
+          String(args.path ?? ""),
+          num(args.offset, 0),
+          num(args.limit, Number.MAX_SAFE_INTEGER),
+        );
 
       case "write_file": {
         const rel = String(args.path ?? "");
@@ -423,6 +872,57 @@ export class Engine {
           callId,
         });
         return `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${rel}`;
+      }
+
+      case "list_dir": {
+        const rel = String(args.path ?? ".");
+        const abs = resolve(this.cwd, rel);
+        this.mustBeInside(abs, rel);
+        return formatListing(rel, walk(abs, { depth: num(args.depth, 1), glob: str(args.glob) }));
+      }
+
+      case "grep": {
+        const rel = String(args.path ?? ".");
+        const abs = resolve(this.cwd, rel);
+        this.mustBeInside(abs, rel);
+        const pattern = String(args.pattern ?? "");
+        return formatMatches(
+          pattern,
+          grepFiles(abs, pattern, {
+            glob: str(args.glob),
+            ignoreCase: args.ignore_case === true,
+          }),
+        );
+      }
+
+      case "edit_file": {
+        const rel = String(args.path ?? "");
+        const abs = resolve(this.cwd, rel);
+        this.mustBeInside(abs, rel);
+        if (!existsSync(abs)) return `no such file: ${rel} — write_file creates a new one`;
+        const before = sha256Of(abs);
+        const current = readFileSync(abs, "utf8");
+        const edit = applyEdit(
+          current,
+          String(args.old_text ?? ""),
+          String(args.new_text ?? ""),
+          args.replace_all === true,
+        );
+        if (!edit.ok) return `edit refused: ${edit.why}`;
+        writeFileSync(abs, edit.text, "utf8");
+        // Ledgered exactly like a write, so files-changed and record-intact
+        // prove a surgical edit the same way they prove a whole-file rewrite.
+        this.ledger.push({
+          path: isAbsolute(rel) ? relative(this.cwd, abs) : rel,
+          before,
+          after: createHash("sha256").update(edit.text, "utf8").digest("hex"),
+          callId,
+        });
+        const delta = Buffer.byteLength(edit.text, "utf8") - Buffer.byteLength(current, "utf8");
+        return (
+          `replaced ${edit.replacements} occurrence(s) in ${rel} · ` +
+          `${delta >= 0 ? "+" : ""}${delta} bytes`
+        );
       }
 
       case "bash":
@@ -456,8 +956,21 @@ export class Engine {
    * rewrote mid-task is not a bar, so the edit is reported as a failure
    * rather than quietly honoured.
    */
-  private runBarGuarded(claim?: string): BarResult {
-    const bar = this.cfg.bar!;
+  /**
+   * Refuse to act outside the project.
+   *
+   * The permission gate already asks about a path outside the project, but a
+   * tool that resolves paths itself has to hold the line itself too: a gate
+   * that only inspects `path` cannot see where a directory walk ends up.
+   */
+  private mustBeInside(abs: string, shown: string): void {
+    if (!insideProject(this.cwd, abs)) {
+      throw new Error(`${shown} is outside this project; molt will not walk there`);
+    }
+  }
+
+  private runBarGuarded(claim?: string, override?: Bar | null): BarResult {
+    const bar = override ?? this.cfg.bar!;
     const t0 = Date.now();
     const now = barFingerprint(this.cwd);
     if (this.barHash !== null && now !== this.barHash) {
@@ -482,13 +995,217 @@ export class Engine {
     return runBar(bar, this.barContext(claim));
   }
 
+  /**
+   * Ask for an answer with what has already been paid for.
+   *
+   * Every guard in this loop used to end a turn by returning nothing: the step
+   * guard, the budget, the turn ceiling, the no-progress stop. A session that
+   * read twenty files and hit a limit threw all of it away — maximum cost,
+   * zero value, which is the worst outcome available and the one a user
+   * actually reported.
+   *
+   * So a stopped turn gets one last request with tools disabled. The model
+   * cannot go looking for more; it has to say what it found and what it could
+   * not determine. That answer is NOT a completion claim and does not go
+   * through the bar — it is a report from a turn molt cut short, and it is
+   * labelled as one, because presenting it as verified would be the exact lie
+   * this whole tool exists to refuse.
+   */
+  private async *salvage(
+    reason: string,
+    fetchFn: typeof fetch,
+    log?: Journal,
+  ): AsyncGenerator<EngineEvent> {
+    this.transcript.push({
+      role: "user",
+      content:
+        `[molt] ${reason} You cannot call any more tools. Answer now with what you have ` +
+        `already found: what you learned, and — just as importantly — what you did not get ` +
+        `to and cannot vouch for. Do not claim anything you did not verify.`,
+    });
+    try {
+      const res = await fetchFn(`${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}),
+        },
+        // `tools` must be present even to say "use none of them" — a
+        // tool_choice without a tools array is a 400 on at least xAI, and the
+        // first version of this sent exactly that and swallowed the refusal.
+        body: JSON.stringify({
+          model: this.cfg.model,
+          messages: this.transcript.wire(),
+          tools: TOOLS,
+          tool_choice: "none",
+        }),
+      });
+      if (!res.ok) {
+        // A safety net that fails silently is not a safety net. Say so.
+        const why = await res.text().catch(() => "");
+        log?.append("error", { text: `salvage failed: HTTP ${res.status}`, body: why.slice(0, 200) });
+        yield {
+          kind: "info",
+          text: `could not write a closing summary (HTTP ${res.status}) — the work above is all there is`,
+        };
+        return;
+      }
+      const json = (await res.json()) as {
+        choices?: { message?: Msg }[];
+        usage?: Usage;
+      };
+      const text = json.choices?.[0]?.message?.content ?? "";
+      const pTok = json.usage?.prompt_tokens ?? 0;
+      const cTok = json.usage?.completion_tokens ?? 0;
+      this.sessionPrompt += pTok;
+      this.sessionCompletion += cTok;
+      if (typeof json.usage?.cost === "number") this.sessionBilled += json.usage.cost;
+      else this.unbilledSteps += 1;
+      log?.append("salvage", { reason, promptTokens: pTok, completionTokens: cTok, chars: text.length });
+      if (!text.trim()) return;
+      yield {
+        kind: "info",
+        text:
+          "the answer below was written after molt stopped the turn. It was NOT checked " +
+          "against the bar — treat it as notes, not as a completed task.",
+      };
+      yield { kind: "assistant_text", text: redact(text, this.secrets()) };
+    } catch (e) {
+      // A courtesy that failed must not mask the real stop, but must not
+      // vanish either.
+      log?.append("error", { text: `salvage failed: ${String(e)}` });
+    }
+  }
+
+  /**
+   * Close out a turn whose claim was never proven: write the receipt, log
+   * the ending, and report it as a failure. Shared by the exhausted path and
+   * the one that stops early because nothing changed, so both produce the
+   * same evidence — a refusal that skips the receipt is a refusal nobody can
+   * audit later.
+   */
+  private async *finishUnproven(
+    claim: string,
+    result: BarResult,
+    attempts: number,
+    log?: Journal,
+  ): AsyncGenerator<EngineEvent> {
+    const onlyWrites = failedOnlyWriteChecks(result);
+    if (this.cfg.receipts) {
+      const receipt = this.cfg.receipts.write({
+        claim,
+        result,
+        attempt: attempts,
+        verdict: "exhausted",
+        model: this.cfg.model,
+        provider: this.provider,
+        sessionTokens: this.sessionTokens,
+        shedBatches: this.transcript.shedCount,
+      });
+      log?.append("receipt", { verdict: "exhausted", file: receipt.path, attempt: attempts });
+      yield { kind: "receipt", path: receipt.path };
+    }
+    log?.append("session_end", { reason: "bar not met", attempts });
+    yield { kind: "proof_exhausted", result, attempts };
+    yield {
+      kind: "error",
+      text: onlyWrites
+        ? `bar not met: ${onlyWrites} requires this turn to have changed a file, and none ` +
+          `changed. molt is reporting failure rather than success. Either the work was not ` +
+          `done, or this was a question — ask questions with /ask, or a leading "?", which ` +
+          `runs the rest of the bar and drops that one check.`
+        : `bar not met after ${attempts} attempts. molt is reporting failure rather ` +
+          `than success. See .molt/receipts/ for what was checked.`,
+    };
+  }
+
   /** Run the bar without touching the loop — backs the /prove command. */
   proveNow(claim?: string): BarResult | null {
     if (!this.cfg.bar) return null;
     return this.runBarGuarded(claim);
   }
 
-  async *run(userText: string, confirm: Confirm): AsyncGenerator<EngineEvent> {
+  /**
+   * One user turn, with its own books.
+   *
+   * The session meter answers "what have I spent?" and must only ever climb.
+   * It cannot also answer "what did that question cost?" — so the per-job
+   * figures are kept here, as a delta against a snapshot taken before the
+   * turn, and reported when the turn ends. Nothing about the session totals
+   * changes; a job is a view of them, never a reset.
+   */
+  async *run(
+    userText: string,
+    confirm: Confirm,
+    opts: RunOptions = {},
+  ): AsyncGenerator<EngineEvent> {
+    const job = ++this.jobCount;
+    const startedAt = Date.now();
+    const before = this.meter();
+    let steps = 0;
+    let cancelled = false;
+    let errored = false;
+    let exhausted = false;
+    let proven = false;
+    let answered = false;
+
+    yield { kind: "job_start", job, text: userText };
+
+    for await (const ev of this.runTurn(userText, confirm, job, opts)) {
+      switch (ev.kind) {
+        case "step_summary":
+          steps += 1;
+          break;
+        case "cancelled":
+          cancelled = true;
+          break;
+        case "error":
+          errored = true;
+          break;
+        case "proof_exhausted":
+          exhausted = true;
+          break;
+        case "proof_result":
+          proven = true;
+          break;
+        case "assistant_text":
+          answered = true;
+          break;
+      }
+      yield ev;
+    }
+
+    // Order matters: a bar that was never met is "not proven" even though an
+    // error event follows it, and an answer nothing checked is never
+    // "verified" — the distinction molt exists to make.
+    const outcome: JobOutcome = cancelled
+      ? "cancelled"
+      : exhausted
+        ? "not proven"
+        : errored
+          ? "error"
+          : proven
+            ? "verified"
+            : answered
+              ? "unverified"
+              : "stopped";
+
+    yield {
+      kind: "job_end",
+      job,
+      steps,
+      spend: this.spendSince(before),
+      durationMs: Date.now() - startedAt,
+      outcome,
+    };
+  }
+
+  private async *runTurn(
+    userText: string,
+    confirm: Confirm,
+    job: number,
+    opts: RunOptions = {},
+  ): AsyncGenerator<EngineEvent> {
     // Remember where this turn began so a cancellation can leave no trace.
     const turnStart = this.transcript.length;
     const log = this.cfg.journal;
@@ -501,13 +1218,81 @@ export class Engine {
     const fetchFn = this.cfg.fetchFn ?? fetch;
     const maxAttempts = this.cfg.maxProofAttempts ?? MAX_PROOF_ATTEMPTS;
     let proofAttempts = 0;
+    /** The last bar result, for deciding whether another run could differ. */
+    let lastResult: BarResult | null = null;
+    this.actsSinceBar = 0;
 
+    /**
+     * Every tool call made this turn, by call and by the digest of what it
+     * returned. A model that asks the same question and gets the same answer
+     * has learned nothing, and resending that answer costs the same as the
+     * first time — which is how thirty steps of re-reading four files became
+     * fifty cents.
+     */
+    const answered = new Map<string, { step: number; sha: string }>();
+    /**
+     * Which lines of which file the model has already been shown this turn.
+     *
+     * Exact-match detection is not enough on its own: asking for line 181 and
+     * then line 182 of the same file returns almost the same bytes under a
+     * different key, which is precisely how a real session walked past the
+     * repeat guard for thirty-two steps. Coverage answers the question that
+     * actually matters — "has this already been shown?" — rather than "is this
+     * byte-identical to something?".
+     */
+    const shown = new Map<string, { from: number; to: number }[]>();
+    /** Consecutive steps in which nothing new came back. */
+    let dryStreak = 0;
+
+    // A question changes nothing, so a check that demands a change can only
+    // ever fail it. `ask` drops exactly those checks for this turn and runs
+    // the rest — the bar is narrowed in the open, never quietly lowered, and
+    // the receipt records which checks actually ran.
+    const bar = opts.ask ? withoutWriteChecks(this.cfg.bar) : this.cfg.bar;
+    if (opts.ask) {
+      const dropped = (this.cfg.bar?.checks.length ?? 0) - (bar?.checks.length ?? 0);
+      log?.append("note", { text: `ask turn — ${dropped} write-dependent check(s) not run` });
+      if (dropped > 0) {
+        yield {
+          kind: "info",
+          text: `asking: ${dropped} check(s) that require a file change are not run this turn`,
+        };
+      }
+    }
+
+    const turnStartTokens = this.sessionTokens;
     for (let step = 0; step < MAX_STEPS; step++) {
+      // An explicit budget speaks for itself, and speaks first: one knob
+      // should not produce two different messages.
       if (this.overBudget()) {
         yield {
           kind: "error",
           text: `budget hit (${this.budgetTokens} tokens) — loop stopped. /budget to raise.`,
         };
+        yield* this.salvage(`You have reached the token budget for this session.`, fetchFn, log);
+        return;
+      }
+
+      // Otherwise a ceiling on the turn, not just on the session. Checked
+      // before the request rather than after, so the limit is what molt
+      // refuses to spend rather than what it noticed spending.
+      const turnCeiling = this.cfg.maxTurnTokens ?? DEFAULT_TURN_TOKENS;
+      const spentThisTurn = this.sessionTokens - turnStartTokens;
+      if (turnCeiling > 0 && spentThisTurn >= turnCeiling) {
+        log?.append("session_end", { reason: "turn ceiling", tokens: spentThisTurn });
+        yield {
+          kind: "error",
+          text:
+            `stopped: this turn has used ${spentThisTurn} tokens` +
+            (this.costUsd() === undefined ? "" : ` · ${fmtUsd(this.costUsd() ?? 0)}`) +
+            `, past the ${turnCeiling}-token ceiling for a single turn. Nothing was verified. ` +
+            `Narrow the request, or raise the ceiling with /budget.`,
+        };
+        yield* this.salvage(
+          `This turn reached its ${turnCeiling}-token ceiling before you finished.`,
+          fetchFn,
+          log,
+        );
         return;
       }
 
@@ -520,13 +1305,13 @@ export class Engine {
           log?.append("elide", { elided: pruned.elided, tokensSaved: pruned.tokensSaved });
           yield {
             kind: "info",
-            text: `pruned ${pruned.elided} superseded tool result(s) · −${pruned.tokensSaved} tokens`,
+            text: `pruned ${pruned.elided} superseded tool result(s) · ${pruned.tokensSaved} tokens freed`,
           };
         }
       }
 
-      const auto = this.cfg.autoShedAtTokens;
-      if (auto !== undefined && this.transcript.historyTokens() > auto) {
+      const auto = this.cfg.autoShedAtTokens ?? DEFAULT_AUTO_SHED_TOKENS;
+      if (auto > 0 && this.transcript.historyTokens() > auto) {
         const shed = this.shed();
         if (shed) {
           log?.append("shed", {
@@ -543,21 +1328,37 @@ export class Engine {
       const stream = this.cfg.stream !== false;
       const controller = new AbortController();
       this.inFlight = controller;
+      const stepStartedAt = Date.now();
 
       const wire = this.transcript.wire();
+      const requestEst = this.bom().requestTotalEst;
       log?.append("request", {
         step,
         messages: wire.length,
-        estTokens: this.bom().requestTotalEst,
+        estTokens: requestEst,
         estimated: true,
         stream,
         model: this.cfg.model,
         endpoint: this.cfg.baseUrl,
       });
+      yield {
+        kind: "request",
+        step,
+        messages: wire.length,
+        estTokens: requestEst,
+        model: this.cfg.model,
+        stream,
+      };
 
-      let res: Response;
-      try {
-        res = await fetchFn(`${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      /**
+       * Streaming responses carry no usage block unless it is asked for.
+       * Without this flag molt fell back to counting the wire JSON itself —
+       * an estimate presented in a meter that reads as a measurement, on
+       * the code path that is on by default. Asking costs one field.
+       */
+      const askForUsage = stream && !this.streamUsageUnsupported;
+      const send = (withUsage: boolean): Promise<Response> =>
+        fetchFn(`${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`, {
           method: "POST",
           signal: controller.signal,
           headers: {
@@ -566,12 +1367,32 @@ export class Engine {
           },
           body: (this.lastRequestBody = JSON.stringify({
             model: this.cfg.model,
-            messages: this.transcript.wire(),
+            messages: wire,
             tools: TOOLS,
             tool_choice: "auto",
             ...(stream ? { stream: true } : {}),
+            ...(withUsage ? { stream_options: { include_usage: true } } : {}),
           })),
         });
+
+      let res: Response;
+      try {
+        res = await send(askForUsage);
+        // A server that does not implement the field rejects the request. Try
+        // once without it rather than failing a turn over a request for better
+        // bookkeeping — and only conclude the field was the problem if the
+        // retry actually works, so a genuine 400 does not quietly turn usage
+        // reporting off for the rest of the session.
+        if (!res.ok && res.status === 400 && askForUsage) {
+          const retry = await send(false);
+          if (retry.ok) {
+            this.streamUsageUnsupported = true;
+            log?.append("note", {
+              text: "provider rejected stream_options — token counts fall back to molt's estimate",
+            });
+          }
+          res = retry;
+        }
       } catch (e) {
         this.inFlight = undefined;
         if (controller.signal.aborted) {
@@ -594,7 +1415,8 @@ export class Engine {
       }
 
       let msg: Msg | undefined;
-      let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
+      let usage: Usage | undefined;
+      let finishReason: string | undefined;
       const contentType = res.headers?.get?.("content-type") ?? "";
       const isSse = stream && res.body != null && contentType.includes("event-stream");
 
@@ -610,7 +1432,18 @@ export class Engine {
             fragments.push(fragment);
           });
           msg = result.message;
-          usage = { prompt_tokens: result.promptTokens, completion_tokens: result.completionTokens };
+          finishReason = result.finishReason;
+          usage = {
+            prompt_tokens: result.promptTokens,
+            completion_tokens: result.completionTokens,
+            ...(result.cachedTokens === undefined
+              ? {}
+              : { prompt_tokens_details: { cached_tokens: result.cachedTokens } }),
+            ...(result.reasoningTokens === undefined
+              ? {}
+              : { completion_tokens_details: { reasoning_tokens: result.reasoningTokens } }),
+            ...(result.costUsd === undefined ? {} : { cost: result.costUsd }),
+          };
         } catch (e) {
           this.inFlight = undefined;
           if (controller.signal.aborted) {
@@ -624,8 +1457,8 @@ export class Engine {
         for (const f of fragments) yield { kind: "delta", text: f };
       } else {
         let json: {
-          choices?: { message?: Msg }[];
-          usage?: { prompt_tokens?: number; completion_tokens?: number };
+          choices?: { message?: Msg; finish_reason?: string | null }[];
+          usage?: Usage;
         };
         try {
           json = (await res.json()) as typeof json;
@@ -640,6 +1473,7 @@ export class Engine {
           return;
         }
         msg = json.choices?.[0]?.message;
+        finishReason = json.choices?.[0]?.finish_reason ?? undefined;
         usage = json.usage;
       }
 
@@ -652,27 +1486,72 @@ export class Engine {
 
       const reportedUsage =
         typeof usage?.prompt_tokens === "number" || typeof usage?.completion_tokens === "number";
-      const pTok = usage?.prompt_tokens ?? estTokens(JSON.stringify(this.transcript.wire()));
+      const pTok = usage?.prompt_tokens ?? estTokens(JSON.stringify(wire));
       const cTok = usage?.completion_tokens ?? estTokens(JSON.stringify(msg));
+      const cachedTok = usage?.prompt_tokens_details?.cached_tokens ?? 0;
+      const billedUsd = usage?.cost;
+      const costBefore = this.costUsd();
+
+      this.sessionPrompt += pTok;
+      this.sessionCompletion += cTok;
+      this.sessionCached += cachedTok;
+      if (!reportedUsage) this.estimatedSteps += 1;
+      if (typeof billedUsd === "number") this.sessionBilled += billedUsd;
+      else this.unbilledSteps += 1;
+
+      const costAfter = this.costUsd();
+      const stepCost =
+        typeof billedUsd === "number"
+          ? billedUsd
+          : costAfter === undefined
+            ? undefined
+            : costAfter - (costBefore ?? 0);
+
       log?.append("response", {
         step,
         promptTokens: pTok,
         completionTokens: cTok,
+        cachedTokens: cachedTok,
         // Providers do not always report usage. Say which this is.
         estimated: !reportedUsage,
+        costUsd: stepCost ?? null,
+        billed: typeof billedUsd === "number",
+        finishReason: finishReason ?? null,
         toolCalls: msg.tool_calls?.length ?? 0,
         contentChars: (msg.content ?? "").length,
         finishedWithText: Boolean(msg.content),
       });
-      this.sessionPrompt += pTok;
-      this.sessionCompletion += cTok;
       yield {
         kind: "usage",
         promptTokens: pTok,
         completionTokens: cTok,
+        cachedTokens: cachedTok,
         sessionTokens: this.sessionTokens,
-        costUsd: this.costUsd(),
+        costUsd: costAfter,
+        estimated: !reportedUsage,
+        billed: typeof billedUsd === "number",
       };
+      const spend: Spend = {
+        promptTokens: pTok,
+        completionTokens: cTok,
+        cachedTokens: cachedTok,
+        costUsd: stepCost,
+        estimated: !reportedUsage,
+        billed: typeof billedUsd === "number",
+      };
+      /** Close out the step with what it did and what it cost. */
+      const summary = (tools: string[], outcome: "tools" | "claim"): EngineEvent => ({
+        kind: "step_summary",
+        job,
+        step,
+        tools,
+        spend,
+        sessionTokens: this.sessionTokens,
+        sessionCostUsd: this.costUsd(),
+        durationMs: Date.now() - stepStartedAt,
+        outcome,
+        finishReason,
+      });
 
       this.transcript.push({
         role: "assistant",
@@ -681,6 +1560,9 @@ export class Engine {
       });
 
       if (msg.tool_calls?.length) {
+        const called: string[] = [];
+        let autoRan = 0;
+        let repeated = 0;
         for (const call of msg.tool_calls) {
           const name = call.function?.name ?? "unknown";
           let args: Record<string, unknown> = {};
@@ -690,11 +1572,14 @@ export class Engine {
             /* model sent malformed args; run with empty */
           }
           const detail = toolDetail(name, args);
-          const target = resolve(this.cwd, String(args.path ?? ""));
-          const outsideCwd =
-            name === "read_file" && !target.startsWith(this.cwd + "/") && target !== this.cwd;
-          const needsGate = name === "bash" || name === "write_file" || outsideCwd;
-          const allowed = needsGate ? await confirm(name, detail) : true;
+          // What the current autonomy level says about this exact call. The
+          // decision is mechanical and the reason travels with it, so an
+          // approval prompt can say which rule produced it rather than
+          // asking the same way about everything.
+          const decision = gate(this.autonomy, { name, args, cwd: this.cwd });
+          // The prompt shows the command in full. You are being asked to judge
+          // it, and a redacted command is one you cannot judge.
+          const allowed = decision.ask ? await confirm(name, `${detail}${decision.why ? ` — ${decision.why}` : ""}`) : true;
 
           let result: string;
           let note: string | undefined;
@@ -709,7 +1594,12 @@ export class Engine {
             yield { kind: "tool_start", name, detail };
             const toolStartedAt = Date.now();
             try {
-              const t = truncateResult(this.runTool(name, args, call.id));
+              // read_file budgets itself, to the byte, so that the notice
+              // saying how to continue survives. Capping it again here is what
+              // cut that notice off and left the model with no way forward.
+              const raw = this.runTool(name, args, call.id);
+              const t =
+                name === "read_file" ? { text: raw, note: undefined } : truncateResult(raw);
               result = t.text;
               note = t.note;
             } catch (e) {
@@ -717,8 +1607,62 @@ export class Engine {
               note = "error";
             }
             durationMs = Date.now() - toolStartedAt;
+
+            // A read of lines the model has already been shown, whatever
+            // offset it spelled them with.
+            if (name === "read_file" && note !== "error") {
+              const path = String(args.path ?? "");
+              const from = num(args.offset, 0);
+              const lines = (result.match(/\n/g)?.length ?? 0) + 1;
+              const to = from + lines;
+              const covered = shown.get(path) ?? [];
+              const already = covered.some((r) => from >= r.from && to <= r.to);
+              if (already) {
+                result =
+                  `[molt: you have already been shown lines ${from + 1}-${to} of ${path} in ` +
+                  `this conversation. Scroll up rather than reading them again — nothing has ` +
+                  `changed since. If you need a different part, ask for an offset past what ` +
+                  `you have; if you have what you need, answer.]`;
+                note = "repeat";
+                repeated += 1;
+              } else {
+                covered.push({ from, to });
+                shown.set(path, covered);
+              }
+            }
+
+            // The same call, returning the same bytes it returned before.
+            // Send a pointer instead of the payload: the answer is already in
+            // the conversation, and saying so is both cheaper and truer than
+            // repeating it.
+            // Canonical key: {path} and {path, offset: 0} are the same call,
+            // and a model that spells out a default must not thereby look like
+            // it is asking something new.
+            const key = callKey(name, args);
+            const sha = createHash("sha256").update(result, "utf8").digest("hex");
+            const prior = answered.get(key);
+            if (prior && prior.sha === sha) {
+              result =
+                `[molt: this is the same ${name} call you made at step ${prior.step + 1}, and ` +
+                `nothing has changed since. Its result is already above in this conversation. ` +
+                `Repeating it cannot tell you anything new — act on what you have, or say ` +
+                `plainly what is blocking you.]`;
+              note = "repeat";
+              repeated += 1;
+            }
+            answered.set(key, { step, sha });
           }
-          if (needsGate) log?.append("permission", { name, detail, allowed });
+          // Both branches are recorded. A call that ran without being asked
+          // about is exactly the thing an audit needs to be able to find, and
+          // it is recorded with the level that let it through.
+          log?.append("permission", {
+            name,
+            detail,
+            allowed,
+            asked: decision.ask,
+            autonomy: this.autonomy,
+            ...(decision.why ? { why: decision.why } : {}),
+          });
           log?.append("tool_call", { step, name, detail, allowed });
           log?.append("tool_result", {
             name,
@@ -727,27 +1671,123 @@ export class Engine {
             note,
             sha256: createHash("sha256").update(result, "utf8").digest("hex").slice(0, 16),
           });
-          yield { kind: "tool", name, detail, note, durationMs };
+          if ((name === "write_file" || name === "edit_file") && allowed) {
+            shown.delete(String(args.path ?? ""));
+          }
+          called.push(name);
+          if (allowed) this.actsSinceBar += 1;
+          if (!decision.ask) autoRan += 1;
+          // Everything that scrolls is redacted. A transcript is pasted into
+          // bug reports and screenshotted into chat windows, which makes the
+          // screen a distribution channel like any other — and unlike the
+          // prompt above, nobody is judging a command from the scrollback.
+          const hide = (t: string) => redact(t, this.secrets());
+          yield {
+            kind: "tool",
+            name,
+            detail: hide(detail),
+            note,
+            durationMs,
+            args: hide(capture(call.function?.arguments ?? "")),
+            bytes: Buffer.byteLength(result, "utf8"),
+            preview: hide(capture(result)),
+            auto: !decision.ask,
+          };
           this.transcript.push({ role: "tool", tool_call_id: call.id, content: result });
+        }
+        yield summary(called, "tools");
+
+        // A step whose every call was a repeat produced no new information.
+        // One can be a stumble; two in a row is a loop, and a loop with a
+        // token meter attached has to be stopped by molt rather than by the
+        // step guard thirty steps later.
+        // Majority, not unanimity. A step that spends three calls on things it
+        // already had and one on something new is thrashing, and requiring
+        // every single call to be a repeat is how a loop walked past this
+        // guard for thirty-two steps and most of a dollar.
+        if (called.length > 0 && repeated * 2 >= called.length) {
+          dryStreak += 1;
+          if (dryStreak === 1) {
+            yield {
+              kind: "info",
+              text:
+                `${repeated} of ${called.length} calls that step were things molt had already ` +
+                `answered — little or nothing new came back`,
+            };
+          }
+        } else {
+          dryStreak = 0;
+        }
+        if (dryStreak >= 2) {
+          log?.append("loop_stop", {
+            step,
+            repeatedCalls: called.length,
+            sessionTokens: this.sessionTokens,
+            costUsd: this.costUsd() ?? null,
+          });
+          log?.append("session_end", { reason: "no progress" });
+          yield {
+            kind: "error",
+            text:
+              `stopped: the model spent two steps repeating calls that had already been ` +
+              `answered, and no new information came back. This turn used ` +
+              `${this.sessionTokens} tokens. Nothing was verified — try a narrower request, ` +
+              `or shift+V to watch what it is reaching for.`,
+          };
+          yield* this.salvage(
+            "You have spent two steps repeating calls that were already answered.",
+            fetchFn,
+            log,
+          );
+          return;
         }
         continue; // let the model see tool results
       }
 
+      yield summary([], "claim");
+
       // ---- The model believes it is finished. That is a claim. ----
       const claim = msg.content ?? "";
 
-      if (!this.cfg.bar || this.cfg.bar.checks.length === 0) {
+      if (!bar || bar.checks.length === 0) {
         yield {
           kind: "info",
-          text: "no .molt/done.yml — completion is unverified. run `molt init` to add a bar.",
+          text: opts.ask
+            ? "nothing left in the bar to check a question against — this answer is unverified."
+            : "no .molt/done.yml — completion is unverified. run `molt init` to add a bar.",
         };
-        if (claim) yield { kind: "assistant_text", text: claim };
+        if (claim) yield { kind: "assistant_text", text: redact(claim, this.secrets()) };
+        return;
+      }
+
+      // Nothing has happened since the last bar run, so the bar cannot
+      // answer differently. Say so and stop, rather than spending another
+      // suite — and another turn's tokens — proving it.
+      if (lastResult !== null && this.actsSinceBar === 0) {
+        log?.append("bar_skipped", {
+          attempt: proofAttempts,
+          reason: "no tool calls since the last bar run; state is unchanged",
+          failed: lastResult.results.filter((r) => !r.ok).map((r) => r.name).join(", "),
+        });
+        yield {
+          kind: "info",
+          text:
+            "the model changed nothing since the last check, so re-running the bar would " +
+            "produce the same result. Stopping instead of spending another attempt.",
+        };
+        yield* this.finishUnproven(claim, lastResult, proofAttempts, log);
         return;
       }
 
       proofAttempts += 1;
-      yield { kind: "proof_start", checks: this.cfg.bar.checks.length };
-      const result = this.runBarGuarded(claim);
+      yield {
+        kind: "proof_start",
+        checks: bar.checks.length,
+        names: bar.checks.map((c) => c.name),
+      };
+      const result = this.runBarGuarded(claim, bar);
+      this.actsSinceBar = 0;
+      lastResult = result;
       log?.append("bar_run", {
         attempt: proofAttempts,
         ok: result.ok,
@@ -776,6 +1816,8 @@ export class Engine {
           model: this.cfg.model,
           provider: this.provider,
           sessionTokens: this.sessionTokens,
+          costUsd: this.costUsd(),
+          costEstimated: this.costEstimated,
           shedBatches: this.transcript.shedCount,
         });
         log?.append("receipt", { verdict, file: receipt.path, attempt: proofAttempts });
@@ -785,18 +1827,23 @@ export class Engine {
       if (result.ok) {
         log?.append("session_end", { reason: "bar met", attempts: proofAttempts });
         yield { kind: "proof_result", result, attempt: proofAttempts };
-        if (claim) yield { kind: "assistant_text", text: claim };
+        if (claim) yield { kind: "assistant_text", text: redact(claim, this.secrets()) };
         return;
       }
 
       if (exhausted) {
         log?.append("session_end", { reason: "bar not met", attempts: proofAttempts });
         yield { kind: "proof_exhausted", result, attempts: proofAttempts };
+        const onlyWrites = failedOnlyWriteChecks(result);
         yield {
           kind: "error",
-          text:
-            `bar not met after ${proofAttempts} attempts. molt is reporting failure rather ` +
-            `than success. See .molt/receipts/ for what was checked.`,
+          text: onlyWrites
+            ? `bar not met: ${onlyWrites} requires this turn to have changed a file, and ` +
+              `none changed. molt is reporting failure rather than success. Either the work ` +
+              `was not done, or this was a question — ask questions with /ask, or a leading ` +
+              `"?", which runs the rest of the bar and drops that one check.`
+            : `bar not met after ${proofAttempts} attempts. molt is reporting failure rather ` +
+              `than success. See .molt/receipts/ for what was checked.`,
         };
         return;
       }
@@ -805,7 +1852,15 @@ export class Engine {
       this.transcript.pushBarFailure(formatBarFailure(result, proofAttempts, maxAttempts));
     }
 
-    yield { kind: "error", text: `stopped after ${MAX_STEPS} steps (loop guard)` };
+    yield {
+      kind: "error",
+      text:
+        `stopped after ${MAX_STEPS} steps (loop guard) · ${this.sessionTokens} tokens` +
+        (this.costUsd() === undefined ? "" : ` · ${fmtUsd(this.costUsd() ?? 0)}`) +
+        `. Nothing was verified. Narrow the request, or set /budget to put a ceiling on a ` +
+        `turn like this.`,
+    };
+    yield* this.salvage(`You have used all ${MAX_STEPS} steps available for this turn.`, fetchFn, log);
   }
 
   /** Preflight: is the endpoint reachable, and is the model actually there? */
