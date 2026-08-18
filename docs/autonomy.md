@@ -84,7 +84,11 @@ At **every** level, including high:
   history and published state (`git push`, `git reset --hard`, `git clean -f`,
   `git checkout -- `, `git restore`, `git rebase`, `git stash drop`,
   `npm publish`), machine state (`sudo`, `shutdown`, `pkill`, `chmod 777`,
-  `dd of=`, `mkfs`), and piping a download into an interpreter.
+  `dd of=`, `mkfs`), piping a download into an interpreter, and handing one a
+  program on the command line (`python -c`, `node -e`, `sh -c`) — an unread
+  program's effect is not readable from the text that launched it, which is the
+  same rule that sends `$(…)` to a prompt. Running a script *file* is ordinary
+  work and is not gated.
 
   **"Named list" is the exact claim**, and it is narrower than "everything that
   could lose data". An earlier version of this page said "everything that cannot
