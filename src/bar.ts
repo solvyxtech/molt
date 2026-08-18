@@ -338,7 +338,7 @@ export function mentionedPaths(claim: string): string[] {
   // Remove them wholesale rather than trying to reject them token by token.
   const text = claim.replace(/\b[a-z][\w+.-]*:\/\/\S+/gi, " ").replace(/\bwww\.\S+/gi, " ");
 
-  const add = (raw: string, quoted = false) => {
+  const add = (raw: string) => {
     const cleaned = raw.replace(/^[`'"(\[]+|[`'".,;:)\]]+$/g, "").trim();
     if (!cleaned || cleaned.length > 200) return;
     if (!/^[\w./@-]+$/.test(cleaned)) return;
@@ -346,17 +346,14 @@ export function mentionedPaths(claim: string): string[] {
     if (/^\d+\.\d+$/.test(cleaned)) return; // version numbers
     if (cleaned.startsWith("http")) return;
     if (NOT_FILENAMES.has(cleaned.toLowerCase())) return;
-    // Prose abbreviations are short stems with short extensions. A real file
-    // shaped that way — a.c, x.h — is written in backticks by anyone
-    // describing it, and that is the form molt trusts.
-    if (!quoted && !cleaned.includes("/")) {
-      const [stem = "", ext = ""] = [cleaned.slice(0, cleaned.lastIndexOf(".")), cleaned.slice(cleaned.lastIndexOf(".") + 1)];
-      if (stem.length <= 2 && ext.length <= 2) return;
-    }
+    // An earlier version also skipped any short stem with a short extension,
+    // which killed "e.g." and "a.ts" alike — so a claim about a real file
+    // stopped being checked at all. The named list above is enough; guessing
+    // by shape cost more than it caught.
     found.add(cleaned.replace(/^\.\//, ""));
   };
 
-  for (const m of text.matchAll(/`([^`]+)`/g)) add(m[1], true);
+  for (const m of text.matchAll(/`([^`]+)`/g)) add(m[1]);
   for (const m of text.matchAll(/[\w./@-]*[\w-]\.[A-Za-z][\w]{0,9}\b/g)) add(m[0]);
 
   return [...found];
@@ -580,15 +577,22 @@ export function runCheck(check: Check, ctx: BarContext): CheckResult {
       exitCode = 124;
     }
   }
+  const passed = exitCode === check.expectExit;
   return {
     name: check.name,
     ...(check.advisory ? { advisory: true } : {}),
     tags: check.tags,
     kind: "command",
     detail: check.run,
-    ok: exitCode === check.expectExit,
+    ok: passed,
     exitCode,
-    output: truncate(output),
+    // A passing command's own stdout is usually noise — "ok", a dot per test —
+    // so the evidence line says what molt actually established instead: this
+    // command, this exit code, this long. A failure keeps its real output,
+    // which is the whole point of a failure.
+    output: passed
+      ? `\`${check.run}\` exited ${exitCode} in ${Date.now() - t0}ms`
+      : truncate(output),
     durationMs: Date.now() - t0,
   };
 }

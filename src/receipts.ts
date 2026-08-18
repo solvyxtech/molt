@@ -115,43 +115,81 @@ export class Receipts {
     costUsd?: number;
     /** True when that figure rests on molt's own token estimate. */
     costEstimated?: boolean;
+    /** Every file the turn changed, with the hashes that prove it. */
+    changed?: { path: string; before: string | null; after: string }[];
+    /** What the model ran and read, in order, as one line each. */
+    did?: string[];
   }): Receipt {
     const iso = new Date().toISOString();
     const seq = this.count();
     const file = `${String(seq).padStart(4, "0")}-${args.verdict}.md`;
     const p = join(this.dir, file);
 
+    // A receipt is read by someone asking "what did it do, and should I
+    // believe it finished?" — so it answers in that order. It used to open
+    // with a provider name and a token count, which answer neither question,
+    // and put the work itself nowhere at all.
+    const verdictLine =
+      args.verdict === "accepted"
+        ? "molt accepted this claim: every check that can block a completion passed."
+        : args.verdict === "refused"
+          ? "molt refused this claim and sent the failures back to the model."
+          : "molt reported failure: the attempt limit was reached with checks still failing.";
+
+    const changed = args.changed ?? [];
+    const work: string[] = ["## What the model changed", ""];
+    if (changed.length === 0) {
+      work.push("Nothing. No file was modified during this turn.", "");
+    } else {
+      work.push("| file | before | after |", "|---|---|---|");
+      for (const c of changed) {
+        work.push(
+          `| \`${c.path}\` | ${c.before === null ? "did not exist" : `\`${c.before.slice(0, 12)}\``} | ` +
+            `\`${c.after.slice(0, 12)}\` |`,
+        );
+      }
+      work.push(
+        "",
+        "Hashes are SHA-256, taken immediately before and after molt wrote the file.",
+        "`work-landed` re-reads each path and fails if what is there now does not match.",
+        "",
+      );
+    }
+
+    const did = args.did ?? [];
+    if (did.length > 0) {
+      work.push("## What the model ran", "");
+      for (const line of did.slice(0, 40)) work.push(`- ${line}`);
+      if (did.length > 40) work.push(`- … and ${did.length - 40} more`);
+      work.push("");
+    }
+
     const head = [
       `# molt receipt ${String(seq).padStart(4, "0")} — ${args.verdict}`,
       "",
-      `- when: ${iso}`,
-      `- attempt: ${args.attempt}`,
-      `- provider: ${args.provider}`,
-      `- model: ${args.model}`,
-      `- session tokens: ${args.sessionTokens}`,
-      ...(args.costUsd === undefined
-        ? []
-        : [`- session cost: ${args.costEstimated ? "~" : ""}$${args.costUsd.toFixed(4)}`]),
-      `- shed batches archived: ${args.shedBatches}`,
-      `- bar duration: ${args.result.durationMs}ms`,
+      verdictLine,
       "",
-      "## Claim",
-      "",
-      "The model asserted the task was complete, saying:",
+      "## What the model claimed",
       "",
       "> " + (args.claim.trim() || "(no final message)").split("\n").join("\n> "),
       "",
-      "## Checks",
+      ...work,
+      "## What was checked, and what it established",
       "",
-      "| check | kind | detail | exit | result | ms |",
-      "|---|---|---|---|---|---|",
+      "| check | verdict | what it established | ms |",
+      "|---|---|---|---|",
     ];
 
-    const rows = args.result.results.map(
-      (r) =>
-        `| ${r.name} | ${r.kind} | \`${r.detail.replace(/\|/g, "\\|").slice(0, 60)}\` | ` +
-        `${r.exitCode ?? "—"} | ${r.ok ? "pass" : "**FAIL**"}${r.cached ? " (reused)" : ""} | ${r.durationMs} |`,
-    );
+    const rows = args.result.results.map((r) => {
+      // The finding, not the label. "pass" is a header; "2 files modified and
+      // verified byte-for-byte on disk" is the reason to believe it.
+      const finding = r.output.trim().split("\n")[0]?.slice(0, 90) ?? "";
+      const verdict = r.ok ? (r.advisory ? "pass" : "pass") : r.advisory ? "warn" : "**FAIL**";
+      return (
+        `| ${r.name} | ${verdict}${r.cached ? " (reused)" : ""} | ` +
+        `${finding.replace(/\|/g, "\\|") || "—"} | ${r.durationMs} |`
+      );
+    });
 
     const detail: string[] = ["", "## Output", ""];
     for (const r of args.result.results) {
@@ -179,6 +217,19 @@ export class Receipts {
 
     const foot = [
       "---",
+      "",
+      "## Session",
+      "",
+      `- when: ${iso}`,
+      `- attempt: ${args.attempt}`,
+      `- provider: ${args.provider}`,
+      `- model: ${args.model}`,
+      `- session tokens: ${args.sessionTokens}`,
+      ...(args.costUsd === undefined
+        ? []
+        : [`- session cost: ${args.costEstimated ? "~" : ""}$${args.costUsd.toFixed(4)}`]),
+      `- shed batches archived: ${args.shedBatches}`,
+      `- bar duration: ${args.result.durationMs}ms`,
       "",
       args.verdict === "accepted"
         ? "Every check passed. This is the evidence behind that claim."

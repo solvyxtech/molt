@@ -333,10 +333,16 @@ export function App({
         // it did not stop anything, and printing it as FAIL next to a met bar
         // teaches people to delete the check rather than read it.
         const label = r.ok ? "pass" : r.advisory ? "warn" : "FAIL";
+        // What the check actually established, on the same line. "pass
+        // work-landed" is a header; "2 files modified and verified byte-for-byte
+        // on disk" is the finding, and it is the reason anyone should believe
+        // the header. It was already computed and only shown on failure.
+        const evidence = r.ok ? r.output.trim().split("\n")[0] ?? "" : "";
         add(
           r.ok ? "ok" : r.advisory ? "info" : "fail",
           `  ${label}  ${r.name}${r.exitCode !== undefined ? ` (exit ${r.exitCode})` : ""}` +
-            (r.cached ? "  [reused — nothing it watches changed]" : ""),
+            (r.cached ? "  [reused]" : "") +
+            (evidence ? `  —  ${evidence}` : ""),
         );
         // What the check actually ran, and how long it took. A passing check
         // that never ran the command you think it runs is the failure mode
