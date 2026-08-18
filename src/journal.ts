@@ -35,6 +35,7 @@ export type JournalKind =
   | "regrow"
   | "receipt"
   | "cancelled"
+  | "note"
   | "error"
   | "session_end";
 
@@ -195,9 +196,21 @@ export class Journal {
         case "request":
           out.push(`${t}  → request · ${d.messages} msgs · ~${d.estTokens} tok${d.stream ? " · streaming" : ""}`);
           break;
-        case "response":
-          out.push(`${t}  ← response · ${d.promptTokens} in / ${d.completionTokens} out · ${d.toolCalls} tool call(s)`);
+        case "response": {
+          // A `~` means molt counted the tokens itself because the provider
+          // reported none — the same mark the meter uses on screen.
+          const e = d.estimated ? "~" : "";
+          const cached = Number(d.cachedTokens ?? 0) > 0 ? ` (${d.cachedTokens} cached)` : "";
+          const cost =
+            d.costUsd === null || d.costUsd === undefined
+              ? ""
+              : ` · ${d.billed ? "" : e}$${Number(d.costUsd).toFixed(6)}`;
+          out.push(
+            `${t}  ← response · ${e}${d.promptTokens} in${cached} / ${e}${d.completionTokens} out · ` +
+              `${d.toolCalls} tool call(s)${cost}`,
+          );
           break;
+        }
         case "tool_call":
           out.push(`${t}  tool ${d.name}: ${d.detail}`);
           break;
@@ -224,6 +237,9 @@ export class Journal {
           break;
         case "cancelled":
           out.push(`${t}  cancelled · turn rolled back`);
+          break;
+        case "note":
+          out.push(`${t}  note: ${d.text}`);
           break;
         case "error":
           out.push(`${t}  error: ${d.text}`);

@@ -44,8 +44,31 @@ export type Bom = {
   requestTotalEst: number;
   sessionPromptTokens: number;
   sessionCompletionTokens: number;
+  /** Prompt tokens the provider said it served from its cache. */
+  sessionCachedTokens: number;
   costUsd?: number;
+  /** True when any part of the cost rests on molt's own token estimate. */
+  costEstimated?: boolean;
   budgetTokens?: number;
+};
+
+/**
+ * What a turn cost, and how much of that molt actually knows.
+ *
+ * `estimated` is the whole point of the shape. A cost derived from token
+ * counts molt guessed is a different kind of number from one the provider
+ * billed, and a meter that renders them identically is lying by omission.
+ */
+export type Spend = {
+  promptTokens: number;
+  completionTokens: number;
+  /** Cached prompt tokens, when the provider itemises them. */
+  cachedTokens: number;
+  costUsd?: number;
+  /** True when token counts came from molt's estimator, not the provider. */
+  estimated: boolean;
+  /** True when the provider itself reported the dollar figure. */
+  billed: boolean;
 };
 
 /** A single verifiable condition from `.molt/done.yml`. */
@@ -122,15 +145,65 @@ export type EngineEvent =
   // Emitted before the tool runs, so a UI can say what is happening while it
   // happens. `tool` still follows on completion and carries the outcome.
   | { kind: "tool_start"; name: string; detail: string }
-  | { kind: "tool"; name: string; detail: string; note?: string; durationMs?: number }
+  | {
+      kind: "tool";
+      name: string;
+      detail: string;
+      note?: string;
+      durationMs?: number;
+      /** Exact arguments the model sent, as JSON. Capped, never reworded. */
+      args?: string;
+      /** Bytes of result handed back to the model. */
+      bytes?: number;
+      /** Head of that result, verbatim. Truncated, never summarized. */
+      preview?: string;
+    }
   | {
       kind: "usage";
       promptTokens: number;
       completionTokens: number;
+      cachedTokens: number;
       sessionTokens: number;
       costUsd?: number;
+      /** True when these counts are molt's estimate rather than the provider's. */
+      estimated: boolean;
+      /** True when the provider reported the dollar figure directly. */
+      billed: boolean;
     }
-  | { kind: "proof_start"; checks: number }
+  /**
+   * A request is about to go out. Carries only what molt can state as fact
+   * before the answer exists — size, destination, and whether the estimate
+   * is an estimate.
+   */
+  | {
+      kind: "request";
+      step: number;
+      messages: number;
+      estTokens: number;
+      model: string;
+      stream: boolean;
+    }
+  /**
+   * One pass of the loop, closed out. Emitted after every step so a reader
+   * never has to infer what a step did from the tool lines that scrolled
+   * past — and so the running total is reconciled step by step rather than
+   * only at the end.
+   */
+  | {
+      kind: "step_summary";
+      step: number;
+      /** Tool names called this step, in call order. */
+      tools: string[];
+      spend: Spend;
+      sessionTokens: number;
+      sessionCostUsd?: number;
+      durationMs: number;
+      /** What the model did with the step: called tools, or claimed done. */
+      outcome: "tools" | "claim";
+      /** Provider-reported stop reason, when one was given. */
+      finishReason?: string;
+    }
+  | { kind: "proof_start"; checks: number; names: string[] }
   | { kind: "proof_result"; result: BarResult; attempt: number }
   | { kind: "proof_refused"; result: BarResult; attempt: number }
   | { kind: "proof_exhausted"; result: BarResult; attempts: number }

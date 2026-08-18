@@ -155,6 +155,43 @@ molt log        # every request, tool call, permission, and bar run
 molt verify     # recompute the log's hash chain
 ```
 
+### While it is running
+
+The same facts are available live. Every step closes with one line saying
+what it did and what it cost, and **shift+V** (`ctrl+V` outside a turn, or
+`/verbose`) opens the detail behind it — the exact arguments of each call,
+the head of each result, and every check's command and duration:
+
+```
+· read_file  src/auth.ts  12ms
+      args {"path":"src/auth.ts"}
+      → 1841 bytes
+      │ import { verify } from "./jwt.js";
+  step 2 · read_file, bash · 3.4k in (2.1k cached) · 412 out · 6.2s · 0.31¢
+
+  checking 3 condition(s) from .molt/done.yml: types, tests, work-landed
+  2 of 3 checks passed · 4.1s · failed: tests
+  the failures above go back to the model; it keeps working
+```
+
+Detail is recorded whether or not the view is open, so shift+V reveals what
+already happened rather than starting a recording. Nothing there is
+paraphrased — a transparency view that summarizes is one more claim to check.
+It is the same record `molt log` prints from disk afterwards.
+
+### What a turn cost
+
+molt reads the price of the selected model from the endpoint that will do the
+billing (xAI and OpenRouter publish theirs) and stamps it with the model it
+belongs to, so a stored rate can never be applied to a different model. Token
+counts come from the provider's own usage block — including cached prompt
+tokens, which are billed at the cache rate rather than the full one — and
+`stream_options.include_usage` is requested so that streaming, the default,
+does not silently fall back to estimates. When a figure *is* an estimate it is
+marked `~`; when the provider reports the dollar amount itself, that is what
+is shown. `/price` says which, and sets the rate by hand for endpoints that
+publish none.
+
 The session log is append-only and hash-chained: each entry stores the SHA-256
 of the one before it, so altering or deleting a line breaks every hash after it
 and `molt verify` names the entry where the chain broke. That is tamper
@@ -204,6 +241,8 @@ nothing has to be typed in full or looked up.
 /bom               context bill of materials
 /wire              exact JSON of the last request
 /budget <n|off>    hard token ceiling
+/verbose           show every call, argument, and result  (shift+V)
+/price             what this model costs, per 1M tokens
 /model <id>        switch model
 /molt              cycle theme
 /clear             reset the session

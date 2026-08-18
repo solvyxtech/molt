@@ -26,7 +26,7 @@ import type { ArchiveLike } from "./archive.js";
 import { barFingerprint, formatBarFailure, runBar, type BarContext } from "./bar.js";
 import { Journal } from "./journal.js";
 import { Receipts } from "./receipts.js";
-import { readStream } from "./stream.js";
+import { readStream, type Usage } from "./stream.js";
 import { Transcript, toolDetail } from "./transcript.js";
 import {
   estTokens,
@@ -38,6 +38,7 @@ import {
   type EngineEvent,
   type LedgerEntry,
   type Msg,
+  type Spend,
 } from "./types.js";
 
 export const SYSTEM_PROMPT = [
@@ -123,6 +124,15 @@ export type EngineConfig = {
   cwd?: string;
   priceInPerMtok?: number;
   priceOutPerMtok?: number;
+  /**
+   * USD per 1M cached prompt tokens. Every provider that caches bills those
+   * tokens at a discount; charging them at the full rate is a wrong number,
+   * not a conservative one. Undefined means "bill them as ordinary prompt
+   * tokens", which is what molt did before it could tell them apart.
+   */
+  priceCachedInPerMtok?: number;
+  /** Where the prices came from — an endpoint, or "set by hand". */
+  priceSource?: string;
   bashTimeoutMs?: number;
   fetchFn?: typeof fetch;
   /** Stream tokens as they generate. On by default; a dead TUI reads as broken. */
@@ -151,6 +161,19 @@ function sha256Of(p: string): string | null {
   return createHash("sha256").update(readFileSync(p)).digest("hex");
 }
 
+/**
+ * What a watcher is shown of a tool's arguments or its result.
+ *
+ * Verbatim head, capped. Never a summary — a transparency view that
+ * paraphrases is just another claim to check, and molt does not summarize
+ * with a model anywhere else either.
+ */
+export const CAPTURE_MAX_CHARS = 600;
+
+function capture(s: string): string {
+  return s.length <= CAPTURE_MAX_CHARS ? s : s.slice(0, CAPTURE_MAX_CHARS) + "…";
+}
+
 function truncateResult(s: string): { text: string; note?: string } {
   const bytes = Buffer.byteLength(s, "utf8");
   if (bytes <= TOOL_RESULT_MAX_BYTES) return { text: s };
@@ -167,6 +190,19 @@ export class Engine {
   private ledger: LedgerEntry[] = [];
   private sessionPrompt = 0;
   private sessionCompletion = 0;
+  private sessionCached = 0;
+  /** Sum of the dollar figures the provider itself reported, when it does. */
+  private sessionBilled = 0;
+  /** Steps whose dollar figure the provider did not report. */
+  private unbilledSteps = 0;
+  /** Steps whose token counts molt had to estimate. */
+  private estimatedSteps = 0;
+  /**
+   * Set once a provider rejects `stream_options`. Some OpenAI-compatible
+   * servers 400 on request fields they do not implement, and re-sending a
+   * field that has already been refused burns a round trip per step.
+   */
+  private streamUsageUnsupported = false;
   budgetTokens?: number;
   /** Exact JSON body of the most recent request — the wire, unhidden. */
   lastRequestBody?: string;
@@ -243,6 +279,12 @@ export class Engine {
     this.transcript = new Transcript(SYSTEM_PROMPT);
     this.ledger = [];
     this.archivedWrites = 0;
+    this.sessionPrompt = 0;
+    this.sessionCompletion = 0;
+    this.sessionCached = 0;
+    this.sessionBilled = 0;
+    this.unbilledSteps = 0;
+    this.estimatedSteps = 0;
   }
 
   /**
@@ -258,10 +300,60 @@ export class Engine {
     return this.cfg.stream !== false;
   }
 
+  get sessionCachedTokens(): number {
+    return this.sessionCached;
+  }
+
+  /** True when any step's tokens were counted by molt rather than the provider. */
+  get costEstimated(): boolean {
+    return this.estimatedSteps > 0;
+  }
+
+  /** True when every step's dollar figure came from the provider itself. */
+  get costBilled(): boolean {
+    return this.sessionBilled > 0 && this.unbilledSteps === 0;
+  }
+
+  /**
+   * What this session has cost so far, in USD.
+   *
+   * Three sources, in descending order of how much molt actually knows:
+   *
+   *   1. The provider billed it. Used only when EVERY step reported a
+   *      figure — a total that mixes billed steps with priced ones is
+   *      neither, and would be wrong in the direction of too small.
+   *   2. Configured prices against reported token counts.
+   *   3. Configured prices against molt's own token estimate, which is why
+   *      `costEstimated` exists and why the meter marks it.
+   *
+   * Cached prompt tokens are billed at the cache rate when one is known.
+   * They are already inside `sessionPrompt`, so they are subtracted out
+   * before the standard rate is applied rather than counted twice.
+   */
   costUsd(): number | undefined {
-    const { priceInPerMtok: pin, priceOutPerMtok: pout } = this.cfg;
+    if (this.costBilled) return this.sessionBilled;
+    const { priceInPerMtok: pin, priceOutPerMtok: pout, priceCachedInPerMtok: pcache } = this.cfg;
     if (pin === undefined || pout === undefined) return undefined;
-    return (this.sessionPrompt / 1e6) * pin + (this.sessionCompletion / 1e6) * pout;
+    const cached = pcache === undefined ? 0 : Math.min(this.sessionCached, this.sessionPrompt);
+    const fresh = this.sessionPrompt - cached;
+    return (fresh / 1e6) * pin + (cached / 1e6) * (pcache ?? pin) + (this.sessionCompletion / 1e6) * pout;
+  }
+
+  /** The prices in force, and where they came from. Backs /price. */
+  pricing(): { in?: number; out?: number; cached?: number; source?: string } {
+    return {
+      in: this.cfg.priceInPerMtok,
+      out: this.cfg.priceOutPerMtok,
+      cached: this.cfg.priceCachedInPerMtok,
+      source: this.cfg.priceSource,
+    };
+  }
+
+  setPricing(p: { in?: number; out?: number; cached?: number; source?: string }): void {
+    this.cfg.priceInPerMtok = p.in;
+    this.cfg.priceOutPerMtok = p.out;
+    this.cfg.priceCachedInPerMtok = p.cached;
+    this.cfg.priceSource = p.source;
   }
 
   bom(): Bom {
@@ -269,7 +361,13 @@ export class Engine {
       prompt: this.sessionPrompt,
       completion: this.sessionCompletion,
     });
-    return { ...b, costUsd: this.costUsd(), budgetTokens: this.budgetTokens };
+    return {
+      ...b,
+      sessionCachedTokens: this.sessionCached,
+      costUsd: this.costUsd(),
+      costEstimated: this.costEstimated,
+      budgetTokens: this.budgetTokens,
+    };
   }
 
   /**
@@ -543,21 +641,37 @@ export class Engine {
       const stream = this.cfg.stream !== false;
       const controller = new AbortController();
       this.inFlight = controller;
+      const stepStartedAt = Date.now();
 
       const wire = this.transcript.wire();
+      const requestEst = this.bom().requestTotalEst;
       log?.append("request", {
         step,
         messages: wire.length,
-        estTokens: this.bom().requestTotalEst,
+        estTokens: requestEst,
         estimated: true,
         stream,
         model: this.cfg.model,
         endpoint: this.cfg.baseUrl,
       });
+      yield {
+        kind: "request",
+        step,
+        messages: wire.length,
+        estTokens: requestEst,
+        model: this.cfg.model,
+        stream,
+      };
 
-      let res: Response;
-      try {
-        res = await fetchFn(`${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      /**
+       * Streaming responses carry no usage block unless it is asked for.
+       * Without this flag molt fell back to counting the wire JSON itself —
+       * an estimate presented in a meter that reads as a measurement, on
+       * the code path that is on by default. Asking costs one field.
+       */
+      const askForUsage = stream && !this.streamUsageUnsupported;
+      const send = (withUsage: boolean): Promise<Response> =>
+        fetchFn(`${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`, {
           method: "POST",
           signal: controller.signal,
           headers: {
@@ -566,12 +680,32 @@ export class Engine {
           },
           body: (this.lastRequestBody = JSON.stringify({
             model: this.cfg.model,
-            messages: this.transcript.wire(),
+            messages: wire,
             tools: TOOLS,
             tool_choice: "auto",
             ...(stream ? { stream: true } : {}),
+            ...(withUsage ? { stream_options: { include_usage: true } } : {}),
           })),
         });
+
+      let res: Response;
+      try {
+        res = await send(askForUsage);
+        // A server that does not implement the field rejects the request. Try
+        // once without it rather than failing a turn over a request for better
+        // bookkeeping — and only conclude the field was the problem if the
+        // retry actually works, so a genuine 400 does not quietly turn usage
+        // reporting off for the rest of the session.
+        if (!res.ok && res.status === 400 && askForUsage) {
+          const retry = await send(false);
+          if (retry.ok) {
+            this.streamUsageUnsupported = true;
+            log?.append("note", {
+              text: "provider rejected stream_options — token counts fall back to molt's estimate",
+            });
+          }
+          res = retry;
+        }
       } catch (e) {
         this.inFlight = undefined;
         if (controller.signal.aborted) {
@@ -594,7 +728,8 @@ export class Engine {
       }
 
       let msg: Msg | undefined;
-      let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
+      let usage: Usage | undefined;
+      let finishReason: string | undefined;
       const contentType = res.headers?.get?.("content-type") ?? "";
       const isSse = stream && res.body != null && contentType.includes("event-stream");
 
@@ -610,7 +745,18 @@ export class Engine {
             fragments.push(fragment);
           });
           msg = result.message;
-          usage = { prompt_tokens: result.promptTokens, completion_tokens: result.completionTokens };
+          finishReason = result.finishReason;
+          usage = {
+            prompt_tokens: result.promptTokens,
+            completion_tokens: result.completionTokens,
+            ...(result.cachedTokens === undefined
+              ? {}
+              : { prompt_tokens_details: { cached_tokens: result.cachedTokens } }),
+            ...(result.reasoningTokens === undefined
+              ? {}
+              : { completion_tokens_details: { reasoning_tokens: result.reasoningTokens } }),
+            ...(result.costUsd === undefined ? {} : { cost: result.costUsd }),
+          };
         } catch (e) {
           this.inFlight = undefined;
           if (controller.signal.aborted) {
@@ -624,8 +770,8 @@ export class Engine {
         for (const f of fragments) yield { kind: "delta", text: f };
       } else {
         let json: {
-          choices?: { message?: Msg }[];
-          usage?: { prompt_tokens?: number; completion_tokens?: number };
+          choices?: { message?: Msg; finish_reason?: string | null }[];
+          usage?: Usage;
         };
         try {
           json = (await res.json()) as typeof json;
@@ -640,6 +786,7 @@ export class Engine {
           return;
         }
         msg = json.choices?.[0]?.message;
+        finishReason = json.choices?.[0]?.finish_reason ?? undefined;
         usage = json.usage;
       }
 
@@ -652,27 +799,71 @@ export class Engine {
 
       const reportedUsage =
         typeof usage?.prompt_tokens === "number" || typeof usage?.completion_tokens === "number";
-      const pTok = usage?.prompt_tokens ?? estTokens(JSON.stringify(this.transcript.wire()));
+      const pTok = usage?.prompt_tokens ?? estTokens(JSON.stringify(wire));
       const cTok = usage?.completion_tokens ?? estTokens(JSON.stringify(msg));
+      const cachedTok = usage?.prompt_tokens_details?.cached_tokens ?? 0;
+      const billedUsd = usage?.cost;
+      const costBefore = this.costUsd();
+
+      this.sessionPrompt += pTok;
+      this.sessionCompletion += cTok;
+      this.sessionCached += cachedTok;
+      if (!reportedUsage) this.estimatedSteps += 1;
+      if (typeof billedUsd === "number") this.sessionBilled += billedUsd;
+      else this.unbilledSteps += 1;
+
+      const costAfter = this.costUsd();
+      const stepCost =
+        typeof billedUsd === "number"
+          ? billedUsd
+          : costAfter === undefined
+            ? undefined
+            : costAfter - (costBefore ?? 0);
+
       log?.append("response", {
         step,
         promptTokens: pTok,
         completionTokens: cTok,
+        cachedTokens: cachedTok,
         // Providers do not always report usage. Say which this is.
         estimated: !reportedUsage,
+        costUsd: stepCost ?? null,
+        billed: typeof billedUsd === "number",
+        finishReason: finishReason ?? null,
         toolCalls: msg.tool_calls?.length ?? 0,
         contentChars: (msg.content ?? "").length,
         finishedWithText: Boolean(msg.content),
       });
-      this.sessionPrompt += pTok;
-      this.sessionCompletion += cTok;
       yield {
         kind: "usage",
         promptTokens: pTok,
         completionTokens: cTok,
+        cachedTokens: cachedTok,
         sessionTokens: this.sessionTokens,
-        costUsd: this.costUsd(),
+        costUsd: costAfter,
+        estimated: !reportedUsage,
+        billed: typeof billedUsd === "number",
       };
+      const spend: Spend = {
+        promptTokens: pTok,
+        completionTokens: cTok,
+        cachedTokens: cachedTok,
+        costUsd: stepCost,
+        estimated: !reportedUsage,
+        billed: typeof billedUsd === "number",
+      };
+      /** Close out the step with what it did and what it cost. */
+      const summary = (tools: string[], outcome: "tools" | "claim"): EngineEvent => ({
+        kind: "step_summary",
+        step,
+        tools,
+        spend,
+        sessionTokens: this.sessionTokens,
+        sessionCostUsd: this.costUsd(),
+        durationMs: Date.now() - stepStartedAt,
+        outcome,
+        finishReason,
+      });
 
       this.transcript.push({
         role: "assistant",
@@ -681,6 +872,7 @@ export class Engine {
       });
 
       if (msg.tool_calls?.length) {
+        const called: string[] = [];
         for (const call of msg.tool_calls) {
           const name = call.function?.name ?? "unknown";
           let args: Record<string, unknown> = {};
@@ -727,11 +919,24 @@ export class Engine {
             note,
             sha256: createHash("sha256").update(result, "utf8").digest("hex").slice(0, 16),
           });
-          yield { kind: "tool", name, detail, note, durationMs };
+          called.push(name);
+          yield {
+            kind: "tool",
+            name,
+            detail,
+            note,
+            durationMs,
+            args: capture(call.function?.arguments ?? ""),
+            bytes: Buffer.byteLength(result, "utf8"),
+            preview: capture(result),
+          };
           this.transcript.push({ role: "tool", tool_call_id: call.id, content: result });
         }
+        yield summary(called, "tools");
         continue; // let the model see tool results
       }
+
+      yield summary([], "claim");
 
       // ---- The model believes it is finished. That is a claim. ----
       const claim = msg.content ?? "";
@@ -746,7 +951,11 @@ export class Engine {
       }
 
       proofAttempts += 1;
-      yield { kind: "proof_start", checks: this.cfg.bar.checks.length };
+      yield {
+        kind: "proof_start",
+        checks: this.cfg.bar.checks.length,
+        names: this.cfg.bar.checks.map((c) => c.name),
+      };
       const result = this.runBarGuarded(claim);
       log?.append("bar_run", {
         attempt: proofAttempts,

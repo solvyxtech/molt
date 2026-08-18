@@ -10,11 +10,18 @@
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Archive } from "./archive.js";
-import { fmtDuration } from "./banner.js";
+import { fmtCost, fmtDuration } from "./banner.js";
 import { BarError, hasBar, loadBar, selectChecks, writeDefaultBar } from "./bar.js";
 import { Engine } from "./engine.js";
 import { Journal } from "./journal.js";
-import { providerName, storedEndpoint, type StoredEndpoint } from "./providers.js";
+import {
+  fetchPricing,
+  needsPriceLookup,
+  providerName,
+  savePricing,
+  storedEndpoint,
+  type StoredEndpoint,
+} from "./providers.js";
 import { Receipts } from "./receipts.js";
 import type { BarResult, EngineEvent } from "./types.js";
 
@@ -49,6 +56,8 @@ options
                      /login stores keys in ~/.config/molt/auth.json (0600)
   --price-in <n>     USD per 1M prompt tokens      (MOLT_PRICE_IN)
   --price-out <n>    USD per 1M completion tokens  (MOLT_PRICE_OUT)
+                     omit both and molt reads the price from the provider
+  --verbose          show every call, argument, and result (shift+V in the TUI)
   --provider <name>  label shown in the status line
   --cwd <dir>        project directory (default: current)
   --budget <n>       hard token ceiling for the session
@@ -76,7 +85,10 @@ type Args = {
   provider?: string;
   priceIn?: number;
   priceOut?: number;
+  priceCachedIn?: number;
+  priceSource?: string;
   cwd: string;
+  verbose: boolean;
   budget?: number;
   autoShed?: number;
   attempts?: number;
@@ -115,12 +127,13 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
     url: process.env.MOLT_BASE_URL ?? stored.baseUrl ?? "http://localhost:11434/v1",
     model: process.env.MOLT_MODEL ?? stored.model ?? "",
     key: process.env.MOLT_API_KEY ?? stored.apiKey,
-    priceIn: num(process.env.MOLT_PRICE_IN) ?? stored.priceIn,
-    priceOut: num(process.env.MOLT_PRICE_OUT) ?? stored.priceOut,
+    priceIn: num(process.env.MOLT_PRICE_IN),
+    priceOut: num(process.env.MOLT_PRICE_OUT),
     cwd: process.cwd(),
     explain: false,
     raw: false,
     stream: true,
+    verbose: false,
     yes: false,
     json: false,
     help: false,
@@ -189,6 +202,10 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
       case "--no-stream":
         out.stream = false;
         break;
+      case "--verbose":
+      case "-v":
+        out.verbose = true;
+        break;
       case "--yes":
       case "-y":
         out.yes = true;
@@ -204,6 +221,19 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
 
   out.cmd = positional[0] ?? "";
   out.task = positional.slice(1).join(" ") || undefined;
+
+  // Prices come last, because a stored price belongs to the model it was
+  // fetched for and the model is not final until every flag has been read.
+  // Applying yesterday's rate to today's model bills the session at a number
+  // nothing checked — which is the failure the whole meter exists to avoid.
+  const byHand = out.priceIn !== undefined || out.priceOut !== undefined;
+  const priceable = stored.priceModel === undefined || stored.priceModel === out.model;
+  out.priceIn ??= priceable ? stored.priceIn : undefined;
+  out.priceOut ??= priceable ? stored.priceOut : undefined;
+  if (out.priceIn !== undefined && out.priceOut !== undefined) {
+    out.priceCachedIn = byHand ? undefined : priceable ? stored.priceCachedIn : undefined;
+    out.priceSource = byHand ? "set by hand" : "stored";
+  }
   return out;
 }
 
@@ -246,6 +276,8 @@ function buildEngine(args: Args): Engine {
     provider: args.provider ?? providerName(args.url),
     priceInPerMtok: args.priceIn,
     priceOutPerMtok: args.priceOut,
+    priceCachedInPerMtok: args.priceCachedIn,
+    priceSource: args.priceSource,
     cwd: args.cwd,
     bar,
     archive: new Archive(args.cwd),
@@ -256,7 +288,29 @@ function buildEngine(args: Args): Engine {
   });
 }
 
+/**
+ * Give the engine a price for the model it is about to use.
+ *
+ * Hand-set prices win — they are the escape hatch for endpoints that
+ * publish nothing, and for accounts whose negotiated rate is not the list
+ * price. Otherwise molt asks the endpoint doing the billing, and if it says
+ * nothing, no cost is shown at all.
+ */
+async function priceEngine(engine: Engine, args: Args): Promise<void> {
+  if (!needsPriceLookup(args.model, engine.pricing(), storedEndpoint())) return;
+  const p = await fetchPricing(args.url, args.model, args.key);
+  // Nothing published: leave whatever was configured by hand in place rather
+  // than blanking a meter the user set up deliberately.
+  if (!p) return;
+  engine.setPricing({ in: p.in, out: p.out, cached: p.cached, source: p.source });
+  savePricing(args.model, p);
+}
+
 function printBar(result: BarResult): void {
+  const passed = result.results.filter((r) => r.ok).length;
+  process.stdout.write(
+    `${passed} of ${result.results.length} checks passed · ${fmtDuration(result.durationMs)}\n`,
+  );
   for (const r of result.results) {
     const tags = r.tags?.length ? `  [${r.tags.join(",")}]` : "";
     process.stdout.write(
@@ -299,18 +353,28 @@ async function cmdRun(args: Args): Promise<number> {
   }
   const engine = buildEngine(args);
   if (args.budget) engine.setBudget(args.budget);
+  await priceEngine(engine, args);
 
   let failed = false;
   let sawAnswer = false;
+  // Streamed text arrives without a trailing newline, so anything printed
+  // after it lands on the same line as the model's last word. Track it and
+  // break the line before saying anything of molt's own.
+  let midLine = false;
 
   const emit = (ev: EngineEvent) => {
     if (args.json) {
       process.stdout.write(JSON.stringify(ev) + "\n");
       return;
     }
+    if (ev.kind !== "delta" && midLine) {
+      process.stdout.write("\n");
+      midLine = false;
+    }
     switch (ev.kind) {
       case "delta":
         process.stdout.write(ev.text);
+        midLine = !ev.text.endsWith("\n");
         break;
       case "cancelled":
         process.stderr.write("\nmolt: cancelled — the session is unchanged\n");
@@ -321,10 +385,44 @@ async function cmdRun(args: Args): Promise<number> {
       case "tool": {
         const took = ev.durationMs === undefined ? "" : `  ${fmtDuration(ev.durationMs)}`;
         process.stdout.write(`· ${ev.name}  ${ev.detail}${ev.note ? `  [${ev.note}]` : ""}${took}\n`);
+        if (args.verbose) {
+          if (ev.args && ev.args !== "{}") {
+            process.stdout.write(`      args ${ev.args.replace(/\s+/g, " ")}\n`);
+          }
+          if (ev.bytes !== undefined) process.stdout.write(`      → ${ev.bytes} bytes\n`);
+          for (const l of (ev.preview ?? "").split("\n").slice(0, 8)) {
+            if (l.trim()) process.stdout.write(`      │ ${l}\n`);
+          }
+        }
+        break;
+      }
+      case "request":
+        if (args.verbose) {
+          process.stdout.write(
+            `→ step ${ev.step + 1} · ${ev.messages} messages · ~${ev.estTokens} tokens → ${ev.model}\n`,
+          );
+        }
+        break;
+      case "step_summary": {
+        // Printed always, not only under --verbose: a CI log that records
+        // what a run cost, step by step, is the difference between a bill
+        // you can audit and one you can only pay.
+        const sp = ev.spend;
+        const cached = sp.cachedTokens > 0 ? ` (${sp.cachedTokens} cached)` : "";
+        const did = ev.outcome === "claim" ? "claims done" : ev.tools.join(", ") || "no tools";
+        const spent =
+          sp.costUsd === undefined ? "" : ` · ${sp.estimated ? "~" : ""}${fmtCost(sp.costUsd)}`;
+        process.stdout.write(
+          `· step ${ev.step + 1} · ${did} · ${sp.promptTokens} in${cached} · ` +
+            `${sp.completionTokens} out · ${fmtDuration(ev.durationMs)}${spent}` +
+            (sp.estimated ? " · tokens estimated" : "") + "\n",
+        );
         break;
       }
       case "proof_start":
-        process.stdout.write(`\nchecking ${ev.checks} condition(s) from .molt/done.yml\n`);
+        process.stdout.write(
+          `\nchecking ${ev.checks} condition(s) from .molt/done.yml: ${ev.names.join(", ")}\n`,
+        );
         break;
       case "proof_refused":
         process.stdout.write(`completion refused (attempt ${ev.attempt})\n`);
@@ -364,6 +462,22 @@ async function cmdRun(args: Args): Promise<number> {
     emit(ev);
     if (ev.kind === "proof_exhausted" || ev.kind === "error") failed = true;
     if (ev.kind === "assistant_text") sawAnswer = true;
+  }
+
+  // What the run cost, said once at the end, in the same terms the step
+  // lines used. `~` means the token counts were molt's estimate because the
+  // provider reported none.
+  const b = engine.bom();
+  if (b.sessionPromptTokens + b.sessionCompletionTokens > 0) {
+    process.stdout.write(
+      `\n${b.sessionPromptTokens} in` +
+        (b.sessionCachedTokens > 0 ? ` (${b.sessionCachedTokens} cached)` : "") +
+        ` · ${b.sessionCompletionTokens} out` +
+        (b.costUsd === undefined
+          ? " · no price for this model"
+          : ` · ${b.costEstimated ? "~" : ""}${fmtCost(b.costUsd)}`) +
+        "\n",
+    );
   }
 
   // An unverified answer is not a success. Neither is no answer at all.
@@ -661,8 +775,17 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   // `molt prove` pay ~450ms of startup for a UI it never renders, which
   // matters because the bar wants to live in CI and in git hooks.
   const [{ render }, { App }] = await Promise.all([import("ink"), import("./app.js")]);
+  // <App /> creates an element for React to render. Calling App(...) directly
+  // executes the component outside React's render phase, so the first hook it
+  // reaches finds a null dispatcher: "Invalid hook call ... reading
+  // 'useContext'". The TUI could not start at all.
   const { waitUntilExit } = render(
-    App({ engine, version: VERSION, autoShed: args.autoShed }),
+    <App
+      engine={engine}
+      version={VERSION}
+      autoShed={args.autoShed}
+      verbose={args.verbose}
+    />,
   );
   await waitUntilExit();
   return 0;

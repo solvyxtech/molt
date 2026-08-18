@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased — the meter says what it knows
+
+The status line quoted a cost to six decimal places from a price nobody had
+checked, and the TUI showed a spinner where the work was. Both are the same
+failure in a tool whose whole claim is that nothing has to be taken on trust:
+a number presented with more confidence than it was earned with.
+
+### Added
+
+- **The transparency view — `shift+V`** while a turn is running, `ctrl+V` any
+  time, or `/verbose`. Shows the exact arguments of every tool call, the head
+  of every result, each check's command and duration, and the request about to
+  go out. Detail is recorded whether or not the view is open, so the key
+  reveals what already happened rather than starting a recording. Verbatim
+  throughout — a transparency view that paraphrases is one more claim to check.
+- **A one-line overview after every step and every verification.** `step 2 ·
+  read_file, bash · 3.4k in (2.1k cached) · 412 out · 6.2s · 0.31¢`, and
+  `2 of 3 checks passed · 4.1s · failed: tests` followed by what happens next.
+  Printed headlessly too, so a CI log records what a run cost step by step.
+- **Prices read from the provider.** `fetchPricing` asks the endpoint that
+  will do the billing (xAI's `/language-models`, OpenRouter's `/models`) and
+  stamps the result with the model it belongs to. `/price` shows the rate and
+  its source, sets one by hand for endpoints that publish none, and `--verbose`
+  is the headless equivalent of the view.
+- **Cached prompt tokens are counted and billed at the cache rate** when the
+  provider publishes one, instead of at the full prompt rate.
+- **Provider-reported cost is used when there is one** (OpenRouter's
+  `usage.cost`), and only when *every* step reported one — a total that blends
+  a billed step with a priced one is neither figure.
+
+### Fixed
+
+- **Streaming responses carry no usage block unless asked, so every cost was a
+  guess.** molt now sends `stream_options: {include_usage: true}` and falls
+  back once, permanently, for servers that reject the field. Streaming is the
+  default, so this was the default path: token counts came from `chars/4` over
+  the wire JSON while the meter rendered them like measurements.
+- **A stored price with no model attached was applied to every model.** The
+  shipped config carried `priceIn`/`priceOut` and nothing saying what they were
+  for; a figure entered once — off by a factor of a hundred, in the case that
+  prompted this — was then used forever, and survived every model switch.
+  Unattributed prices are now re-fetched rather than trusted.
+- **Sub-cent costs rendered as `$0.000024`** — six digits to count in the one
+  field that has to be legible at a glance. Anything under a cent now reads in
+  cents (`0.24¢`), and a cost resting on molt's own token estimate is prefixed
+  `~` so a guess and a bill do not look alike.
+- **The session meter was not reset by `/clear`.** Token totals and cost
+  carried across a reset session.
+- **Headless output ran the model's last streamed word into molt's next line.**
+
 ## 1.0.0-rc.3 — the archive earns its claim
 
 An audit found that "verification runs against preserved history" was

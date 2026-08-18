@@ -47,6 +47,76 @@ Example:
 
 Every line is recomputed from entries. Nothing in that output is narration.
 
+## Watching it happen
+
+The log answers "what did it do?" after the fact. During a turn, the same
+facts are on screen.
+
+Every step closes with one line — printed whether or not anyone asked for it,
+in the TUI and headlessly:
+
+```
+  step 2 · read_file, bash · 3.4k in (2.1k cached) · 412 out · 6.2s · 0.31¢
+```
+
+**shift+V** opens the detail behind it while a turn is running (`ctrl+V` any
+time, `/verbose` as a command, `--verbose` headlessly):
+
+```
+· read_file  src/auth.ts  12ms
+      args {"path":"src/auth.ts"}
+      → 1841 bytes
+      │ import { verify } from "./jwt.js";
+      │ export function check(token: string) {
+  step 2 · read_file · 3.4k in · 412 out · 6.2s · 0.31¢
+      session 12.1k tokens · 1.4¢ · finish: tool_calls
+```
+
+Three properties make it worth trusting:
+
+- **Verbatim.** Arguments and results are shown as they were sent and
+  received, truncated but never reworded. A view that paraphrases is one more
+  claim to check, and molt does not summarize with a model anywhere else.
+- **Recorded regardless.** Detail lines are written whether or not the view is
+  open, so shift+V reveals what already happened rather than starting a
+  recording.
+- **The same facts as the log.** Nothing on screen is derived from anything
+  the log does not also record — with the exception that the log stores
+  digests where the screen shows content, deliberately (see below).
+
+Verification is narrated the same way: the checks are named before they run,
+and the result leads with the count, the duration, and what failed.
+
+```
+  checking 3 condition(s) from .molt/done.yml: types, tests, work-landed
+  2 of 3 checks passed · 4.1s · failed: tests
+  the failures above go back to the model; it keeps working
+```
+
+## What a turn cost
+
+Cost is a claim like any other, so molt says where each part of it came from.
+
+- **Token counts** come from the provider's usage block. Streaming responses
+  omit that block unless it is asked for, so molt sends
+  `stream_options: {include_usage: true}`; a server that rejects the field is
+  retried once without it, and the resulting counts are marked as estimates.
+- **Cached prompt tokens** are counted separately and billed at the cache rate
+  when the provider publishes one, because they are not billed at the full
+  rate by anybody.
+- **Prices** are read from the endpoint that will do the billing — xAI's
+  `/language-models` and OpenRouter's `/models` publish them — and stored
+  against the model they belong to, so a rate can never follow a model switch.
+  `/price` shows the figure and its source, and sets one by hand where nothing
+  is published.
+- **The dollar amount itself**, when the provider reports one (OpenRouter's
+  `usage.cost`), is used instead of molt's arithmetic — but only when every
+  step of the session reported one.
+
+A cost that rests on an estimate anywhere is prefixed `~`. A cost under a cent
+is shown in cents, because `$0.000024` is a number you have to count rather
+than read.
+
 ## Estimated versus measured
 
 molt distinguishes the two rather than blurring them.

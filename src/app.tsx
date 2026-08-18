@@ -7,7 +7,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
-import { Banner, fmtDuration } from "./banner.js";
+import { Banner, fmtCost, fmtDuration } from "./banner.js";
 import { COMMANDS, completionFor, matchCommands, windowAround, wrapIndex } from "./commands.js";
 import { StatusLine } from "./status-line.js";
 import { loadBar, writeDefaultBar, BarError } from "./bar.js";
@@ -15,15 +15,19 @@ import type { Engine } from "./engine.js";
 import {
   PROVIDERS,
   defaultConfigDir,
+  fetchPricing,
   firstSelectable,
   keyedProviders,
   modelSources,
   moveSelection,
+  needsPriceLookup,
   pickerRows,
   readAuth,
   resolveProvider,
   saveEndpoint,
   saveKey,
+  savePricing,
+  storedEndpoint,
   windowRows,
   type ModelChoice,
   type PickerRow,
@@ -35,6 +39,13 @@ type Line = {
   id: number;
   tone: "user" | "agent" | "tool" | "info" | "error" | "ok" | "fail";
   text: string;
+  /**
+   * Detail lines are written whether or not anyone is watching, and are
+   * shown only in the transparency view. Recording them unconditionally is
+   * the point: shift+V reveals what the model did earlier in the session,
+   * not just what it does from the moment you pressed it.
+   */
+  detail?: boolean;
 };
 
 const HELP = [
@@ -42,7 +53,16 @@ const HELP = [
   ...COMMANDS.map((c) => `  ${(c.name + (c.args ? " " + c.args : "")).padEnd(20)}${c.summary}`),
   "",
   "  type / to browse · ↑↓ to choose · tab to fill · enter to run",
+  "  shift+V while working (or ctrl+V any time) shows every call, argument,",
+  "  and result — the same facts the session log records to disk.",
 ].join("\n");
+
+/** Tokens, at a width that does not make the line jitter as it climbs. */
+function tok(n: number): string {
+  if (n < 1000) return `${n}`;
+  const k = n / 1000;
+  return `${k < 10 ? k.toFixed(1) : Math.round(k)}k`;
+}
 
 /** How many palette rows to show at once. */
 const PALETTE_ROWS = 6;
@@ -58,10 +78,13 @@ export function App({
   engine,
   version,
   autoShed,
+  verbose: startVerbose = false,
 }: {
   engine: Engine;
   version: string;
   autoShed?: number;
+  /** Start in the transparency view, from `--verbose`. */
+  verbose?: boolean;
 }) {
   const { exit } = useApp();
   const [themeName, setThemeName] = useState(DEFAULT_THEME);
@@ -76,6 +99,8 @@ export function App({
   const [tokens, setTokens] = useState(0);
   const [streamText, setStreamText] = useState("");
   const [cost, setCost] = useState<number | undefined>(undefined);
+  const [costEstimated, setCostEstimated] = useState(false);
+  const [verbose, setVerbose] = useState(startVerbose);
 
   // Picker state. `login-key` is the one mode that must never echo what you
   // type, so it is a distinct state rather than a flag on a shared one.
@@ -88,13 +113,22 @@ export function App({
 
   // What the model is doing right now, and since when. Held separately from
   // `busy` because the turn stays busy across several distinct phases.
-  const [activity, setActivity] = useState<{ label: string; since: number } | null>(null);
+  const [activity, setActivity] = useState<{
+    label: string;
+    what?: string;
+    since: number;
+  } | null>(null);
   const [frame, setFrame] = useState(0);
   const nextId = useRef(0);
   const resolver = useRef<((ok: boolean) => void) | null>(null);
 
   const add = useCallback((tone: Line["tone"], text: string) => {
     setLines((prev) => [...prev, { id: nextId.current++, tone, text }]);
+  }, []);
+
+  /** Record a line that only the transparency view shows. */
+  const detail = useCallback((tone: Line["tone"], text: string) => {
+    setLines((prev) => [...prev, { id: nextId.current++, tone, text, detail: true }]);
   }, []);
 
   useEffect(() => {
@@ -118,9 +152,14 @@ export function App({
     return () => clearInterval(id);
   }, [busy]);
 
-  /** Name the current phase, restarting the clock only when it actually changes. */
-  const beginActivity = useCallback((label: string) => {
-    setActivity((a) => (a?.label === label ? a : { label, since: Date.now() }));
+  /**
+   * Name the current phase, restarting the clock only when it actually
+   * changes. `what` is the thing being acted on — the file being read, the
+   * command being run — so the working line says what is happening rather
+   * than only that something is.
+   */
+  const beginActivity = useCallback((label: string, what?: string) => {
+    setActivity((a) => (a?.label === label && a?.what === what ? a : { label, what, since: Date.now() }));
   }, []);
 
   const confirm = useCallback(
@@ -143,11 +182,29 @@ export function App({
   const renderBar = useCallback(
     (result: BarResult, header: string) => {
       add(result.ok ? "ok" : "fail", header);
+      const passed = result.results.filter((r) => r.ok).length;
+      // The one-line verdict, before the per-check list. A reader who wants
+      // the detail scrolls; a reader who wants to know whether to trust the
+      // last thing the model said does not have to.
+      add(
+        result.ok ? "ok" : "fail",
+        `  ${passed} of ${result.results.length} checks passed · ${fmtDuration(result.durationMs)}` +
+          (result.ok
+            ? ""
+            : ` · failed: ${result.results.filter((r) => !r.ok).map((r) => r.name).join(", ")}`),
+      );
       for (const r of result.results) {
         add(
           r.ok ? "ok" : "fail",
           `  ${r.ok ? "pass" : "FAIL"}  ${r.name}${r.exitCode !== undefined ? ` (exit ${r.exitCode})` : ""}`,
         );
+        // What the check actually ran, and how long it took. A passing check
+        // that never ran the command you think it runs is the failure mode
+        // this makes visible.
+        detail("info", `          ${r.detail} · ${fmtDuration(r.durationMs)}`);
+        if (r.ok && r.output.trim()) {
+          for (const l of r.output.trim().split("\n").slice(0, 4)) detail("info", `          ${l}`);
+        }
         if (!r.ok) {
           for (const l of r.output.trim().split("\n").slice(0, 8)) add("fail", `        ${l}`);
         }
@@ -171,7 +228,7 @@ export function App({
         );
       }
     },
-    [add],
+    [add, detail],
   );
 
   const handleEvent = useCallback(
@@ -190,23 +247,68 @@ export function App({
           add("agent", ev.text);
           break;
         case "tool_start":
-          beginActivity(ev.name);
+          beginActivity(ev.name, ev.detail);
           break;
         case "tool": {
           // The duration earns its place next to the call it describes, not
           // in a summary at the end where it cannot be acted on.
           const took = ev.durationMs === undefined ? "" : `  ${fmtDuration(ev.durationMs)}`;
           add("tool", `${ev.name}  ${ev.detail}${ev.note ? `  [${ev.note}]` : ""}${took}`);
+          // The exact call and the head of what came back. Verbatim: a
+          // transparency view that paraphrases is one more thing to verify.
+          if (ev.args && ev.args !== "{}") detail("info", `      args ${ev.args.replace(/\s+/g, " ")}`);
+          if (ev.bytes !== undefined) {
+            detail("info", `      → ${ev.bytes} bytes${ev.note ? ` · ${ev.note}` : ""}`);
+          }
+          for (const l of (ev.preview ?? "").split("\n").slice(0, 8)) {
+            if (l.trim()) detail("info", `      │ ${l}`);
+          }
           beginActivity("thinking");
+          break;
+        }
+        case "request":
+          beginActivity("thinking");
+          detail(
+            "info",
+            `→ step ${ev.step + 1} · ${ev.messages} messages · ~${tok(ev.estTokens)} tokens → ${ev.model}` +
+              (ev.stream ? " · streaming" : ""),
+          );
+          break;
+        case "step_summary": {
+          // Every step closes with what it did and what it cost. Emitted
+          // whether or not the transparency view is open: the running total
+          // is reconciled step by step, so a surprising bill has a line
+          // where it came from rather than only a final number.
+          const s = ev.spend;
+          const cached = s.cachedTokens > 0 ? ` (${tok(s.cachedTokens)} cached)` : "";
+          const did = ev.outcome === "claim" ? "claims done" : ev.tools.join(", ") || "no tools";
+          const spent =
+            s.costUsd === undefined ? "" : ` · ${s.estimated ? "~" : ""}${fmtCost(s.costUsd)}`;
+          add(
+            "info",
+            `step ${ev.step + 1} · ${did} · ${tok(s.promptTokens)} in${cached} · ` +
+              `${tok(s.completionTokens)} out · ${fmtDuration(ev.durationMs)}${spent}` +
+              (s.estimated ? " · tokens estimated" : s.billed ? " · billed by provider" : ""),
+          );
+          detail(
+            "info",
+            `      session ${tok(ev.sessionTokens)} tokens` +
+              (ev.sessionCostUsd === undefined ? "" : ` · ${fmtCost(ev.sessionCostUsd)}`) +
+              (ev.finishReason ? ` · finish: ${ev.finishReason}` : ""),
+          );
           break;
         }
         case "usage":
           setTokens(ev.sessionTokens);
           setCost(ev.costUsd);
+          if (ev.estimated) setCostEstimated(true);
           break;
         case "proof_start":
           beginActivity("checking the bar");
-          add("info", `checking ${ev.checks} condition(s) from .molt/done.yml`);
+          add(
+            "info",
+            `checking ${ev.checks} condition(s) from .molt/done.yml: ${ev.names.join(", ")}`,
+          );
           break;
         case "proof_result":
           renderBar(ev.result, "bar met");
@@ -217,6 +319,7 @@ export function App({
           // buffer and the next attempt's tokens append to it.
           setStreamText("");
           renderBar(ev.result, `completion refused (attempt ${ev.attempt}) — continuing`);
+          add("info", "  the failures above go back to the model; it keeps working");
           break;
         case "proof_exhausted":
           setStreamText("");
@@ -236,13 +339,68 @@ export function App({
           break;
       }
     },
-    [add, beginActivity, renderBar],
+    [add, beginActivity, detail, renderBar],
   );
 
   /** Remember the endpoint so the next bare `molt` starts where this left off. */
   const persistEndpoint = useCallback(() => {
     if (engine.model) saveEndpoint(engine.baseUrl, engine.model);
   }, [engine]);
+
+  const toggleVerbose = useCallback(() => {
+    setVerbose((v) => {
+      add(
+        "info",
+        v
+          ? "detail hidden — shift+V while working, ctrl+V any time"
+          : "detail shown: every call, argument, and result, as recorded in .molt/log",
+      );
+      return !v;
+    });
+  }, [add]);
+
+  /**
+   * Ask the provider what this model costs.
+   *
+   * Prices are per model and change without notice, so molt reads them from
+   * the endpoint that will do the billing rather than from a table it ships
+   * or a number typed once and forgotten. Providers that publish nothing
+   * leave the meter with no cost to show, which is the honest outcome.
+   */
+  const refreshPricing = useCallback(
+    async (announce: boolean) => {
+      const model = engine.model;
+      if (!model) return;
+      const p = await fetchPricing(engine.baseUrl, model, engine.cfg.apiKey);
+      if (!p) {
+        // Publishing nothing is not the same as costing nothing, and it is
+        // not a reason to discard a price someone set by hand.
+        if (announce) {
+          add("info", `${engine.provider} publishes no price for ${model} — /price <in> <out> to set one`);
+        }
+        return;
+      }
+      engine.setPricing({ in: p.in, out: p.out, cached: p.cached, source: p.source });
+      savePricing(model, p);
+      if (announce) {
+        add(
+          "info",
+          `pricing · $${p.in}/M in${p.cached === undefined ? "" : ` · $${p.cached}/M cached`} · ` +
+            `$${p.out}/M out · from ${p.source}`,
+        );
+      }
+    },
+    [add, engine],
+  );
+
+  // On start, and never again unless the model changes. One /models-style
+  // request, off the critical path — the prompt is usable before it lands.
+  useEffect(() => {
+    if (needsPriceLookup(engine.model, engine.pricing(), storedEndpoint())) {
+      void refreshPricing(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const startLogin = useCallback(
     (arg?: string) => {
@@ -339,8 +497,12 @@ export function App({
       engine.setModel(c.id);
       persistEndpoint();
       add("ok", `model → ${c.provider}/${c.id}`);
+      // A price belongs to a model. Carrying the old one across a switch
+      // bills the new model at the old rate, silently and wrongly.
+      setCostEstimated(false);
+      void refreshPricing(true);
     },
-    [add, engine, persistEndpoint],
+    [add, engine, persistEndpoint, refreshPricing],
   );
 
   const command = useCallback(
@@ -372,7 +534,11 @@ export function App({
             "info",
             `system ${b.systemTokens} · tools ${b.toolSchemaTokens} · history ${b.historyTokens} · ` +
               `request ≈ ${b.requestTotalEst} · session ${b.sessionPromptTokens + b.sessionCompletionTokens}` +
-              (b.budgetTokens ? ` / ${b.budgetTokens}` : ""),
+              (b.budgetTokens ? ` / ${b.budgetTokens}` : "") +
+              (b.sessionCachedTokens > 0 ? ` · ${b.sessionCachedTokens} cached` : "") +
+              (b.costUsd === undefined
+                ? ""
+                : ` · ${b.costEstimated ? "~" : ""}${fmtCost(b.costUsd)}`),
           );
           return true;
         }
@@ -401,8 +567,69 @@ export function App({
             engine.setModel(arg);
             persistEndpoint();
             add("ok", `model → ${arg}`);
+            void refreshPricing(true);
           }
           return true;
+        case "/verbose":
+        case "/detail":
+          toggleVerbose();
+          return true;
+        case "/price": {
+          const p = engine.pricing();
+          if (arg === "" || arg === "show") {
+            if (p.in === undefined || p.out === undefined) {
+              add(
+                "info",
+                `no price known for ${engine.model || "this model"} — the meter shows tokens only. ` +
+                  "/price <in> <out> sets USD per 1M tokens.",
+              );
+            } else {
+              add(
+                "info",
+                `${engine.model} · $${p.in}/M in` +
+                  (p.cached === undefined ? "" : ` · $${p.cached}/M cached`) +
+                  ` · $${p.out}/M out · ${p.source ?? "set by hand"}`,
+              );
+              const b = engine.bom();
+              if (b.sessionPromptTokens + b.sessionCompletionTokens > 0) {
+                add(
+                  "info",
+                  `  this session: ${b.sessionPromptTokens} in` +
+                    (b.sessionCachedTokens > 0 ? ` (${b.sessionCachedTokens} cached)` : "") +
+                    ` · ${b.sessionCompletionTokens} out · ` +
+                    `${b.costEstimated ? "~" : ""}${fmtCost(b.costUsd ?? 0)}` +
+                    (b.costEstimated ? " (token counts estimated)" : ""),
+                );
+              }
+            }
+            return true;
+          }
+          if (arg === "off" || arg === "clear") {
+            engine.setPricing({});
+            savePricing(engine.model, null);
+            add("info", "pricing cleared — the meter will show tokens only");
+            return true;
+          }
+          if (arg === "refresh" || arg === "fetch") {
+            void refreshPricing(true);
+            return true;
+          }
+          const parts = arg.split(/\s+/).map(Number);
+          if (parts.length < 2 || parts.some((n) => !Number.isFinite(n) || n < 0)) {
+            add("error", "usage: /price <usd-per-1M-in> <usd-per-1M-out> [cached] | refresh | off");
+            return true;
+          }
+          const [pin, pout, pcache] = parts;
+          engine.setPricing({ in: pin, out: pout, cached: pcache, source: "set by hand" });
+          savePricing(engine.model, {
+            in: pin!,
+            out: pout!,
+            cached: pcache,
+            source: "set by hand",
+          });
+          add("ok", `pricing · $${pin}/M in · $${pout}/M out` + (pcache ? ` · $${pcache}/M cached` : ""));
+          return true;
+        }
         case "/regrow": {
           if (!arg) {
             add("error", "usage: /regrow <pattern>");
@@ -524,7 +751,18 @@ export function App({
           return false;
       }
     },
-    [add, engine, exit, persistEndpoint, renderBar, startLogin, startModelPicker, themeName],
+    [
+      add,
+      engine,
+      exit,
+      persistEndpoint,
+      refreshPricing,
+      renderBar,
+      startLogin,
+      startModelPicker,
+      themeName,
+      toggleVerbose,
+    ],
   );
 
   const submit = useCallback(
@@ -587,9 +825,18 @@ export function App({
       return;
     }
 
+    // --- the transparency view. Ctrl-V works anywhere; shift+V is bound
+    // only while a turn is running, where the prompt takes no typing and a
+    // capital V can therefore never be part of a message. ---
+    if (key.ctrl && (char === "v" || char === "\u0016")) {
+      toggleVerbose();
+      return;
+    }
+
     // --- mid-stream: Ctrl-C cancels the turn rather than killing molt ---
     if (busy) {
       if (key.ctrl && char === "c") engine.cancel();
+      else if (char === "V" && !key.ctrl && !key.meta) toggleVerbose();
       return;
     }
 
@@ -728,12 +975,14 @@ export function App({
       />
 
       <Box flexDirection="column" marginTop={1}>
-        {lines.map((l) => (
-          <Text key={l.id} color={toneColor[l.tone]}>
-            {l.tone === "user" ? "› " : l.tone === "tool" ? "· " : "  "}
-            {l.text}
-          </Text>
-        ))}
+        {lines
+          .filter((l) => verbose || !l.detail)
+          .map((l) => (
+            <Text key={l.id} color={l.detail ? theme.ghost : toneColor[l.tone]}>
+              {l.tone === "user" ? "› " : l.tone === "tool" ? "· " : "  "}
+              {l.text}
+            </Text>
+          ))}
       </Box>
 
       {streamText ? (
@@ -809,12 +1058,23 @@ export function App({
                 <>
                   <Text color={theme.accent}>{SPINNER[frame % SPINNER.length]} </Text>
                   <Text color={theme.dim}>{activity?.label ?? "working"}</Text>
+                  {/* What it is working ON, not just that it is working. */}
+                  {activity?.what && (
+                    <Text color={theme.dim}>
+                      {" \u00b7 "}
+                      {activity.what.length > 48 ? activity.what.slice(0, 47) + "…" : activity.what}
+                    </Text>
+                  )}
                   {activity && (
                     <Text color={theme.ghost}>
                       {" \u00b7 "}
                       {fmtDuration(Date.now() - activity.since)}
                     </Text>
                   )}
+                  <Text color={theme.ghost}>
+                    {" \u00b7 "}
+                    {verbose ? "shift+V hide detail" : "shift+V detail"}
+                  </Text>
                 </>
               ) : (
                 <>
@@ -869,6 +1129,7 @@ export function App({
           model: engine.model,
           sessionTokens: tokens,
           costUsd: cost,
+          costEstimated,
           budgetTokens: engine.budgetTokens,
         }}
       />
