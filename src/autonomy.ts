@@ -33,7 +33,7 @@ export const DEFAULT_AUTONOMY: Autonomy = "low";
 /** One line each, for the status line and `/autonomy`. */
 export const AUTONOMY_SUMMARY: Record<Autonomy, string> = {
   low: "asks before every command and every write",
-  medium: "runs reads, read-only commands, and writes inside the project",
+  medium: "runs searches, read-only commands, and writes inside the project",
   high: "runs everything except what cannot be undone",
 };
 
@@ -183,6 +183,20 @@ export function insideProject(cwd: string, p: unknown): boolean {
   return target === resolve(cwd) || target.startsWith(resolve(cwd) + "/");
 }
 
+/**
+ * Tools that cannot change anything, whatever their arguments say.
+ *
+ * This is the argument for having them at all. `ls` through bash is a string
+ * the classifier has to reason about; `list_dir` is a tool that has no code
+ * path to a write. The safety comes from the shape of the tool rather than
+ * from a regex over a command line, which is a better kind of safety — there
+ * is nothing to outsmart.
+ */
+const READING_TOOLS = new Set(["read_file", "list_dir", "grep"]);
+
+/** Tools that write, and are gated exactly like write_file. */
+const WRITING_TOOLS = new Set(["write_file", "edit_file"]);
+
 export type Decision = {
   /** True when a human has to answer before this runs. */
   ask: boolean;
@@ -207,11 +221,17 @@ export function gate(
 
   // Leaving the project is a prompt at every level. molt was pointed at one
   // directory, and "outside it" is the one boundary no autonomy setting is
-  // allowed to imply.
-  const outside = (name === "read_file" || name === "write_file") && !insideProject(cwd, path);
-  if (outside) return { ask: true, why: `${String(path)} is outside this project` };
+  // allowed to imply. A path argument is only checked when there is one:
+  // list_dir and grep default to the project root.
+  const pathed = READING_TOOLS.has(name) || WRITING_TOOLS.has(name);
+  const needsPath = name === "read_file" || WRITING_TOOLS.has(name);
+  const hasPath = typeof path === "string" && path !== "";
+  if (pathed && (hasPath || needsPath) && !insideProject(cwd, path)) {
+    return { ask: true, why: `${String(path)} is outside this project` };
+  }
 
-  if (name === "read_file") return { ask: false };
+  // A tool with no write in it needs no permission at any level.
+  if (READING_TOOLS.has(name)) return { ask: false };
 
   if (level === "high") {
     if (name === "bash" && isIrreversible(command)) {
@@ -221,7 +241,7 @@ export function gate(
   }
 
   if (level === "medium") {
-    if (name === "write_file") return { ask: false };
+    if (WRITING_TOOLS.has(name)) return { ask: false };
     if (name === "bash") {
       if (isIrreversible(command)) return { ask: true, why: "this cannot be undone" };
       if (isReadOnlyCommand(command)) return { ask: false };

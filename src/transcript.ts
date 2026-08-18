@@ -281,9 +281,11 @@ export class Transcript {
           const prior = lastRead.get(path);
           if (prior !== undefined) supersededBy.set(prior, `re-read at step ${i}`);
           lastRead.set(path, i);
-        } else if (call.function.name === "write_file") {
+        } else if (call.function.name === "write_file" || call.function.name === "edit_file") {
+          // A surgical edit invalidates a read exactly as a rewrite does: what
+          // is in context is no longer what is on disk.
           const prior = lastRead.get(path);
-          if (prior !== undefined) supersededBy.set(prior, `overwritten at step ${i}`);
+          if (prior !== undefined) supersededBy.set(prior, `changed at step ${i}`);
           lastRead.delete(path);
         }
       }
@@ -380,14 +382,28 @@ export function buildExuvia(dropped: Msg[], index: number): string {
   return [...head, ...body].join("\n");
 }
 
+/**
+ * What a tool call did, in one line, for a person reading the transcript.
+ *
+ * Each tool says the thing that identifies the call: a command, a pattern, a
+ * path — never a JSON blob, which is what a grep looked like before this had
+ * a case for it. A paged read says which part it asked for, because two
+ * identical-looking read_file lines are a loop while "from line 240" is
+ * progress, and the reader should not have to guess which they are watching.
+ */
 export function toolDetail(name: string, args: Record<string, unknown>): string {
+  const where = String(args.path ?? "");
+  const glob = args.glob ? ` ${String(args.glob)}` : "";
   const raw =
-    name === "bash" ? String(args.command ?? "") : String(args.path ?? JSON.stringify(args));
-  // A paged read says which part it is asking for. Two identical-looking
-  // read_file lines in a transcript are a loop; "src/app.tsx from line 240" is
-  // progress, and the reader should not have to guess which they are watching.
-  const part =
-    name === "read_file" && Number(args.offset) > 0 ? ` from line ${Number(args.offset) + 1}` : "";
-  const oneLine = (raw + part).replace(/\s+/g, " ").trim();
+    name === "bash"
+      ? String(args.command ?? "")
+      : name === "grep"
+        ? `/${String(args.pattern ?? "")}/${where ? ` in ${where}` : ""}${glob}`
+        : name === "list_dir"
+          ? `${where || "."}${glob}`
+          : name === "read_file" && Number(args.offset) > 0
+            ? `${where} from line ${Number(args.offset) + 1}`
+            : where || JSON.stringify(args);
+  const oneLine = raw.replace(/\s+/g, " ").trim();
   return [...oneLine].slice(0, 80).join("");
 }

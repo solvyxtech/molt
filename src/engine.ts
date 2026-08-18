@@ -28,8 +28,16 @@ import {
   AUTONOMY_SUMMARY,
   DEFAULT_AUTONOMY,
   gate,
+  insideProject,
   type Autonomy,
 } from "./autonomy.js";
+import {
+  applyEdit,
+  formatListing,
+  formatMatches,
+  grepFiles,
+  walk,
+} from "./files.js";
 import { Journal } from "./journal.js";
 import { Receipts } from "./receipts.js";
 import { readStream, type Usage } from "./stream.js";
@@ -61,7 +69,14 @@ type Meter = {
 
 export const SYSTEM_PROMPT = [
   "You are molt, a coding agent working in the current directory.",
-  "Use the tools to read files, write files, and run shell commands (grep/find/git via bash).",
+  "",
+  "Tools: list_dir and grep to find things, read_file to read them, edit_file to change",
+  "exact text, write_file for a new file or a full rewrite, bash for everything else.",
+  "Prefer list_dir and grep over running ls/grep/find through bash — they need no",
+  "permission and their output is bounded. Prefer edit_file over write_file on a file",
+  "that already exists: copy old_text verbatim from what you read, and molt will refuse",
+  "the edit rather than write a guess.",
+  "",
   "Read only what you need. Be terse.",
   "",
   "Every tool result stays in this conversation. Never read a file you have already",
@@ -137,6 +152,62 @@ const TOOLS = [
         type: "object",
         properties: { path: { type: "string" }, content: { type: "string" } },
         required: ["path", "content"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_dir",
+      description:
+        "List a directory. Build and dependency directories are skipped. Prefer this over " +
+        "`ls` through bash: it needs no permission and its output is bounded.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Directory, relative to the project. Default '.'." },
+          depth: { type: "number", description: "How many levels down. Default 1." },
+          glob: { type: "string", description: "Only files matching this, e.g. '**/*.ts'." },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "grep",
+      description:
+        "Search file contents for a JavaScript regular expression, returning path:line: text. " +
+        "Prefer this over `grep` through bash: it needs no permission and its output is bounded.",
+      parameters: {
+        type: "object",
+        properties: {
+          pattern: { type: "string" },
+          path: { type: "string", description: "Directory to search. Default '.'." },
+          glob: { type: "string", description: "Only search files matching this, e.g. '**/*.ts'." },
+          ignore_case: { type: "boolean" },
+        },
+        required: ["pattern"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "edit_file",
+      description:
+        "Replace exact text in a file. Copy old_text verbatim from a read, including " +
+        "indentation; the edit is refused if it does not appear, or if it appears more than " +
+        "once without replace_all. Prefer this over rewriting a whole file with write_file.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          old_text: { type: "string" },
+          new_text: { type: "string" },
+          replace_all: { type: "boolean" },
+        },
+        required: ["path", "old_text", "new_text"],
       },
     },
   },
@@ -273,6 +344,11 @@ function callKey(name: string, args: Record<string, unknown>): string {
     .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
     .sort();
   return `${name}(${parts.join(",")})`;
+}
+
+/** A tool argument that should be a non-empty string, or nothing. */
+function str(v: unknown): string | undefined {
+  return typeof v === "string" && v.trim() !== "" ? v : undefined;
 }
 
 /** A tool argument that should be a non-negative integer, or its default. */
@@ -757,6 +833,57 @@ export class Engine {
         return `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${rel}`;
       }
 
+      case "list_dir": {
+        const rel = String(args.path ?? ".");
+        const abs = resolve(this.cwd, rel);
+        this.mustBeInside(abs, rel);
+        return formatListing(rel, walk(abs, { depth: num(args.depth, 1), glob: str(args.glob) }));
+      }
+
+      case "grep": {
+        const rel = String(args.path ?? ".");
+        const abs = resolve(this.cwd, rel);
+        this.mustBeInside(abs, rel);
+        const pattern = String(args.pattern ?? "");
+        return formatMatches(
+          pattern,
+          grepFiles(abs, pattern, {
+            glob: str(args.glob),
+            ignoreCase: args.ignore_case === true,
+          }),
+        );
+      }
+
+      case "edit_file": {
+        const rel = String(args.path ?? "");
+        const abs = resolve(this.cwd, rel);
+        this.mustBeInside(abs, rel);
+        if (!existsSync(abs)) return `no such file: ${rel} — write_file creates a new one`;
+        const before = sha256Of(abs);
+        const current = readFileSync(abs, "utf8");
+        const edit = applyEdit(
+          current,
+          String(args.old_text ?? ""),
+          String(args.new_text ?? ""),
+          args.replace_all === true,
+        );
+        if (!edit.ok) return `edit refused: ${edit.why}`;
+        writeFileSync(abs, edit.text, "utf8");
+        // Ledgered exactly like a write, so files-changed and record-intact
+        // prove a surgical edit the same way they prove a whole-file rewrite.
+        this.ledger.push({
+          path: isAbsolute(rel) ? relative(this.cwd, abs) : rel,
+          before,
+          after: createHash("sha256").update(edit.text, "utf8").digest("hex"),
+          callId,
+        });
+        const delta = Buffer.byteLength(edit.text, "utf8") - Buffer.byteLength(current, "utf8");
+        return (
+          `replaced ${edit.replacements} occurrence(s) in ${rel} · ` +
+          `${delta >= 0 ? "+" : ""}${delta} bytes`
+        );
+      }
+
       case "bash":
         try {
           return execSync(String(args.command ?? ""), {
@@ -788,6 +915,19 @@ export class Engine {
    * rewrote mid-task is not a bar, so the edit is reported as a failure
    * rather than quietly honoured.
    */
+  /**
+   * Refuse to act outside the project.
+   *
+   * The permission gate already asks about a path outside the project, but a
+   * tool that resolves paths itself has to hold the line itself too: a gate
+   * that only inspects `path` cannot see where a directory walk ends up.
+   */
+  private mustBeInside(abs: string, shown: string): void {
+    if (!insideProject(this.cwd, abs)) {
+      throw new Error(`${shown} is outside this project; molt will not walk there`);
+    }
+  }
+
   private runBarGuarded(claim?: string, override?: Bar | null): BarResult {
     const bar = override ?? this.cfg.bar!;
     const t0 = Date.now();

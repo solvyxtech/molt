@@ -33,9 +33,16 @@ collide with, the key cycles outright, because that is where speed matters.
 
 | level | runs without asking |
 |---|---|
-| **low** (default) | Reading a file inside the project. Nothing else. |
-| **medium** | Reads, writes **inside the project**, and commands that only report. |
+| **low** (default) | The tools that cannot write: `read_file`, `list_dir`, `grep`. |
+| **medium** | Those, plus writes **inside the project**, plus commands that only report. |
 | **high** | Everything except what cannot be undone, or what leaves the project. |
+
+The read-only tools are never gated at any level, and that is the argument for
+having them at all. `ls` through `bash` is a string this classifier has to
+reason about; `list_dir` is a tool with no code path to a write, so its safety
+is a property of its shape rather than of a regex over a command line. There is
+nothing to outsmart. The project boundary still applies to them: a listing or a
+search outside the directory molt was pointed at asks, at every level.
 
 `--yes` is `--autonomy high`.
 

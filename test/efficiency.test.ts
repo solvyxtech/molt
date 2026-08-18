@@ -82,7 +82,7 @@ describe("superseded tool results", () => {
 
     const results = t.all().filter((m) => m.role === "tool");
     assert.ok(results[0].content!.startsWith(ELIDED_PREFIX));
-    assert.match(results[0].content!, /overwritten at step/);
+    assert.match(results[0].content!, /changed at step/);
     // The notice must not send the model back to the file. Earlier wording
     // ("full contents remain in the archived record") read as an invitation to
     // go and get them, which a model can only do by re-reading — the exact
