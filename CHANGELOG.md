@@ -9,6 +9,21 @@ a number presented with more confidence than it was earned with.
 
 ### Added
 
+- **`list_dir`, `grep`, and `edit_file`.** Three tools became six, which is a
+  change to a stated design rule and so needs its reason in the open: `ls`
+  through `bash` is a string the autonomy classifier has to reason about, and an
+  unfamiliar construction sends it to a prompt — in one real session, a model
+  that could not list a directory started guessing filenames. A tool with no
+  write in it needs no classifier and is never gated at any level; safety by
+  shape beats safety by regex.
+
+  `list_dir` and `grep` skip build and dependency directories (saying which),
+  cap their own output, and refuse to walk outside the project. `edit_file`
+  replaces exact text and refuses rather than guesses: absent text fails, and
+  text appearing more than once fails without `replace_all`, because a write
+  that lands on the wrong occurrence looks exactly like a write that worked.
+  Edits are ledgered like any other write, so `files-changed` and
+  `record-intact` prove them, and a superseded read is elided the same way.
 - **Autonomy levels — `shift+A`.** low (default) asks about every command and
   every write, as before; medium runs reads, writes inside the project, and
   commands that only report; high runs everything except what cannot be undone.

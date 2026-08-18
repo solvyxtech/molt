@@ -161,7 +161,7 @@ describe("over a real socket", () => {
     }[]) {
       assert.equal(body.model, "mock-model");
       assert.equal(body.tool_choice, "auto");
-      assert.equal(body.tools.length, 3);
+      assert.equal(body.tools.length, 6);
       for (const m of body.messages) {
         assert.ok(!("molt" in m), "internal metadata must never reach a provider");
         assert.ok(["system", "user", "assistant", "tool"].includes(String(m.role)));

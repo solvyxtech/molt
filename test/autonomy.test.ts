@@ -215,6 +215,29 @@ describe("medium", () => {
     assert.ok(bash("medium", "mv a b"));
   });
 
+  it("never asks about a tool that has no write in it", () => {
+    // The argument for having these as tools rather than shell strings: their
+    // shape decides it, so there is nothing for a classifier to be wrong about.
+    for (const level of AUTONOMY_LEVELS) {
+      assert.ok(!ask(level, "list_dir", {}), `${level} gated a listing`);
+      assert.ok(!ask(level, "list_dir", { path: "src" }), `${level} gated a listing`);
+      assert.ok(!ask(level, "grep", { pattern: "verify" }), `${level} gated a search`);
+      assert.ok(!ask(level, "grep", { pattern: "x", path: "src" }), `${level} gated a search`);
+    }
+    // The project boundary still holds, even for a tool that only reads.
+    for (const level of AUTONOMY_LEVELS) {
+      assert.ok(ask(level, "list_dir", { path: "/etc" }), `${level} listed outside the project`);
+      assert.ok(ask(level, "grep", { pattern: "x", path: "../.." }), `${level} searched outside`);
+    }
+  });
+
+  it("gates an edit exactly as it gates a write", () => {
+    assert.ok(ask("low", "edit_file", { path: "src/a.ts" }));
+    assert.ok(!ask("medium", "edit_file", { path: "src/a.ts" }));
+    assert.ok(!ask("high", "edit_file", { path: "src/a.ts" }));
+    assert.ok(ask("high", "edit_file", { path: "../other/a.ts" }));
+  });
+
   it("asks about a tool it has never heard of", () => {
     // A level written today cannot have consented to a tool added tomorrow.
     const d = gate("medium", { name: "send_email", args: {}, cwd: CWD });
