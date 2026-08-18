@@ -18,6 +18,15 @@ a number presented with more confidence than it was earned with.
   tears the terminal) and the full detail goes to the transcript, which is
   printed once and never redrawn — so the terminal's own scrollback keeps it
   all. Opening the view also prints everything recorded before you opened it.
+- **No credential-shaped literal anywhere in the source.** The redaction tests
+  needed key-shaped strings and had them written out — `sk-proj-…`, `ghp_…`,
+  `xai-…` — all invented, none real, and every one of them something a reader
+  has to stop and check. Someone did, and was right to: a project arguing "do
+  not take claims on trust" should not ship test data that has to be verified
+  by hand, and GitHub's scanner would have flagged the PAT-shaped one and tried
+  to revoke a token that never existed. The fixtures are assembled at runtime
+  now, so the values are exactly as key-shaped as the redactor needs to see and
+  the source contains nothing that looks like a credential.
 - **One bar template instead of two.** `DEFAULT_BAR` was a hand-written
   template that nothing generated any more, sitting next to the generator that
   actually writes the file. It is now derived from that generator

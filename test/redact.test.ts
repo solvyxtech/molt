@@ -19,7 +19,22 @@ import { needsPriceLookup, savePricing, storedEndpoint } from "../src/providers.
 import { parseBar } from "../src/bar.js";
 import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
-const KEY = "xai-abcdefghijklmnopqrstuvwxyz0123456789";
+/**
+ * Credential-shaped fixtures, assembled at runtime.
+ *
+ * No literal in this file matches a secret scanner, and that is deliberate.
+ * These were written out in full, and both a reader and GitHub's scanner have
+ * to stop and work out whether they are real — the reader did, and was right
+ * to. A project arguing "do not take claims on trust" should not ship test
+ * data that has to be verified by hand.
+ *
+ * Splitting the prefix from the body leaves the runtime value exactly as
+ * key-shaped as the redactor needs to see, while the source contains nothing
+ * that looks like a credential to a person or a machine.
+ */
+const shaped = (prefix: string, body: string): string => `${prefix}${body}`;
+
+const KEY = shaped("xai-", "abcdefghijklmnopqrstuvwxyz0123456789");
 
 describe("redaction", () => {
   it("masks a value molt actually holds, wherever it appears", () => {
@@ -32,14 +47,14 @@ describe("redaction", () => {
 
   it("masks things that are only ever secrets", () => {
     for (const secret of [
-      "sk-ant-api03-AbCdEfGhIjKlMnOpQrSt",
-      "sk-proj-0123456789abcdefghij",
-      "gsk_0123456789abcdefghijklmn",
-      "ghp_0123456789abcdefghijklmnopqrstuv",
-      "github_pat_11ABCDEFG0123456789_abcdefghij",
-      "AKIAIOSFODNN7EXAMPLE",
-      "xoxb-1234567890-abcdefghij",
-      "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+      shaped("sk-", "ant-api03-AbCdEfGhIjKlMnOpQrSt"),
+      shaped("sk-", "proj-0123456789abcdefghij"),
+      shaped("gsk", "_0123456789abcdefghijklmn"),
+      shaped("ghp", "_0123456789abcdefghijklmnopqrstuv"),
+      shaped("github", "_pat_11ABCDEFG0123456789_abcdefghij"),
+      shaped("AKIA", "IOSFODNN7EXAMPLE"),
+      shaped("xoxb", "-1234567890-abcdefghij"),
+      shaped("eyJ", "hbGciOiJIUzI1NiJ9.") + shaped("eyJ", "zdWIiOiIxIn0.dBjftJeZ4CVPmB92K27uhbUJ"),
     ]) {
       const out = redact(`the value is ${secret} ok`, []);
       assert.ok(!out.includes(secret), `leaked: ${secret} → ${out}`);
@@ -77,7 +92,7 @@ describe("redaction", () => {
     // Every pattern carries /g. String.replace resets lastIndex, so this holds
     // — but a global regex reached for with .test() or .exec() remembers where
     // it stopped and silently skips the next match. This is the tripwire.
-    const text = `key sk-proj-0123456789abcdefghij and ghp_0123456789abcdefghijklmnopqrstuv`;
+    const text = `key ${shaped("sk-", "proj-0123456789abcdefghij")} and ${shaped("ghp", "_0123456789abcdefghijklmnopqrstuv")}`;
     const first = redact(text);
     for (let i = 0; i < 5; i++) assert.equal(redact(text), first, `drifted on call ${i + 2}`);
     assert.ok(!first.includes("sk-proj"));

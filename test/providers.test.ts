@@ -442,13 +442,14 @@ describe("authentication headers", () => {
     // login. Their compatibility layer takes `Authorization: Bearer` on
     // /chat/completions but not on /models, which wants x-api-key and a
     // version — so the key worked for chat and 401'd on the model list.
-    const anthropic = authHeaders("https://api.anthropic.com/v1", "sk-ant-key-value");
-    assert.equal(anthropic["x-api-key"], "sk-ant-key-value");
+    const fake = `sk-${"ant-key-value"}`;
+    const anthropic = authHeaders("https://api.anthropic.com/v1", fake);
+    assert.equal(anthropic["x-api-key"], fake);
     assert.equal(anthropic["anthropic-version"], "2023-06-01");
-    assert.equal(anthropic.authorization, "Bearer sk-ant-key-value");
+    assert.equal(anthropic.authorization, `Bearer ${fake}`);
 
     // Everyone else gets the common case, and nothing extra.
-    const xai = authHeaders("https://api.x.ai/v1", "xai-key-value");
+    const xai = authHeaders("https://api.x.ai/v1", `xai-${"key-value"}`);
     assert.deepEqual(Object.keys(xai), ["authorization"]);
   });
 
