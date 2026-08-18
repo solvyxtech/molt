@@ -13,6 +13,7 @@ import {
   DEFAULT_BAR,
   claimedWrites,
   loadBar,
+  mentionedPaths,
   parseBar,
   runBar,
   writeDefaultBar,
@@ -33,6 +34,72 @@ function ws() {
 function ctx(dir: string, over: Partial<BarContext> = {}): BarContext {
   return { cwd: dir, record: [], ledger: [], archivedBatches: 0, ...over };
 }
+
+describe("claims-grounded grounds a read", () => {
+  it("accepts a file the model read, wherever it lives", () => {
+    // The reported failure: molt was asked to assess its own source, which is
+    // installed outside the project directory. It read engine.ts, described it
+    // accurately, and was told it had invented the name — then spent 1.13M
+    // tokens rewriting a correct document. Reading a file is evidence it
+    // exists; it is the same evidence a write is, one step earlier.
+    const dir = ws();
+    const bar = parseBar("version: 1\nchecks:\n  - name: grounded\n    builtin: claims-grounded\n");
+    const ctx = {
+      cwd: dir,
+      record: [],
+      ledger: [],
+      liveLedger: [],
+      archivedBatches: 0,
+      expectedArchivedWrites: 0,
+      expectedArchiveFiles: [],
+      claim: "engine.ts holds the loop and bar.ts runs the checks.",
+    };
+
+    // Nothing read: the names are unsupported, and the check says so.
+    assert.equal(runBar(bar, ctx).ok, false);
+
+    // Read from anywhere, including outside the project.
+    const grounded = runBar(bar, {
+      ...ctx,
+      read: ["/opt/homebrew/lib/node_modules/@solvyx/molt/src/engine.ts", "/elsewhere/bar.ts"],
+    });
+    assert.equal(grounded.ok, true, grounded.results[0]?.output);
+  });
+});
+
+describe("claims-grounded, on prose about code", () => {
+  it("does not think e.g. is a file", () => {
+    // Reported from use: a correct assessment of molt's own source was refused
+    // because "e.g." parses as a stem and a one-letter extension — and the
+    // model was then sent back to strip abbreviations out of its own writing.
+    // A check that makes work worse in order to be satisfied is not a check.
+    const claim = "engine.ts holds the loop, e.g. the proof gate. i.e. see bar.ts. 1.5x vs. before.";
+    assert.deepEqual(mentionedPaths(claim).sort(), ["bar.ts", "engine.ts"]);
+  });
+
+  it("leaves the rest of English alone", () => {
+    for (const prose of [
+      "roughly 2.5x faster",
+      "see section 3.1 for details",
+      "at 9 a.m. or p.m.",
+      "in the U.S. and U.K.",
+      "cf. the earlier note",
+      "approx. 40 steps",
+      "Dr. Smith and Mr. Jones",
+    ]) {
+      assert.deepEqual(mentionedPaths(prose), [], `flagged prose: ${prose}`);
+    }
+  });
+
+  it("still trusts a short name someone put in backticks", () => {
+    // `a.c` is how a person writes a filename they mean.
+    assert.deepEqual(mentionedPaths("look at `a.c` and `x.h`").sort(), ["a.c", "x.h"]);
+  });
+
+  it("still catches a fabricated reference", () => {
+    assert.deepEqual(mentionedPaths("I created src/invented.ts for you"), ["src/invented.ts"]);
+  });
+});
 
 describe("parseBar", () => {
   it("accepts a well-formed bar", () => {

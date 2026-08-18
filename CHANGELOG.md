@@ -112,6 +112,24 @@ a number presented with more confidence than it was earned with.
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
+- **`claims-grounded` refused a correct document, then made the model wreck it.**
+  Three faults at once, reported from a real session that spent 1.13M tokens
+  and never finished. "e.g." parses as a stem and a one-letter extension, so it
+  was flagged as a missing file — along with "i.e.". A file the model had *read*
+  did not count as grounded, only one it had written or one sitting in the
+  project directory, so an assessment of source installed elsewhere was called
+  a fabrication for naming files it had just been reading. And a bar failing
+  identically on every attempt kept going, so the model spent step after step
+  stripping abbreviations out of its own prose to satisfy a check that was
+  wrong about it.
+
+  Reading a file now grounds a reference to it — the same evidence a write is,
+  one step earlier. Prose abbreviations are excluded by name and by shape,
+  while anything in backticks is still trusted as a filename. And a bar that
+  fails in exactly the same way twice stops, because the model is not
+  converging on it: either the work cannot satisfy the check, or the check is
+  wrong about the work, and both are worth a person's attention rather than
+  more tokens.
 - **"844k in" read as 844,000 tokens of reading.** It is one conversation
   resent once per step — thirty steps at a 28k context is 840k billed input,
   and maybe 30k of distinct content. The session line now shows the live
@@ -328,6 +346,24 @@ claim literally true.
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
+- **`claims-grounded` refused a correct document, then made the model wreck it.**
+  Three faults at once, reported from a real session that spent 1.13M tokens
+  and never finished. "e.g." parses as a stem and a one-letter extension, so it
+  was flagged as a missing file — along with "i.e.". A file the model had *read*
+  did not count as grounded, only one it had written or one sitting in the
+  project directory, so an assessment of source installed elsewhere was called
+  a fabrication for naming files it had just been reading. And a bar failing
+  identically on every attempt kept going, so the model spent step after step
+  stripping abbreviations out of its own prose to satisfy a check that was
+  wrong about it.
+
+  Reading a file now grounds a reference to it — the same evidence a write is,
+  one step earlier. Prose abbreviations are excluded by name and by shape,
+  while anything in backticks is still trusted as a filename. And a bar that
+  fails in exactly the same way twice stops, because the model is not
+  converging on it: either the work cannot satisfy the check, or the check is
+  wrong about the work, and both are worth a person's attention rather than
+  more tokens.
 - **"844k in" read as 844,000 tokens of reading.** It is one conversation
   resent once per step — thirty steps at a 28k context is 840k billed input,
   and maybe 30k of distinct content. The session line now shows the live
@@ -564,6 +600,24 @@ artifact molt cannot silently edit.
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
+- **`claims-grounded` refused a correct document, then made the model wreck it.**
+  Three faults at once, reported from a real session that spent 1.13M tokens
+  and never finished. "e.g." parses as a stem and a one-letter extension, so it
+  was flagged as a missing file — along with "i.e.". A file the model had *read*
+  did not count as grounded, only one it had written or one sitting in the
+  project directory, so an assessment of source installed elsewhere was called
+  a fabrication for naming files it had just been reading. And a bar failing
+  identically on every attempt kept going, so the model spent step after step
+  stripping abbreviations out of its own prose to satisfy a check that was
+  wrong about it.
+
+  Reading a file now grounds a reference to it — the same evidence a write is,
+  one step earlier. Prose abbreviations are excluded by name and by shape,
+  while anything in backticks is still trusted as a filename. And a bar that
+  fails in exactly the same way twice stops, because the model is not
+  converging on it: either the work cannot satisfy the check, or the check is
+  wrong about the work, and both are worth a person's attention rather than
+  more tokens.
 - **"844k in" read as 844,000 tokens of reading.** It is one conversation
   resent once per step — thirty steps at a 28k context is 840k billed input,
   and maybe 30k of distinct content. The session line now shows the live
@@ -763,6 +817,24 @@ session. Shrinking them is a rounding error.
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
+- **`claims-grounded` refused a correct document, then made the model wreck it.**
+  Three faults at once, reported from a real session that spent 1.13M tokens
+  and never finished. "e.g." parses as a stem and a one-letter extension, so it
+  was flagged as a missing file — along with "i.e.". A file the model had *read*
+  did not count as grounded, only one it had written or one sitting in the
+  project directory, so an assessment of source installed elsewhere was called
+  a fabrication for naming files it had just been reading. And a bar failing
+  identically on every attempt kept going, so the model spent step after step
+  stripping abbreviations out of its own prose to satisfy a check that was
+  wrong about it.
+
+  Reading a file now grounds a reference to it — the same evidence a write is,
+  one step earlier. Prose abbreviations are excluded by name and by shape,
+  while anything in backticks is still trusted as a filename. And a bar that
+  fails in exactly the same way twice stops, because the model is not
+  converging on it: either the work cannot satisfy the check, or the check is
+  wrong about the work, and both are worth a person's attention rather than
+  more tokens.
 - **"844k in" read as 844,000 tokens of reading.** It is one conversation
   resent once per step — thirty steps at a 28k context is 840k billed input,
   and maybe 30k of distinct content. The session line now shows the live
@@ -964,6 +1036,24 @@ against a real provider before behaviour changes.
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
+- **`claims-grounded` refused a correct document, then made the model wreck it.**
+  Three faults at once, reported from a real session that spent 1.13M tokens
+  and never finished. "e.g." parses as a stem and a one-letter extension, so it
+  was flagged as a missing file — along with "i.e.". A file the model had *read*
+  did not count as grounded, only one it had written or one sitting in the
+  project directory, so an assessment of source installed elsewhere was called
+  a fabrication for naming files it had just been reading. And a bar failing
+  identically on every attempt kept going, so the model spent step after step
+  stripping abbreviations out of its own prose to satisfy a check that was
+  wrong about it.
+
+  Reading a file now grounds a reference to it — the same evidence a write is,
+  one step earlier. Prose abbreviations are excluded by name and by shape,
+  while anything in backticks is still trusted as a filename. And a bar that
+  fails in exactly the same way twice stops, because the model is not
+  converging on it: either the work cannot satisfy the check, or the check is
+  wrong about the work, and both are worth a person's attention rather than
+  more tokens.
 - **"844k in" read as 844,000 tokens of reading.** It is one conversation
   resent once per step — thirty steps at a 28k context is 840k billed input,
   and maybe 30k of distinct content. The session line now shows the live
@@ -1199,6 +1289,24 @@ can't say "done" without proving it.**
   cost about $0.69** — a meter 40% under the truth, which is worse than one
   showing nothing. A price only stands for the model it was recorded against;
   otherwise it is cleared, and molt says so.
+- **`claims-grounded` refused a correct document, then made the model wreck it.**
+  Three faults at once, reported from a real session that spent 1.13M tokens
+  and never finished. "e.g." parses as a stem and a one-letter extension, so it
+  was flagged as a missing file — along with "i.e.". A file the model had *read*
+  did not count as grounded, only one it had written or one sitting in the
+  project directory, so an assessment of source installed elsewhere was called
+  a fabrication for naming files it had just been reading. And a bar failing
+  identically on every attempt kept going, so the model spent step after step
+  stripping abbreviations out of its own prose to satisfy a check that was
+  wrong about it.
+
+  Reading a file now grounds a reference to it — the same evidence a write is,
+  one step earlier. Prose abbreviations are excluded by name and by shape,
+  while anything in backticks is still trusted as a filename. And a bar that
+  fails in exactly the same way twice stops, because the model is not
+  converging on it: either the work cannot satisfy the check, or the check is
+  wrong about the work, and both are worth a person's attention rather than
+  more tokens.
 - **"844k in" read as 844,000 tokens of reading.** It is one conversation
   resent once per step — thirty steps at a 28k context is 840k billed input,
   and maybe 30k of distinct content. The session line now shows the live
