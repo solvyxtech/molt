@@ -1055,9 +1055,12 @@ export class Engine {
   /**
    * Refuse to act outside the project.
    *
-   * The permission gate already asks about a path outside the project, but a
-   * tool that resolves paths itself has to hold the line itself too: a gate
-   * that only inspects `path` cannot see where a directory walk ends up.
+   * Only the tools that resolve paths THEMSELVES need this. `write_file` and
+   * `read_file` are handed one path, which the permission gate has already
+   * checked against the project boundary at every autonomy level — so a
+   * second refusal here would not add safety, it would override a person who
+   * looked at the prompt and said yes. `list_dir` and `grep` walk, and a walk
+   * can end up somewhere the gate never saw.
    */
   private mustBeInside(abs: string, shown: string): void {
     if (!insideProject(this.cwd, abs)) {
@@ -1535,8 +1538,9 @@ export class Engine {
         this.inFlight = undefined;
         if (controller.signal.aborted) {
           this.transcript.rollbackTo(turnStart);
-          log?.append("cancelled", { step, rolledBack: true });
-          yield { kind: "cancelled" };
+          const wrote = [...new Set(this.ledger.map((e) => e.path))];
+          log?.append("cancelled", { step, rolledBack: true, filesWritten: wrote });
+          yield { kind: "cancelled", filesWritten: wrote };
           return;
         }
         log?.append("error", { text: `network: ${String(e)}` });
@@ -1586,7 +1590,7 @@ export class Engine {
           this.inFlight = undefined;
           if (controller.signal.aborted) {
             this.transcript.rollbackTo(turnStart);
-            yield { kind: "cancelled" };
+            yield { kind: "cancelled", filesWritten: [...new Set(this.ledger.map((e) => e.path))] };
             return;
           }
           yield { kind: "error", text: `stream: ${String(e)}` };
@@ -1604,7 +1608,7 @@ export class Engine {
           this.inFlight = undefined;
           if (controller.signal.aborted) {
             this.transcript.rollbackTo(turnStart);
-            yield { kind: "cancelled" };
+            yield { kind: "cancelled", filesWritten: [...new Set(this.ledger.map((e) => e.path))] };
             return;
           }
           yield { kind: "error", text: "provider returned non-JSON response" };
@@ -1724,10 +1728,15 @@ export class Engine {
         for (const call of msg.tool_calls) {
           const name = call.function?.name ?? "unknown";
           let args: Record<string, unknown> = {};
+          let malformed = false;
           try {
             args = JSON.parse(call.function?.arguments || "{}") as Record<string, unknown>;
           } catch {
-            /* model sent malformed args; run with empty */
+            // Running with empty arguments produced a misleading error — a
+            // malformed read_file became "EISDIR: illegal operation on a
+            // directory", which sends the model to debug a path it never
+            // sent. Say what actually happened instead.
+            malformed = true;
           }
           const detail = toolDetail(name, args);
           // What the current autonomy level says about this exact call. The
@@ -1741,6 +1750,28 @@ export class Engine {
 
           let result: string;
           let note: string | undefined;
+          if (malformed) {
+            const raw = capture(call.function?.arguments ?? "");
+            yield {
+              kind: "tool",
+              name,
+              detail: "malformed arguments",
+              note: "malformed",
+              args: raw,
+              bytes: 0,
+              preview: raw,
+              auto: true,
+            };
+            this.transcript.push({
+              role: "tool",
+              tool_call_id: call.id,
+              content:
+                `[molt: the arguments for ${name} were not valid JSON, so nothing ran. ` +
+                `Send them again as a JSON object. What arrived was: ${raw}]`,
+            });
+            called.push(name);
+            continue;
+          }
           // Timed around execution only. Waiting on a human to approve a gated
           // tool is not the tool being slow, and folding the two together
           // would make every gated call look like one.

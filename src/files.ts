@@ -205,6 +205,9 @@ export function formatListing(
  * identical — would have to be a same-length edit written within the
  * filesystem's timestamp granularity, and molt's own writes always move mtime.
  */
+/** Makes every unreadable-scope signature unique, even within a millisecond. */
+let unreadable = 0;
+
 export function fingerprint(root: string, globs?: string[]): string {
   const parts: string[] = [];
   const patterns = globs?.length ? globs : [undefined];
@@ -215,7 +218,10 @@ export function fingerprint(root: string, globs?: string[]): string {
     // A listing that hit its bound has not seen the whole scope, and a
     // signature of an unknown subset is not a signature. Say so, and the
     // caller treats it as never matching.
-    if (truncated) return `unbounded:${Date.now()}`;
+    // Never equal to anything, including itself: a signature of a scope that
+    // could not be read in full must not match on the next call, and Date.now()
+    // repeats inside a millisecond.
+    if (truncated) return `unbounded:${Date.now()}:${unreadable++}`;
     for (const e of entries) {
       if (e.kind !== "file" || seen.has(e.path)) continue;
       seen.add(e.path);
@@ -380,9 +386,16 @@ export function applyEdit(
         `one of them, or pass replace_all to change every occurrence`,
     };
   }
+  // Split and join, never String.replace: a replacement string is not literal
+  // to `replace`, which reads `$&`, `$1`, "$`" and `$'` as substitutions. A
+  // model editing code that contains any of them — regex replacements, shell,
+  // jQuery — got silently different text than it asked for, which is the worst
+  // possible failure in the tool whose job is exactness. `replaceAll` already
+  // joined; only the single case was wrong.
+  const [first, ...rest] = parts;
   return {
     ok: true,
-    text: replaceAll ? parts.join(newText) : current.replace(oldText, newText),
+    text: replaceAll ? parts.join(newText) : first + newText + rest.join(oldText),
     replacements: replaceAll ? found : 1,
   };
 }

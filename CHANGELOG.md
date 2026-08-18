@@ -18,6 +18,29 @@ a number presented with more confidence than it was earned with.
   tears the terminal) and the full detail goes to the transcript, which is
   printed once and never redrawn — so the terminal's own scrollback keeps it
   all. Opening the view also prints everything recorded before you opened it.
+- **`edit_file` silently corrupted any replacement containing `$`.** The single
+  replacement used `String.replace`, which reads `$&`, `$1`, `` $` `` and `$'`
+  in the replacement as substitutions rather than text — so editing a regex, a
+  shell script, or anything with jQuery in it wrote something other than what
+  was asked for, in the one tool whose whole job is exactness.
+  `const price = OLD;` with `$&` came out as
+  `const price = OLD and const price =  and $1;`. It splits and joins now, like
+  `replace_all` already did.
+- **A malformed tool call told the model the wrong thing.** Unparseable
+  arguments became `{}` and the tool ran anyway, so a bad `read_file` surfaced
+  as "EISDIR: illegal operation on a directory" — sending the model to debug a
+  path it never sent. Nothing runs now, and the result says the arguments were
+  not valid JSON and shows what arrived.
+- **`--budget`, `--auto-shed` and `--attempts` accepted junk as NaN**, which
+  compares false against everything and silently switched the limit off.
+  Rejected with a message naming the flag and the value.
+- **"Cancelled — the session is unchanged" was not true.** The transcript rolls
+  back; the filesystem cannot, and molt cannot un-write a file. Cancelling now
+  names the files that were already written and are still on disk, or says
+  plainly that none were.
+- **A dead branch in the receipt** (`r.ok ? (r.advisory ? "pass" : "pass")`) and
+  **a fingerprint that could collide inside a millisecond**, letting a stale bar
+  result be reused after an unreadable scope. Both from the same review.
 - **Shedding removed a file from context and then molt refused to give it
   back.** The read-coverage map that stops a model re-reading what it already
   has did not know about compaction — so after a shed, molt told the model to
