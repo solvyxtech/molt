@@ -16,6 +16,7 @@ checks:               # required, non-empty
     run: <command>    # a shell command …
     timeout: 300      # optional, seconds (default 120)
     expect_exit: 0    # optional (default 0)
+    advisory: false   # optional — true reports without blocking
 
   - name: <string>
     builtin: <id>     # … or a molt builtin, but never both
@@ -89,6 +90,28 @@ reference.
 
 It says nothing to ground rather than passing vacuously when the claim
 mentions no files.
+
+## Advisory checks
+
+```yaml
+  - name: lint
+    run: npm run lint
+    advisory: true
+```
+
+An advisory check runs, reports, and is recorded — and does not block a
+completion. Its failure shows as `warn` rather than `FAIL`, and the bar is still
+"met".
+
+The distinction matters because not every condition worth running is a
+condition worth refusing over. A linter's opinion, a coverage delta, a
+bundle-size trend: treating those as a broken contract teaches people to take
+the check out of the bar rather than to read it, and a bar people delete checks
+from is worse than one that distinguishes. Advisory failures are handed to the
+model too — it just is not blocked by them.
+
+Everything else about the check is unchanged: it is selected by tag, it appears
+in the receipt, and it cannot be edited by the work being judged against it.
 
 ## Tamper detection
 

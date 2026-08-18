@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — the meter says what it knows, and you set the ceiling
+## 1.0.0-rc.4 — the meter says what it knows, and you set the ceiling
 
 The status line quoted a cost to six decimal places from a price nobody had
 checked, and the TUI showed a spinner where the work was. Both are the same
@@ -9,6 +9,26 @@ a number presented with more confidence than it was earned with.
 
 ### Added
 
+- **Advisory checks.** `advisory: true` on a check in `done.yml` makes a failure
+  information rather than a refusal: it runs, it is reported as `warn`, it is
+  recorded in the receipt, and it does not block a completion. Not every
+  condition worth running is worth refusing over — treating a linter's opinion
+  as a broken contract teaches people to delete the check instead of reading it.
+- **Credentials are masked before anything is written.** The journal already
+  refused to log message content for this reason, and then logged
+  `curl -H "authorization: Bearer sk-live-…"` verbatim in a tool call's detail.
+  Values molt actually holds (the session key) are masked exactly; provider key
+  shapes, bearer headers, private-key blocks, and assignments to something named
+  "secret" are masked by pattern, keeping the field name so the record still
+  says *what* was hidden. Receipts are filtered the same way, because a receipt
+  is a document you hand to someone who does not trust you.
+- **Cost in the record.** Receipts carry what the session had spent when the
+  claim was made, and `molt stats` reports **cost per verified change** beside
+  tokens per verified change — the number molt's own pitch stands or falls by.
+- **A standing probe suite for the autonomy classifier** (81 cases × 8
+  shell variations). Every hole this classifier has had was found by running
+  commands against it, never by reading it, so the probing is now a test that
+  runs in CI.
 - **`list_dir`, `grep`, and `edit_file`.** Three tools became six, which is a
   change to a stated design rule and so needs its reason in the open: `ls`
   through `bash` is a string the autonomy classifier has to reason about, and an
@@ -85,6 +105,10 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **An unrecognised tool ran unattended at `high`**, which contradicted the
+  deny-by-default rule stated at the top of the classifier. A level written
+  today cannot consent to a tool added tomorrow; unknown tools now ask at every
+  level. Found by the probe suite on its first run.
 - **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
   `docs/autonomy.md` both said it ran "everything except what cannot be undone".
   The deny-list required a flag on `rm`, so deleting one named file was not on
@@ -208,6 +232,10 @@ claim literally true.
 
 ### Fixed
 
+- **An unrecognised tool ran unattended at `high`**, which contradicted the
+  deny-by-default rule stated at the top of the classifier. A level written
+  today cannot consent to a tool added tomorrow; unknown tools now ask at every
+  level. Found by the probe suite on its first run.
 - **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
   `docs/autonomy.md` both said it ran "everything except what cannot be undone".
   The deny-list required a flag on `rm`, so deleting one named file was not on
@@ -351,6 +379,10 @@ artifact molt cannot silently edit.
 
 ### Fixed
 
+- **An unrecognised tool ran unattended at `high`**, which contradicted the
+  deny-by-default rule stated at the top of the classifier. A level written
+  today cannot consent to a tool added tomorrow; unknown tools now ask at every
+  level. Found by the probe suite on its first run.
 - **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
   `docs/autonomy.md` both said it ran "everything except what cannot be undone".
   The deny-list required a flag on `rm`, so deleting one named file was not on
@@ -457,6 +489,10 @@ session. Shrinking them is a rounding error.
 
 ### Fixed
 
+- **An unrecognised tool ran unattended at `high`**, which contradicted the
+  deny-by-default rule stated at the top of the classifier. A level written
+  today cannot consent to a tool added tomorrow; unknown tools now ask at every
+  level. Found by the probe suite on its first run.
 - **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
   `docs/autonomy.md` both said it ran "everything except what cannot be undone".
   The deny-list required a flag on `rm`, so deleting one named file was not on
@@ -565,6 +601,10 @@ against a real provider before behaviour changes.
 
 ### Fixed
 
+- **An unrecognised tool ran unattended at `high`**, which contradicted the
+  deny-by-default rule stated at the top of the classifier. A level written
+  today cannot consent to a tool added tomorrow; unknown tools now ask at every
+  level. Found by the probe suite on its first run.
 - **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
   `docs/autonomy.md` both said it ran "everything except what cannot be undone".
   The deny-list required a flag on `rm`, so deleting one named file was not on
@@ -707,6 +747,10 @@ can't say "done" without proving it.**
 
 ### Fixed
 
+- **An unrecognised tool ran unattended at `high`**, which contradicted the
+  deny-by-default rule stated at the top of the classifier. A level written
+  today cannot consent to a tool added tomorrow; unknown tools now ask at every
+  level. Found by the probe suite on its first run.
 - **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
   `docs/autonomy.md` both said it ran "everything except what cannot be undone".
   The deny-list required a flag on `rm`, so deleting one named file was not on

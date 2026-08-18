@@ -207,6 +207,33 @@ changing one bar result from FAIL to pass and hoping nobody recomputes. If you
 need stronger guarantees, commit the logs, or ship the final hash somewhere
 molt cannot write.
 
+## Credentials
+
+Masked before anything is written, and before anything scrolls.
+
+```
+04:33:49  tool bash: curl -H "authorization: Bearer [redacted]" https://api.x.ai/v1/models
+```
+
+Two kinds of pattern. The **exact** kind: values molt actually holds — the
+session's API key — masked with no false negatives possible. The **shape** kind:
+provider key prefixes (`sk-`, `sk-ant-`, `xai-`, `gsk_`, `ghp_`, `AKIA`, …),
+bearer and `x-api-key` headers, JWTs, private-key blocks, and assignments to
+something named secret/token/password. The field name survives the mask, so the
+record still says *what* was hidden.
+
+It applies to the log, to receipts, to the transcript on screen, and to the
+model's own final answer — because every one of those is a distribution
+channel. A transcript gets pasted into a bug report; a receipt is handed to
+someone who does not trust you.
+
+**The permission prompt is the one exception**, deliberately: it shows the
+command in full, because you are being asked to judge it and a redacted command
+is one you cannot judge.
+
+This is a filter with a stated shape, not a guarantee. The durable protection is
+still not to paste a key into a prompt.
+
 ## What is deliberately not logged
 
 Message content. The log records a user message's length, a 120-character

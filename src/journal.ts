@@ -18,6 +18,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { redactData } from "./redact.js";
 
 export const GENESIS = "0".repeat(64);
 
@@ -73,11 +74,27 @@ export class Journal {
   private seq = 0;
   private prev = GENESIS;
 
+  /**
+   * Values that must never appear in the log, whatever an entry carries.
+   *
+   * The session's API key, mostly. Held here so redaction can be exact rather
+   * than only pattern-based — a key molt knows the value of can be masked
+   * with no false negatives.
+   */
+  private secrets: (string | undefined)[] = [];
+
   constructor(root: string, sessionId = randomUUID().slice(0, 8)) {
     this.dir = join(root, ".molt", "log");
     mkdirSync(this.dir, { recursive: true });
     this.sessionId = sessionId;
     this.path = join(this.dir, `${sessionId}.jsonl`);
+  }
+
+  /** Register a value to mask everywhere it appears. Idempotent. */
+  protect(...values: (string | undefined)[]): void {
+    for (const v of values) {
+      if (v && v.length >= 8 && !this.secrets.includes(v)) this.secrets.push(v);
+    }
   }
 
   /**
@@ -89,7 +106,11 @@ export class Journal {
       seq: this.seq,
       iso: new Date().toISOString(),
       kind,
-      data,
+      // Redacted on the way in, not on the way out. A log is written once and
+      // read many times, often by something that is not molt — `cat`, a CI
+      // artifact viewer, a git diff — so the only place a filter can be
+      // trusted is before the bytes hit the file.
+      data: redactData(data, this.secrets),
       prev: this.prev,
     };
     const entry: JournalEntry = { ...base, hash: hashEntry(base) };
