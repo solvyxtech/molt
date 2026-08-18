@@ -65,11 +65,19 @@ const READ_ONLY: Record<string, true> = {
   true: true, false: true, env: true, uname: true, hostname: true, sleep: true,
 };
 
-/** Subcommands of `git` that only report. Anything else asks. */
+/**
+ * Subcommands of `git` that only report. Anything else asks.
+ *
+ * `stash`, `config`, and `tag` were on this list and should never have been:
+ * bare `git stash` moves the working tree, `git config` writes a file, and
+ * `git tag` creates a ref. All three ran unattended at medium. Found by a
+ * model reading this file and saying so — which is the review this list wants,
+ * since every entry is a promise that a word cannot write.
+ */
 const GIT_READ_ONLY: Record<string, true> = {
   status: true, log: true, diff: true, show: true, branch: true, remote: true,
   "ls-files": true, "rev-parse": true, blame: true, describe: true,
-  shortlog: true, "cat-file": true, tag: true, config: true, stash: true,
+  shortlog: true, "cat-file": true, "show-ref": true, "symbolic-ref": true,
 };
 
 /** Package-manager subcommands that run project scripts rather than mutate deps. */

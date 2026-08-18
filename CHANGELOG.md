@@ -105,6 +105,35 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
+  on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
+  deleted what the model had just read, and the model went back to read it
+  again. Every step, for thirteen minutes, at $0.93, with no answer. Two
+  features that were each correct alone. Elision now keys on the exact window,
+  and a write still invalidates every part of that file.
+- **Shifted offsets walked past the repeat guard.** Asking for line 181 and then
+  line 182 returns almost the same bytes under a different key, so exact-match
+  detection saw nothing. molt now tracks which lines of which file it has
+  already shown, and a request inside that coverage gets a pointer. The
+  no-progress stop now triggers on a majority of repeats rather than requiring
+  every call in a step to be one.
+- **A stopped turn threw away everything it had paid for.** The step guard, the
+  budget, the turn ceiling, and the no-progress stop all ended a turn with
+  nothing — maximum cost, zero value. A stopped turn now gets one final request
+  with tools disabled, asking for what was found and what could not be
+  determined. That answer is explicitly **not** run through the bar and is
+  labelled as notes rather than a completed task, because presenting it as
+  verified would be the lie this tool exists to refuse.
+- **A per-turn token ceiling** (200k, `/budget` to change) and **shedding on by
+  default** (60k of history). Both existed as options nobody set; the runaway
+  session had neither.
+- **`git stash`, `git config`, and `git tag` were classified read-only** and ran
+  unattended at medium — bare `git stash` moves the working tree, `git config`
+  writes a file, `git tag` creates a ref. Found by a model reading the list and
+  saying so.
+- **`claimedWrites` ignored `edit_file`**, so a session whose edits all failed
+  reported "no file was modified" rather than naming the edits that did not
+  land: a correct refusal with a misleading reason.
 - **An unrecognised tool ran unattended at `high`**, which contradicted the
   deny-by-default rule stated at the top of the classifier. A level written
   today cannot consent to a tool added tomorrow; unknown tools now ask at every
@@ -232,6 +261,35 @@ claim literally true.
 
 ### Fixed
 
+- **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
+  on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
+  deleted what the model had just read, and the model went back to read it
+  again. Every step, for thirteen minutes, at $0.93, with no answer. Two
+  features that were each correct alone. Elision now keys on the exact window,
+  and a write still invalidates every part of that file.
+- **Shifted offsets walked past the repeat guard.** Asking for line 181 and then
+  line 182 returns almost the same bytes under a different key, so exact-match
+  detection saw nothing. molt now tracks which lines of which file it has
+  already shown, and a request inside that coverage gets a pointer. The
+  no-progress stop now triggers on a majority of repeats rather than requiring
+  every call in a step to be one.
+- **A stopped turn threw away everything it had paid for.** The step guard, the
+  budget, the turn ceiling, and the no-progress stop all ended a turn with
+  nothing — maximum cost, zero value. A stopped turn now gets one final request
+  with tools disabled, asking for what was found and what could not be
+  determined. That answer is explicitly **not** run through the bar and is
+  labelled as notes rather than a completed task, because presenting it as
+  verified would be the lie this tool exists to refuse.
+- **A per-turn token ceiling** (200k, `/budget` to change) and **shedding on by
+  default** (60k of history). Both existed as options nobody set; the runaway
+  session had neither.
+- **`git stash`, `git config`, and `git tag` were classified read-only** and ran
+  unattended at medium — bare `git stash` moves the working tree, `git config`
+  writes a file, `git tag` creates a ref. Found by a model reading the list and
+  saying so.
+- **`claimedWrites` ignored `edit_file`**, so a session whose edits all failed
+  reported "no file was modified" rather than naming the edits that did not
+  land: a correct refusal with a misleading reason.
 - **An unrecognised tool ran unattended at `high`**, which contradicted the
   deny-by-default rule stated at the top of the classifier. A level written
   today cannot consent to a tool added tomorrow; unknown tools now ask at every
@@ -379,6 +437,35 @@ artifact molt cannot silently edit.
 
 ### Fixed
 
+- **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
+  on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
+  deleted what the model had just read, and the model went back to read it
+  again. Every step, for thirteen minutes, at $0.93, with no answer. Two
+  features that were each correct alone. Elision now keys on the exact window,
+  and a write still invalidates every part of that file.
+- **Shifted offsets walked past the repeat guard.** Asking for line 181 and then
+  line 182 returns almost the same bytes under a different key, so exact-match
+  detection saw nothing. molt now tracks which lines of which file it has
+  already shown, and a request inside that coverage gets a pointer. The
+  no-progress stop now triggers on a majority of repeats rather than requiring
+  every call in a step to be one.
+- **A stopped turn threw away everything it had paid for.** The step guard, the
+  budget, the turn ceiling, and the no-progress stop all ended a turn with
+  nothing — maximum cost, zero value. A stopped turn now gets one final request
+  with tools disabled, asking for what was found and what could not be
+  determined. That answer is explicitly **not** run through the bar and is
+  labelled as notes rather than a completed task, because presenting it as
+  verified would be the lie this tool exists to refuse.
+- **A per-turn token ceiling** (200k, `/budget` to change) and **shedding on by
+  default** (60k of history). Both existed as options nobody set; the runaway
+  session had neither.
+- **`git stash`, `git config`, and `git tag` were classified read-only** and ran
+  unattended at medium — bare `git stash` moves the working tree, `git config`
+  writes a file, `git tag` creates a ref. Found by a model reading the list and
+  saying so.
+- **`claimedWrites` ignored `edit_file`**, so a session whose edits all failed
+  reported "no file was modified" rather than naming the edits that did not
+  land: a correct refusal with a misleading reason.
 - **An unrecognised tool ran unattended at `high`**, which contradicted the
   deny-by-default rule stated at the top of the classifier. A level written
   today cannot consent to a tool added tomorrow; unknown tools now ask at every
@@ -489,6 +576,35 @@ session. Shrinking them is a rounding error.
 
 ### Fixed
 
+- **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
+  on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
+  deleted what the model had just read, and the model went back to read it
+  again. Every step, for thirteen minutes, at $0.93, with no answer. Two
+  features that were each correct alone. Elision now keys on the exact window,
+  and a write still invalidates every part of that file.
+- **Shifted offsets walked past the repeat guard.** Asking for line 181 and then
+  line 182 returns almost the same bytes under a different key, so exact-match
+  detection saw nothing. molt now tracks which lines of which file it has
+  already shown, and a request inside that coverage gets a pointer. The
+  no-progress stop now triggers on a majority of repeats rather than requiring
+  every call in a step to be one.
+- **A stopped turn threw away everything it had paid for.** The step guard, the
+  budget, the turn ceiling, and the no-progress stop all ended a turn with
+  nothing — maximum cost, zero value. A stopped turn now gets one final request
+  with tools disabled, asking for what was found and what could not be
+  determined. That answer is explicitly **not** run through the bar and is
+  labelled as notes rather than a completed task, because presenting it as
+  verified would be the lie this tool exists to refuse.
+- **A per-turn token ceiling** (200k, `/budget` to change) and **shedding on by
+  default** (60k of history). Both existed as options nobody set; the runaway
+  session had neither.
+- **`git stash`, `git config`, and `git tag` were classified read-only** and ran
+  unattended at medium — bare `git stash` moves the working tree, `git config`
+  writes a file, `git tag` creates a ref. Found by a model reading the list and
+  saying so.
+- **`claimedWrites` ignored `edit_file`**, so a session whose edits all failed
+  reported "no file was modified" rather than naming the edits that did not
+  land: a correct refusal with a misleading reason.
 - **An unrecognised tool ran unattended at `high`**, which contradicted the
   deny-by-default rule stated at the top of the classifier. A level written
   today cannot consent to a tool added tomorrow; unknown tools now ask at every
@@ -601,6 +717,35 @@ against a real provider before behaviour changes.
 
 ### Fixed
 
+- **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
+  on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
+  deleted what the model had just read, and the model went back to read it
+  again. Every step, for thirteen minutes, at $0.93, with no answer. Two
+  features that were each correct alone. Elision now keys on the exact window,
+  and a write still invalidates every part of that file.
+- **Shifted offsets walked past the repeat guard.** Asking for line 181 and then
+  line 182 returns almost the same bytes under a different key, so exact-match
+  detection saw nothing. molt now tracks which lines of which file it has
+  already shown, and a request inside that coverage gets a pointer. The
+  no-progress stop now triggers on a majority of repeats rather than requiring
+  every call in a step to be one.
+- **A stopped turn threw away everything it had paid for.** The step guard, the
+  budget, the turn ceiling, and the no-progress stop all ended a turn with
+  nothing — maximum cost, zero value. A stopped turn now gets one final request
+  with tools disabled, asking for what was found and what could not be
+  determined. That answer is explicitly **not** run through the bar and is
+  labelled as notes rather than a completed task, because presenting it as
+  verified would be the lie this tool exists to refuse.
+- **A per-turn token ceiling** (200k, `/budget` to change) and **shedding on by
+  default** (60k of history). Both existed as options nobody set; the runaway
+  session had neither.
+- **`git stash`, `git config`, and `git tag` were classified read-only** and ran
+  unattended at medium — bare `git stash` moves the working tree, `git config`
+  writes a file, `git tag` creates a ref. Found by a model reading the list and
+  saying so.
+- **`claimedWrites` ignored `edit_file`**, so a session whose edits all failed
+  reported "no file was modified" rather than naming the edits that did not
+  land: a correct refusal with a misleading reason.
 - **An unrecognised tool ran unattended at `high`**, which contradicted the
   deny-by-default rule stated at the top of the classifier. A level written
   today cannot consent to a tool added tomorrow; unknown tools now ask at every
@@ -747,6 +892,35 @@ can't say "done" without proving it.**
 
 ### Fixed
 
+- **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
+  on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
+  deleted what the model had just read, and the model went back to read it
+  again. Every step, for thirteen minutes, at $0.93, with no answer. Two
+  features that were each correct alone. Elision now keys on the exact window,
+  and a write still invalidates every part of that file.
+- **Shifted offsets walked past the repeat guard.** Asking for line 181 and then
+  line 182 returns almost the same bytes under a different key, so exact-match
+  detection saw nothing. molt now tracks which lines of which file it has
+  already shown, and a request inside that coverage gets a pointer. The
+  no-progress stop now triggers on a majority of repeats rather than requiring
+  every call in a step to be one.
+- **A stopped turn threw away everything it had paid for.** The step guard, the
+  budget, the turn ceiling, and the no-progress stop all ended a turn with
+  nothing — maximum cost, zero value. A stopped turn now gets one final request
+  with tools disabled, asking for what was found and what could not be
+  determined. That answer is explicitly **not** run through the bar and is
+  labelled as notes rather than a completed task, because presenting it as
+  verified would be the lie this tool exists to refuse.
+- **A per-turn token ceiling** (200k, `/budget` to change) and **shedding on by
+  default** (60k of history). Both existed as options nobody set; the runaway
+  session had neither.
+- **`git stash`, `git config`, and `git tag` were classified read-only** and ran
+  unattended at medium — bare `git stash` moves the working tree, `git config`
+  writes a file, `git tag` creates a ref. Found by a model reading the list and
+  saying so.
+- **`claimedWrites` ignored `edit_file`**, so a session whose edits all failed
+  reported "no file was modified" rather than naming the edits that did not
+  land: a correct refusal with a misleading reason.
 - **An unrecognised tool ran unattended at `high`**, which contradicted the
   deny-by-default rule stated at the top of the classifier. A level written
   today cannot consent to a tool added tomorrow; unknown tools now ask at every

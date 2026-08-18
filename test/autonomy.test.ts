@@ -247,6 +247,20 @@ describe("medium", () => {
     assert.ok(!bash("medium", "curl -sS https://wttr.in/Salem"));
   });
 
+  it("does not call a git subcommand read-only when it writes", () => {
+    // These three were on the read-only list and ran unattended at medium:
+    // bare `git stash` moves the working tree, `git config` writes a file,
+    // `git tag` creates a ref. Every entry on that list is a promise.
+    for (const c of ["git stash", "git stash pop", "git config user.email x@y.z", "git tag v9"]) {
+      assert.ok(!isReadOnlyCommand(c), `claimed read-only: ${c}`);
+      assert.ok(bash("medium", c), `medium ran it unattended: ${c}`);
+    }
+    // The reporting subcommands are untouched.
+    for (const c of ["git status", "git log -5", "git diff", "git show HEAD", "git blame x"]) {
+      assert.ok(isReadOnlyCommand(c), `broke a genuine read: ${c}`);
+    }
+  });
+
   it("still asks about anything that does more than read", () => {
     assert.ok(bash("medium", "npm install left-pad"));
     assert.ok(bash("medium", "rm src/old.ts"));

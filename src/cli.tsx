@@ -63,7 +63,7 @@ options
   --provider <name>  label shown in the status line
   --cwd <dir>        project directory (default: current)
   --budget <n>       hard token ceiling for the session
-  --auto-shed <n>    shed once history exceeds n tokens
+  --auto-shed <n>    shed once history exceeds n tokens (default 60000, 0 off)
   --attempts <n>     completion attempts before molt reports failure (default 4)
   --autonomy <level> low | medium | high — how much runs without asking
                      low asks about every command and write (default)
