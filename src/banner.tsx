@@ -65,11 +65,25 @@ export type SessionStatus = {
   sessionTokens: number;
   /** Undefined when no pricing is configured — omitted rather than faked. */
   costUsd?: number;
+  /**
+   * True when the cost rests on molt's own token estimate rather than the
+   * provider's count. Rendered as a leading "~": a guess and a bill must
+   * not look alike in the one field people quote back at each other.
+   */
+  costEstimated?: boolean;
   budgetTokens?: number;
   /** Model context window, when the endpoint reports one. */
   contextTokens?: number;
   /** Estimated outbound size of an in-flight request. */
   pendingEst?: number;
+  /**
+   * How much molt is doing without asking.
+   *
+   * Sits beside the model because the two together are the answer to "what
+   * is about to happen on my machine, and who said it could": a level is
+   * only a control if it is visible while it is in force.
+   */
+  autonomy?: "low" | "medium" | "high";
 };
 
 export type FrameOptions = {
@@ -89,22 +103,29 @@ function fmtTokens(n: number): string {
 }
 
 /**
- * Cost, at enough precision to still be a number.
+ * Cost, in one unit, forever.
  *
- * Decimals scale to the magnitude. A fixed 4 places flattened everything
- * under $0.0001 to "$0.0000", which is worse than showing nothing: a meter
- * reading zero while tokens climb looks broken, and the natural conclusion
- * is that the pricing is wrong rather than the formatter. Cheap models and
- * short sessions live down there — a 998-token turn at $0.02/Mtok really
- * does cost $0.000024.
+ * Two rules, learned the hard way, and in tension:
+ *
+ * 1. No long runs of zeros. "$0.000024" has to be counted digit by digit
+ *    before it means anything, and counting is what a glanceable meter must
+ *    never require.
+ * 2. Never change unit. A session meter that reads "0.9¢" and then "$0.029"
+ *    looks like it went DOWN. Switching units to save a character makes the
+ *    one number people quote back at each other unreadable as a series, which
+ *    is worse than the zeros — the reader cannot tell rising from falling
+ *    without doing arithmetic in their head.
+ *
+ * So: always dollars, three decimals at the most, and "under" below that.
+ * The widest form is "$0.003"; a step too cheap to render at that precision
+ * says "<$0.001" rather than claiming a false zero. Precision is spent on
+ * the running totals, which is where it is read.
  */
-function fmtCost(usd: number): string {
-  if (usd <= 0) return "$0.00";
-  if (usd >= 0.01) return `$${usd.toFixed(2)}`;
-  if (usd >= 0.0001) return `$${usd.toFixed(4)}`;
-  // Below a hundredth of a cent, six places still resolves it. Past that,
-  // say "less than" rather than print a zero that is not one.
-  return usd >= 0.000001 ? `$${usd.toFixed(6)}` : "<$0.000001";
+export function fmtCost(usd: number): string {
+  if (!Number.isFinite(usd) || usd <= 0) return "$0.00";
+  if (usd >= 0.1) return `$${usd.toFixed(2)}`;
+  if (usd >= 0.001) return `$${usd.toFixed(3)}`;
+  return "<$0.001";
 }
 
 /**
@@ -163,14 +184,17 @@ export function statusSegments(s: SessionStatus, maxWidth = COLS): Segment[] {
   };
 
   const cost =
-    s.costUsd === undefined || s.sessionTokens === 0 ? null : fmtCost(s.costUsd);
+    s.costUsd === undefined || s.sessionTokens === 0
+      ? null
+      : `${s.costEstimated ? "~" : ""}${fmtCost(s.costUsd)}`;
 
   const tail = [usage(), cost].filter(Boolean).join(SEP);
 
   // Model names run long (qwen2.5-coder-32b-instruct-q4_K_M). The model
   // yields first, since provider and cost are short and non-negotiable.
+  const auto = s.autonomy ? `auto ${s.autonomy}`.length + SEP.length : 0;
   const seps = tail ? SEP.length * 2 : SEP.length;
-  const room = Math.max(8, maxWidth - s.provider.length - seps - tail.length);
+  const room = Math.max(8, maxWidth - s.provider.length - seps - auto - tail.length);
   const model =
     s.model.length > room ? s.model.slice(0, room - 2) + ".." : s.model;
 
@@ -179,6 +203,11 @@ export function statusSegments(s: SessionStatus, maxWidth = COLS): Segment[] {
     { text: SEP, tone: "ghost" },
     { text: model, tone: "mid" },
   ];
+  if (s.autonomy) {
+    segs.push({ text: SEP, tone: "ghost" });
+    // High autonomy is the one state on this row worth catching your eye.
+    segs.push({ text: `auto ${s.autonomy}`, tone: s.autonomy === "high" ? "accent" : "dim" });
+  }
   if (tail) {
     segs.push({ text: SEP, tone: "ghost" });
     segs.push({ text: tail, tone: "dim" });
@@ -269,11 +298,19 @@ export function Banner({
   themeName,
   animate = false,
   version,
+  onSettle,
 }: {
   theme: Theme;
   themeName: string;
   animate?: boolean;
   version?: string;
+  /**
+   * Fired once the splash has stopped moving — by finishing, by a keypress,
+   * or by never having animated at all. The caller needs it because a
+   * transcript that never redraws cannot be printed above a picture that is
+   * still changing.
+   */
+  onSettle?: () => void;
 }) {
   const { stdout } = useStdout();
   const { isRawModeSupported } = useStdin();
@@ -305,6 +342,10 @@ export function Banner({
   useInput(() => setFrame(SETTLED_FRAME), {
     isActive: running && isRawModeSupported,
   });
+
+  useEffect(() => {
+    if (frame >= SETTLED_FRAME) onSettle?.();
+  }, [frame, onSettle]);
 
   const color: Record<Tone, string> = {
     accent: theme.accent,

@@ -115,6 +115,7 @@ export class Transcript {
       requestTotalEst: systemTokens + toolSchemaTokens + historyTokens,
       sessionPromptTokens: session.prompt,
       sessionCompletionTokens: session.completion,
+      sessionCachedTokens: 0,
     };
   }
 
@@ -261,29 +262,53 @@ export class Transcript {
    */
   elideSupersededReads(): { elided: number; tokensSaved: number } {
     const supersededBy = new Map<number, string>();
+    /**
+     * Reads still worth keeping, keyed by the exact window they returned.
+     *
+     * Keyed by window and not by path, which is the whole lesson of a session
+     * that spent 661k tokens and thirteen minutes going nowhere. Long files
+     * arrive in parts, so lines 401-440 of a file do not supersede lines 1-40
+     * of it — they complete them. Path-keyed elision treated every page as a
+     * replacement for the last, deleted what the model had just read, and sent
+     * it back to read the same file again, forever. Two features that were
+     * each correct alone.
+     */
     const lastRead = new Map<string, number>();
+    /** Every live read of a path, so a write can invalidate all of them. */
+    const readsOf = new Map<string, string[]>();
 
     for (let i = 0; i < this.working.length; i++) {
       const m = this.working[i];
       for (const call of m.tool_calls ?? []) {
-        let path = "";
+        let args: Record<string, unknown> = {};
         try {
-          path = String(
-            (JSON.parse(call.function.arguments || "{}") as { path?: unknown }).path ?? "",
-          );
+          args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
         } catch {
           continue;
         }
+        const path = String(args.path ?? "");
         if (!path) continue;
 
         if (call.function.name === "read_file") {
-          const prior = lastRead.get(path);
+          // Identical arguments return identical bytes; anything else is a
+          // different part of the file and stands on its own.
+          const window = `${path}@${Number(args.offset ?? 0)}+${String(args.limit ?? "all")}`;
+          const prior = lastRead.get(window);
           if (prior !== undefined) supersededBy.set(prior, `re-read at step ${i}`);
-          lastRead.set(path, i);
-        } else if (call.function.name === "write_file") {
-          const prior = lastRead.get(path);
-          if (prior !== undefined) supersededBy.set(prior, `overwritten at step ${i}`);
-          lastRead.delete(path);
+          lastRead.set(window, i);
+          const windows = readsOf.get(path) ?? [];
+          if (!windows.includes(window)) windows.push(window);
+          readsOf.set(path, windows);
+        } else if (call.function.name === "write_file" || call.function.name === "edit_file") {
+          // A change to the file invalidates every part of it that was read,
+          // whichever window it came from: what is in context is no longer
+          // what is on disk.
+          for (const window of readsOf.get(path) ?? []) {
+            const prior = lastRead.get(window);
+            if (prior !== undefined) supersededBy.set(prior, `changed at step ${i}`);
+            lastRead.delete(window);
+          }
+          readsOf.delete(path);
         }
       }
     }
@@ -297,8 +322,19 @@ export class Transcript {
         if (m.role !== "tool") break;
         if (!m.content || m.content.startsWith(ELIDED_PREFIX)) continue;
         const before = estTokens(m.content);
-        m.content = `${ELIDED_PREFIX} ${reason}. Full contents remain in the archived record.`;
-        tokensSaved += before - estTokens(m.content);
+        // Wording matters here. "Full contents remain in the archived record"
+        // reads, to a model, as an invitation to go and get them — which it
+        // can only do by re-reading the file, which is what elided this copy
+        // in the first place. Point at the newer copy instead.
+        const marker =
+          `${ELIDED_PREFIX} ${reason}. The current contents are further down this ` +
+          `conversation; do not read the file again to recover this.`;
+        // A short result costs less than the notice explaining its absence.
+        // Eliding it would drop content AND grow the context — which is how
+        // the meter came to report "−-17 tokens" saved.
+        if (estTokens(marker) >= before) continue;
+        m.content = marker;
+        tokensSaved += before - estTokens(marker);
         elided++;
       }
     }
@@ -368,9 +404,28 @@ export function buildExuvia(dropped: Msg[], index: number): string {
   return [...head, ...body].join("\n");
 }
 
+/**
+ * What a tool call did, in one line, for a person reading the transcript.
+ *
+ * Each tool says the thing that identifies the call: a command, a pattern, a
+ * path — never a JSON blob, which is what a grep looked like before this had
+ * a case for it. A paged read says which part it asked for, because two
+ * identical-looking read_file lines are a loop while "from line 240" is
+ * progress, and the reader should not have to guess which they are watching.
+ */
 export function toolDetail(name: string, args: Record<string, unknown>): string {
+  const where = String(args.path ?? "");
+  const glob = args.glob ? ` ${String(args.glob)}` : "";
   const raw =
-    name === "bash" ? String(args.command ?? "") : String(args.path ?? JSON.stringify(args));
+    name === "bash"
+      ? String(args.command ?? "")
+      : name === "grep"
+        ? `/${String(args.pattern ?? "")}/${where ? ` in ${where}` : ""}${glob}`
+        : name === "list_dir"
+          ? `${where || "."}${glob}`
+          : name === "read_file" && Number(args.offset) > 0
+            ? `${where} from line ${Number(args.offset) + 1}`
+            : where || JSON.stringify(args);
   const oneLine = raw.replace(/\s+/g, " ").trim();
   return [...oneLine].slice(0, 80).join("");
 }

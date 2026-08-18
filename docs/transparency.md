@@ -38,7 +38,7 @@ Example:
 04:33:49  receipt refused → .molt/receipts/0000-refused.md
 04:33:49  → request · 4 msgs · ~405 tok · streaming
 04:33:49  ← response · 300 in / 50 out · 1 tool call(s)
-04:33:49  permission granted: write_file fix.txt
+04:33:49  permission granted: write_file fix.txt [autonomy low]
 04:33:49  tool write_file: fix.txt
 04:33:49    24 bytes
 04:33:49  bar PASS 1/1 · 1ms
@@ -46,6 +46,115 @@ Example:
 ```
 
 Every line is recomputed from entries. Nothing in that output is narration.
+
+## Watching it happen
+
+The log answers "what did it do?" after the fact. During a turn, the same
+facts are on screen.
+
+Every step closes with one line — printed whether or not anyone asked for it,
+in the TUI and headlessly:
+
+```
+  step 2 · read_file, bash · 3.4k in (2.1k cached) · 412 out · $0.0072 · 6.2s
+```
+
+Press **shift+V** while a turn is running to open the live view (`ctrl+V` any
+time, `/verbose` as a command, `--verbose` headlessly):
+
+```
+── what the model is doing ─────────────────────────────  shift+V closes
+  job 3 · rewrite the auth guard · 2 step(s) · 8.0k in (3.0k cached) · 45 out · $0.012 · 4.2s
+  · read_file src/auth.ts  12ms
+      args {"path":"src/auth.ts"}
+      → 1841 bytes
+      │ import { verify } from "./jwt.js";
+    ↳ session 16k tokens · $0.024 · finish: tool_calls
+
+  job 1 verified · 2 step(s) · 4.8k in · 90 out · $0.0074 · 1.2s
+  job 2 not proven · 4 step(s) · 11k in · 210 out · $0.017 · 3.6s
+```
+
+Four properties make it worth trusting:
+
+- **Verbatim.** Arguments and results are shown as they were sent and
+  received, truncated but never reworded. A view that paraphrases is one more
+  claim to check, and molt does not summarize with a model anywhere else.
+- **Recorded regardless.** Feed lines are written whether or not the view is
+  open, so shift+V reveals what already happened rather than starting a
+  recording.
+- **Bounded.** It is a panel of fixed height over a transcript that is printed
+  once and never redrawn. A view that grows the region a terminal has to
+  repaint is a view that eventually tears its own output.
+- **The same facts as the log.** Nothing on screen is derived from anything
+  the log does not also record — with the exception that the log stores
+  digests where the screen shows content, deliberately (see below).
+
+When a bar is narrowed for a turn — asking a question with `?` or `/ask` drops
+the checks that require a file to change — the panel and the transcript both
+say how many were dropped, and the receipt lists only the checks that actually
+ran. A narrowed bar is stated; it is never quietly applied.
+
+Verification is narrated the same way: the checks are named before they run,
+and the result leads with the count, the duration, and what failed.
+
+```
+  checking 3 condition(s) from .molt/done.yml: types, tests, work-landed
+  2 of 3 checks passed · 4.1s · failed: tests
+  the failures above go back to the model; it keeps working
+```
+
+## What a turn cost
+
+Cost is a claim like any other, so molt says where each part of it came from.
+
+- **Token counts** come from the provider's usage block. Streaming responses
+  omit that block unless it is asked for, so molt sends
+  `stream_options: {include_usage: true}`; a server that rejects the field is
+  retried once without it, and the resulting counts are marked as estimates.
+- **Cached prompt tokens** are counted separately and billed at the cache rate
+  when the provider publishes one, because they are not billed at the full
+  rate by anybody.
+- **Prices** are read from the endpoint that will do the billing — xAI's
+  `/language-models` and OpenRouter's `/models` publish them — and stored
+  against the model they belong to, so a rate can never follow a model switch.
+  `/price` shows the figure and its source, and sets one by hand where nothing
+  is published.
+- **The dollar amount itself**, when the provider reports one (OpenRouter's
+  `usage.cost`), is used instead of molt's arithmetic — but only when every
+  step of the session reported one.
+
+Two rules govern how it is shown, and they are in tension:
+
+- **No long runs of zeros.** `$0.000024` is a number you count rather than
+  read, and the meter has to be legible at a glance.
+- **Never change unit.** Quoting small sums in cents made the meter read
+  `0.9¢` and then `$0.029` — which looks like it went *down*. A running total
+  must be comparable against its own previous value without arithmetic, so
+  cost is always in dollars and only the decimals move.
+
+A cost resting on an estimate anywhere is prefixed `~`.
+
+The bottom line is the session meter and only ever climbs. **Per-job** figures
+— what one question cost — live in the view, measured as a delta against the
+session meter rather than by resetting it.
+
+## Work that goes nowhere
+
+A tool call that returns exactly what it returned before has taught the model
+nothing, and resending that answer costs what it cost the first time. molt says
+so instead:
+
+```
+· read_file  README.md  [repeat]  0ms
+  that step repeated calls molt had already answered — nothing new came back
+```
+
+The result handed back is a pointer to the earlier one, not the payload. Two
+consecutive steps of nothing but repeats end the turn, with what it spent
+stated, and `loop_stop` in the log naming the step. A long file is read with
+`offset`, and every partial result says how many lines remain and which offset
+continues it — so "read it again" is never the only move available.
 
 ## Estimated versus measured
 
@@ -59,6 +168,23 @@ molt distinguishes the two rather than blurring them.
 
 A number without a `~` came from something molt counted. A number with one is
 molt's arithmetic, and it says so.
+
+## Who approved it
+
+Every tool call carries the permission decision that let it through, and
+whether a human was asked at all:
+
+```
+04:33:49  permission granted: write_file fix.txt [autonomy low]
+04:33:50  permission granted (auto): bash grep -rn verify src/ [autonomy medium]
+04:33:52  autonomy medium → high · runs everything except what cannot be undone
+```
+
+`(auto)` means autonomy allowed it without a prompt — the entry an audit most
+needs to be able to find — and the level in force is recorded beside it.
+Changing the level is journalled too, because a record that does not say when
+the ceiling moved cannot explain why a command ran unattended. See
+[autonomy.md](autonomy.md).
 
 ## The hash chain
 
@@ -80,6 +206,33 @@ can rewrite a whole log and re-chain it. What it rules out is a *silent* edit �
 changing one bar result from FAIL to pass and hoping nobody recomputes. If you
 need stronger guarantees, commit the logs, or ship the final hash somewhere
 molt cannot write.
+
+## Credentials
+
+Masked before anything is written, and before anything scrolls.
+
+```
+04:33:49  tool bash: curl -H "authorization: Bearer [redacted]" https://api.x.ai/v1/models
+```
+
+Two kinds of pattern. The **exact** kind: values molt actually holds — the
+session's API key — masked with no false negatives possible. The **shape** kind:
+provider key prefixes (`sk-`, `sk-ant-`, `xai-`, `gsk_`, `ghp_`, `AKIA`, …),
+bearer and `x-api-key` headers, JWTs, private-key blocks, and assignments to
+something named secret/token/password. The field name survives the mask, so the
+record still says *what* was hidden.
+
+It applies to the log, to receipts, to the transcript on screen, and to the
+model's own final answer — because every one of those is a distribution
+channel. A transcript gets pasted into a bug report; a receipt is handed to
+someone who does not trust you.
+
+**The permission prompt is the one exception**, deliberately: it shows the
+command in full, because you are being asked to judge it and a redacted command
+is one you cannot judge.
+
+This is a filter with a stated shape, not a guarantee. The durable protection is
+still not to paste a key into a prompt.
 
 ## What is deliberately not logged
 

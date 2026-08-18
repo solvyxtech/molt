@@ -12,6 +12,17 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MOLT=(node "$ROOT/dist/cli.js")
 
+# macOS ships no `timeout`, and CI runs on both. Prefer it where it exists,
+# fall back to coreutils' gtimeout, and run unguarded rather than failing every
+# scenario with exit 127 — which is what a hard dependency on it did.
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT="timeout 30"
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT="gtimeout 30"
+else
+  TIMEOUT=""
+fi
+
 if [ "$#" -gt 0 ]; then
   SCENARIOS=("$@")
 else
@@ -65,7 +76,7 @@ for scenario in "${SCENARIOS[@]}"; do
   echo "scenario: $scenario"
   echo "──────────────────────────────────────────────────────────"
 
-  timeout 30 "${MOLT[@]}" run "fix the failing test" \
+  $TIMEOUT "${MOLT[@]}" run "fix the failing test" \
     --url "http://127.0.0.1:$port/v1" \
     --model mock-model \
     --cwd "$work" \

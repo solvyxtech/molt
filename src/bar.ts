@@ -141,6 +141,12 @@ export function parseBar(source: string): Bar {
       tags = (c.tags as string[]).map((t) => t.trim()).filter(Boolean);
     }
 
+    // `advisory: true` makes a failure information rather than a refusal.
+    if (c.advisory !== undefined && typeof c.advisory !== "boolean") {
+      throw new BarError(`done.yml: check "${name}" has a non-boolean \`advisory\`.`);
+    }
+    const advisory = c.advisory === true ? { advisory: true as const } : {};
+
     if (hasBuiltin) {
       const builtin = String(c.builtin) as BuiltinCheck;
       if (!BUILTINS.includes(builtin)) {
@@ -148,7 +154,7 @@ export function parseBar(source: string): Bar {
           `done.yml: check "${name}" uses unknown builtin "${builtin}". Known: ${BUILTINS.join(", ")}.`,
         );
       }
-      return { name, kind: "builtin", builtin, tags };
+      return { name, kind: "builtin", builtin, tags, ...advisory };
     }
 
     const timeout = c.timeout === undefined ? undefined : Number(c.timeout);
@@ -166,6 +172,7 @@ export function parseBar(source: string): Bar {
       timeoutMs: timeout === undefined ? DEFAULT_TIMEOUT_MS : timeout * 1000,
       expectExit,
       tags,
+      ...advisory,
     };
   });
 
@@ -305,12 +312,19 @@ export function mentionedPaths(claim: string): string[] {
   return [...found];
 }
 
-/** Every path the model asked to write, across the entire session record. */
+/**
+ * Every path the model asked to change, across the entire session record.
+ *
+ * Both write tools count. When `edit_file` arrived this still looked only for
+ * `write_file`, so a session whose edits all failed reported "no file was
+ * modified" instead of naming the edits that did not land — a correct refusal
+ * with a misleading reason, which is its own kind of wrong.
+ */
 export function claimedWrites(record: Msg[]): string[] {
   const paths: string[] = [];
   for (const m of record) {
     for (const c of m.tool_calls ?? []) {
-      if (c.function.name !== "write_file") continue;
+      if (c.function.name !== "write_file" && c.function.name !== "edit_file") continue;
       try {
         const args = JSON.parse(c.function.arguments || "{}") as Record<string, unknown>;
         if (typeof args.path === "string") paths.push(args.path);
@@ -476,6 +490,7 @@ export function runCheck(check: Check, ctx: BarContext): CheckResult {
     const { ok, output } = runBuiltin(check.builtin, ctx);
     return {
       name: check.name,
+      ...(check.advisory ? { advisory: true } : {}),
       tags: check.tags,
       kind: "builtin",
       detail: check.builtin,
@@ -506,6 +521,7 @@ export function runCheck(check: Check, ctx: BarContext): CheckResult {
   }
   return {
     name: check.name,
+    ...(check.advisory ? { advisory: true } : {}),
     tags: check.tags,
     kind: "command",
     detail: check.run,
@@ -520,7 +536,15 @@ export function runCheck(check: Check, ctx: BarContext): CheckResult {
 export function runBar(bar: Bar, ctx: BarContext): BarResult {
   const t0 = Date.now();
   const results = bar.checks.map((c) => runCheck(c, ctx));
-  return { ok: results.every((r) => r.ok), results, durationMs: Date.now() - t0 };
+  const warnings = results.filter((r) => !r.ok && r.advisory);
+  return {
+    // An advisory failure is not a failed contract. It is still reported, and
+    // still goes to the model — it just does not refuse the completion.
+    ok: results.every((r) => r.ok || r.advisory),
+    ...(warnings.length ? { warnings } : {}),
+    results,
+    durationMs: Date.now() - t0,
+  };
 }
 
 /**
@@ -529,7 +553,7 @@ export function runBar(bar: Bar, ctx: BarContext): BarResult {
  * check failed" without the error is how you get a second wrong guess.
  */
 export function formatBarFailure(result: BarResult, attempt: number, maxAttempts: number): string {
-  const failed = result.results.filter((r) => !r.ok);
+  const failed = result.results.filter((r) => !r.ok && !r.advisory);
   const lines = [
     `[molt] You indicated the task is complete, but ${failed.length} of ${result.results.length} ` +
       `checks in .molt/done.yml did not pass. This is attempt ${attempt} of ${maxAttempts}.`,
