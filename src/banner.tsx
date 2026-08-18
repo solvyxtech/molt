@@ -95,28 +95,30 @@ function fmtTokens(n: number): string {
 }
 
 /**
- * Cost, in the unit that keeps it a number you can read at a glance.
+ * Cost, in one unit, forever.
  *
- * Small sums change unit rather than growing a run of zeros. "$0.000024"
- * has to be counted digit by digit before it means anything, and counting
- * is exactly what a glanceable meter must not require — so anything under a
- * cent is quoted in cents, where the same figure reads "0.0024¢" and the
- * common case reads "0.24¢".
+ * Two rules, learned the hard way, and in tension:
  *
- * Two decimals in each unit is the whole precision budget. More digits
- * describe a number molt does not know that precisely anyway: the token
- * counts behind it are the provider's, but the rate is a published list
- * price that ignores per-account discounts.
+ * 1. No long runs of zeros. "$0.000024" has to be counted digit by digit
+ *    before it means anything, and counting is what a glanceable meter must
+ *    never require.
+ * 2. Never change unit. A session meter that reads "0.9¢" and then "$0.029"
+ *    looks like it went DOWN. Switching units to save a character makes the
+ *    one number people quote back at each other unreadable as a series, which
+ *    is worse than the zeros — the reader cannot tell rising from falling
+ *    without doing arithmetic in their head.
+ *
+ * So: always dollars, with the decimals scaled to the magnitude and floored
+ * at four. Everything above a hundredth of a cent reads directly, the widest
+ * form is "$0.0009", and below that molt says "under" rather than rounding a
+ * real charge to nothing.
  */
 export function fmtCost(usd: number): string {
   if (!Number.isFinite(usd) || usd <= 0) return "$0.00";
-  if (usd >= 1) return `$${usd.toFixed(2)}`;
-  if (usd >= 0.01) return `$${usd.toFixed(3).replace(/0$/, "")}`;
-  const cents = usd * 100;
-  if (cents >= 0.01) return `${Number(cents.toFixed(2))}¢`;
-  // Below a hundredth of a cent there is no honest short form. Say "under"
-  // rather than round a real charge down to nothing.
-  return "<0.01¢";
+  if (usd >= 0.1) return `$${usd.toFixed(2)}`;
+  if (usd >= 0.01) return `$${usd.toFixed(3)}`;
+  if (usd >= 0.0001) return `$${usd.toFixed(4)}`;
+  return "<$0.0001";
 }
 
 /**
@@ -283,11 +285,19 @@ export function Banner({
   themeName,
   animate = false,
   version,
+  onSettle,
 }: {
   theme: Theme;
   themeName: string;
   animate?: boolean;
   version?: string;
+  /**
+   * Fired once the splash has stopped moving — by finishing, by a keypress,
+   * or by never having animated at all. The caller needs it because a
+   * transcript that never redraws cannot be printed above a picture that is
+   * still changing.
+   */
+  onSettle?: () => void;
 }) {
   const { stdout } = useStdout();
   const { isRawModeSupported } = useStdin();
@@ -319,6 +329,10 @@ export function Banner({
   useInput(() => setFrame(SETTLED_FRAME), {
     isActive: running && isRawModeSupported,
   });
+
+  useEffect(() => {
+    if (frame >= SETTLED_FRAME) onSettle?.();
+  }, [frame, onSettle]);
 
   const color: Record<Tone, string> = {
     accent: theme.accent,

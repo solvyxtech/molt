@@ -150,11 +150,12 @@ async function submit(stdin: FakeStdin, text: string): Promise<void> {
 
 describe("the transparency view", () => {
   it("offers the key while it is working, where the answer is needed", async () => {
-    const t = await mount();
+    const t = await mount({ fetchFn: slowProvider(150) });
     try {
       void submit(t.stdin, "read the seed");
-      await tick(80);
-      assert.match(t.stdout.text, /shift\+V/, "never told anyone the view exists");
+      await tick(120);
+      assert.match(t.stdout.text, /v to watch/, "never told anyone the view exists");
+      await tick(600);
     } finally {
       t.cleanup();
     }
@@ -174,6 +175,7 @@ describe("the transparency view", () => {
       const loud = t.stdout.lastFrame;
       assert.match(loud, /args \{"path":"seed\.txt"\}/, "the view revealed nothing");
       assert.match(loud, /bytes/);
+      assert.match(loud, /what the model is doing/);
     } finally {
       t.cleanup();
     }
@@ -202,36 +204,76 @@ describe("the transparency view", () => {
       assert.match(frame, /step 1 · read_file/);
       assert.match(frame, /1\.2k in/);
       assert.match(frame, /step 2 · claims done/);
-      // Priced in a unit that needs no counting: 1200 in at $2/M plus 30 out
-      // at $6/M is $0.00258 — 0.26¢, not "$0.002580".
-      assert.match(frame, /0\.26¢/);
+      // Priced in the same unit the session meter uses, so a step and a
+      // total can be read against each other: 1200 in at $2/M plus 30 out at
+      // $6/M is $0.0026.
+      assert.match(frame, /\$0\.0026/);
     } finally {
       t.cleanup();
     }
   });
 
-  it("takes shift+V while the turn is running, which is when it is asked", async () => {
-    // The prompt takes no typing mid-turn, so a bare capital V is free there
-    // and free is what a key has to be to earn the shortest binding.
-    const t = await mount({ fetchFn: slowProvider(120) });
+  it("takes a bare v while the turn is running, which is when it is asked", async () => {
+    // The prompt takes no typing mid-turn, so a letter is free there — and
+    // free is what a key has to be to earn the shortest binding.
+    const t = await mount({ fetchFn: slowProvider(150) });
     try {
       void submit(t.stdin, "read the seed");
-      await tick(60);
-      t.stdin.press("V");
-      await tick(500);
-      assert.match(t.stdout.lastFrame, /args \{"path":"seed\.txt"\}/, "shift+V showed nothing");
+      await tick(80);
+      t.stdin.press("v");
+      await tick(600);
+      assert.match(t.stdout.lastFrame, /what the model is doing/, "v showed nothing");
     } finally {
       t.cleanup();
     }
   });
 
-  it("does not eat a capital V typed into a message", async () => {
+  it("does not eat a v typed into a message", async () => {
     const t = await mount();
     try {
-      for (const ch of "Verify") t.stdin.press(ch);
+      for (const ch of "verify this") t.stdin.press(ch);
       await tick(60);
-      assert.match(t.stdout.lastFrame, /Verify/, "swallowed a letter someone was typing");
-      assert.ok(!/detail shown/.test(t.stdout.lastFrame), "toggled the view mid-word");
+      assert.match(t.stdout.lastFrame, /verify this/, "swallowed a letter someone was typing");
+      assert.ok(
+        !/what the model is doing/.test(t.stdout.lastFrame),
+        "opened the view mid-word",
+      );
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("keeps the session meter climbing across jobs", async () => {
+    // The meter is the running total for the session and must only ever
+    // grow. Per-job figures live in the view; they are a lens on the meter,
+    // never a reset of it.
+    const t = await mount();
+    try {
+      await submit(t.stdin, "job one");
+      const first = t.stdout.lastFrame.match(/· ([\d.]+k?) tokens/)?.[1];
+      await submit(t.stdin, "job two");
+      const second = t.stdout.lastFrame.match(/· ([\d.]+k?) tokens/)?.[1];
+      const n = (v?: string) => Number(String(v).replace("k", "")) * (String(v).endsWith("k") ? 1000 : 1);
+      assert.ok(n(second) > n(first), `meter did not climb: ${first} → ${second}`);
+      // Two jobs, three requests between them, every token still counted.
+      assert.equal(t.engine.sessionTokens, 3690);
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("shows each job with its own tokens and price", async () => {
+    const t = await mount();
+    try {
+      await submit(t.stdin, "job one");
+      await submit(t.stdin, "job two");
+      t.stdin.press(CTRL_V);
+      await tick(80);
+      const frame = t.stdout.lastFrame;
+      // Each job priced on its own, in the same unit as the session meter:
+      // job one made two requests (2.4k in, 60 out), job two made one.
+      assert.match(frame, /job 1 unverified · 2 step\(s\) · 2\.4k in · 60 out · \$0\.0052/);
+      assert.match(frame, /job 2 unverified · 1 step\(s\) · 1\.2k in · 30 out · \$0\.0026/);
     } finally {
       t.cleanup();
     }

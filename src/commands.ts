@@ -40,7 +40,7 @@ export const COMMANDS: Command[] = [
   { name: "/budget", args: "<n|off>", summary: "hard token ceiling for this session", aliases: ["tokens"] },
   {
     name: "/verbose",
-    summary: "show every call, argument, and result (shift+V)",
+    summary: "watch every call, argument, and result (press v)",
     aliases: ["detail", "transparency", "watch", "view"],
   },
   {

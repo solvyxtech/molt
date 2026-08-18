@@ -6,7 +6,7 @@
  * work, the receipts, and the refusals, and nothing else.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Box, Text, useApp, useInput } from "ink";
+import { Box, Static, Text, useApp, useInput, useStdout } from "ink";
 import { Banner, fmtCost, fmtDuration } from "./banner.js";
 import { COMMANDS, completionFor, matchCommands, windowAround, wrapIndex } from "./commands.js";
 import { StatusLine } from "./status-line.js";
@@ -33,28 +33,56 @@ import {
   type PickerRow,
 } from "./providers.js";
 import { DEFAULT_THEME, getTheme, nextTheme } from "./theme.js";
-import type { BarResult, EngineEvent } from "./types.js";
+import type { BarResult, EngineEvent, JobOutcome } from "./types.js";
 
 type Line = {
   id: number;
   tone: "user" | "agent" | "tool" | "info" | "error" | "ok" | "fail";
   text: string;
-  /**
-   * Detail lines are written whether or not anyone is watching, and are
-   * shown only in the transparency view. Recording them unconditionally is
-   * the point: shift+V reveals what the model did earlier in the session,
-   * not just what it does from the moment you pressed it.
-   */
-  detail?: boolean;
 };
+
+/**
+ * One line of the live feed behind `v`.
+ *
+ * Kept separate from the transcript because the two have opposite
+ * lifetimes. The transcript is permanent and is printed once, never
+ * redrawn — that is what keeps a long session from tearing itself apart in
+ * a terminal that cannot scroll backwards. The feed is a bounded window on
+ * what is happening now, redrawn freely because it never grows.
+ */
+type Feed = { id: number; text: string; dim?: boolean };
+
+/** A user turn, and what it cost. */
+type Job = {
+  n: number;
+  text: string;
+  startedAt: number;
+  steps: number;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  costUsd?: number;
+  estimated: boolean;
+  durationMs?: number;
+  outcome?: JobOutcome;
+};
+
+/** Feed lines kept in memory. Bounded: this is a window, not a second log. */
+const FEED_MEMORY = 300;
+/** Feed lines on screen at once. The panel must never outgrow the viewport. */
+const FEED_ROWS = 9;
+/** Finished jobs listed under the running one. */
+const JOB_ROWS = 4;
+/** Lines of an in-flight answer shown while it streams. */
+const STREAM_ROWS = 8;
 
 const HELP = [
   "commands",
   ...COMMANDS.map((c) => `  ${(c.name + (c.args ? " " + c.args : "")).padEnd(20)}${c.summary}`),
   "",
   "  type / to browse · ↑↓ to choose · tab to fill · enter to run",
-  "  shift+V while working (or ctrl+V any time) shows every call, argument,",
-  "  and result — the same facts the session log records to disk.",
+  "  press v while molt is working (or ctrl+V any time) to watch every call,",
+  "  argument, and result — the same facts the session log records to disk.",
 ].join("\n");
 
 /** Tokens, at a width that does not make the line jitter as it climbs. */
@@ -62,6 +90,27 @@ function tok(n: number): string {
   if (n < 1000) return `${n}`;
   const k = n / 1000;
   return `${k < 10 ? k.toFixed(1) : Math.round(k)}k`;
+}
+
+/**
+ * Tokens and money, in one phrasing used everywhere.
+ *
+ * Every place that reports spending says it the same way, so a step, a job,
+ * and the session can be read against each other without translating
+ * between formats — the thing that made the old meter look like it was
+ * jumping around.
+ */
+function spendText(s: {
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  costUsd?: number;
+  estimated: boolean;
+}): string {
+  const cached = s.cachedTokens > 0 ? ` (${tok(s.cachedTokens)} cached)` : "";
+  const money =
+    s.costUsd === undefined ? "" : ` · ${s.estimated ? "~" : ""}${fmtCost(s.costUsd)}`;
+  return `${tok(s.promptTokens)} in${cached} · ${tok(s.completionTokens)} out${money}`;
 }
 
 /** How many palette rows to show at once. */
@@ -87,6 +136,14 @@ export function App({
   verbose?: boolean;
 }) {
   const { exit } = useApp();
+  const { stdout } = useStdout();
+  // The live panel must fit the window exactly. A line one column too long
+  // wraps, the panel grows a row, and the region molt redraws every frame
+  // stops matching the region it erased — which is how a "view" turns into
+  // torn output.
+  const columns = stdout?.columns ?? 80;
+  const room = Math.max(24, columns - 4);
+  const fit = (t: string) => (t.length > room ? t.slice(0, room - 1) + "…" : t);
   const [themeName, setThemeName] = useState(DEFAULT_THEME);
   const theme = getTheme(themeName);
 
@@ -101,6 +158,11 @@ export function App({
   const [cost, setCost] = useState<number | undefined>(undefined);
   const [costEstimated, setCostEstimated] = useState(false);
   const [verbose, setVerbose] = useState(startVerbose);
+  const [feed, setFeed] = useState<Feed[]>([]);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  // The splash is the one moving thing on screen at startup, and the
+  // transcript cannot be printed permanently above something still moving.
+  const [settled, setSettled] = useState(false);
 
   // Picker state. `login-key` is the one mode that must never echo what you
   // type, so it is a distinct state rather than a flag on a shared one.
@@ -126,9 +188,18 @@ export function App({
     setLines((prev) => [...prev, { id: nextId.current++, tone, text }]);
   }, []);
 
-  /** Record a line that only the transparency view shows. */
-  const detail = useCallback((tone: Line["tone"], text: string) => {
-    setLines((prev) => [...prev, { id: nextId.current++, tone, text, detail: true }]);
+  /**
+   * Record a line for the live feed.
+   *
+   * Written whether or not the view is open: `v` reveals what already
+   * happened rather than starting a recording. Bounded, because the durable
+   * copy of all of this is the session log on disk.
+   */
+  const note = useCallback((text: string, dim = false) => {
+    setFeed((prev) => {
+      const next = [...prev, { id: nextId.current++, text, dim }];
+      return next.length > FEED_MEMORY ? next.slice(-FEED_MEMORY) : next;
+    });
   }, []);
 
   useEffect(() => {
@@ -201,9 +272,9 @@ export function App({
         // What the check actually ran, and how long it took. A passing check
         // that never ran the command you think it runs is the failure mode
         // this makes visible.
-        detail("info", `          ${r.detail} · ${fmtDuration(r.durationMs)}`);
+        note(`  ${r.ok ? "pass" : "FAIL"} ${r.name} · ${r.detail} · ${fmtDuration(r.durationMs)}`, true);
         if (r.ok && r.output.trim()) {
-          for (const l of r.output.trim().split("\n").slice(0, 4)) detail("info", `          ${l}`);
+          for (const l of r.output.trim().split("\n").slice(0, 4)) note(`      ${l}`, true);
         }
         if (!r.ok) {
           for (const l of r.output.trim().split("\n").slice(0, 8)) add("fail", `        ${l}`);
@@ -228,7 +299,7 @@ export function App({
         );
       }
     },
-    [add, detail],
+    [add, note],
   );
 
   const handleEvent = useCallback(
@@ -256,22 +327,65 @@ export function App({
           add("tool", `${ev.name}  ${ev.detail}${ev.note ? `  [${ev.note}]` : ""}${took}`);
           // The exact call and the head of what came back. Verbatim: a
           // transparency view that paraphrases is one more thing to verify.
-          if (ev.args && ev.args !== "{}") detail("info", `      args ${ev.args.replace(/\s+/g, " ")}`);
+          note(`· ${ev.name} ${ev.detail}${took}`);
+          if (ev.args && ev.args !== "{}") note(`    args ${ev.args.replace(/\s+/g, " ")}`, true);
           if (ev.bytes !== undefined) {
-            detail("info", `      → ${ev.bytes} bytes${ev.note ? ` · ${ev.note}` : ""}`);
+            note(`    → ${ev.bytes} bytes${ev.note ? ` · ${ev.note}` : ""}`, true);
           }
-          for (const l of (ev.preview ?? "").split("\n").slice(0, 8)) {
-            if (l.trim()) detail("info", `      │ ${l}`);
+          for (const l of (ev.preview ?? "").split("\n").slice(0, 5)) {
+            if (l.trim()) note(`    │ ${l}`, true);
           }
           beginActivity("thinking");
           break;
         }
+        case "job_start":
+          setJobs((prev) => [
+            ...prev,
+            {
+              n: ev.job,
+              text: ev.text,
+              startedAt: Date.now(),
+              steps: 0,
+              promptTokens: 0,
+              completionTokens: 0,
+              cachedTokens: 0,
+              costUsd: undefined,
+              estimated: false,
+            },
+          ]);
+          note(`▸ job ${ev.job} · ${ev.text.replace(/\s+/g, " ").slice(0, 60)}`);
+          break;
+        case "job_end":
+          // The job's own books, closed. The session meter below never
+          // resets — this is a view of it, not a replacement for it.
+          setJobs((prev) =>
+            prev.map((j) =>
+              j.n === ev.job
+                ? {
+                    ...j,
+                    steps: ev.steps,
+                    promptTokens: ev.spend.promptTokens,
+                    completionTokens: ev.spend.completionTokens,
+                    cachedTokens: ev.spend.cachedTokens,
+                    costUsd: ev.spend.costUsd,
+                    estimated: ev.spend.estimated,
+                    durationMs: ev.durationMs,
+                    outcome: ev.outcome,
+                  }
+                : j,
+            ),
+          );
+          note(
+            `▪ job ${ev.job} ${ev.outcome} · ${ev.steps} step(s) · ` +
+              `${spendText(ev.spend)} · ${fmtDuration(ev.durationMs)}`,
+          );
+          break;
         case "request":
           beginActivity("thinking");
-          detail(
-            "info",
+          note(
             `→ step ${ev.step + 1} · ${ev.messages} messages · ~${tok(ev.estTokens)} tokens → ${ev.model}` +
               (ev.stream ? " · streaming" : ""),
+            true,
           );
           break;
         case "step_summary": {
@@ -280,21 +394,38 @@ export function App({
           // is reconciled step by step, so a surprising bill has a line
           // where it came from rather than only a final number.
           const s = ev.spend;
-          const cached = s.cachedTokens > 0 ? ` (${tok(s.cachedTokens)} cached)` : "";
           const did = ev.outcome === "claim" ? "claims done" : ev.tools.join(", ") || "no tools";
-          const spent =
-            s.costUsd === undefined ? "" : ` · ${s.estimated ? "~" : ""}${fmtCost(s.costUsd)}`;
           add(
             "info",
-            `step ${ev.step + 1} · ${did} · ${tok(s.promptTokens)} in${cached} · ` +
-              `${tok(s.completionTokens)} out · ${fmtDuration(ev.durationMs)}${spent}` +
+            `step ${ev.step + 1} · ${did} · ${spendText(s)} · ${fmtDuration(ev.durationMs)}` +
               (s.estimated ? " · tokens estimated" : s.billed ? " · billed by provider" : ""),
           );
-          detail(
-            "info",
-            `      session ${tok(ev.sessionTokens)} tokens` +
+          // Fold the step into the job it belongs to, so the panel can show
+          // a running cost for work that has not finished yet.
+          setJobs((prev) =>
+            prev.map((j) =>
+              j.n === ev.job
+                ? {
+                    ...j,
+                    steps: j.steps + 1,
+                    promptTokens: j.promptTokens + s.promptTokens,
+                    completionTokens: j.completionTokens + s.completionTokens,
+                    cachedTokens: j.cachedTokens + s.cachedTokens,
+                    costUsd:
+                      s.costUsd === undefined ? j.costUsd : (j.costUsd ?? 0) + s.costUsd,
+                    estimated: j.estimated || s.estimated,
+                  }
+                : j,
+            ),
+          );
+          // The step line is already in the transcript a row above; what the
+          // panel adds is the reconciliation — where the session total stands
+          // after it, and why the model stopped.
+          note(
+            `  ↳ session ${tok(ev.sessionTokens)} tokens` +
               (ev.sessionCostUsd === undefined ? "" : ` · ${fmtCost(ev.sessionCostUsd)}`) +
               (ev.finishReason ? ` · finish: ${ev.finishReason}` : ""),
+            true,
           );
           break;
         }
@@ -339,7 +470,7 @@ export function App({
           break;
       }
     },
-    [add, beginActivity, detail, renderBar],
+    [add, beginActivity, note, renderBar],
   );
 
   /** Remember the endpoint so the next bare `molt` starts where this left off. */
@@ -347,17 +478,22 @@ export function App({
     if (engine.model) saveEndpoint(engine.baseUrl, engine.model);
   }, [engine]);
 
+  // Stable identity: Banner fires this from an effect, so a new function
+  // every render would re-fire it on every frame of the animation.
+  const onSettle = useCallback(() => setSettled(true), []);
+
   const toggleVerbose = useCallback(() => {
     setVerbose((v) => {
-      add(
-        "info",
+      // Said in the feed, not the transcript: a keypress that permanently
+      // prints a line into the record is a keypress people stop pressing.
+      note(
         v
-          ? "detail hidden — shift+V while working, ctrl+V any time"
-          : "detail shown: every call, argument, and result, as recorded in .molt/log",
+          ? "view closed — v while working, ctrl+V any time"
+          : "view open: every call, argument, and result, as recorded in .molt/log",
       );
       return !v;
     });
-  }, [add]);
+  }, [note]);
 
   /**
    * Ask the provider what this model costs.
@@ -526,7 +662,11 @@ export function App({
         case "/clear":
           engine.reset();
           setLines([]);
+          setFeed([]);
+          setJobs([]);
           setTokens(0);
+          setCost(undefined);
+          setCostEstimated(false);
           return true;
         case "/bom": {
           const b = engine.bom();
@@ -825,9 +965,9 @@ export function App({
       return;
     }
 
-    // --- the transparency view. Ctrl-V works anywhere; shift+V is bound
+    // --- the transparency view. Ctrl-V works anywhere; a bare `v` is bound
     // only while a turn is running, where the prompt takes no typing and a
-    // capital V can therefore never be part of a message. ---
+    // letter can therefore never be part of a message. ---
     if (key.ctrl && (char === "v" || char === "\u0016")) {
       toggleVerbose();
       return;
@@ -836,7 +976,7 @@ export function App({
     // --- mid-stream: Ctrl-C cancels the turn rather than killing molt ---
     if (busy) {
       if (key.ctrl && char === "c") engine.cancel();
-      else if (char === "V" && !key.ctrl && !key.meta) toggleVerbose();
+      else if ((char === "v" || char === "V") && !key.ctrl && !key.meta) toggleVerbose();
       return;
     }
 
@@ -965,32 +1105,115 @@ export function App({
     fail: theme.fail,
   };
 
+  // Everything above the live region is printed once and never redrawn.
+  // The old TUI re-rendered the whole session on every frame, which a
+  // terminal cannot do once the output is taller than the window: it can
+  // only erase what is still on screen, so the rest tears and duplicates.
+  // That is the "buggy viewer", and it got worse the more molt had to say.
+  //
+  // The splash is held back until it stops moving, because permanent output
+  // cannot be printed above something still animating.
+  const staticItems: { key: string; line?: Line }[] = settled
+    ? [{ key: "banner" }, ...lines.map((l) => ({ key: `l${l.id}`, line: l }))]
+    : [];
+
+  const running = jobs.find((j) => j.outcome === undefined);
+  const done = jobs.filter((j) => j.outcome !== undefined);
+
   return (
     <Box flexDirection="column">
-      <Banner
-        theme={theme}
-        themeName={themeName}
-        animate
-        version={version}
-      />
-
-      <Box flexDirection="column" marginTop={1}>
-        {lines
-          .filter((l) => verbose || !l.detail)
-          .map((l) => (
-            <Text key={l.id} color={l.detail ? theme.ghost : toneColor[l.tone]}>
-              {l.tone === "user" ? "› " : l.tone === "tool" ? "· " : "  "}
-              {l.text}
+      <Static items={staticItems}>
+        {(item) =>
+          item.line ? (
+            <Text key={item.key} color={toneColor[item.line.tone]}>
+              {item.line.tone === "user" ? "› " : item.line.tone === "tool" ? "· " : "  "}
+              {item.line.text}
             </Text>
-          ))}
-      </Box>
+          ) : (
+            <Box key={item.key} flexDirection="column">
+              <Banner theme={theme} themeName={themeName} version={version} />
+            </Box>
+          )
+        }
+      </Static>
 
+      {!settled && (
+        <Banner
+          theme={theme}
+          themeName={themeName}
+          animate
+          version={version}
+          onSettle={onSettle}
+        />
+      )}
+
+      {/* An answer in flight. Capped: the full text joins the transcript
+          when it completes, and an uncapped live region is the other half
+          of the redraw problem. */}
       {streamText ? (
-        <Box marginTop={1}>
-          <Text color={theme.accent}>{streamText}</Text>
-          <Text color={theme.dim}>▌</Text>
+        <Box marginTop={1} flexDirection="column">
+          {(() => {
+            const all = streamText.split("\n");
+            const shown = all.slice(-STREAM_ROWS);
+            return (
+              <>
+                {all.length > STREAM_ROWS && (
+                  <Text color={theme.ghost}>  ↑ {all.length - STREAM_ROWS} more line(s)</Text>
+                )}
+                {shown.map((l, i) => (
+                  <Text key={i} color={theme.accent}>
+                    {fit(l)}
+                    {i === shown.length - 1 ? <Text color={theme.dim}>▌</Text> : null}
+                  </Text>
+                ))}
+              </>
+            );
+          })()}
         </Box>
       ) : null}
+
+      {verbose && (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color={theme.dim}>
+            {fit(`── what the model is doing ${"─".repeat(Math.max(2, room - 38))}`)}
+            <Text color={theme.ghost}>  v closes</Text>
+          </Text>
+
+          {running ? (
+            <Text color={theme.accent}>
+              {fit(
+                `  job ${running.n} · ${running.text.replace(/\s+/g, " ").slice(0, 32)} · ` +
+                  `${running.steps} step(s) · ${spendText(running)} · ` +
+                  `${fmtDuration(Date.now() - running.startedAt)}`,
+              )}
+            </Text>
+          ) : (
+            <Text color={theme.ghost}>  idle · no job running</Text>
+          )}
+
+          {feed.slice(-FEED_ROWS).map((f) => (
+            <Text key={f.id} color={f.dim ? theme.ghost : theme.dim}>
+              {fit(`  ${f.text}`)}
+            </Text>
+          ))}
+
+          {done.length > 0 && (
+            <Box flexDirection="column" marginTop={1}>
+              {done.slice(-JOB_ROWS).map((j) => (
+                <Text key={j.n} color={theme.ghost}>
+                  {fit(
+                    `  job ${j.n} ${j.outcome} · ${j.steps} step(s) · ${spendText(j)}` +
+                      (j.durationMs === undefined ? "" : ` · ${fmtDuration(j.durationMs)}`),
+                  )}
+                </Text>
+              ))}
+              {done.length > JOB_ROWS && (
+                <Text color={theme.ghost}>{`  … and ${done.length - JOB_ROWS} earlier job(s)`}</Text>
+              )}
+            </Box>
+          )}
+        </Box>
+      )}
 
       {pending ? (
         <Box flexDirection="column" marginTop={1}>
@@ -1073,7 +1296,7 @@ export function App({
                   )}
                   <Text color={theme.ghost}>
                     {" \u00b7 "}
-                    {verbose ? "shift+V hide detail" : "shift+V detail"}
+                    {verbose ? "v closes this" : "v to watch"}
                   </Text>
                 </>
               ) : (

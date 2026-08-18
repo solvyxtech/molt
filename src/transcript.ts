@@ -298,8 +298,13 @@ export class Transcript {
         if (m.role !== "tool") break;
         if (!m.content || m.content.startsWith(ELIDED_PREFIX)) continue;
         const before = estTokens(m.content);
-        m.content = `${ELIDED_PREFIX} ${reason}. Full contents remain in the archived record.`;
-        tokensSaved += before - estTokens(m.content);
+        const marker = `${ELIDED_PREFIX} ${reason}. Full contents remain in the archived record.`;
+        // A short result costs less than the notice explaining its absence.
+        // Eliding it would drop content AND grow the context — which is how
+        // the meter came to report "−-17 tokens" saved.
+        if (estTokens(marker) >= before) continue;
+        m.content = marker;
+        tokensSaved += before - estTokens(marker);
         elided++;
       }
     }

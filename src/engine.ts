@@ -37,9 +37,21 @@ import {
   type Confirm,
   type EngineEvent,
   type LedgerEntry,
+  type JobOutcome,
   type Msg,
   type Spend,
 } from "./types.js";
+
+/** A reading of the session meter, for measuring one job against. */
+type Meter = {
+  prompt: number;
+  completion: number;
+  cached: number;
+  billed: number;
+  unbilledSteps: number;
+  estimatedSteps: number;
+  costUsd?: number;
+};
 
 export const SYSTEM_PROMPT = [
   "You are molt, a coding agent working in the current directory.",
@@ -203,6 +215,8 @@ export class Engine {
    * field that has already been refused burns a round trip per step.
    */
   private streamUsageUnsupported = false;
+  /** User turns handled this session. Numbers the jobs the meter reports. */
+  private jobCount = 0;
   budgetTokens?: number;
   /** Exact JSON body of the most recent request — the wire, unhidden. */
   lastRequestBody?: string;
@@ -285,6 +299,7 @@ export class Engine {
     this.sessionBilled = 0;
     this.unbilledSteps = 0;
     this.estimatedSteps = 0;
+    this.jobCount = 0;
   }
 
   /**
@@ -354,6 +369,38 @@ export class Engine {
     this.cfg.priceOutPerMtok = p.out;
     this.cfg.priceCachedInPerMtok = p.cached;
     this.cfg.priceSource = p.source;
+  }
+
+  /** Everything the meter is made of, at this instant. */
+  private meter(): Meter {
+    return {
+      prompt: this.sessionPrompt,
+      completion: this.sessionCompletion,
+      cached: this.sessionCached,
+      billed: this.sessionBilled,
+      unbilledSteps: this.unbilledSteps,
+      estimatedSteps: this.estimatedSteps,
+      costUsd: this.costUsd(),
+    };
+  }
+
+  /** What has been spent since a snapshot, and how much of it molt knows. */
+  private spendSince(before: Meter): Spend {
+    const billedHere = this.sessionBilled - before.billed;
+    const wasBilled = this.unbilledSteps === before.unbilledSteps && billedHere > 0;
+    const now = this.costUsd();
+    return {
+      promptTokens: this.sessionPrompt - before.prompt,
+      completionTokens: this.sessionCompletion - before.completion,
+      cachedTokens: this.sessionCached - before.cached,
+      costUsd: wasBilled
+        ? billedHere
+        : now === undefined
+          ? undefined
+          : now - (before.costUsd ?? 0),
+      estimated: this.estimatedSteps > before.estimatedSteps,
+      billed: wasBilled,
+    };
   }
 
   bom(): Bom {
@@ -586,7 +633,82 @@ export class Engine {
     return this.runBarGuarded(claim);
   }
 
+  /**
+   * One user turn, with its own books.
+   *
+   * The session meter answers "what have I spent?" and must only ever climb.
+   * It cannot also answer "what did that question cost?" — so the per-job
+   * figures are kept here, as a delta against a snapshot taken before the
+   * turn, and reported when the turn ends. Nothing about the session totals
+   * changes; a job is a view of them, never a reset.
+   */
   async *run(userText: string, confirm: Confirm): AsyncGenerator<EngineEvent> {
+    const job = ++this.jobCount;
+    const startedAt = Date.now();
+    const before = this.meter();
+    let steps = 0;
+    let cancelled = false;
+    let errored = false;
+    let exhausted = false;
+    let proven = false;
+    let answered = false;
+
+    yield { kind: "job_start", job, text: userText };
+
+    for await (const ev of this.runTurn(userText, confirm, job)) {
+      switch (ev.kind) {
+        case "step_summary":
+          steps += 1;
+          break;
+        case "cancelled":
+          cancelled = true;
+          break;
+        case "error":
+          errored = true;
+          break;
+        case "proof_exhausted":
+          exhausted = true;
+          break;
+        case "proof_result":
+          proven = true;
+          break;
+        case "assistant_text":
+          answered = true;
+          break;
+      }
+      yield ev;
+    }
+
+    // Order matters: a bar that was never met is "not proven" even though an
+    // error event follows it, and an answer nothing checked is never
+    // "verified" — the distinction molt exists to make.
+    const outcome: JobOutcome = cancelled
+      ? "cancelled"
+      : exhausted
+        ? "not proven"
+        : errored
+          ? "error"
+          : proven
+            ? "verified"
+            : answered
+              ? "unverified"
+              : "stopped";
+
+    yield {
+      kind: "job_end",
+      job,
+      steps,
+      spend: this.spendSince(before),
+      durationMs: Date.now() - startedAt,
+      outcome,
+    };
+  }
+
+  private async *runTurn(
+    userText: string,
+    confirm: Confirm,
+    job: number,
+  ): AsyncGenerator<EngineEvent> {
     // Remember where this turn began so a cancellation can leave no trace.
     const turnStart = this.transcript.length;
     const log = this.cfg.journal;
@@ -618,7 +740,7 @@ export class Engine {
           log?.append("elide", { elided: pruned.elided, tokensSaved: pruned.tokensSaved });
           yield {
             kind: "info",
-            text: `pruned ${pruned.elided} superseded tool result(s) · −${pruned.tokensSaved} tokens`,
+            text: `pruned ${pruned.elided} superseded tool result(s) · ${pruned.tokensSaved} tokens freed`,
           };
         }
       }
@@ -855,6 +977,7 @@ export class Engine {
       /** Close out the step with what it did and what it cost. */
       const summary = (tools: string[], outcome: "tools" | "claim"): EngineEvent => ({
         kind: "step_summary",
+        job,
         step,
         tools,
         spend,

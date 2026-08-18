@@ -56,30 +56,35 @@ Every step closes with one line — printed whether or not anyone asked for it,
 in the TUI and headlessly:
 
 ```
-  step 2 · read_file, bash · 3.4k in (2.1k cached) · 412 out · 6.2s · 0.31¢
+  step 2 · read_file, bash · 3.4k in (2.1k cached) · 412 out · $0.0072 · 6.2s
 ```
 
-**shift+V** opens the detail behind it while a turn is running (`ctrl+V` any
+Press **`v`** while a turn is running to open the live view (`ctrl+V` any
 time, `/verbose` as a command, `--verbose` headlessly):
 
 ```
-· read_file  src/auth.ts  12ms
+── what the model is doing ──────────────────────────────────  v closes
+  job 3 · rewrite the auth guard · 2 step(s) · 8.0k in (3.0k cached) · 45 out · $0.012 · 4.2s
+  · read_file src/auth.ts  12ms
       args {"path":"src/auth.ts"}
       → 1841 bytes
       │ import { verify } from "./jwt.js";
-      │ export function check(token: string) {
-  step 2 · read_file · 3.4k in · 412 out · 6.2s · 0.31¢
-      session 12.1k tokens · 1.4¢ · finish: tool_calls
+    ↳ session 16k tokens · $0.024 · finish: tool_calls
+
+  job 1 verified · 2 step(s) · 4.8k in · 90 out · $0.0074 · 1.2s
+  job 2 not proven · 4 step(s) · 11k in · 210 out · $0.017 · 3.6s
 ```
 
-Three properties make it worth trusting:
+Four properties make it worth trusting:
 
 - **Verbatim.** Arguments and results are shown as they were sent and
   received, truncated but never reworded. A view that paraphrases is one more
   claim to check, and molt does not summarize with a model anywhere else.
-- **Recorded regardless.** Detail lines are written whether or not the view is
-  open, so shift+V reveals what already happened rather than starting a
-  recording.
+- **Recorded regardless.** Feed lines are written whether or not the view is
+  open, so `v` reveals what already happened rather than starting a recording.
+- **Bounded.** It is a panel of fixed height over a transcript that is printed
+  once and never redrawn. A view that grows the region a terminal has to
+  repaint is a view that eventually tears its own output.
 - **The same facts as the log.** Nothing on screen is derived from anything
   the log does not also record — with the exception that the log stores
   digests where the screen shows content, deliberately (see below).
@@ -113,9 +118,20 @@ Cost is a claim like any other, so molt says where each part of it came from.
   `usage.cost`), is used instead of molt's arithmetic — but only when every
   step of the session reported one.
 
-A cost that rests on an estimate anywhere is prefixed `~`. A cost under a cent
-is shown in cents, because `$0.000024` is a number you have to count rather
-than read.
+Two rules govern how it is shown, and they are in tension:
+
+- **No long runs of zeros.** `$0.000024` is a number you count rather than
+  read, and the meter has to be legible at a glance.
+- **Never change unit.** Quoting small sums in cents made the meter read
+  `0.9¢` and then `$0.029` — which looks like it went *down*. A running total
+  must be comparable against its own previous value without arithmetic, so
+  cost is always in dollars and only the decimals move.
+
+A cost resting on an estimate anywhere is prefixed `~`.
+
+The bottom line is the session meter and only ever climbs. **Per-job** figures
+— what one question cost — live in the view, measured as a delta against the
+session meter rather than by resetting it.
 
 ## Estimated versus measured
 

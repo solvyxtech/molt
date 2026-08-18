@@ -329,7 +329,7 @@ describe("the meter", () => {
     })
       .map((s) => s.text)
       .join("");
-    assert.match(text, /1\.0k\/50k tokens · 0\.42¢/);
+    assert.match(text, /1\.0k\/50k tokens · \$0\.0042/);
   });
 
   it("omits the cost when no pricing is configured", () => {
@@ -379,23 +379,36 @@ describe("cost formatting", () => {
       .split("· ")
       .pop();
 
-  it("changes unit rather than growing a run of zeros", () => {
-    // The bug: sub-cent sums rendered as "$0.000024" — six digits the reader
-    // has to count before the number means anything, in the one field on
-    // screen that has to be legible at a glance.
+  it("keeps the run of zeros short", () => {
+    // The first bug: sub-cent sums rendered as "$0.000024" — six digits the
+    // reader has to count before the number means anything, in the one field
+    // on screen that has to be legible at a glance.
     assert.equal(cost(12.5), "$12.50");
-    assert.equal(cost(0.07), "$0.07");
-    assert.equal(cost(0.0042), "0.42¢");
-    assert.equal(cost(0.000024), "<0.01¢");
+    assert.equal(cost(0.07), "$0.070");
+    assert.equal(cost(0.0042), "$0.0042");
     for (const usd of [12.5, 0.07, 0.0042, 0.00024]) {
-      assert.ok(!/000/.test(cost(usd)!), `zero run survived: ${cost(usd)}`);
+      assert.ok(!/0000/.test(cost(usd)!), `zero run survived: ${cost(usd)}`);
+    }
+  });
+
+  it("never changes unit as the session grows", () => {
+    // The second bug, and the worse one: quoting small sums in cents made the
+    // meter read "0.9¢" and then "$0.029" — which looks like it went DOWN.
+    // A running total has to be comparable against its own previous value
+    // without arithmetic, so the unit is fixed and only the digits move.
+    const series = [0.0009, 0.009, 0.029, 0.061, 0.42, 1.2, 12.5].map((u) => cost(u)!);
+    for (const s of series) assert.ok(s.startsWith("$"), `changed unit: ${s}`);
+    // Monotone as rendered, not just as computed.
+    const asNumbers = series.map((s) => Number(s.replace("$", "")));
+    for (let i = 1; i < asNumbers.length; i++) {
+      assert.ok(asNumbers[i]! > asNumbers[i - 1]!, `${series[i - 1]} → ${series[i]} reads as a fall`);
     }
   });
 
   it("never flattens a real charge to zero", () => {
     // A meter reading zero while the token count climbs reads as broken
     // pricing rather than a cheap turn, so the floor says "under", not "none".
-    assert.equal(cost(0.0000001), "<0.01¢");
+    assert.equal(cost(0.0000001), "<$0.0001");
     assert.notEqual(cost(0.0000001), "$0.00");
   });
 
@@ -404,6 +417,7 @@ describe("cost formatting", () => {
     // quote back at each other.
     assert.equal(cost(0.42, true), "~$0.42");
     assert.equal(cost(0.42, false), "$0.42");
+    assert.equal(cost(0.0031, true), "~$0.0031");
   });
 
   it("shows a true zero as zero", () => {

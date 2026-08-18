@@ -9,12 +9,17 @@ a number presented with more confidence than it was earned with.
 
 ### Added
 
-- **The transparency view — `shift+V`** while a turn is running, `ctrl+V` any
-  time, or `/verbose`. Shows the exact arguments of every tool call, the head
-  of every result, each check's command and duration, and the request about to
-  go out. Detail is recorded whether or not the view is open, so the key
-  reveals what already happened rather than starting a recording. Verbatim
-  throughout — a transparency view that paraphrases is one more claim to check.
+- **The live view — press `v`** while a turn is running (`ctrl+V` any time, or
+  `/verbose`). A bounded panel showing what the model is doing right now, the
+  exact arguments of every tool call, the head of every result, each check's
+  command and duration, and what every job has cost. Feed lines are recorded
+  whether or not the view is open, so the key reveals what already happened
+  rather than starting a recording. Verbatim throughout — a view that
+  paraphrases is one more claim to check.
+- **Per-job accounting.** Every user turn is a job with its own tokens, cost,
+  step count, duration, and outcome (`verified`, `unverified`, `not proven`,
+  `cancelled`), measured as a delta against the session meter rather than by
+  resetting it. Shown in the view, and printed headlessly at the end of a run.
 - **A one-line overview after every step and every verification.** `step 2 ·
   read_file, bash · 3.4k in (2.1k cached) · 412 out · 6.2s · 0.31¢`, and
   `2 of 3 checks passed · 4.1s · failed: tests` followed by what happens next.
@@ -43,9 +48,21 @@ a number presented with more confidence than it was earned with.
   prompted this — was then used forever, and survived every model switch.
   Unattributed prices are now re-fetched rather than trusted.
 - **Sub-cent costs rendered as `$0.000024`** — six digits to count in the one
-  field that has to be legible at a glance. Anything under a cent now reads in
-  cents (`0.24¢`), and a cost resting on molt's own token estimate is prefixed
-  `~` so a guess and a bill do not look alike.
+  field that has to be legible at a glance. Decimals now scale to the
+  magnitude, floored at four, and a cost resting on molt's own token estimate
+  is prefixed `~` so a guess and a bill do not look alike.
+- **The meter changed unit as it climbed.** Quoting small sums in cents made
+  the session total read `0.9¢` and then `$0.029` — which looks like it went
+  down. Cost is always in dollars now; only the decimals move.
+- **The TUI redrew the entire session on every frame.** A terminal can only
+  erase what is still on screen, so once the output was taller than the window
+  the transcript tore and duplicated — and the more molt had to say, the worse
+  it got. The transcript is now printed once and never redrawn, and every live
+  region (the view, a streaming answer) is bounded and fitted to the window
+  width.
+- **`pruned N superseded tool result(s) · −-17 tokens`.** Eliding a result
+  shorter than the notice explaining its absence dropped content *and* grew
+  the context. Such results are now left alone.
 - **The session meter was not reset by `/clear`.** Token totals and cost
   carried across a reset session.
 - **Headless output ran the model's last streamed word into molt's next line.**
