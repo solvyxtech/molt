@@ -1,5 +1,11 @@
 # `.molt/done.yml` — the completion bar
 
+`molt init` writes a first draft by reading the project: `package.json` scripts
+(with the runner your lockfile implies), `Cargo.toml`, `go.mod`,
+`pyproject.toml`, or a `Makefile`. Every generated check names its source in a
+comment, and molt proposes nothing the project does not itself declare. Edit
+freely — it is your file, and a first draft is all it claims to be.
+
 The bar is what "done" means in this project, as a file you commit.
 
 molt will not emit a final answer while any check fails. This is the default

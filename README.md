@@ -60,7 +60,7 @@ Node 20.11+.
 
 ```bash
 cd your-project
-molt init                     # writes .molt/done.yml
+molt init                     # reads the project, writes .molt/done.yml
 $EDITOR .molt/done.yml        # say what "done" means here
 molt                          # interactive
 ```
@@ -95,6 +95,25 @@ molt stats                        # false-claim rate, tokens and cost per verifi
 ```
 
 ## The bar
+
+`molt init` reads the project before writing one. It takes commands from
+`package.json` scripts (using the runner your lockfile implies), `Cargo.toml`,
+`go.mod`, `pyproject.toml`, or a `Makefile`, and names the source of each check
+in the file it writes:
+
+```
+$ molt init
+read out of this project:
+  types    npm run typecheck            package.json scripts.typecheck
+  tests    npm test                     package.json scripts.test
+```
+
+Two rules keep that honest: molt only proposes what the project itself
+declares, and every generated line says where it came from — a bar you did not
+write and cannot explain is one you will delete the first time it fails. A
+`lint` script lands as `advisory: true`, because a style opinion is information
+rather than a contract.
+
 
 `.molt/done.yml` is a committed, versioned artifact. Ordinary shell commands, plus builtins that only molt can run because only molt still holds the full session record.
 
@@ -253,6 +272,26 @@ blocks and `secret =` assignments are masked by pattern, keeping the field name
 so the record still says what was hidden. The permission prompt is the
 deliberate exception — you cannot judge a command you cannot read.
 
+### What a turn costs before molt stops
+
+A single turn has a spending ceiling — **$1.00 by default**, in money rather
+than tokens. Tokens are the wrong unit for this: the whole conversation is
+resent every step, so a token ceiling divided by your context size is the
+number of steps you get, which means the same limit buys forty steps on a small
+project and four on a large one. It also ignores caching, charging full price
+for tokens the provider is discounting.
+
+molt says something at 50% and 80% of the way up rather than speaking for the
+first time while stopping you. `/budget $2.50` raises it, `/budget off` removes
+it entirely, and `/budget <n>` still sets a session token budget. Where no
+price is known, a generous token fallback applies instead — without a price,
+molt cannot tell an expensive turn from a long one.
+
+A stopped turn is not thrown away: molt spends one last tool-less request
+asking what was found and what could not be determined, labelled clearly as
+notes rather than a completed task, because a truncated report presented as
+verified is the claim this whole tool exists to refuse.
+
 ### What a turn cost
 
 The bottom line is the **session** meter — provider, model, tokens, price —
@@ -313,7 +352,7 @@ nothing has to be typed in full or looked up.
 /autonomy [level]  how much molt does without asking  (shift+A)
 /prove             run the bar now, without the model
 /bar               show the current bar
-/init              write a starter .molt/done.yml
+/init              read the project and write .molt/done.yml
 /shed              compact context; the full record is archived
 /shed --explain    digest and original, side by side
 /regrow <pattern>  pull archived context back in by search
@@ -322,7 +361,7 @@ nothing has to be typed in full or looked up.
 /stats             false-claim rate, tokens per verified change
 /bom               context bill of materials
 /wire              exact JSON of the last request
-/budget <n|off>    hard token ceiling
+/budget <n|$n|off> session token budget, or a per-turn ceiling in dollars
 /verbose           watch every call, argument, and result  (shift+V)
 /price             what this model costs, per 1M tokens
 /model <id>        switch model
