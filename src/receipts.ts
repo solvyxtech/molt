@@ -184,7 +184,7 @@ export class Receipts {
       // The finding, not the label. "pass" is a header; "2 files modified and
       // verified byte-for-byte on disk" is the reason to believe it.
       const finding = r.output.trim().split("\n")[0]?.slice(0, 90) ?? "";
-      const verdict = r.ok ? (r.advisory ? "pass" : "pass") : r.advisory ? "warn" : "**FAIL**";
+      const verdict = r.ok ? "pass" : r.advisory ? "warn" : "**FAIL**";
       return (
         `| ${r.name} | ${verdict}${r.cached ? " (reused)" : ""} | ` +
         `${finding.replace(/\|/g, "\\|") || "—"} | ${r.durationMs} |`

@@ -293,6 +293,36 @@ describe("editing", () => {
     assert.equal(r.ok && r.replacements, 2);
   });
 
+  it("treats the replacement as literal text, dollar signs and all", () => {
+    // String.replace reads `$&`, `$1`, "$`" and `$'` in a replacement as
+    // substitutions, so a model editing a regex, a shell script, or anything
+    // with jQuery in it got silently different text than it asked for — in the
+    // one tool whose entire job is exactness.
+    for (const [oldText, newText] of [
+      ["OLD", "$& and more"],
+      ["OLD", "$1"],
+      ["OLD", "$`"],
+      ["OLD", "$'"],
+      ["OLD", "$$"],
+      ["OLD", "text.replace(/x/g, '$&')"],
+    ]) {
+      const r = applyEdit(`const a = ${oldText};`, oldText, newText);
+      assert.ok(r.ok);
+      assert.equal(r.ok && r.text, `const a = ${newText};`, `mangled: ${newText}`);
+    }
+  });
+
+  it("keeps replace_all literal too", () => {
+    const r = applyEdit("A and A", "A", "$&!", true);
+    assert.ok(r.ok);
+    assert.equal(r.ok && r.text, "$&! and $&!");
+  });
+
+  it("only replaces the first occurrence when not told otherwise", () => {
+    const r = applyEdit("x = 1; y = 1;", "= 1", "= 2");
+    assert.ok(!r.ok, "two occurrences without replace_all must be refused");
+  });
+
   it("refuses edits that cannot mean anything", () => {
     assert.ok(!applyEdit("abc", "", "x").ok);
     assert.ok(!applyEdit("abc", "abc", "abc").ok);

@@ -191,7 +191,12 @@ export type EngineEvent =
   | { kind: "assistant_text"; text: string }
   /** A fragment as it arrives. Render incrementally; do not accumulate twice. */
   | { kind: "delta"; text: string }
-  | { kind: "cancelled" }
+  /**
+   * A turn was cancelled. The transcript is rolled back; the filesystem is
+   * not, because molt cannot un-write a file it already wrote — so any paths
+   * that changed are named rather than covered by a claim of "unchanged".
+   */
+  | { kind: "cancelled"; filesWritten?: string[] }
   // Emitted before the tool runs, so a UI can say what is happening while it
   // happens. `tool` still follows on completion and carries the outcome.
   | { kind: "tool_start"; name: string; detail: string }

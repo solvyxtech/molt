@@ -195,15 +195,33 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
       case "--cwd":
         out.cwd = resolve(next());
         break;
-      case "--budget":
-        out.budget = Number(next());
+      case "--budget": {
+        // Rejected rather than turned into NaN, which compares false against
+        // everything and silently switched the limit off.
+        const raw = next();
+        const value = num(raw);
+        if (value === undefined) throw new Error(`--budget needs a non-negative number, got "${raw}"`);
+        out.budget = value;
         break;
-      case "--auto-shed":
-        out.autoShed = Number(next());
+      }
+      case "--auto-shed": {
+        // Rejected rather than turned into NaN, which compares false against
+        // everything and silently switched the limit off.
+        const raw = next();
+        const value = num(raw);
+        if (value === undefined) throw new Error(`--auto-shed needs a non-negative number, got "${raw}"`);
+        out.autoShed = value;
         break;
-      case "--attempts":
-        out.attempts = Number(next());
+      }
+      case "--attempts": {
+        // Rejected rather than turned into NaN, which compares false against
+        // everything and silently switched the limit off.
+        const raw = next();
+        const value = num(raw);
+        if (value === undefined) throw new Error(`--attempts needs a non-negative number, got "${raw}"`);
+        out.attempts = value;
         break;
+      }
       case "--only":
         out.only = next().split(",").map((t) => t.trim()).filter(Boolean);
         break;
@@ -427,7 +445,12 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         midLine = !ev.text.endsWith("\n");
         break;
       case "cancelled":
-        process.stderr.write("\nmolt: cancelled — the session is unchanged\n");
+        process.stderr.write(
+          ev.filesWritten?.length
+            ? `\nmolt: cancelled — conversation rolled back, but these files were already ` +
+              `written and remain on disk: ${ev.filesWritten.join(", ")}\n`
+            : "\nmolt: cancelled — nothing was written, and the conversation is rolled back\n",
+        );
         break;
       case "assistant_text":
         process.stdout.write(`\n${ev.text}\n`);

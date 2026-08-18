@@ -420,7 +420,16 @@ export function App({
         }
         case "cancelled":
           flushPartial();
-          add("info", "cancelled — the session is unchanged");
+          // "The session is unchanged" was true of the transcript and false of
+          // the disk. molt cannot un-write a file, and saying otherwise is the
+          // kind of small confident wrongness this whole tool exists to refuse.
+          add(
+            "info",
+            ev.filesWritten?.length
+              ? `cancelled — the conversation is rolled back, but ${ev.filesWritten.length} file(s) ` +
+                `were already written and are still on disk: ${ev.filesWritten.join(", ")}`
+              : "cancelled — nothing was written, and the conversation is rolled back",
+          );
           break;
         case "assistant_text":
           // Streamed text is already on screen line by line, so only the tail
