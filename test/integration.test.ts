@@ -380,6 +380,41 @@ describe("over a real socket", () => {
     );
   });
 
+  it("serves a file again after shedding removed it from context", async () => {
+    // The trap, from a real session: shedding archives the messages holding a
+    // file's contents, and the read-coverage map went on believing the model
+    // had them — so molt refused the re-read and told it to scroll up to
+    // something molt had just deleted. 29 of that session's 31 repeat-refusals
+    // came after the first shed, and the no-progress guard then called the
+    // stall a loop and killed the turn.
+    const dir = ws();
+    writeDefaultBar(dir);
+    writeFileSync(join(dir, "notes.md"), Array.from({ length: 40 }, (_, i) => `note ${i}`).join("\n"));
+    const filler = "z".repeat(1500);
+    const { url } = await mockProvider({
+      turns: [
+        { calls: [{ name: "read_file", args: { path: "notes.md" } }] },
+        // Enough traffic to force a shed.
+        ...Array.from({ length: 6 }, (_, i) => ({
+          calls: [{ name: "bash", args: { command: `echo ${i} ${filler}` } }],
+        })),
+        // The same read again, now that context no longer holds it.
+        { calls: [{ name: "read_file", args: { path: "notes.md" } }] },
+        { text: "done" },
+      ],
+    });
+    const engine = engineAt(dir, url, { autoShedAtTokens: 1500 });
+    const events = await drain(engine.run("read and then work", allowAll));
+
+    assert.ok(events.some((e) => e.kind === "shed"), "the fixture did not actually shed");
+    const reads = events.filter(
+      (e): e is Extract<EngineEvent, { kind: "tool" }> => e.kind === "tool" && e.name === "read_file",
+    );
+    assert.equal(reads.length, 2);
+    assert.notEqual(reads[1]!.note, "repeat", "refused to re-serve a file it had shed");
+    assert.match(reads[1]!.preview ?? "", /note 0/, "the second read did not return the contents");
+  });
+
   it("keeps every part of a file it was shown, so it never re-reads one", async () => {
     // Elision was keyed on the path, so page two deleted page one and the
     // model had to fetch it again — forever.
