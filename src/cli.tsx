@@ -514,9 +514,12 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   // provider reported none.
   const b = engine.bom();
   if (b.sessionPromptTokens + b.sessionCompletionTokens > 0) {
+    // The context size next to the cumulative total, because "844k in" reads
+    // as 844k of reading when it is one conversation resent thirty times.
     process.stdout.write(
       `\n${b.sessionPromptTokens} in` +
-        (b.sessionCachedTokens > 0 ? ` (${b.sessionCachedTokens} cached)` : "") +
+        (b.sessionCachedTokens > 0 ? ` (${b.sessionCachedTokens} cached)` : " (0 cached)") +
+        ` · ${b.requestTotalEst} of context` +
         ` · ${b.sessionCompletionTokens} out` +
         (b.costUsd === undefined
           ? " · no price for this model"
