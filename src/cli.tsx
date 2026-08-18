@@ -314,9 +314,13 @@ function buildEngine(args: Args): Engine {
 async function priceEngine(engine: Engine, args: Args): Promise<void> {
   if (!needsPriceLookup(args.model, engine.pricing(), storedEndpoint())) return;
   const p = await fetchPricing(args.url, args.model, args.key);
-  // Nothing published: leave whatever was configured by hand in place rather
-  // than blanking a meter the user set up deliberately.
-  if (!p) return;
+  if (!p) {
+    // Nothing published. A price only stands if it was recorded for THIS
+    // model; inheriting the last one is how a Claude session gets billed at
+    // grok's rates.
+    if (storedEndpoint().priceModel !== args.model) engine.setPricing({});
+    return;
+  }
   engine.setPricing({ in: p.in, out: p.out, cached: p.cached, source: p.source });
   savePricing(args.model, p);
 }
