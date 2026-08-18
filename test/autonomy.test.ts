@@ -131,6 +131,46 @@ describe("read-only commands", () => {
 });
 
 describe("things that cannot be undone", () => {
+  it("catches deletion without needing a flag on it", () => {
+    // Found by probing, not by reading: the first version required -r or -f,
+    // so `rm secrets.env` ran unattended at high while the documentation said
+    // "everything except what cannot be undone". One named file is no more
+    // recoverable than a tree.
+    for (const c of [
+      "rm secrets.env",
+      "find . -name '*.ts' -exec rm {} \\;",
+      "find . -delete",
+      "truncate -s 0 notes.md",
+      "tee notes.md",
+      "echo x > important.txt",
+      "git checkout HEAD~1 -- .",
+      "git restore src/",
+      "git rebase -i main",
+      "git stash drop",
+    ]) {
+      assert.ok(isIrreversible(c), `slipped through: ${c}`);
+      assert.ok(bash("high", c), `high ran it unattended: ${c}`);
+    }
+  });
+
+  it("leaves the reversible half of the shell alone", () => {
+    // A list that catches everything is a level nobody would turn on.
+    for (const c of [
+      "npm install left-pad",
+      "npm test",
+      "git commit -am wip",
+      "ls -la",
+      "grep -rn x src/ 2>/dev/null",
+      "cat a >> b",
+      "mkdir out",
+      "node script.js",
+      "curl -sS https://wttr.in",
+    ]) {
+      assert.ok(!isIrreversible(c), `false positive: ${c}`);
+      assert.ok(!bash("high", c), `high asked about ordinary work: ${c}`);
+    }
+  });
+
   it("catches them", () => {
     for (const c of [
       "rm -rf build",
@@ -159,7 +199,7 @@ describe("things that cannot be undone", () => {
   });
 
   it("does not mistake an ordinary command for one", () => {
-    for (const c of ["npm test", "git status", "ls -la", "grep -rn rm src/"]) {
+    for (const c of ["npm test", "git status", "ls -la"]) {
       assert.ok(!isIrreversible(c), `false positive: ${c}`);
     }
   });

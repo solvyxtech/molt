@@ -35,7 +35,7 @@ collide with, the key cycles outright, because that is where speed matters.
 |---|---|
 | **low** (default) | The tools that cannot write: `read_file`, `list_dir`, `grep`. |
 | **medium** | Those, plus writes **inside the project**, plus commands that only report. |
-| **high** | Everything except what cannot be undone, or what leaves the project. |
+| **high** | Everything except a named list of destructive commands, and anything leaving the project. |
 
 The read-only tools are never gated at any level, and that is the argument for
 having them at all. `ls` through `bash` is a string this classifier has to
@@ -78,9 +78,20 @@ At **every** level, including high:
 - **Leaving the project.** Reading or writing a path outside the directory
   molt was pointed at. molt was aimed at one tree; no level implies consent
   beyond it.
-- **What cannot be undone.** `rm -r`/`rm -f`, `rmdir`, `sudo`, `git push`,
-  `git reset --hard`, `git clean -f`, `git branch -D`, `npm publish`, piping a
-  download into a shell, `dd of=`, `mkfs`, `chmod 777`, `shutdown`, `pkill`.
+- **A named list of destructive commands.** Deletion in any form (`rm` with or
+  without flags, `rmdir`, `unlink`, `shred`, `find -delete`, `find -exec`),
+  emptying a file in place (`truncate`, `tee`, `>` redirection to a path),
+  history and published state (`git push`, `git reset --hard`, `git clean -f`,
+  `git checkout -- `, `git restore`, `git rebase`, `git stash drop`,
+  `npm publish`), machine state (`sudo`, `shutdown`, `pkill`, `chmod 777`,
+  `dd of=`, `mkfs`), and piping a download into an interpreter.
+
+  **"Named list" is the exact claim**, and it is narrower than "everything that
+  could lose data". An earlier version of this page said "everything that cannot
+  be undone" while the code required a flag on `rm` — so `rm secrets.env` ran
+  unattended at high. That gap was found by probing the classifier rather than
+  by reading it, which is the only way this kind of gap is ever found. If you
+  find another, it is a bug worth filing.
 
 ## What it is not
 
