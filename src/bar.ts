@@ -43,6 +43,8 @@ export type BarContext = {
   cwd: string;
   /** Full session record, including everything shed. */
   record: Msg[];
+  /** Every path the model read this session. Reading grounds a reference. */
+  read?: string[];
   /**
    * Every write this project can still prove: live memory plus everything
    * recovered from the archive. After a shed, entries for early work exist
@@ -284,6 +286,22 @@ function sha256File(p: string): string | null {
 }
 
 /**
+ * English that looks like a filename and is not one.
+ *
+ * "e.g." parses as a stem and a one-letter extension, and molt refused a
+ * correct document over it — then sent the model back to strip abbreviations
+ * out of its own prose. A check that makes work worse to satisfy it is not a
+ * check, so the bias here is heavily toward silence: a missed fabrication
+ * costs one unnoticed sentence, a false positive costs the whole turn.
+ */
+const NOT_FILENAMES = new Set([
+  "e.g", "i.e", "etc", "vs", "cf", "al", "viz", "ibid", "approx", "no", "fig",
+  "eq", "ref", "dept", "est", "min", "max", "avg", "sec", "ch", "pp", "vol",
+  "ed", "jr", "sr", "mr", "mrs", "ms", "dr", "st", "ave", "inc", "ltd", "co",
+  "corp", "u.s", "u.k", "a.m", "p.m", "p.s", "n.b",
+]);
+
+/**
  * File paths a completion claim refers to. Deliberately conservative: a
  * token must look like a path with an extension, or be backtick-quoted.
  * Over-matching would fail correct work, which is worse than missing a
@@ -296,17 +314,25 @@ export function mentionedPaths(claim: string): string[] {
   // Remove them wholesale rather than trying to reject them token by token.
   const text = claim.replace(/\b[a-z][\w+.-]*:\/\/\S+/gi, " ").replace(/\bwww\.\S+/gi, " ");
 
-  const add = (raw: string) => {
+  const add = (raw: string, quoted = false) => {
     const cleaned = raw.replace(/^[`'"(\[]+|[`'".,;:)\]]+$/g, "").trim();
     if (!cleaned || cleaned.length > 200) return;
     if (!/^[\w./@-]+$/.test(cleaned)) return;
     if (!/\.[A-Za-z][\w]{0,9}$/.test(cleaned)) return; // needs a file extension
     if (/^\d+\.\d+$/.test(cleaned)) return; // version numbers
     if (cleaned.startsWith("http")) return;
+    if (NOT_FILENAMES.has(cleaned.toLowerCase())) return;
+    // Prose abbreviations are short stems with short extensions. A real file
+    // shaped that way — a.c, x.h — is written in backticks by anyone
+    // describing it, and that is the form molt trusts.
+    if (!quoted && !cleaned.includes("/")) {
+      const [stem = "", ext = ""] = [cleaned.slice(0, cleaned.lastIndexOf(".")), cleaned.slice(cleaned.lastIndexOf(".") + 1)];
+      if (stem.length <= 2 && ext.length <= 2) return;
+    }
     found.add(cleaned.replace(/^\.\//, ""));
   };
 
-  for (const m of text.matchAll(/`([^`]+)`/g)) add(m[1]);
+  for (const m of text.matchAll(/`([^`]+)`/g)) add(m[1], true);
   for (const m of text.matchAll(/[\w./@-]*[\w-]\.[A-Za-z][\w]{0,9}\b/g)) add(m[0]);
 
   return [...found];
@@ -391,9 +417,20 @@ function runBuiltin(builtin: BuiltinCheck, ctx: BarContext): { ok: boolean; outp
     }
 
     const written = new Set(ctx.ledger.map((e) => e.path));
+    // A file the model READ is grounded too. It refused a correct assessment
+    // of molt's own source because the source lives outside the project
+    // directory: the model had read engine.ts, quoted it accurately, and was
+    // told it had invented the name. Reading something is evidence it exists —
+    // it is the same evidence a write is, one step earlier.
+    const read = new Set<string>();
+    for (const p of ctx.read ?? []) {
+      read.add(p);
+      read.add(p.split("/").pop() ?? p);
+    }
     const ungrounded: string[] = [];
     for (const p of mentioned) {
       if (written.has(p)) continue;
+      if (read.has(p) || read.has(p.split("/").pop() ?? p)) continue;
       if (existsSync(resolve(ctx.cwd, p))) continue;
       ungrounded.push(p);
     }

@@ -496,6 +496,15 @@ export class Engine {
   private streamUsageUnsupported = false;
   /** Said once: this endpoint is not caching anything. */
   private warnedNoCache = false;
+  /**
+   * Every path the model read this session.
+   *
+   * Kept because reading a file is evidence it exists, and claims-grounded
+   * needs that evidence: a correct assessment of source living outside the
+   * project directory was refused as a fabrication, for naming files the model
+   * had just read.
+   */
+  private readPaths = new Set<string>();
   /** User turns handled this session. Numbers the jobs the meter reports. */
   private jobCount = 0;
   /**
@@ -780,6 +789,7 @@ export class Engine {
     return {
       cwd: this.cwd,
       record: this.transcript.record(),
+      read: [...this.readPaths],
       ledger: this.mergedLedger(),
       liveLedger: [...this.ledger],
       archive: this.cfg.archive,
@@ -894,6 +904,7 @@ export class Engine {
   private runTool(name: string, args: Record<string, unknown>, callId: string): string {
     switch (name) {
       case "read_file":
+        this.readPaths.add(String(args.path ?? ""));
         return readPart(
           resolve(this.cwd, String(args.path ?? "")),
           String(args.path ?? ""),
@@ -1264,6 +1275,8 @@ export class Engine {
     let proofAttempts = 0;
     /** The last bar result, for deciding whether another run could differ. */
     let lastResult: BarResult | null = null;
+    /** The previous attempt's failures, to notice a bar going nowhere. */
+    let lastFailure = "";
     this.actsSinceBar = 0;
 
     /**
@@ -1911,7 +1924,17 @@ export class Engine {
           ms: r.durationMs,
         })),
       });
-      const exhausted = !result.ok && proofAttempts >= maxAttempts;
+      // A bar failing in exactly the same way it failed last time is a bar the
+      // model is not converging on. It spent 1.13M tokens on one such loop,
+      // rewriting a correct document to satisfy a check that was wrong about
+      // it — so identical twice is enough.
+      const signature = result.results
+        .filter((r) => !r.ok)
+        .map((r) => `${r.name}:${r.output.trim()}`)
+        .join("|");
+      const stuck = !result.ok && signature === lastFailure;
+      lastFailure = signature;
+      const exhausted = !result.ok && (stuck || proofAttempts >= maxAttempts);
       const verdict = result.ok ? "accepted" : exhausted ? "exhausted" : "refused";
 
       if (this.cfg.receipts) {
@@ -1942,6 +1965,15 @@ export class Engine {
         log?.append("session_end", { reason: "bar not met", attempts: proofAttempts });
         yield { kind: "proof_exhausted", result, attempts: proofAttempts };
         const onlyWrites = failedOnlyWriteChecks(result);
+        if (stuck) {
+          yield {
+            kind: "info",
+            text:
+              "the bar failed in exactly the same way twice. Continuing would spend more " +
+              "tokens on a check the work is not moving — either the work cannot satisfy " +
+              "it, or the check is wrong about the work.",
+          };
+        }
         yield {
           kind: "error",
           text: onlyWrites
