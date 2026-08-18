@@ -116,6 +116,7 @@ const HELP = [
   "  start a line with ? to ask a question rather than request a change —",
   "  checks that require a file to change are not run for that turn.",
   "  arrows move · alt+arrows by word · ctrl+W/K/U cut · ctrl+A start · ctrl+E end",
+  "  you can keep typing while molt works — enter queues it for when the turn ends.",
   "",
   "  shift+V while molt is working (or ctrl+V any time) watches every call,",
   "  argument, and result — the same facts the session log records to disk.",
@@ -201,6 +202,8 @@ export function App({
   /** The line still being written, and whether anything streamed this turn. */
   const partial = useRef("");
   const streamed = useRef(false);
+  /** Things typed while molt was busy, waiting for the turn to end. */
+  const queued = useRef<string[]>([]);
   const [cost, setCost] = useState<number | undefined>(undefined);
   const [costEstimated, setCostEstimated] = useState(false);
   const [verbose, setVerbose] = useState(startVerbose);
@@ -1190,6 +1193,10 @@ export function App({
       } finally {
         setBusy(false);
       }
+
+      // Anything typed while that ran goes now, in the order it was typed.
+      const next = queued.current.shift();
+      if (next) submitRef.current?.(next);
     },
     [add, beginActivity, command, confirm, engine, handleEvent],
   );
@@ -1262,11 +1269,46 @@ export function App({
       return;
     }
 
-    // --- mid-stream: Ctrl-C cancels the turn rather than killing molt ---
+    // --- while a turn runs: ctrl+C cancels it, and you can still type ---
+    //
+    // Typing used to be swallowed entirely, so a thought that arrived while
+    // molt was working had to be held in your head until it finished. There is
+    // no reason for that: the line is yours, and enter queues it for the moment
+    // the turn ends.
+    //
+    // shift+V and shift+A still work here, but only on an empty line — the same
+    // rule as at an idle prompt. A letter is a command when there is nothing to
+    // type it into, and a letter otherwise.
     if (busy) {
-      if (key.ctrl && char === "c") engine.cancel();
-      else if (char === "V" && !key.ctrl && !key.meta) toggleVerbose();
-      else if (char === "A" && !key.ctrl && !key.meta) cycleAutonomy();
+      if (key.ctrl && char === "c") {
+        engine.cancel();
+        return;
+      }
+      if (input === "" && char === "V" && !key.ctrl && !key.meta) {
+        toggleVerbose();
+        return;
+      }
+      if (input === "" && char === "A" && !key.ctrl && !key.meta) {
+        cycleAutonomy();
+        return;
+      }
+      if (key.return) {
+        const text = input.trim();
+        if (text) {
+          setInput("");
+          queued.current.push(text);
+          add("info", `queued — molt will start this when the current turn ends: ${text}`);
+        }
+        return;
+      }
+      if (key.leftArrow) return edit(key.meta || key.ctrl ? wordLeft : left);
+      if (key.rightArrow) return edit(key.meta || key.ctrl ? wordRight : right);
+      if (key.backspace) return edit(backspace);
+      if (key.delete) return edit((l) => (l.at < l.text.length ? deleteForward(l) : backspace(l)));
+      if (key.ctrl && char === "w") return edit(deleteWord);
+      if (key.ctrl && char === "u") return edit(killToStart);
+      if (key.ctrl && char === "k") return edit(killToEnd);
+      if (char && !key.ctrl && !key.meta) edit((l) => insert(l, char));
       return;
     }
 
@@ -1679,6 +1721,8 @@ export function App({
                     {" \u00b7 "}
                     {verbose ? "shift+V closes" : "shift+V to watch"}
                   </Text>
+                  {/* The line is still yours while it works. */}
+                  <Text color={theme.text}>{input ? `  › ${input}` : ""}</Text>
                 </>
               ) : (
                 <>

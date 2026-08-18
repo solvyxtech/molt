@@ -514,12 +514,56 @@ describe("the transparency view", () => {
     }
   });
 
+  it("lets you type while it works, and runs it when the turn ends", async () => {
+    // Reported from use: "you also can't type when the model is thinking".
+    // Correct, and there was no reason for it — a thought that arrives mid-turn
+    // had to be held in your head until molt finished.
+    const t = await mount({ fetchFn: slowProvider(200) });
+    try {
+      void submit(t.stdin, "read the seed");
+      await tick(80);
+      for (const ch of "and then summarise it") t.stdin.press(ch);
+      await tick(60);
+      assert.match(t.stdout.lastFrame, /and then summarise it/, "typing was swallowed mid-turn");
+
+      t.stdin.press("\r");
+      await tick(60);
+      assert.match(t.stdout.lastFrame, /queued/, "enter mid-turn said nothing");
+      await tick(900);
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("keeps shift+V and shift+A on an empty line only", async () => {
+    // A letter is a command when there is nothing to type it into, and a
+    // letter otherwise — the same rule at an idle prompt and mid-turn.
+    const t = await mount({ fetchFn: slowProvider(200) });
+    try {
+      void submit(t.stdin, "read the seed");
+      await tick(80);
+      t.stdin.press("V");
+      await tick(60);
+      assert.match(t.stdout.lastFrame, /what the model is doing/, "shift+V stopped working");
+
+      // With something already typed, the same key is just a letter.
+      for (const ch of "then ") t.stdin.press(ch);
+      await tick(40);
+      for (const ch of "Verify") t.stdin.press(ch);
+      await tick(60);
+      assert.match(t.stdout.lastFrame, /then Verify/, "a capital was eaten mid-sentence");
+      await tick(900);
+    } finally {
+      t.cleanup();
+    }
+  });
+
   it("takes shift+A while the turn is running", async () => {
     const t = await mount({ fetchFn: slowProvider(150) });
     try {
       void submit(t.stdin, "read the seed");
       await tick(80);
-      t.stdin.press("A");
+      t.stdin.press("A"); // empty line, so it is the autonomy key
       await tick(600);
       assert.equal(t.engine.autonomy, "medium");
     } finally {

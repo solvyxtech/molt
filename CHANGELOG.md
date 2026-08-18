@@ -18,6 +18,20 @@ a number presented with more confidence than it was earned with.
   tears the terminal) and the full detail goes to the transcript, which is
   printed once and never redrawn — so the terminal's own scrollback keeps it
   all. Opening the view also prints everything recorded before you opened it.
+- **You can type while molt is working.** Keystrokes were swallowed for the
+  whole turn, so a thought that arrived mid-run had to be held until it
+  finished. The line is yours now, and enter queues it to start the moment the
+  turn ends. shift+V and shift+A still work there, but only on an empty line —
+  which is the same rule as at an idle prompt: a letter is a command when there
+  is nothing to type it into, and a letter otherwise.
+- **`claims-grounded` called `Date.now` a missing file.** It also flagged
+  `r.ok`, `String.replace`, `Journal.protect` and `//example.com`, and refused a
+  correct analysis over all of them. "Anything after a dot" describes a method
+  call as readily as a filename, so the extension is checked against a list of
+  actual file extensions now. An allowlist, because this check refuses work: an
+  extension missing from the list costs one unnoticed fabrication, and the
+  alternative cost a real session its completion for writing `Date.now()` in a
+  sentence.
 - **A prompt longer than the terminal was clipped, not wrapped.** The input row
   was a Box of sibling Texts, which lay out as flex children — cut at the edge
   of the window rather than reflowed — so the tail of a long prompt vanished and
