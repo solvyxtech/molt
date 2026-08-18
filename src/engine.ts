@@ -354,14 +354,16 @@ function sha256Of(p: string): string | null {
 /**
  * What a watcher is shown of a tool's arguments or its result.
  *
- * Verbatim head, capped. Never a summary — a transparency view that
- * paraphrases is just another claim to check, and molt does not summarize
- * with a model anywhere else either.
+ * Everything the model got. Not a summary, not a head — the result was already
+ * capped on its way to the model, and capping it again on its way to the
+ * person watching means the two of you are looking at different things. That
+ * is the one outcome a transparency view cannot have.
+ *
+ * The bound is the tool-result cap itself, so what you see is exactly what the
+ * model saw, byte for byte.
  */
-export const CAPTURE_MAX_CHARS = 600;
-
 function capture(s: string): string {
-  return s.length <= CAPTURE_MAX_CHARS ? s : s.slice(0, CAPTURE_MAX_CHARS) + "…";
+  return s;
 }
 
 /**

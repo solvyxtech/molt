@@ -94,8 +94,14 @@ type Job = {
   outcome?: JobOutcome;
 };
 
-/** Feed lines kept in memory. Bounded: this is a window, not a second log. */
-const FEED_MEMORY = 300;
+/**
+ * Feed lines kept in memory.
+ *
+ * Generous, because this is what `v` reveals about what already happened, and
+ * a transparency view whose memory is shorter than the session is a view that
+ * hides the beginning of it. Still bounded: the durable copy is .molt/log.
+ */
+const FEED_MEMORY = 5_000;
 /** Feed lines on screen at once. The panel must never outgrow the viewport. */
 const FEED_ROWS = 9;
 /** Finished jobs listed under the running one. */
@@ -197,6 +203,9 @@ export function App({
   const [costEstimated, setCostEstimated] = useState(false);
   const [verbose, setVerbose] = useState(startVerbose);
   const [feed, setFeed] = useState<Feed[]>([]);
+  // Read inside `note`, which must not be rebuilt every time the view opens or
+  // closes — a new identity there would re-run every effect that depends on it.
+  const verboseRef = useRef(startVerbose);
   const [jobs, setJobs] = useState<Job[]>([]);
   // The splash is the one moving thing on screen at startup, and the
   // transcript cannot be printed permanently above something still moving.
@@ -229,18 +238,32 @@ export function App({
   }, []);
 
   /**
-   * Record a line for the live feed.
+   * Record a line for the live feed, and — when the view is open — for the
+   * transcript as well.
    *
-   * Written whether or not the view is open: `v` reveals what already
-   * happened rather than starting a recording. Bounded, because the durable
-   * copy of all of this is the session log on disk.
+   * The panel has to stay a fixed height, because a live region that grows is
+   * a live region a terminal cannot repaint without tearing; that was the
+   * original viewer bug. But "bounded" and "truncated" are different
+   * promises, and transparency needs the second one broken, not the first.
+   *
+   * So the panel keeps showing the tail, and the full detail goes into the
+   * transcript, which is printed once and never redrawn. Your terminal's own
+   * scrollback then holds every line of it, at full width, for as long as the
+   * session lasts.
    */
-  const note = useCallback((text: string, dim = false) => {
-    setFeed((prev) => {
-      const next = [...prev, { id: nextId.current++, text, dim }];
-      return next.length > FEED_MEMORY ? next.slice(-FEED_MEMORY) : next;
-    });
-  }, []);
+  const note = useCallback(
+    (text: string, dim = false) => {
+      const id = nextId.current++;
+      setFeed((prev) => {
+        const next = [...prev, { id, text, dim }];
+        return next.length > FEED_MEMORY ? next.slice(-FEED_MEMORY) : next;
+      });
+      if (verboseRef.current) {
+        setLines((prev) => [...prev, { id: nextId.current++, tone: "info", text: `  ${text}` }]);
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!engine.hasBar) {
@@ -322,7 +345,9 @@ export function App({
           for (const l of r.output.trim().split("\n").slice(0, 4)) note(`      ${l}`, true);
         }
         if (!r.ok) {
-          for (const l of r.output.trim().split("\n").slice(0, 8)) {
+          // The whole failure. A check's output is the evidence for a refusal,
+          // and evidence with the end cut off is an assertion.
+          for (const l of r.output.trim().split("\n")) {
             add(r.advisory ? "info" : "fail", `        ${l}`);
           }
         }
@@ -386,7 +411,9 @@ export function App({
           if (ev.bytes !== undefined) {
             note(`    → ${ev.bytes} bytes${ev.note ? ` · ${ev.note}` : ""}`, true);
           }
-          for (const l of (ev.preview ?? "").split("\n").slice(0, 5)) {
+          // Every line of it. A view that shows five lines of a forty-line
+          // result is asking you to trust the other thirty-five.
+          for (const l of (ev.preview ?? "").split("\n")) {
             if (l.trim()) note(`    │ ${l}`, true);
           }
           beginActivity("thinking");
@@ -572,6 +599,20 @@ export function App({
 
   const toggleVerbose = useCallback(() => {
     setVerbose((v) => {
+      verboseRef.current = !v;
+      // Opening the view prints everything it has been recording, so what you
+      // get is the session so far and not just the session from here on.
+      if (!v) {
+        setFeed((current) => {
+          setLines((prev) => [
+            ...prev,
+            { id: nextId.current++, tone: "info", text: "── everything recorded so far ──" },
+            ...current.map((f) => ({ id: nextId.current++, tone: "info" as const, text: `  ${f.text}` })),
+            { id: nextId.current++, tone: "info", text: "── live from here ──" },
+          ]);
+          return current;
+        });
+      }
       // Said in the feed, not the transcript: a keypress that permanently
       // prints a line into the record is a keypress people stop pressing.
       note(
