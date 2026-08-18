@@ -76,6 +76,7 @@ Headless, for scripts and CI — exits non-zero when the bar is not met:
 
 ```bash
 molt run "fix the failing test" --yes
+molt ask "what does the bar check here?"   # a question, not a change
 molt prove                    # run the checks now, without the model
 molt run "..." --json         # machine-readable event stream
 molt prove --skip slow        # tag selection, for the inner loop
@@ -249,6 +250,7 @@ Type `/` to browse. `↑↓` chooses, `tab` fills, `enter` runs, `esc` clears �
 nothing has to be typed in full or looked up.
 
 ```
+/ask <question>    a question, not a change (or start a line with ?)
 /prove             run the bar now, without the model
 /bar               show the current bar
 /init              write a starter .molt/done.yml
@@ -273,7 +275,7 @@ nothing has to be typed in full or looked up.
 Being specific about this matters more here than anywhere else.
 
 - **Three tools** — read, write, bash. Everything else is shell. No MCP, no sub-agents, no orchestration.
-- **`files-changed` fails read-only tasks by design.** If a task legitimately changes nothing, leave that check out of your bar.
+- **`files-changed` fails read-only tasks by design.** Ask a question with a leading `?` (or `/ask`, or `molt ask`) and molt runs the rest of the bar without it. molt will not decide this for you: the only party that knows whether "done" meant a change is you, and the only other candidate — asking the model whether its own claim needs proving — is precisely the decision molt exists to take away from it. If a project never verifies writes, leave the check out of your bar.
 - **A passing bar is not proof of correctness.** It proves your declared checks ran and passed against real state. A weak bar proves little — that is your call to make, visibly, in a file you commit.
 - **Not benchmarked against other harnesses yet.** `rnd/grade.mjs` runs scenarios with hidden graders against any agent CLI, and molt scores 4/4 on its own four scenarios — which is worth exactly what a self-run benchmark is worth. Four scenarios supports "harnesses differ measurably", not a ranking. Adapters and scenarios from people who are not me are the thing that makes those numbers mean anything.
 - **No novelty claim.** Every ingredient here exists somewhere else; see [docs/prior-art.md](docs/prior-art.md). What molt claims is behavioural and testable: it refuses to say done without proving it.

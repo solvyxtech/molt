@@ -89,6 +89,11 @@ Four properties make it worth trusting:
   the log does not also record — with the exception that the log stores
   digests where the screen shows content, deliberately (see below).
 
+When a bar is narrowed for a turn — asking a question with `?` or `/ask` drops
+the checks that require a file to change — the panel and the transcript both
+say how many were dropped, and the receipt lists only the checks that actually
+ran. A narrowed bar is stated; it is never quietly applied.
+
 Verification is narrated the same way: the checks are named before they run,
 and the result leads with the count, the duration, and what failed.
 

@@ -27,6 +27,12 @@ export type Command = {
 
 export const COMMANDS: Command[] = [
   { name: "/help", summary: "list every command" },
+  {
+    name: "/ask",
+    args: "<question>",
+    summary: "a question, not a change (or start a line with ?)",
+    aliases: ["question", "lookup", "read-only"],
+  },
   { name: "/prove", summary: "run the bar now, without the model" },
   { name: "/bar", summary: "show the checks this project requires" },
   { name: "/init", summary: "write a starter .molt/done.yml" },

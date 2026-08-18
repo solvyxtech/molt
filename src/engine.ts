@@ -128,6 +128,30 @@ const SECRET_ENV = [
   "MISTRAL_API_KEY",
 ];
 
+/** Per-turn options. Nothing here changes the session's configuration. */
+export type RunOptions = {
+  /**
+   * Treat the turn as a question. Checks that cannot be satisfied without a
+   * file change are not run — a lookup or an explanation can never satisfy
+   * one, and refusing an honest answer for failing to invent work punishes
+   * exactly the behaviour molt is built to encourage.
+   */
+  ask?: boolean;
+};
+
+/**
+ * The bar minus the checks that require a write to pass. Only
+ * `files-changed` is inherently one: every other check reads state that a
+ * read-only turn can still satisfy, so it stays.
+ */
+export function withoutWriteChecks(bar?: Bar | null): Bar | null {
+  if (!bar) return null;
+  return {
+    ...bar,
+    checks: bar.checks.filter((c) => !(c.kind === "builtin" && c.builtin === "files-changed")),
+  };
+}
+
 export type EngineConfig = {
   baseUrl: string;
   apiKey?: string;
@@ -186,6 +210,18 @@ function capture(s: string): string {
   return s.length <= CAPTURE_MAX_CHARS ? s : s.slice(0, CAPTURE_MAX_CHARS) + "…";
 }
 
+/**
+ * Name the failing check when the ONLY thing standing between a turn and an
+ * answer is a check that demands a write. Read-only work — a question, a
+ * lookup, an explanation — can never satisfy one, so the refusal needs to
+ * say that in the user's terms rather than read as molt malfunctioning.
+ */
+function failedOnlyWriteChecks(result: BarResult): string | null {
+  const failed = result.results.filter((r) => !r.ok);
+  if (failed.length === 0) return null;
+  return failed.every((r) => r.detail === "files-changed") ? failed.map((r) => r.name).join(", ") : null;
+}
+
 function truncateResult(s: string): { text: string; note?: string } {
   const bytes = Buffer.byteLength(s, "utf8");
   if (bytes <= TOOL_RESULT_MAX_BYTES) return { text: s };
@@ -217,6 +253,15 @@ export class Engine {
   private streamUsageUnsupported = false;
   /** User turns handled this session. Numbers the jobs the meter reports. */
   private jobCount = 0;
+  /**
+   * Tool calls the model has been allowed to make since the bar last ran.
+   *
+   * The proof loop's premise is that the model can act on what failed. When
+   * it has acted on nothing, the same bar is about to be run against the
+   * same state — and molt was doing exactly that, four times, at the cost of
+   * a full test suite each round.
+   */
+  private actsSinceBar = 0;
   budgetTokens?: number;
   /** Exact JSON body of the most recent request — the wire, unhidden. */
   lastRequestBody?: string;
@@ -601,8 +646,8 @@ export class Engine {
    * rewrote mid-task is not a bar, so the edit is reported as a failure
    * rather than quietly honoured.
    */
-  private runBarGuarded(claim?: string): BarResult {
-    const bar = this.cfg.bar!;
+  private runBarGuarded(claim?: string, override?: Bar | null): BarResult {
+    const bar = override ?? this.cfg.bar!;
     const t0 = Date.now();
     const now = barFingerprint(this.cwd);
     if (this.barHash !== null && now !== this.barHash) {
@@ -627,6 +672,48 @@ export class Engine {
     return runBar(bar, this.barContext(claim));
   }
 
+  /**
+   * Close out a turn whose claim was never proven: write the receipt, log
+   * the ending, and report it as a failure. Shared by the exhausted path and
+   * the one that stops early because nothing changed, so both produce the
+   * same evidence — a refusal that skips the receipt is a refusal nobody can
+   * audit later.
+   */
+  private async *finishUnproven(
+    claim: string,
+    result: BarResult,
+    attempts: number,
+    log?: Journal,
+  ): AsyncGenerator<EngineEvent> {
+    const onlyWrites = failedOnlyWriteChecks(result);
+    if (this.cfg.receipts) {
+      const receipt = this.cfg.receipts.write({
+        claim,
+        result,
+        attempt: attempts,
+        verdict: "exhausted",
+        model: this.cfg.model,
+        provider: this.provider,
+        sessionTokens: this.sessionTokens,
+        shedBatches: this.transcript.shedCount,
+      });
+      log?.append("receipt", { verdict: "exhausted", file: receipt.path, attempt: attempts });
+      yield { kind: "receipt", path: receipt.path };
+    }
+    log?.append("session_end", { reason: "bar not met", attempts });
+    yield { kind: "proof_exhausted", result, attempts };
+    yield {
+      kind: "error",
+      text: onlyWrites
+        ? `bar not met: ${onlyWrites} requires this turn to have changed a file, and none ` +
+          `changed. molt is reporting failure rather than success. Either the work was not ` +
+          `done, or this was a question — ask questions with /ask, or a leading "?", which ` +
+          `runs the rest of the bar and drops that one check.`
+        : `bar not met after ${attempts} attempts. molt is reporting failure rather ` +
+          `than success. See .molt/receipts/ for what was checked.`,
+    };
+  }
+
   /** Run the bar without touching the loop — backs the /prove command. */
   proveNow(claim?: string): BarResult | null {
     if (!this.cfg.bar) return null;
@@ -642,7 +729,11 @@ export class Engine {
    * turn, and reported when the turn ends. Nothing about the session totals
    * changes; a job is a view of them, never a reset.
    */
-  async *run(userText: string, confirm: Confirm): AsyncGenerator<EngineEvent> {
+  async *run(
+    userText: string,
+    confirm: Confirm,
+    opts: RunOptions = {},
+  ): AsyncGenerator<EngineEvent> {
     const job = ++this.jobCount;
     const startedAt = Date.now();
     const before = this.meter();
@@ -655,7 +746,7 @@ export class Engine {
 
     yield { kind: "job_start", job, text: userText };
 
-    for await (const ev of this.runTurn(userText, confirm, job)) {
+    for await (const ev of this.runTurn(userText, confirm, job, opts)) {
       switch (ev.kind) {
         case "step_summary":
           steps += 1;
@@ -708,6 +799,7 @@ export class Engine {
     userText: string,
     confirm: Confirm,
     job: number,
+    opts: RunOptions = {},
   ): AsyncGenerator<EngineEvent> {
     // Remember where this turn began so a cancellation can leave no trace.
     const turnStart = this.transcript.length;
@@ -721,6 +813,25 @@ export class Engine {
     const fetchFn = this.cfg.fetchFn ?? fetch;
     const maxAttempts = this.cfg.maxProofAttempts ?? MAX_PROOF_ATTEMPTS;
     let proofAttempts = 0;
+    /** The last bar result, for deciding whether another run could differ. */
+    let lastResult: BarResult | null = null;
+    this.actsSinceBar = 0;
+
+    // A question changes nothing, so a check that demands a change can only
+    // ever fail it. `ask` drops exactly those checks for this turn and runs
+    // the rest — the bar is narrowed in the open, never quietly lowered, and
+    // the receipt records which checks actually ran.
+    const bar = opts.ask ? withoutWriteChecks(this.cfg.bar) : this.cfg.bar;
+    if (opts.ask) {
+      const dropped = (this.cfg.bar?.checks.length ?? 0) - (bar?.checks.length ?? 0);
+      log?.append("note", { text: `ask turn — ${dropped} write-dependent check(s) not run` });
+      if (dropped > 0) {
+        yield {
+          kind: "info",
+          text: `asking: ${dropped} check(s) that require a file change are not run this turn`,
+        };
+      }
+    }
 
     for (let step = 0; step < MAX_STEPS; step++) {
       if (this.overBudget()) {
@@ -1043,6 +1154,7 @@ export class Engine {
             sha256: createHash("sha256").update(result, "utf8").digest("hex").slice(0, 16),
           });
           called.push(name);
+          if (allowed) this.actsSinceBar += 1;
           yield {
             kind: "tool",
             name,
@@ -1064,22 +1176,45 @@ export class Engine {
       // ---- The model believes it is finished. That is a claim. ----
       const claim = msg.content ?? "";
 
-      if (!this.cfg.bar || this.cfg.bar.checks.length === 0) {
+      if (!bar || bar.checks.length === 0) {
         yield {
           kind: "info",
-          text: "no .molt/done.yml — completion is unverified. run `molt init` to add a bar.",
+          text: opts.ask
+            ? "nothing left in the bar to check a question against — this answer is unverified."
+            : "no .molt/done.yml — completion is unverified. run `molt init` to add a bar.",
         };
         if (claim) yield { kind: "assistant_text", text: claim };
+        return;
+      }
+
+      // Nothing has happened since the last bar run, so the bar cannot
+      // answer differently. Say so and stop, rather than spending another
+      // suite — and another turn's tokens — proving it.
+      if (lastResult !== null && this.actsSinceBar === 0) {
+        log?.append("bar_skipped", {
+          attempt: proofAttempts,
+          reason: "no tool calls since the last bar run; state is unchanged",
+          failed: lastResult.results.filter((r) => !r.ok).map((r) => r.name).join(", "),
+        });
+        yield {
+          kind: "info",
+          text:
+            "the model changed nothing since the last check, so re-running the bar would " +
+            "produce the same result. Stopping instead of spending another attempt.",
+        };
+        yield* this.finishUnproven(claim, lastResult, proofAttempts, log);
         return;
       }
 
       proofAttempts += 1;
       yield {
         kind: "proof_start",
-        checks: this.cfg.bar.checks.length,
-        names: this.cfg.bar.checks.map((c) => c.name),
+        checks: bar.checks.length,
+        names: bar.checks.map((c) => c.name),
       };
-      const result = this.runBarGuarded(claim);
+      const result = this.runBarGuarded(claim, bar);
+      this.actsSinceBar = 0;
+      lastResult = result;
       log?.append("bar_run", {
         attempt: proofAttempts,
         ok: result.ok,
@@ -1124,11 +1259,16 @@ export class Engine {
       if (exhausted) {
         log?.append("session_end", { reason: "bar not met", attempts: proofAttempts });
         yield { kind: "proof_exhausted", result, attempts: proofAttempts };
+        const onlyWrites = failedOnlyWriteChecks(result);
         yield {
           kind: "error",
-          text:
-            `bar not met after ${proofAttempts} attempts. molt is reporting failure rather ` +
-            `than success. See .molt/receipts/ for what was checked.`,
+          text: onlyWrites
+            ? `bar not met: ${onlyWrites} requires this turn to have changed a file, and ` +
+              `none changed. molt is reporting failure rather than success. Either the work ` +
+              `was not done, or this was a question — ask questions with /ask, or a leading ` +
+              `"?", which runs the rest of the bar and drops that one check.`
+            : `bar not met after ${proofAttempts} attempts. molt is reporting failure rather ` +
+              `than success. See .molt/receipts/ for what was checked.`,
         };
         return;
       }

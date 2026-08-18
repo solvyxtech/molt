@@ -30,6 +30,7 @@ export type JournalKind =
   | "tool_result"
   | "permission"
   | "bar_run"
+  | "bar_skipped"
   | "shed"
   | "elide"
   | "regrow"
@@ -219,6 +220,9 @@ export class Journal {
           break;
         case "permission":
           out.push(`${t}  permission ${d.allowed ? "granted" : "DENIED"}: ${d.name} ${d.detail}`);
+          break;
+        case "bar_skipped":
+          out.push(`${t}  bar skipped · ${d.reason}${d.failed ? ` · still failing: ${d.failed}` : ""}`);
           break;
         case "bar_run":
           out.push(`${t}  bar ${d.ok ? "PASS" : "FAIL"} ${d.passed}/${d.total}${d.failed ? ` · failed: ${d.failed}` : ""} · ${d.ms}ms`);

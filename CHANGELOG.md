@@ -35,7 +35,25 @@ a number presented with more confidence than it was earned with.
   `usage.cost`), and only when *every* step reported one — a total that blends
   a billed step with a priced one is neither figure.
 
+- **`/ask`, and a leading `?`.** A question changes nothing, so a bar that
+  requires a change can only ever refuse it — and molt would rather refuse an
+  honest answer than accept an invented file edit. Asking runs the rest of the
+  bar and drops only the checks that need a write, says which it dropped, and
+  records it in the receipt. `molt ask "<question>"` headlessly.
+
+  molt does not infer this. The only party that knows whether "done" meant a
+  change is the person who asked, and the only other candidate — letting the
+  model decide whether its own claim needs proving — is the decision the whole
+  tool exists to take away from it.
+
 ### Fixed
+
+- **The proof loop re-ran the bar against state nothing had touched.** A model
+  that repeated its claim without calling a tool got the full four attempts,
+  each paying for a complete test suite, and each necessarily reaching the
+  same verdict. molt now stops as soon as an attempt cannot differ from the
+  last, says why, and still writes the receipt. Reported from the field as a
+  loop when asking questions in a repo whose bar requires a write.
 
 - **Streaming responses carry no usage block unless asked, so every cost was a
   guess.** molt now sends `stream_options: {include_usage: true}` and falls
@@ -97,7 +115,25 @@ claim literally true.
   evidence to lose.** Shedding must shrink context, never the ability to
   prove what happened.
 
+- **`/ask`, and a leading `?`.** A question changes nothing, so a bar that
+  requires a change can only ever refuse it — and molt would rather refuse an
+  honest answer than accept an invented file edit. Asking runs the rest of the
+  bar and drops only the checks that need a write, says which it dropped, and
+  records it in the receipt. `molt ask "<question>"` headlessly.
+
+  molt does not infer this. The only party that knows whether "done" meant a
+  change is the person who asked, and the only other candidate — letting the
+  model decide whether its own claim needs proving — is the decision the whole
+  tool exists to take away from it.
+
 ### Fixed
+
+- **The proof loop re-ran the bar against state nothing had touched.** A model
+  that repeated its claim without calling a tool got the full four attempts,
+  each paying for a complete test suite, and each necessarily reaching the
+  same verdict. molt now stops as soon as an attempt cannot differ from the
+  last, says why, and still writes the receipt. Reported from the field as a
+  loop when asking questions in a repo whose bar requires a write.
 
 - **`record-intact` broke every reopened project.** It required the archive to
   hold exactly what the current session shed, but the archive is per project
@@ -180,7 +216,25 @@ artifact molt cannot silently edit.
 - **`docs/transparency.md`** — what is recorded, what is deliberately not,
   and how to reconstruct any claim end to end.
 
+- **`/ask`, and a leading `?`.** A question changes nothing, so a bar that
+  requires a change can only ever refuse it — and molt would rather refuse an
+  honest answer than accept an invented file edit. Asking runs the rest of the
+  bar and drops only the checks that need a write, says which it dropped, and
+  records it in the receipt. `molt ask "<question>"` headlessly.
+
+  molt does not infer this. The only party that knows whether "done" meant a
+  change is the person who asked, and the only other candidate — letting the
+  model decide whether its own claim needs proving — is the decision the whole
+  tool exists to take away from it.
+
 ### Fixed
+
+- **The proof loop re-ran the bar against state nothing had touched.** A model
+  that repeated its claim without calling a tool got the full four attempts,
+  each paying for a complete test suite, and each necessarily reaching the
+  same verdict. molt now stops as soon as an attempt cannot differ from the
+  last, says why, and still writes the receipt. Reported from the field as a
+  loop when asking questions in a repo whose bar requires a write.
 
 - **"cancelled — the session is unchanged" was not literally true.** The user
   turn was pushed before the request, so a cancellation left it behind.
@@ -226,7 +280,25 @@ session. Shrinking them is a rounding error.
   replacement says plainly what happened. Mechanical, idempotent, and the
   full original stays in the archived record.
 
+- **`/ask`, and a leading `?`.** A question changes nothing, so a bar that
+  requires a change can only ever refuse it — and molt would rather refuse an
+  honest answer than accept an invented file edit. Asking runs the rest of the
+  bar and drops only the checks that need a write, says which it dropped, and
+  records it in the receipt. `molt ask "<question>"` headlessly.
+
+  molt does not infer this. The only party that knows whether "done" meant a
+  change is the person who asked, and the only other candidate — letting the
+  model decide whether its own claim needs proving — is the decision the whole
+  tool exists to take away from it.
+
 ### Fixed
+
+- **The proof loop re-ran the bar against state nothing had touched.** A model
+  that repeated its claim without calling a tool got the full four attempts,
+  each paying for a complete test suite, and each necessarily reaching the
+  same verdict. molt now stops as soon as an attempt cannot differ from the
+  last, says why, and still writes the receipt. Reported from the field as a
+  loop when asking questions in a repo whose bar requires a write.
 
 - **Stale bar failures were carried forever.** Each refusal appended a full
   failure message that was resent on every subsequent request, so attempt 3
@@ -274,7 +346,25 @@ against a real provider before behaviour changes.
   splitting tool arguments at an inconvenient boundary, so the demo and the
   grader exercise the streaming path rather than only the JSON one.
 
+- **`/ask`, and a leading `?`.** A question changes nothing, so a bar that
+  requires a change can only ever refuse it — and molt would rather refuse an
+  honest answer than accept an invented file edit. Asking runs the rest of the
+  bar and drops only the checks that need a write, says which it dropped, and
+  records it in the receipt. `molt ask "<question>"` headlessly.
+
+  molt does not infer this. The only party that knows whether "done" meant a
+  change is the person who asked, and the only other candidate — letting the
+  model decide whether its own claim needs proving — is the decision the whole
+  tool exists to take away from it.
+
 ### Fixed
+
+- **The proof loop re-ran the bar against state nothing had touched.** A model
+  that repeated its claim without calling a tool got the full four attempts,
+  each paying for a complete test suite, and each necessarily reaching the
+  same verdict. molt now stops as soon as an attempt cannot differ from the
+  last, says why, and still writes the receipt. Reported from the field as a
+  loop when asking questions in a repo whose bar requires a write.
 
 - **The round-trip test was measuring the wrong thing.** It asserted seeded
   facts were recoverable from the archive *plus* context combined — which
@@ -356,7 +446,25 @@ can't say "done" without proving it.**
 - **`rnd/mock-provider.mjs` and `rnd/demo.sh`** — four scripted model
   personalities with known-correct outcomes, graded automatically.
 
+- **`/ask`, and a leading `?`.** A question changes nothing, so a bar that
+  requires a change can only ever refuse it — and molt would rather refuse an
+  honest answer than accept an invented file edit. Asking runs the rest of the
+  bar and drops only the checks that need a write, says which it dropped, and
+  records it in the receipt. `molt ask "<question>"` headlessly.
+
+  molt does not infer this. The only party that knows whether "done" meant a
+  change is the person who asked, and the only other candidate — letting the
+  model decide whether its own claim needs proving — is the decision the whole
+  tool exists to take away from it.
+
 ### Fixed
+
+- **The proof loop re-ran the bar against state nothing had touched.** A model
+  that repeated its claim without calling a tool got the full four attempts,
+  each paying for a complete test suite, and each necessarily reaching the
+  same verdict. molt now stops as soon as an attempt cannot differ from the
+  last, says why, and still writes the receipt. Reported from the field as a
+  loop when asking questions in a repo whose bar requires a write.
 
 - **Shedding could not fire inside a long tool run.** `planShed` only cut on
   user turns, so a single request producing thirty tool calls — exactly when

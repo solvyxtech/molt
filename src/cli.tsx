@@ -32,6 +32,7 @@ const USAGE = `molt ${VERSION} — a coding agent that can't say "done" without 
 usage
   molt                      interactive session
   molt run "<task>"         headless; exits non-zero if the bar is not met
+  molt ask "<question>"     a question, not a change — no work-landed check
   molt prove                run .molt/done.yml now and exit
   molt init                 write a starter .molt/done.yml
   molt doctor               check the endpoint and model
@@ -338,9 +339,13 @@ function printBar(result: BarResult): void {
   }
 }
 
-async function cmdRun(args: Args): Promise<number> {
+async function cmdRun(args: Args, ask = false): Promise<number> {
   if (!args.task) {
-    process.stderr.write('molt: run needs a task, e.g. molt run "fix the failing test"\n');
+    process.stderr.write(
+      ask
+        ? 'molt: ask needs a question, e.g. molt ask "what does the bar check?"\n'
+        : 'molt: run needs a task, e.g. molt run "fix the failing test"\n',
+    );
     return 2;
   }
   // The TUI refuses this at the prompt; headless has to refuse it too, or a
@@ -472,7 +477,7 @@ async function cmdRun(args: Args): Promise<number> {
     return false;
   };
 
-  for await (const ev of engine.run(args.task, confirm)) {
+  for await (const ev of engine.run(args.task, confirm, { ask })) {
     emit(ev);
     if (ev.kind === "proof_exhausted" || ev.kind === "error") failed = true;
     if (ev.kind === "assistant_text") sawAnswer = true;
@@ -754,6 +759,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   switch (args.cmd) {
     case "run":
       return cmdRun(args);
+    case "ask":
+      return cmdRun(args, true);
     case "prove":
       return cmdProve(args);
     case "init":
