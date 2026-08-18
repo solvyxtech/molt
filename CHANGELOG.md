@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — the meter says what it knows
+## Unreleased — the meter says what it knows, and you set the ceiling
 
 The status line quoted a cost to six decimal places from a price nobody had
 checked, and the TUI showed a spinner where the work was. Both are the same
@@ -9,8 +9,25 @@ a number presented with more confidence than it was earned with.
 
 ### Added
 
-- **The live view — press `v`** while a turn is running (`ctrl+V` any time, or
-  `/verbose`). A bounded panel showing what the model is doing right now, the
+- **Autonomy levels — `shift+A`.** low (default) asks about every command and
+  every write, as before; medium runs reads, writes inside the project, and
+  commands that only report; high runs everything except what cannot be undone.
+  The level sits beside the model in the status line the whole time it is in
+  force, cycles with one key while molt is working *and* while it is asking
+  permission, and is also `/autonomy <level>` or `--autonomy <level>`. `--yes`
+  now means high.
+
+  The classifier is mechanical and denies by default: a short allowlist of
+  reporting commands, judged segment by segment, with redirection, command
+  substitution, leading assignments, and `sudo` disqualified because their
+  effect is not readable from the text. Leaving the project and anything
+  irreversible (`rm -rf`, `git push`, `git reset --hard`, piping a download
+  into a shell, …) ask at every level, including high. Unasked calls are marked
+  `[auto]` on screen and journalled with the level that allowed them, and
+  moving the ceiling is journalled too. It governs what molt asks about, not
+  what is possible — see `docs/autonomy.md`.
+- **The live view — press `shift+V`** while a turn is running (`ctrl+V` any
+  time, or `/verbose`). A bounded panel showing what the model is doing right now, the
   exact arguments of every tool call, the head of every result, each check's
   command and duration, and what every job has cost. Feed lines are recorded
   whether or not the view is open, so the key reveals what already happened
@@ -66,9 +83,10 @@ a number presented with more confidence than it was earned with.
   prompted this — was then used forever, and survived every model switch.
   Unattributed prices are now re-fetched rather than trusted.
 - **Sub-cent costs rendered as `$0.000024`** — six digits to count in the one
-  field that has to be legible at a glance. Decimals now scale to the
-  magnitude, floored at four, and a cost resting on molt's own token estimate
-  is prefixed `~` so a guess and a bill do not look alike.
+  field that has to be legible at a glance. Cost is now three decimals at the
+  most (`$0.003`), with `<$0.001` below that rather than a false zero, and a
+  cost resting on molt's own token estimate is prefixed `~` so a guess and a
+  bill do not look alike.
 - **The meter changed unit as it climbed.** Quoting small sums in cents made
   the session total read `0.9¢` and then `$0.029` — which looks like it went
   down. Cost is always in dollars now; only the decimals move.

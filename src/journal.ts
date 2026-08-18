@@ -29,6 +29,7 @@ export type JournalKind =
   | "tool_call"
   | "tool_result"
   | "permission"
+  | "autonomy"
   | "bar_run"
   | "bar_skipped"
   | "shed"
@@ -219,7 +220,13 @@ export class Journal {
           out.push(`${t}    ${d.bytes} bytes${d.truncated ? " (truncated)" : ""}${d.note ? ` [${d.note}]` : ""}`);
           break;
         case "permission":
-          out.push(`${t}  permission ${d.allowed ? "granted" : "DENIED"}: ${d.name} ${d.detail}`);
+          out.push(
+            `${t}  permission ${d.allowed ? "granted" : "DENIED"}${d.asked === false ? " (auto)" : ""}: ` +
+              `${d.name} ${d.detail}${d.autonomy ? ` [autonomy ${d.autonomy}]` : ""}`,
+          );
+          break;
+        case "autonomy":
+          out.push(`${t}  autonomy ${d.from} → ${d.to} · ${d.means}`);
           break;
         case "bar_skipped":
           out.push(`${t}  bar skipped · ${d.reason}${d.failed ? ` · still failing: ${d.failed}` : ""}`);

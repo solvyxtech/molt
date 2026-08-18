@@ -45,8 +45,14 @@ export const COMMANDS: Command[] = [
   { name: "/wire", summary: "exact JSON of the last request" },
   { name: "/budget", args: "<n|off>", summary: "hard token ceiling for this session", aliases: ["tokens"] },
   {
+    name: "/autonomy",
+    args: "[low|medium|high]",
+    summary: "how much molt does without asking (shift+A)",
+    aliases: ["auto", "permissions", "yes", "approve"],
+  },
+  {
     name: "/verbose",
-    summary: "watch every call, argument, and result (press v)",
+    summary: "watch every call, argument, and result (shift+V)",
     aliases: ["detail", "transparency", "watch", "view"],
   },
   {

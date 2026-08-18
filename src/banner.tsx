@@ -76,6 +76,14 @@ export type SessionStatus = {
   contextTokens?: number;
   /** Estimated outbound size of an in-flight request. */
   pendingEst?: number;
+  /**
+   * How much molt is doing without asking.
+   *
+   * Sits beside the model because the two together are the answer to "what
+   * is about to happen on my machine, and who said it could": a level is
+   * only a control if it is visible while it is in force.
+   */
+  autonomy?: "low" | "medium" | "high";
 };
 
 export type FrameOptions = {
@@ -108,17 +116,16 @@ function fmtTokens(n: number): string {
  *    is worse than the zeros — the reader cannot tell rising from falling
  *    without doing arithmetic in their head.
  *
- * So: always dollars, with the decimals scaled to the magnitude and floored
- * at four. Everything above a hundredth of a cent reads directly, the widest
- * form is "$0.0009", and below that molt says "under" rather than rounding a
- * real charge to nothing.
+ * So: always dollars, three decimals at the most, and "under" below that.
+ * The widest form is "$0.003"; a step too cheap to render at that precision
+ * says "<$0.001" rather than claiming a false zero. Precision is spent on
+ * the running totals, which is where it is read.
  */
 export function fmtCost(usd: number): string {
   if (!Number.isFinite(usd) || usd <= 0) return "$0.00";
   if (usd >= 0.1) return `$${usd.toFixed(2)}`;
-  if (usd >= 0.01) return `$${usd.toFixed(3)}`;
-  if (usd >= 0.0001) return `$${usd.toFixed(4)}`;
-  return "<$0.0001";
+  if (usd >= 0.001) return `$${usd.toFixed(3)}`;
+  return "<$0.001";
 }
 
 /**
@@ -185,8 +192,9 @@ export function statusSegments(s: SessionStatus, maxWidth = COLS): Segment[] {
 
   // Model names run long (qwen2.5-coder-32b-instruct-q4_K_M). The model
   // yields first, since provider and cost are short and non-negotiable.
+  const auto = s.autonomy ? `auto ${s.autonomy}`.length + SEP.length : 0;
   const seps = tail ? SEP.length * 2 : SEP.length;
-  const room = Math.max(8, maxWidth - s.provider.length - seps - tail.length);
+  const room = Math.max(8, maxWidth - s.provider.length - seps - auto - tail.length);
   const model =
     s.model.length > room ? s.model.slice(0, room - 2) + ".." : s.model;
 
@@ -195,6 +203,11 @@ export function statusSegments(s: SessionStatus, maxWidth = COLS): Segment[] {
     { text: SEP, tone: "ghost" },
     { text: model, tone: "mid" },
   ];
+  if (s.autonomy) {
+    segs.push({ text: SEP, tone: "ghost" });
+    // High autonomy is the one state on this row worth catching your eye.
+    segs.push({ text: `auto ${s.autonomy}`, tone: s.autonomy === "high" ? "accent" : "dim" });
+  }
   if (tail) {
     segs.push({ text: SEP, tone: "ghost" });
     segs.push({ text: tail, tone: "dim" });

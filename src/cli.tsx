@@ -10,6 +10,7 @@
 import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Archive } from "./archive.js";
+import { isAutonomy, type Autonomy } from "./autonomy.js";
 import { fmtCost, fmtDuration } from "./banner.js";
 import { BarError, hasBar, loadBar, selectChecks, writeDefaultBar } from "./bar.js";
 import { Engine } from "./engine.js";
@@ -64,7 +65,11 @@ options
   --budget <n>       hard token ceiling for the session
   --auto-shed <n>    shed once history exceeds n tokens
   --attempts <n>     completion attempts before molt reports failure (default 4)
-  --yes              auto-approve tool calls (use in sandboxes only)
+  --autonomy <level> low | medium | high — how much runs without asking
+                     low asks about every command and write (default)
+                     medium runs reads, read-only commands, project writes
+                     high runs everything except what cannot be undone
+  --yes              auto-approve every tool call (same as --autonomy high)
   --json             machine-readable output (run/prove/stats/receipts)
   --no-stream        disable token streaming (default: streaming on)
   --only <tags>      run only checks with these tags (comma separated)
@@ -93,6 +98,7 @@ type Args = {
   budget?: number;
   autoShed?: number;
   attempts?: number;
+  autonomy?: Autonomy;
   only?: string[];
   skip?: string[];
   grep?: string;
@@ -207,6 +213,12 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
       case "-v":
         out.verbose = true;
         break;
+      case "--autonomy": {
+        const level = next();
+        if (!isAutonomy(level)) throw new Error(`--autonomy takes low, medium, or high`);
+        out.autonomy = level;
+        break;
+      }
       case "--yes":
       case "-y":
         out.yes = true;
@@ -286,6 +298,8 @@ function buildEngine(args: Args): Engine {
     maxProofAttempts: args.attempts,
     autoShedAtTokens: args.autoShed,
     stream: args.stream,
+    // --yes predates autonomy and means the same thing as its top level.
+    autonomy: args.yes ? "high" : args.autonomy,
   });
 }
 
@@ -469,10 +483,12 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
     }
   };
 
+  // Nobody is watching a headless run, so a call that would prompt is
+  // refused rather than waited on. Autonomy decides which calls those are:
+  // the engine only asks about what the level does not cover.
   const confirm = async (name: string, detail: string) => {
-    if (args.yes) return true;
     process.stderr.write(
-      `molt: refusing ${name} (${detail}) — headless runs need --yes to act on the filesystem\n`,
+      `molt: refusing ${name} (${detail}) — raise --autonomy, or pass --yes, for headless work\n`,
     );
     return false;
   };

@@ -1,0 +1,94 @@
+# Autonomy — how much molt does without asking
+
+Every approval prompt is a tax on a decision that was going to be "yes". A
+prompt you always approve has stopped being a control and become a reflex, and
+a reflex is worse than nothing: it trains you to click through the one that
+mattered.
+
+So the decision moves up a layer. You say how far molt may go; molt asks only
+at the edge of it, and shows the level on screen the whole time it is in force.
+
+```
+xai · grok-4.6 · auto medium · 12k tokens · $0.012
+```
+
+**shift+A** cycles low → medium → high → low, while molt is working and while
+it is asking you something — the two places the prompt takes no typing. At an
+idle prompt a capital letter is usually the start of a sentence, so there it is
+`ctrl+A`, or `/autonomy <level>`. Headlessly: `--autonomy <level>`.
+
+## The levels
+
+| level | runs without asking |
+|---|---|
+| **low** (default) | Reading a file inside the project. Nothing else. |
+| **medium** | Reads, writes **inside the project**, and commands that only report. |
+| **high** | Everything except what cannot be undone, or what leaves the project. |
+
+`--yes` is `--autonomy high`.
+
+## What "only reports" means
+
+Mechanically, not approximately. A command is read-only when **every** segment
+of it — split on `;`, `&&`, `||`, and `|` — starts with something whose whole
+purpose is to report:
+
+- `ls cat head tail wc nl sort uniq cut tr diff cmp jq find fd file stat tree
+  du df pwd echo printf which whoami date basename dirname realpath readlink
+  grep rg ag ack env uname hostname`
+- `git` with `status log diff show branch remote ls-files rev-parse blame
+  describe shortlog cat-file tag config stash`
+- `npm` / `pnpm` / `yarn` / `npx` with `test run ls why outdated view`
+- `curl` / `wget` **without** a flag that makes it write or send a payload
+  (`-X --request -d --data -F --form -T --upload-file -o --output -O`)
+
+Anything else asks. Three rules make that safe rather than merely tidy:
+
+1. **Deny by default.** An unrecognised command asks. A tool molt gains next
+   year asks, because a level written today cannot have consented to it.
+2. **Opaque constructions ask.** Redirection (`>`, `<`), command substitution
+   (`$(…)`, backticks), a leading `VAR=value`, and `sudo` all mean the effect
+   is not readable from the text, so it is not judged — it is asked about.
+3. **A chain is judged by its worst link.** `git status && rm -rf build` is not
+   a read.
+
+## What is never automatic
+
+At **every** level, including high:
+
+- **Leaving the project.** Reading or writing a path outside the directory
+  molt was pointed at. molt was aimed at one tree; no level implies consent
+  beyond it.
+- **What cannot be undone.** `rm -r`/`rm -f`, `rmdir`, `sudo`, `git push`,
+  `git reset --hard`, `git clean -f`, `git branch -D`, `npm publish`, piping a
+  download into a shell, `dd of=`, `mkfs`, `chmod 777`, `shutdown`, `pkill`.
+
+## What it is not
+
+**It is not a sandbox.** These levels decide what molt *asks about*, not what
+is possible. A command that runs can do anything you can do; the classifier is
+a convenience over a permission prompt, not a boundary enforced by the
+operating system. High autonomy on a machine that matters is your call to
+make — which is why the level is always on screen while it is in force.
+
+**It is not a way around the bar.** Autonomy governs permission; the bar
+governs completion. A turn that ran forty commands unattended still has to
+prove it finished, and a failing check still refuses the claim.
+
+## The record
+
+Every tool call is journalled with the decision that let it through:
+
+```
+04:33:49  permission granted (auto): bash grep -rn verify src/ [autonomy medium]
+04:33:50  permission granted: write_file ../other/x.ts [autonomy medium]
+04:33:52  autonomy medium → high · runs everything except what cannot be undone
+```
+
+A call nobody was asked about is exactly what an audit needs to find, so it is
+recorded as `auto`, with the level in force at the time — and marked `[auto]`
+in the transcript as it happens. Moving the ceiling is journalled too: a
+session record that does not say when the level changed cannot explain why a
+command ran unattended.
+
+See [transparency.md](transparency.md) for the log itself.

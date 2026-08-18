@@ -32,6 +32,13 @@ import {
   type ModelChoice,
   type PickerRow,
 } from "./providers.js";
+import {
+  AUTONOMY_SUMMARY,
+  DEFAULT_AUTONOMY,
+  isAutonomy,
+  nextAutonomy,
+  type Autonomy,
+} from "./autonomy.js";
 import { DEFAULT_THEME, getTheme, nextTheme } from "./theme.js";
 import type { BarResult, EngineEvent, JobOutcome } from "./types.js";
 
@@ -83,8 +90,9 @@ const HELP = [
   "  type / to browse · ↑↓ to choose · tab to fill · enter to run",
   "  start a line with ? to ask a question rather than request a change —",
   "  checks that require a file to change are not run for that turn.",
-  "  press v while molt is working (or ctrl+V any time) to watch every call,",
+  "  shift+V while molt is working (or ctrl+V any time) watches every call,",
   "  argument, and result — the same facts the session log records to disk.",
+  "  shift+A raises how much molt does without asking. ctrl+A at the prompt.",
 ].join("\n");
 
 /** Tokens, at a width that does not make the line jitter as it climbs. */
@@ -165,6 +173,7 @@ export function App({
   // The splash is the one moving thing on screen at startup, and the
   // transcript cannot be printed permanently above something still moving.
   const [settled, setSettled] = useState(false);
+  const [autonomy, setAutonomyState] = useState<Autonomy>(engine.autonomy ?? DEFAULT_AUTONOMY);
 
   // Picker state. `login-key` is the one mode that must never echo what you
   // type, so it is a distinct state rather than a flag on a shared one.
@@ -327,7 +336,13 @@ export function App({
           // The duration earns its place next to the call it describes, not
           // in a summary at the end where it cannot be acted on.
           const took = ev.durationMs === undefined ? "" : `  ${fmtDuration(ev.durationMs)}`;
-          add("tool", `${ev.name}  ${ev.detail}${ev.note ? `  [${ev.note}]` : ""}${took}`);
+          // A call nobody was asked about says so. Autonomy is a convenience,
+          // and the record of what it let through has to be readable without
+          // opening the log.
+          add(
+            "tool",
+            `${ev.name}  ${ev.detail}${ev.note ? `  [${ev.note}]` : ""}${ev.auto ? "  [auto]" : ""}${took}`,
+          );
           // The exact call and the head of what came back. Verbatim: a
           // transparency view that paraphrases is one more thing to verify.
           note(`· ${ev.name} ${ev.detail}${took}`);
@@ -485,13 +500,33 @@ export function App({
   // every render would re-fire it on every frame of the animation.
   const onSettle = useCallback(() => setSettled(true), []);
 
+  /**
+   * Move the autonomy ceiling.
+   *
+   * Announced in the transcript rather than the feed: this is the one setting
+   * that changes what molt may do to the machine, so the record of the
+   * session has to carry it whether or not anyone had the view open.
+   */
+  const applyAutonomy = useCallback(
+    (level: Autonomy) => {
+      engine.setAutonomy(level);
+      setAutonomyState(level);
+      add("info", `autonomy: ${level} — ${AUTONOMY_SUMMARY[level]}`);
+    },
+    [add, engine],
+  );
+
+  const cycleAutonomy = useCallback(() => {
+    applyAutonomy(nextAutonomy(engine.autonomy));
+  }, [applyAutonomy, engine]);
+
   const toggleVerbose = useCallback(() => {
     setVerbose((v) => {
       // Said in the feed, not the transcript: a keypress that permanently
       // prints a line into the record is a keypress people stop pressing.
       note(
         v
-          ? "view closed — v while working, ctrl+V any time"
+          ? "view closed — shift+V while working, ctrl+V any time"
           : "view open: every call, argument, and result, as recorded in .molt/log",
       );
       return !v;
@@ -727,6 +762,28 @@ export function App({
           void submitRef.current?.(arg, { ask: true });
           return true;
         }
+        case "/autonomy":
+        case "/auto": {
+          if (!arg) {
+            add(
+              "info",
+              `autonomy: ${engine.autonomy} — ${AUTONOMY_SUMMARY[engine.autonomy]}\n` +
+                `  low     ${AUTONOMY_SUMMARY.low}\n` +
+                `  medium  ${AUTONOMY_SUMMARY.medium}\n` +
+                `  high    ${AUTONOMY_SUMMARY.high}\n` +
+                "  shift+A cycles while molt is working or while it is asking.\n" +
+                "  Levels decide what molt asks about, not what is possible — a command that\n" +
+                "  runs can do anything you can.",
+            );
+            return true;
+          }
+          if (!isAutonomy(arg)) {
+            add("error", "usage: /autonomy <low|medium|high>");
+            return true;
+          }
+          applyAutonomy(arg);
+          return true;
+        }
         case "/verbose":
         case "/detail":
           toggleVerbose();
@@ -910,6 +967,7 @@ export function App({
     },
     [
       add,
+      applyAutonomy,
       engine,
       exit,
       persistEndpoint,
@@ -964,6 +1022,17 @@ export function App({
   useInput((char, key) => {
     // --- permission prompt: arrows choose, enter commits, no typing ---
     if (pending) {
+      // The prompt is exactly where "stop asking me this" is decided, so the
+      // autonomy key works here. Raising the ceiling does not answer the
+      // question in front of you — that stays a deliberate keypress.
+      if (char === "A") {
+        cycleAutonomy();
+        return;
+      }
+      if (char === "V") {
+        toggleVerbose();
+        return;
+      }
       if (key.leftArrow || key.upArrow) {
         setPromptChoice((i) => wrapIndex(i - 1, 2));
         return;
@@ -994,18 +1063,27 @@ export function App({
       return;
     }
 
-    // --- the transparency view. Ctrl-V works anywhere; a bare `v` is bound
-    // only while a turn is running, where the prompt takes no typing and a
-    // letter can therefore never be part of a message. ---
+    // --- shift+V opens the view, shift+A moves the autonomy ceiling.
+    //
+    // Both are bound while a turn is running and while molt is asking
+    // permission — the two places the prompt takes no typing, so a letter is
+    // free. At an idle prompt a capital letter is the first character of a
+    // sentence far more often than it is a command, so there they are
+    // ctrl+V / ctrl+A, or /verbose and /autonomy. ---
     if (key.ctrl && (char === "v" || char === "\u0016")) {
       toggleVerbose();
+      return;
+    }
+    if (key.ctrl && (char === "a" || char === "\u0001")) {
+      cycleAutonomy();
       return;
     }
 
     // --- mid-stream: Ctrl-C cancels the turn rather than killing molt ---
     if (busy) {
       if (key.ctrl && char === "c") engine.cancel();
-      else if ((char === "v" || char === "V") && !key.ctrl && !key.meta) toggleVerbose();
+      else if (char === "V" && !key.ctrl && !key.meta) toggleVerbose();
+      else if (char === "A" && !key.ctrl && !key.meta) cycleAutonomy();
       return;
     }
 
@@ -1204,8 +1282,8 @@ export function App({
       {verbose && (
         <Box flexDirection="column" marginTop={1}>
           <Text color={theme.dim}>
-            {fit(`── what the model is doing ${"─".repeat(Math.max(2, room - 38))}`)}
-            <Text color={theme.ghost}>  v closes</Text>
+            {fit(`── what the model is doing ${"─".repeat(Math.max(2, room - 44))}`)}
+            <Text color={theme.ghost}>  shift+V closes</Text>
           </Text>
 
           {running ? (
@@ -1261,7 +1339,9 @@ export function App({
               </Text>
             ))}
           </Box>
-          <Text color={theme.ghost}>  ←→ choose · enter confirm · esc deny</Text>
+          <Text color={theme.ghost}>
+            {`  ←→ choose · enter confirm · esc deny · shift+A autonomy (${autonomy}) · shift+V watch`}
+          </Text>
         </Box>
       ) : (
         <Box flexDirection="column" marginTop={1}>
@@ -1325,7 +1405,7 @@ export function App({
                   )}
                   <Text color={theme.ghost}>
                     {" \u00b7 "}
-                    {verbose ? "v closes this" : "v to watch"}
+                    {verbose ? "shift+V closes" : "shift+V to watch"}
                   </Text>
                 </>
               ) : (
@@ -1382,6 +1462,7 @@ export function App({
           sessionTokens: tokens,
           costUsd: cost,
           costEstimated,
+          autonomy,
           budgetTokens: engine.budgetTokens,
         }}
       />

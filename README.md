@@ -77,6 +77,7 @@ Headless, for scripts and CI — exits non-zero when the bar is not met:
 ```bash
 molt run "fix the failing test" --yes
 molt ask "what does the bar check here?"   # a question, not a change
+molt run "..." --autonomy medium           # fewer prompts, same boundaries
 molt prove                    # run the checks now, without the model
 molt run "..." --json         # machine-readable event stream
 molt prove --skip slow        # tag selection, for the inner loop
@@ -169,13 +170,13 @@ Every step closes with one line saying what it did and what it cost:
   the failures above go back to the model; it keeps working
 ```
 
-Press **`v`** while molt is working — `ctrl+V` any time, `/verbose` as a
+Press **shift+V** while molt is working — `ctrl+V` any time, `/verbose` as a
 command, `--verbose` headlessly — to open the live view: what the model is
 doing right now, the exact arguments of each call, the head of each result,
 each check's command and duration, and **what every job has cost**.
 
 ```
-── what the model is doing ──────────────────────────────────  v closes
+── what the model is doing ─────────────────────────────  shift+V closes
   job 3 · rewrite the auth guard · 2 step(s) · 8.0k in (3.0k cached) · 45 out · $0.012 · 4.2s
   · read_file src/auth.ts  12ms
       args {"path":"src/auth.ts"}
@@ -190,9 +191,32 @@ each check's command and duration, and **what every job has cost**.
 It is a bounded panel, not an expanding scrollback: the transcript above it is
 printed once and never redrawn, which is what stops a long session from
 tearing itself apart in a terminal that cannot scroll backwards. Detail is
-recorded whether or not the view is open, so `v` shows what already happened
-rather than starting a recording. Nothing in it is paraphrased — a
+recorded whether or not the view is open, so shift+V shows what already
+happened rather than starting a recording. Nothing in it is paraphrased — a
 transparency view that summarizes is one more claim to check.
+
+### How much it does without asking
+
+**shift+A** cycles the autonomy ceiling — low, medium, high — while molt is
+working and while it is asking you to approve something, which is exactly where
+"stop asking me this" gets decided. The level sits beside the model in the
+status line the whole time it is in force.
+
+| level | runs without asking |
+|---|---|
+| **low** (default) | reading a file inside the project, and nothing else |
+| **medium** | reads, writes inside the project, and commands that only report |
+| **high** | everything except what cannot be undone, or what leaves the project |
+
+The classifier is mechanical and conservative — a short allowlist of commands
+whose purpose is to report, judged segment by segment, with redirection and
+substitution disqualified because their effect is not readable from the text.
+Anything unrecognised asks. `rm -rf`, `sudo`, `git push`, and writing outside
+the project ask at *every* level, including high. A call that ran unasked is
+marked `[auto]` as it happens and journalled with the level that allowed it.
+
+It decides what molt asks about, not what is possible: a command that runs can
+do anything you can. See [docs/autonomy.md](docs/autonomy.md).
 
 ### What a turn cost
 
@@ -251,6 +275,7 @@ nothing has to be typed in full or looked up.
 
 ```
 /ask <question>    a question, not a change (or start a line with ?)
+/autonomy [level]  how much molt does without asking  (shift+A)
 /prove             run the bar now, without the model
 /bar               show the current bar
 /init              write a starter .molt/done.yml
@@ -263,7 +288,7 @@ nothing has to be typed in full or looked up.
 /bom               context bill of materials
 /wire              exact JSON of the last request
 /budget <n|off>    hard token ceiling
-/verbose           watch every call, argument, and result  (press v)
+/verbose           watch every call, argument, and result  (shift+V)
 /price             what this model costs, per 1M tokens
 /model <id>        switch model
 /molt              cycle theme
@@ -297,6 +322,7 @@ The test suite includes a 400-transcript fuzz asserting that shedding never prod
 - [docs/why.md](docs/why.md) — the gap molt closes, and a worked example of confident wrong claims caught by the habits molt encodes
 - [docs/done-yml.md](docs/done-yml.md) — the completion bar
 - [docs/transparency.md](docs/transparency.md) — what is recorded and how to check it
+- [docs/autonomy.md](docs/autonomy.md) — what runs without asking, and what never does
 - [docs/receipts.md](docs/receipts.md) · [docs/shed.md](docs/shed.md) · [docs/metrics.md](docs/metrics.md)
 - [docs/prior-art.md](docs/prior-art.md) — what came before, credited by name
 
