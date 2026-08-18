@@ -25,6 +25,39 @@ function writeBar(dir: string, yaml: string): void {
   writeFileSync(join(dir, ".molt", "done.yml"), yaml, "utf8");
 }
 
+describe("switching endpoints", () => {
+  it("does not carry the model across", () => {
+    // Reported from use: after logging into Anthropic the status line read
+    // `anthropic · grok-4.6` — a pairing that exists nowhere, shown as fact,
+    // on the row whose whole job is to say what you are pointed at.
+    const engine = new Engine({
+      baseUrl: "https://api.x.ai/v1",
+      model: "grok-4.6",
+      provider: "xai",
+      cwd: ws(),
+      bar: null,
+    });
+    assert.equal(engine.model, "grok-4.6");
+
+    engine.setBaseUrl("https://api.anthropic.com/v1", "k", "anthropic");
+    assert.equal(engine.provider, "anthropic");
+    assert.equal(engine.model, "", "a model name belongs to the endpoint that serves it");
+  });
+
+  it("keeps the model when the endpoint has not moved", () => {
+    // Re-authenticating against the same endpoint is not a switch.
+    const engine = new Engine({
+      baseUrl: "https://api.x.ai/v1",
+      model: "grok-4.6",
+      provider: "xai",
+      cwd: ws(),
+      bar: null,
+    });
+    engine.setBaseUrl("https://api.x.ai/v1", "new-key", "xai");
+    assert.equal(engine.model, "grok-4.6");
+  });
+});
+
 describe("doctor", () => {
   const endpoint = (ids: string[]) =>
     (async (url: string) => {

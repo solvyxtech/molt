@@ -40,6 +40,7 @@ import {
   walk,
 } from "./files.js";
 import { Journal } from "./journal.js";
+import { authHeaders } from "./providers.js";
 import { Receipts } from "./receipts.js";
 import { readStream, type Usage } from "./stream.js";
 import { Transcript, toolDetail } from "./transcript.js";
@@ -555,8 +556,17 @@ export class Engine {
     this.barHash = barFingerprint(this.cwd);
   }
 
-  /** Point at a different endpoint. Resets the session — different world. */
+  /**
+   * Point at a different endpoint. Resets the session — different world.
+   *
+   * The model goes with it. A model name belongs to the endpoint that serves
+   * it, so carrying `grok-4.6` across a login to Anthropic produced a status
+   * line reading `anthropic · grok-4.6` — a combination that exists nowhere,
+   * displayed as fact, on the row whose whole job is to answer "what am I
+   * pointed at?". Better to say nothing and ask for a model.
+   */
   setBaseUrl(url: string, apiKey?: string, provider?: string): void {
+    if (url !== this.cfg.baseUrl) this.cfg.model = "";
     this.cfg.baseUrl = url;
     this.cfg.apiKey = apiKey;
     this.cfg.journal?.protect(apiKey);
@@ -1028,7 +1038,7 @@ export class Engine {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}),
+          ...authHeaders(this.cfg.baseUrl, this.cfg.apiKey),
         },
         // `tools` must be present even to say "use none of them" — a
         // tool_choice without a tools array is a 400 on at least xAI, and the
@@ -1363,7 +1373,7 @@ export class Engine {
           signal: controller.signal,
           headers: {
             "content-type": "application/json",
-            ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}),
+            ...authHeaders(this.cfg.baseUrl, this.cfg.apiKey),
           },
           body: (this.lastRequestBody = JSON.stringify({
             model: this.cfg.model,
@@ -1880,9 +1890,7 @@ export class Engine {
     const fetchFn = this.cfg.fetchFn ?? fetch;
     const base = this.cfg.baseUrl.replace(/\/$/, "");
     try {
-      const res = await fetchFn(`${base}/models`, {
-        headers: this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {},
-      });
+      const res = await fetchFn(`${base}/models`, { headers: authHeaders(base, this.cfg.apiKey) });
       if (!res.ok) return { ok: false, detail: `HTTP ${res.status} from ${base}/models` };
       const json = (await res.json().catch(() => null)) as { data?: { id?: string }[] } | null;
       const ids = (json?.data ?? []).map((m) => m.id).filter(Boolean) as string[];
@@ -1914,9 +1922,7 @@ export class Engine {
     const fetchFn = this.cfg.fetchFn ?? fetch;
     const base = baseUrl.replace(/\/$/, "");
     try {
-      const res = await fetchFn(`${base}/models`, {
-        headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
-      });
+      const res = await fetchFn(`${base}/models`, { headers: authHeaders(base, apiKey) });
       if (!res.ok) return { ok: false, error: `HTTP ${res.status} from ${base}/models` };
       const json = (await res.json().catch(() => null)) as { data?: { id?: string }[] } | null;
       const ids = (json?.data ?? []).map((m) => m.id).filter(Boolean) as string[];

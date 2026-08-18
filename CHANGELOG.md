@@ -105,6 +105,34 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **`/model` listed no Anthropic models after a successful login.** Their
+  compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
+  but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
+  working key produced a 401 on the model list and an empty provider in the
+  picker. Headers are now chosen per endpoint.
+- **Logging in changed the provider but kept the old model**, so the status
+  line read `anthropic · grok-4.6` — a pairing that exists nowhere, shown as
+  fact, on the row whose entire job is to say what you are pointed at. A model
+  belongs to the endpoint that serves it; switching endpoints clears it, and
+  the picker opens straight away. With no model selected the hint now says
+  `/model` when a key is already stored, rather than telling someone who just
+  logged in to log in.
+- **`grep` could hang molt indefinitely.** A pattern the model wrote —
+  `(a+)+$` against a long line — ran with no timeout, no output, and no way
+  back. `bash` and bar checks have had timeouts all along; the tool running
+  model-supplied input had none. Nested quantifiers are declined before they
+  run (naming the simpler equivalent), with a 5s deadline and a line-length cap
+  behind that.
+- **The project boundary was crossable by a symlink.** `insideProject` resolved
+  lexically, so a link inside the project pointing anywhere read as "inside" —
+  and a model at high autonomy can create that link itself. Resolved through
+  symlinks now, including for files that do not exist yet.
+- **`molt doctor` exited 0 with a model the endpoint does not have**, so a
+  preflight passed and every subsequent request failed at the provider.
+- **A model drifting its read offset a few lines at a time** ran to the step
+  guard — 32 steps, 99,000 tokens — because a window overlapping an earlier one
+  by 99% is not *contained* by it. What counts is how much of a read is new.
+  Same shape now stops in 3 steps.
 - **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
   on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
   deleted what the model had just read, and the model went back to read it
@@ -261,6 +289,34 @@ claim literally true.
 
 ### Fixed
 
+- **`/model` listed no Anthropic models after a successful login.** Their
+  compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
+  but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
+  working key produced a 401 on the model list and an empty provider in the
+  picker. Headers are now chosen per endpoint.
+- **Logging in changed the provider but kept the old model**, so the status
+  line read `anthropic · grok-4.6` — a pairing that exists nowhere, shown as
+  fact, on the row whose entire job is to say what you are pointed at. A model
+  belongs to the endpoint that serves it; switching endpoints clears it, and
+  the picker opens straight away. With no model selected the hint now says
+  `/model` when a key is already stored, rather than telling someone who just
+  logged in to log in.
+- **`grep` could hang molt indefinitely.** A pattern the model wrote —
+  `(a+)+$` against a long line — ran with no timeout, no output, and no way
+  back. `bash` and bar checks have had timeouts all along; the tool running
+  model-supplied input had none. Nested quantifiers are declined before they
+  run (naming the simpler equivalent), with a 5s deadline and a line-length cap
+  behind that.
+- **The project boundary was crossable by a symlink.** `insideProject` resolved
+  lexically, so a link inside the project pointing anywhere read as "inside" —
+  and a model at high autonomy can create that link itself. Resolved through
+  symlinks now, including for files that do not exist yet.
+- **`molt doctor` exited 0 with a model the endpoint does not have**, so a
+  preflight passed and every subsequent request failed at the provider.
+- **A model drifting its read offset a few lines at a time** ran to the step
+  guard — 32 steps, 99,000 tokens — because a window overlapping an earlier one
+  by 99% is not *contained* by it. What counts is how much of a read is new.
+  Same shape now stops in 3 steps.
 - **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
   on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
   deleted what the model had just read, and the model went back to read it
@@ -437,6 +493,34 @@ artifact molt cannot silently edit.
 
 ### Fixed
 
+- **`/model` listed no Anthropic models after a successful login.** Their
+  compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
+  but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
+  working key produced a 401 on the model list and an empty provider in the
+  picker. Headers are now chosen per endpoint.
+- **Logging in changed the provider but kept the old model**, so the status
+  line read `anthropic · grok-4.6` — a pairing that exists nowhere, shown as
+  fact, on the row whose entire job is to say what you are pointed at. A model
+  belongs to the endpoint that serves it; switching endpoints clears it, and
+  the picker opens straight away. With no model selected the hint now says
+  `/model` when a key is already stored, rather than telling someone who just
+  logged in to log in.
+- **`grep` could hang molt indefinitely.** A pattern the model wrote —
+  `(a+)+$` against a long line — ran with no timeout, no output, and no way
+  back. `bash` and bar checks have had timeouts all along; the tool running
+  model-supplied input had none. Nested quantifiers are declined before they
+  run (naming the simpler equivalent), with a 5s deadline and a line-length cap
+  behind that.
+- **The project boundary was crossable by a symlink.** `insideProject` resolved
+  lexically, so a link inside the project pointing anywhere read as "inside" —
+  and a model at high autonomy can create that link itself. Resolved through
+  symlinks now, including for files that do not exist yet.
+- **`molt doctor` exited 0 with a model the endpoint does not have**, so a
+  preflight passed and every subsequent request failed at the provider.
+- **A model drifting its read offset a few lines at a time** ran to the step
+  guard — 32 steps, 99,000 tokens — because a window overlapping an earlier one
+  by 99% is not *contained* by it. What counts is how much of a read is new.
+  Same shape now stops in 3 steps.
 - **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
   on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
   deleted what the model had just read, and the model went back to read it
@@ -576,6 +660,34 @@ session. Shrinking them is a rounding error.
 
 ### Fixed
 
+- **`/model` listed no Anthropic models after a successful login.** Their
+  compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
+  but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
+  working key produced a 401 on the model list and an empty provider in the
+  picker. Headers are now chosen per endpoint.
+- **Logging in changed the provider but kept the old model**, so the status
+  line read `anthropic · grok-4.6` — a pairing that exists nowhere, shown as
+  fact, on the row whose entire job is to say what you are pointed at. A model
+  belongs to the endpoint that serves it; switching endpoints clears it, and
+  the picker opens straight away. With no model selected the hint now says
+  `/model` when a key is already stored, rather than telling someone who just
+  logged in to log in.
+- **`grep` could hang molt indefinitely.** A pattern the model wrote —
+  `(a+)+$` against a long line — ran with no timeout, no output, and no way
+  back. `bash` and bar checks have had timeouts all along; the tool running
+  model-supplied input had none. Nested quantifiers are declined before they
+  run (naming the simpler equivalent), with a 5s deadline and a line-length cap
+  behind that.
+- **The project boundary was crossable by a symlink.** `insideProject` resolved
+  lexically, so a link inside the project pointing anywhere read as "inside" —
+  and a model at high autonomy can create that link itself. Resolved through
+  symlinks now, including for files that do not exist yet.
+- **`molt doctor` exited 0 with a model the endpoint does not have**, so a
+  preflight passed and every subsequent request failed at the provider.
+- **A model drifting its read offset a few lines at a time** ran to the step
+  guard — 32 steps, 99,000 tokens — because a window overlapping an earlier one
+  by 99% is not *contained* by it. What counts is how much of a read is new.
+  Same shape now stops in 3 steps.
 - **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
   on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
   deleted what the model had just read, and the model went back to read it
@@ -717,6 +829,34 @@ against a real provider before behaviour changes.
 
 ### Fixed
 
+- **`/model` listed no Anthropic models after a successful login.** Their
+  compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
+  but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
+  working key produced a 401 on the model list and an empty provider in the
+  picker. Headers are now chosen per endpoint.
+- **Logging in changed the provider but kept the old model**, so the status
+  line read `anthropic · grok-4.6` — a pairing that exists nowhere, shown as
+  fact, on the row whose entire job is to say what you are pointed at. A model
+  belongs to the endpoint that serves it; switching endpoints clears it, and
+  the picker opens straight away. With no model selected the hint now says
+  `/model` when a key is already stored, rather than telling someone who just
+  logged in to log in.
+- **`grep` could hang molt indefinitely.** A pattern the model wrote —
+  `(a+)+$` against a long line — ran with no timeout, no output, and no way
+  back. `bash` and bar checks have had timeouts all along; the tool running
+  model-supplied input had none. Nested quantifiers are declined before they
+  run (naming the simpler equivalent), with a 5s deadline and a line-length cap
+  behind that.
+- **The project boundary was crossable by a symlink.** `insideProject` resolved
+  lexically, so a link inside the project pointing anywhere read as "inside" —
+  and a model at high autonomy can create that link itself. Resolved through
+  symlinks now, including for files that do not exist yet.
+- **`molt doctor` exited 0 with a model the endpoint does not have**, so a
+  preflight passed and every subsequent request failed at the provider.
+- **A model drifting its read offset a few lines at a time** ran to the step
+  guard — 32 steps, 99,000 tokens — because a window overlapping an earlier one
+  by 99% is not *contained* by it. What counts is how much of a read is new.
+  Same shape now stops in 3 steps.
 - **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
   on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
   deleted what the model had just read, and the model went back to read it
@@ -892,6 +1032,34 @@ can't say "done" without proving it.**
 
 ### Fixed
 
+- **`/model` listed no Anthropic models after a successful login.** Their
+  compatibility layer accepts `Authorization: Bearer` on `/chat/completions`
+  but not on `/models`, which wants `x-api-key` and `anthropic-version` — so a
+  working key produced a 401 on the model list and an empty provider in the
+  picker. Headers are now chosen per endpoint.
+- **Logging in changed the provider but kept the old model**, so the status
+  line read `anthropic · grok-4.6` — a pairing that exists nowhere, shown as
+  fact, on the row whose entire job is to say what you are pointed at. A model
+  belongs to the endpoint that serves it; switching endpoints clears it, and
+  the picker opens straight away. With no model selected the hint now says
+  `/model` when a key is already stored, rather than telling someone who just
+  logged in to log in.
+- **`grep` could hang molt indefinitely.** A pattern the model wrote —
+  `(a+)+$` against a long line — ran with no timeout, no output, and no way
+  back. `bash` and bar checks have had timeouts all along; the tool running
+  model-supplied input had none. Nested quantifiers are declined before they
+  run (naming the simpler equivalent), with a 5s deadline and a line-length cap
+  behind that.
+- **The project boundary was crossable by a symlink.** `insideProject` resolved
+  lexically, so a link inside the project pointing anywhere read as "inside" —
+  and a model at high autonomy can create that link itself. Resolved through
+  symlinks now, including for files that do not exist yet.
+- **`molt doctor` exited 0 with a model the endpoint does not have**, so a
+  preflight passed and every subsequent request failed at the provider.
+- **A model drifting its read offset a few lines at a time** ran to the step
+  guard — 32 steps, 99,000 tokens — because a window overlapping an earlier one
+  by 99% is not *contained* by it. What counts is how much of a read is new.
+  Same shape now stops in 3 steps.
 - **Paging and pruning combined into a 661,000-token loop.** Elision was keyed
   on the file path, so lines 401-440 of a file "superseded" lines 1-40 — molt
   deleted what the model had just read, and the model went back to read it

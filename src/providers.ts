@@ -41,6 +41,33 @@ export function keyedProviders(): string[] {
   return Object.keys(PROVIDERS).filter((n) => PROVIDERS[n]!.needsKey);
 }
 
+/**
+ * Headers that authenticate a request to a given endpoint.
+ *
+ * Nearly every OpenAI-compatible provider takes `Authorization: Bearer`, and
+ * molt sent only that. Anthropic's compatibility layer accepts it on
+ * /chat/completions but *not* on /models, which wants `x-api-key` and
+ * `anthropic-version` — so a key that worked perfectly well for chat produced
+ * a 401 on the model list, and /model showed an empty provider. Both header
+ * styles go out to hosts that want them; a header a provider does not know is
+ * a header it ignores.
+ */
+export function authHeaders(baseUrl: string, apiKey?: string): Record<string, string> {
+  if (!apiKey) return {};
+  const headers: Record<string, string> = { authorization: `Bearer ${apiKey}` };
+  let host = "";
+  try {
+    host = new URL(baseUrl).hostname;
+  } catch {
+    /* a malformed URL gets the common case and fails on its own terms */
+  }
+  if (host.endsWith("anthropic.com")) {
+    headers["x-api-key"] = apiKey;
+    headers["anthropic-version"] = "2023-06-01";
+  }
+  return headers;
+}
+
 export function defaultConfigDir(): string {
   return join(homedir(), ".config", "molt");
 }
@@ -234,9 +261,7 @@ export async function fetchPricing(
   if (!route) return null;
 
   try {
-    const res = await fetchFn(`${base}${route.path}`, {
-      headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
-    });
+    const res = await fetchFn(`${base}${route.path}`, { headers: authHeaders(base, apiKey) });
     if (!res.ok) return null;
     return route.parse(await res.json(), model);
   } catch {

@@ -84,6 +84,13 @@ export type SessionStatus = {
    * only a control if it is visible while it is in force.
    */
   autonomy?: "low" | "medium" | "high";
+  /**
+   * What to do next when no model is selected. `/login` is right on a cold
+   * start and wrong the moment a key exists — telling someone who just
+   * authenticated to authenticate is the kind of small lie that makes a
+   * status line stop being read.
+   */
+  hint?: string;
 };
 
 export type FrameOptions = {
@@ -170,7 +177,7 @@ export function statusSegments(s: SessionStatus, maxWidth = COLS): Segment[] {
     return [
       { text: "no model", tone: "ghost" },
       { text: SEP, tone: "ghost" },
-      { text: "/login", tone: "dim" },
+      { text: s.hint ?? "/login", tone: "dim" },
     ];
   }
 
