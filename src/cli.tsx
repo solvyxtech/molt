@@ -26,7 +26,7 @@ import {
 import { Receipts } from "./receipts.js";
 import type { BarResult, EngineEvent } from "./types.js";
 
-const VERSION = "v1.0.0-rc.3";
+const VERSION = "v1.0.0-rc.4";
 
 const USAGE = `molt ${VERSION} — a coding agent that can't say "done" without proving it.
 
@@ -328,14 +328,20 @@ function printBar(result: BarResult): void {
   );
   for (const r of result.results) {
     const tags = r.tags?.length ? `  [${r.tags.join(",")}]` : "";
+    const label = r.ok ? "pass" : r.advisory ? "warn" : "FAIL";
     process.stdout.write(
-      `${r.ok ? "pass" : "FAIL"}  ${r.name}${r.exitCode !== undefined ? ` (exit ${r.exitCode})` : ""}${tags}\n`,
+      `${label}  ${r.name}${r.exitCode !== undefined ? ` (exit ${r.exitCode})` : ""}${tags}\n`,
     );
     if (!r.ok) {
       for (const line of r.output.trim().split("\n")) process.stdout.write(`      ${line}\n`);
     }
   }
-  process.stdout.write(result.ok ? "\nbar met\n" : "\nbar NOT met\n");
+  const warned = result.warnings ?? [];
+  process.stdout.write(
+    (result.ok ? "\nbar met" : "\nbar NOT met") +
+      (warned.length ? ` · ${warned.length} advisory check(s) failed` : "") +
+      "\n",
+  );
 
   // A check's output speaks to the model; a person staring at a refusal they
   // cannot act on needs the other half.
@@ -678,7 +684,8 @@ function cmdStats(args: Args): number {
       `  exhausted             ${s.exhausted}\n\n` +
       `false-claim rate        ${(s.falseClaimRate * 100).toFixed(1)}%  ` +
       `(share of claims that did not survive the bar)\n` +
-      `tokens per verified change  ${s.tokensPerVerifiedChange ?? "—"}\n\n`,
+      `tokens per verified change  ${s.tokensPerVerifiedChange ?? "—"}\n` +
+      `cost per verified change    ${s.usdPerVerifiedChange === undefined ? "—" : `$${s.usdPerVerifiedChange.toFixed(4)}`}\n\n`,
   );
   for (const [model, m] of Object.entries(s.byModel)) {
     process.stdout.write(`  ${model}: ${m.accepted} accepted / ${m.attempts} attempts\n`);

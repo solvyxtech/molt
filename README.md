@@ -91,7 +91,7 @@ molt receipts --grep "tests"      # jump to the evidence behind a claim
 molt archive                      # shed batches, browsable
 molt archive --grep "auth token"  # find something that left context
 molt archive --explain            # digest vs original, side by side
-molt stats                        # false-claim rate, tokens per verified change
+molt stats                        # false-claim rate, tokens and cost per verified change
 ```
 
 ## The bar
@@ -222,6 +222,15 @@ marked `[auto]` as it happens and journalled with the level that allowed it.
 
 It decides what molt asks about, not what is possible: a command that runs can
 do anything you can. See [docs/autonomy.md](docs/autonomy.md).
+
+### Credentials
+
+Masked before anything is written *or* printed: the log, receipts, the
+transcript on screen, and the model's own answer. Values molt holds (the session
+key) are masked exactly; provider key shapes, bearer headers, JWTs, private-key
+blocks and `secret =` assignments are masked by pattern, keeping the field name
+so the record still says what was hidden. The permission prompt is the
+deliberate exception — you cannot judge a command you cannot read.
 
 ### What a turn cost
 

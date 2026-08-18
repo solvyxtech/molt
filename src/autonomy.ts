@@ -229,6 +229,17 @@ const READING_TOOLS = new Set(["read_file", "list_dir", "grep"]);
 /** Tools that write, and are gated exactly like write_file. */
 const WRITING_TOOLS = new Set(["write_file", "edit_file"]);
 
+/**
+ * Every tool this classifier has an opinion about.
+ *
+ * A level written today cannot have consented to a tool added tomorrow, and
+ * "high" is a statement about the shell, not a blank endorsement of whatever
+ * molt grows next. An unrecognised tool asks at every level — which is the
+ * deny-by-default rule at the top of this file, applied to itself. Found
+ * missing by the probe suite, at high, where it mattered most.
+ */
+const KNOWN_TOOLS = new Set([...READING_TOOLS, ...WRITING_TOOLS, "bash"]);
+
 export type Decision = {
   /** True when a human has to answer before this runs. */
   ask: boolean;
@@ -262,6 +273,10 @@ export function gate(
     return { ask: true, why: `${String(path)} is outside this project` };
   }
 
+  if (!KNOWN_TOOLS.has(name)) {
+    return { ask: true, why: `${name} is not a tool any autonomy level has agreed to` };
+  }
+
   // A tool with no write in it needs no permission at any level.
   if (READING_TOOLS.has(name)) return { ask: false };
 
@@ -279,7 +294,6 @@ export function gate(
       if (isReadOnlyCommand(command)) return { ask: false };
       return { ask: true, why: "this command does more than read" };
     }
-    // An unrecognised tool is not covered by a level that predates it.
     return { ask: true, why: `${name} is not covered at medium autonomy` };
   }
 

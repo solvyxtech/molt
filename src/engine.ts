@@ -31,6 +31,7 @@ import {
   insideProject,
   type Autonomy,
 } from "./autonomy.js";
+import { redact } from "./redact.js";
 import {
   applyEdit,
   formatListing,
@@ -456,6 +457,9 @@ export class Engine {
     this.cfg = cfg;
     this.transcript = new Transcript(SYSTEM_PROMPT);
     this.barHash = barFingerprint(this.cwd);
+    // The key molt was handed is the one secret it can mask exactly.
+    cfg.journal?.protect(cfg.apiKey, process.env.MOLT_API_KEY);
+    cfg.receipts?.protect(cfg.apiKey, process.env.MOLT_API_KEY);
   }
 
   get model(): string {
@@ -494,6 +498,7 @@ export class Engine {
   }
   setApiKey(k?: string): void {
     this.cfg.apiKey = k;
+    this.cfg.journal?.protect(k);
   }
   setBudget(tokens?: number): void {
     this.budgetTokens = tokens;
@@ -507,6 +512,7 @@ export class Engine {
   setBaseUrl(url: string, apiKey?: string, provider?: string): void {
     this.cfg.baseUrl = url;
     this.cfg.apiKey = apiKey;
+    this.cfg.journal?.protect(apiKey);
     this.cfg.provider = provider;
     this.reset();
   }
@@ -535,6 +541,11 @@ export class Engine {
 
   get streaming(): boolean {
     return this.cfg.stream !== false;
+  }
+
+  /** Values that must not appear on screen or in a file molt writes. */
+  private secrets(): (string | undefined)[] {
+    return [this.cfg.apiKey, process.env.MOLT_API_KEY, process.env.OPENAI_API_KEY];
   }
 
   get autonomy(): Autonomy {
@@ -1399,6 +1410,8 @@ export class Engine {
           // approval prompt can say which rule produced it rather than
           // asking the same way about everything.
           const decision = gate(this.autonomy, { name, args, cwd: this.cwd });
+          // The prompt shows the command in full. You are being asked to judge
+          // it, and a redacted command is one you cannot judge.
           const allowed = decision.ask ? await confirm(name, `${detail}${decision.why ? ` — ${decision.why}` : ""}`) : true;
 
           let result: string;
@@ -1471,15 +1484,20 @@ export class Engine {
           called.push(name);
           if (allowed) this.actsSinceBar += 1;
           if (!decision.ask) autoRan += 1;
+          // Everything that scrolls is redacted. A transcript is pasted into
+          // bug reports and screenshotted into chat windows, which makes the
+          // screen a distribution channel like any other — and unlike the
+          // prompt above, nobody is judging a command from the scrollback.
+          const hide = (t: string) => redact(t, this.secrets());
           yield {
             kind: "tool",
             name,
-            detail,
+            detail: hide(detail),
             note,
             durationMs,
-            args: capture(call.function?.arguments ?? ""),
+            args: hide(capture(call.function?.arguments ?? "")),
             bytes: Buffer.byteLength(result, "utf8"),
-            preview: capture(result),
+            preview: hide(capture(result)),
             auto: !decision.ask,
           };
           this.transcript.push({ role: "tool", tool_call_id: call.id, content: result });
@@ -1534,7 +1552,7 @@ export class Engine {
             ? "nothing left in the bar to check a question against — this answer is unverified."
             : "no .molt/done.yml — completion is unverified. run `molt init` to add a bar.",
         };
-        if (claim) yield { kind: "assistant_text", text: claim };
+        if (claim) yield { kind: "assistant_text", text: redact(claim, this.secrets()) };
         return;
       }
 
@@ -1594,6 +1612,8 @@ export class Engine {
           model: this.cfg.model,
           provider: this.provider,
           sessionTokens: this.sessionTokens,
+          costUsd: this.costUsd(),
+          costEstimated: this.costEstimated,
           shedBatches: this.transcript.shedCount,
         });
         log?.append("receipt", { verdict, file: receipt.path, attempt: proofAttempts });
@@ -1603,7 +1623,7 @@ export class Engine {
       if (result.ok) {
         log?.append("session_end", { reason: "bar met", attempts: proofAttempts });
         yield { kind: "proof_result", result, attempt: proofAttempts };
-        if (claim) yield { kind: "assistant_text", text: claim };
+        if (claim) yield { kind: "assistant_text", text: redact(claim, this.secrets()) };
         return;
       }
 

@@ -72,22 +72,36 @@ export type Spend = {
 };
 
 /** A single verifiable condition from `.molt/done.yml`. */
-export type Check =
-  | {
-      name: string;
-      kind: "command";
-      run: string;
-      timeoutMs: number;
-      expectExit: number;
-      /** Portable selection labels, e.g. fast, slow, ci, local, manual. */
-      tags: string[];
-    }
-  | {
-      name: string;
-      kind: "builtin";
-      builtin: BuiltinCheck;
-      tags: string[];
-    };
+/**
+ * A check that reports but does not block.
+ *
+ * Not every condition worth running is a condition worth refusing over. A
+ * linter's opinion, a coverage delta, a bundle-size trend — a failing one is
+ * information, and treating it as a broken contract teaches people to take
+ * checks out of the bar rather than to read them. Advisory failures are shown,
+ * recorded in the receipt, and handed to the model, and they do not stop a
+ * completion.
+ */
+export type Advisory = { advisory?: boolean };
+
+export type Check = Advisory &
+  (
+    | {
+        name: string;
+        kind: "command";
+        run: string;
+        timeoutMs: number;
+        expectExit: number;
+        /** Portable selection labels, e.g. fast, slow, ci, local, manual. */
+        tags: string[];
+      }
+    | {
+        name: string;
+        kind: "builtin";
+        builtin: BuiltinCheck;
+        tags: string[];
+      }
+  );
 
 export type BuiltinCheck = "files-changed" | "record-intact" | "claims-grounded";
 
@@ -98,6 +112,8 @@ export type Bar = {
 
 export type CheckResult = {
   name: string;
+  /** True when a failure here reports rather than refuses. */
+  advisory?: boolean;
   tags?: string[];
   kind: "command" | "builtin";
   /** The command run, or the builtin's identifier. */
@@ -110,7 +126,10 @@ export type CheckResult = {
 };
 
 export type BarResult = {
+  /** True when every check that can block a completion passed. */
   ok: boolean;
+  /** Advisory checks that failed. Reported, never blocking. */
+  warnings?: CheckResult[];
   results: CheckResult[];
   durationMs: number;
 };

@@ -292,17 +292,22 @@ export function App({
       // The one-line verdict, before the per-check list. A reader who wants
       // the detail scrolls; a reader who wants to know whether to trust the
       // last thing the model said does not have to.
+      const blocking = result.results.filter((r) => !r.ok && !r.advisory);
+      const warned = result.warnings ?? [];
       add(
         result.ok ? "ok" : "fail",
         `  ${passed} of ${result.results.length} checks passed · ${fmtDuration(result.durationMs)}` +
-          (result.ok
-            ? ""
-            : ` · failed: ${result.results.filter((r) => !r.ok).map((r) => r.name).join(", ")}`),
+          (blocking.length ? ` · failed: ${blocking.map((r) => r.name).join(", ")}` : "") +
+          (warned.length ? ` · advisory: ${warned.map((r) => r.name).join(", ")}` : ""),
       );
       for (const r of result.results) {
+        // An advisory failure reads as a warning, because that is what it is:
+        // it did not stop anything, and printing it as FAIL next to a met bar
+        // teaches people to delete the check rather than read it.
+        const label = r.ok ? "pass" : r.advisory ? "warn" : "FAIL";
         add(
-          r.ok ? "ok" : "fail",
-          `  ${r.ok ? "pass" : "FAIL"}  ${r.name}${r.exitCode !== undefined ? ` (exit ${r.exitCode})` : ""}`,
+          r.ok ? "ok" : r.advisory ? "info" : "fail",
+          `  ${label}  ${r.name}${r.exitCode !== undefined ? ` (exit ${r.exitCode})` : ""}`,
         );
         // What the check actually ran, and how long it took. A passing check
         // that never ran the command you think it runs is the failure mode
@@ -312,7 +317,9 @@ export function App({
           for (const l of r.output.trim().split("\n").slice(0, 4)) note(`      ${l}`, true);
         }
         if (!r.ok) {
-          for (const l of r.output.trim().split("\n").slice(0, 8)) add("fail", `        ${l}`);
+          for (const l of r.output.trim().split("\n").slice(0, 8)) {
+            add(r.advisory ? "info" : "fail", `        ${l}`);
+          }
         }
       }
 
@@ -928,7 +935,10 @@ export function App({
             "info",
             `${st.attempts} attempts · ${st.accepted} accepted · ` +
               `false-claim rate ${(st.falseClaimRate * 100).toFixed(1)}% · ` +
-              `${st.tokensPerVerifiedChange ?? "—"} tokens per verified change`,
+              `${st.tokensPerVerifiedChange ?? "—"} tokens per verified change` +
+              (st.usdPerVerifiedChange === undefined
+                ? ""
+                : ` · ${fmtCost(st.usdPerVerifiedChange)} per verified change`),
           );
           return true;
         }

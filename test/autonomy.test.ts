@@ -282,7 +282,7 @@ describe("medium", () => {
     // A level written today cannot have consented to a tool added tomorrow.
     const d = gate("medium", { name: "send_email", args: {}, cwd: CWD });
     assert.ok(d.ask);
-    assert.match(d.why ?? "", /not covered/);
+    assert.match(d.why ?? "", /not a tool any autonomy level/);
   });
 });
 
