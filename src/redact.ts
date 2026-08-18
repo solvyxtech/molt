@@ -28,12 +28,28 @@
 export const MASK = "[redacted]";
 
 /**
+ * The shortest string worth masking exactly.
+ *
+ * Below this, masking shreds ordinary prose to no purpose — and a secret this
+ * short is not one. Exported because the journal and the receipts apply the
+ * same rule when they decide what to protect, and a threshold living in three
+ * files is a threshold that will eventually differ in three files.
+ */
+export const MIN_SECRET_CHARS = 8;
+
+/**
  * Patterns that are secrets by their shape.
  *
  * Each is anchored on something structural — a provider prefix, a header
  * name, a key-ish assignment — rather than on entropy, because "looks
  * random" also describes a hash, a build id, and a UUID, none of which are
  * worth hiding from an audit log.
+ *
+ * Every pattern carries /g and is used only with String.replace, which resets
+ * lastIndex on entry — so redact() is stateless across calls, and there is a
+ * test that says so. Reach for .test() or .exec() with one of these and that
+ * stops being true: a global regex remembers where it stopped, and the second
+ * call silently skips the first match.
  *
  * A capturing group here means one thing and one thing only: "keep this part,
  * it names the field". Every other group must be non-capturing. Getting that
@@ -72,7 +88,7 @@ export function redact(text: string, known: (string | undefined)[] = []): string
   let out = text;
 
   for (const secret of known) {
-    if (!secret || secret.length < 8) continue;
+    if (!secret || secret.length < MIN_SECRET_CHARS) continue;
     out = out.split(secret).join(MASK);
   }
 

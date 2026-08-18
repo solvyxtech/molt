@@ -9,11 +9,20 @@ a number presented with more confidence than it was earned with.
 
 ### Added
 
+- **Word navigation in the prompt.** `alt+←`/`alt+→` move by word and `alt+D`
+  deletes the word ahead. `ctrl+W` could already chop a long path in one
+  stroke; getting back in front of it took an arrow per character.
 - **Advisory checks.** `advisory: true` on a check in `done.yml` makes a failure
   information rather than a refusal: it runs, it is reported as `warn`, it is
   recorded in the receipt, and it does not block a completion. Not every
   condition worth running is worth refusing over — treating a linter's opinion
   as a broken contract teaches people to delete the check instead of reading it.
+- **One minimum-secret-length constant instead of three.** `redact`, the
+  journal, and the receipts each spelled out the same threshold; a guard whose
+  threshold lives in three files eventually differs in three files. Also a test
+  pinning that redaction is stateless across calls — every pattern carries `/g`,
+  which is harmless with `String.replace` and a silent skipped-match bug the
+  moment anyone reaches for `.test()`.
 - **Credentials are masked before anything is written.** The journal already
   refused to log message content for this reason, and then logged
   `curl -H "authorization: Bearer sk-live-…"` verbatim in a tool call's detail.

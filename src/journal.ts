@@ -18,7 +18,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { redactData } from "./redact.js";
+import { MIN_SECRET_CHARS, redactData } from "./redact.js";
 
 export const GENESIS = "0".repeat(64);
 
@@ -94,7 +94,7 @@ export class Journal {
   /** Register a value to mask everywhere it appears. Idempotent. */
   protect(...values: (string | undefined)[]): void {
     for (const v of values) {
-      if (v && v.length >= 8 && !this.secrets.includes(v)) this.secrets.push(v);
+      if (v && v.length >= MIN_SECRET_CHARS && !this.secrets.includes(v)) this.secrets.push(v);
     }
   }
 

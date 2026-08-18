@@ -81,6 +81,37 @@ export function deleteWord(l: Line): Line {
   return { text: l.text.slice(0, i) + l.text.slice(at), at: i };
 }
 
+/**
+ * Move by words, the way every other prompt does.
+ *
+ * `deleteWord` existed and the movements did not, so a long line could be
+ * chopped but not traversed — you could delete "src/app.tsx" in one stroke and
+ * then had to arrow back over it a character at a time to get in front of it.
+ */
+export function wordLeft(l: Line): Line {
+  const at = clamp(l.at, l.text.length);
+  let i = at;
+  while (i > 0 && /\s/.test(l.text[i - 1]!)) i--;
+  while (i > 0 && !/\s/.test(l.text[i - 1]!)) i--;
+  return { ...l, at: i };
+}
+
+export function wordRight(l: Line): Line {
+  const at = clamp(l.at, l.text.length);
+  let i = at;
+  while (i < l.text.length && /\s/.test(l.text[i]!)) i++;
+  while (i < l.text.length && !/\s/.test(l.text[i]!)) i++;
+  return { ...l, at: i };
+}
+
+/** Delete the word ahead of the caret, and the whitespace before it. */
+export function deleteWordForward(l: Line): Line {
+  const at = clamp(l.at, l.text.length);
+  const to = wordRight({ ...l, at }).at;
+  if (to === at) return { ...l, at };
+  return { text: l.text.slice(0, at) + l.text.slice(to), at };
+}
+
 /** Drop everything from the caret to the end of the line. */
 export function killToEnd(l: Line): Line {
   const at = clamp(l.at, l.text.length);

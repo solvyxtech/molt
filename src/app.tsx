@@ -45,6 +45,7 @@ import {
   backspace,
   deleteForward,
   deleteWord,
+  deleteWordForward,
   end,
   home,
   insert,
@@ -54,6 +55,8 @@ import {
   line,
   right,
   split,
+  wordLeft,
+  wordRight,
   type Line,
 } from "./line.js";
 import { DEFAULT_THEME, getTheme, nextTheme } from "./theme.js";
@@ -107,6 +110,8 @@ const HELP = [
   "  type / to browse · ↑↓ to choose · tab to fill · enter to run",
   "  start a line with ? to ask a question rather than request a change —",
   "  checks that require a file to change are not run for that turn.",
+  "  arrows move · alt+arrows by word · ctrl+W/K/U cut · ctrl+A start · ctrl+E end",
+  "",
   "  shift+V while molt is working (or ctrl+V any time) watches every call,",
   "  argument, and result — the same facts the session log records to disk.",
   "  shift+A raises how much molt does without asking. ctrl+A at the prompt.",
@@ -1303,11 +1308,17 @@ export function App({
     // Enough of readline to fix a mistake without retyping the sentence, and
     // no more: this is a one-line prompt, not an editor.
     if (key.leftArrow) {
-      edit(left);
+      // alt/ctrl + arrow moves by words, as every other prompt does.
+      edit(key.meta || key.ctrl ? wordLeft : left);
       return;
     }
     if (key.rightArrow) {
-      edit(right);
+      edit(key.meta || key.ctrl ? wordRight : right);
+      return;
+    }
+    if (key.meta && (char === "d" || char === "D")) {
+      edit(deleteWordForward);
+      setPaletteIndex(0);
       return;
     }
     if (key.backspace) {

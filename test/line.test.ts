@@ -11,6 +11,7 @@ import {
   backspace,
   deleteForward,
   deleteWord,
+  deleteWordForward,
   end,
   home,
   insert,
@@ -20,6 +21,8 @@ import {
   line,
   right,
   split,
+  wordLeft,
+  wordRight,
   type Line,
 } from "../src/line.js";
 
@@ -92,6 +95,37 @@ describe("moving", () => {
   it("jumps to either end", () => {
     assert.equal(show(home(line("abc", 2))), "|abc");
     assert.equal(show(end(line("abc", 0))), "abc|");
+  });
+});
+
+describe("moving by words", () => {
+  it("steps over a word, not a character", () => {
+    // deleteWord existed and the movements did not, so a long line could be
+    // chopped but not traversed.
+    assert.equal(show(wordLeft(line("read src/app.tsx"))), "read |src/app.tsx");
+    assert.equal(show(wordLeft(wordLeft(line("read src/app.tsx")))), "|read src/app.tsx");
+    assert.equal(show(wordRight(line("read src/app.tsx", 0))), "read| src/app.tsx");
+    assert.equal(show(wordRight(line("read src/app.tsx", 4))), "read src/app.tsx|");
+  });
+
+  it("stops at both ends", () => {
+    assert.equal(show(wordLeft(line("abc", 0))), "|abc");
+    assert.equal(show(wordRight(line("abc"))), "abc|");
+    assert.equal(show(wordLeft(line("", 0))), "|");
+  });
+
+  it("deletes the word ahead without touching what is behind", () => {
+    assert.equal(show(deleteWordForward(line("keep this drop-this", 10))), "keep this |");
+    assert.equal(show(deleteWordForward(line("one two three", 0))), "| two three");
+    const end = line("abc");
+    assert.deepEqual(deleteWordForward(end), end);
+  });
+
+  it("keeps the caret inside the text, like everything else here", () => {
+    for (const op of [wordLeft, wordRight, deleteWordForward]) {
+      const out = op({ text: "abc", at: 99 });
+      assert.ok(out.at >= 0 && out.at <= out.text.length, `${op.name} produced at=${out.at}`);
+    }
   });
 });
 
