@@ -83,6 +83,28 @@ describe("listing", () => {
     }
   });
 
+  it("lists molt's own directory but does not search it", () => {
+    // done.yml is the most relevant file in a molt project; hiding it from a
+    // listing hides the bar the agent is judged against. The session logs
+    // under it are prose, and searching them buries the answer in molt's own
+    // record of looking for it.
+    const p = project();
+    try {
+      mkdirSync(join(p.dir, ".molt", "log"), { recursive: true });
+      writeFileSync(join(p.dir, ".molt", "done.yml"), "version: 1\nchecks: []\n");
+      writeFileSync(join(p.dir, ".molt", "log", "s.jsonl"), '{"text":"verify"}\n');
+
+      const listed = walk(p.dir, { depth: 2 }).entries.map((e) => e.path);
+      assert.ok(listed.includes(".molt/"), "hid the project's own bar directory");
+      assert.ok(listed.includes(".molt/done.yml"));
+
+      const hits = grepFiles(p.dir, "verify").matches.map((m) => m.path);
+      assert.ok(!hits.some((h) => h.startsWith(".molt")), "searched molt's own logs");
+    } finally {
+      p.cleanup();
+    }
+  });
+
   it("goes deeper only when asked", () => {
     const p = project();
     try {

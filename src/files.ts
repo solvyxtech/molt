@@ -33,8 +33,18 @@ import { join, relative, sep } from "node:path";
 export const SKIP_DIRS = new Set([
   ".git", "node_modules", "dist", "build", "out", "coverage", "target", "vendor",
   ".next", ".nuxt", ".svelte-kit", ".venv", "venv", "__pycache__", ".mypy_cache",
-  ".pytest_cache", ".gradle", ".idea", ".cache", ".turbo", ".molt",
+  ".pytest_cache", ".gradle", ".idea", ".cache", ".turbo",
 ]);
+
+/**
+ * molt's own artifacts: listed, but not searched.
+ *
+ * `.molt/done.yml` is the most relevant file in the project — hiding it from a
+ * listing means the agent cannot discover the bar it is being judged against.
+ * But `.molt/log/` holds session logs full of prose, and a content search that
+ * walks them buries the answer in molt's own record of looking for it.
+ */
+export const SEARCH_SKIP_DIRS = new Set([...SKIP_DIRS, ".molt"]);
 
 /** How many entries or matches a single result may carry. */
 export const MAX_ENTRIES = 400;
@@ -96,8 +106,15 @@ export type Entry = { path: string; kind: "file" | "dir"; bytes?: number };
  */
 export function walk(
   root: string,
-  opts: { depth?: number; glob?: string; limit?: number; dirsOnly?: boolean } = {},
+  opts: {
+    depth?: number;
+    glob?: string;
+    limit?: number;
+    dirsOnly?: boolean;
+    skip?: ReadonlySet<string>;
+  } = {},
 ): { entries: Entry[]; truncated: boolean; skipped: string[] } {
+  const skip = opts.skip ?? SKIP_DIRS;
   const depth = opts.depth ?? 1;
   const limit = opts.limit ?? MAX_ENTRIES;
   const entries: Entry[] = [];
@@ -126,7 +143,7 @@ export function walk(
         continue;
       }
 
-      if (isDir && SKIP_DIRS.has(name)) {
+      if (isDir && skip.has(name)) {
         skipped.push(rel);
         continue;
       }
@@ -188,7 +205,12 @@ export function grepFiles(
   }
 
   const limit = opts.limit ?? MAX_MATCHES;
-  const { entries } = walk(root, { depth: opts.depth ?? 12, glob: opts.glob, limit: 5000 });
+  const { entries } = walk(root, {
+    depth: opts.depth ?? 12,
+    glob: opts.glob,
+    limit: 5000,
+    skip: SEARCH_SKIP_DIRS,
+  });
   const matches: Match[] = [];
   let scanned = 0;
 

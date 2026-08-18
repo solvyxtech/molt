@@ -69,22 +69,11 @@ type Meter = {
 
 export const SYSTEM_PROMPT = [
   "You are molt, a coding agent working in the current directory.",
-  "",
-  "Tools: list_dir and grep to find things, read_file to read them, edit_file to change",
-  "exact text, write_file for a new file or a full rewrite, bash for everything else.",
-  "Prefer list_dir and grep over running ls/grep/find through bash — they need no",
-  "permission and their output is bounded. Prefer edit_file over write_file on a file",
-  "that already exists: copy old_text verbatim from what you read, and molt will refuse",
-  "the edit rather than write a guess.",
-  "",
   "Read only what you need. Be terse.",
   "",
-  "Every tool result stays in this conversation. Never read a file you have already",
-  "read unless you changed it — scroll up instead. Long files arrive one part at a",
-  "time and tell you the offset that continues them; use that offset rather than",
-  "reading the same file again, which returns the same part. If you find yourself",
-  "wanting a file you already have, you are done gathering: answer, or say what is",
-  "actually blocking you.",
+  "Tool results stay in this conversation. Never read a file twice unless you changed",
+  "it — scroll up. If you want a file you already have, you are done gathering: answer,",
+  "or say what is blocking you.",
   "",
   "This project defines what 'done' means in .molt/done.yml. When you finish,",
   "those checks run automatically. If any fail you will be told exactly which,",
@@ -129,15 +118,14 @@ const TOOLS = [
     function: {
       name: "read_file",
       description:
-        "Read a UTF-8 text file. Long files come back one part at a time, and the result " +
-        "says how many lines remain and which offset continues it. Use that offset to read " +
-        "on; do not call this again with the same arguments, which returns the same part.",
+        "Read a text file. A long file arrives in parts; the result gives the offset that " +
+        "continues it. Same arguments return the same part.",
       parameters: {
         type: "object",
         properties: {
           path: { type: "string" },
-          offset: { type: "number", description: "First line to return, 0-based. Default 0." },
-          limit: { type: "number", description: "How many lines to return. Default: as many as fit." },
+          offset: { type: "number", description: "First line, 0-based." },
+          limit: { type: "number", description: "How many lines." },
         },
         required: ["path"],
       },
@@ -147,7 +135,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "write_file",
-      description: "Create or overwrite a UTF-8 text file.",
+      description: "Create a file, or overwrite one whole. Use edit_file to change part of one.",
       parameters: {
         type: "object",
         properties: { path: { type: "string" }, content: { type: "string" } },
@@ -159,15 +147,13 @@ const TOOLS = [
     type: "function",
     function: {
       name: "list_dir",
-      description:
-        "List a directory. Build and dependency directories are skipped. Prefer this over " +
-        "`ls` through bash: it needs no permission and its output is bounded.",
+      description: "List a directory, skipping build and dependency directories.",
       parameters: {
         type: "object",
         properties: {
-          path: { type: "string", description: "Directory, relative to the project. Default '.'." },
-          depth: { type: "number", description: "How many levels down. Default 1." },
-          glob: { type: "string", description: "Only files matching this, e.g. '**/*.ts'." },
+          path: { type: "string", description: "Default '.'." },
+          depth: { type: "number", description: "Levels down. Default 1." },
+          glob: { type: "string", description: "e.g. '**/*.ts'." },
         },
       },
     },
@@ -176,15 +162,13 @@ const TOOLS = [
     type: "function",
     function: {
       name: "grep",
-      description:
-        "Search file contents for a JavaScript regular expression, returning path:line: text. " +
-        "Prefer this over `grep` through bash: it needs no permission and its output is bounded.",
+      description: "Search file contents by regular expression. Returns path:line: text.",
       parameters: {
         type: "object",
         properties: {
           pattern: { type: "string" },
-          path: { type: "string", description: "Directory to search. Default '.'." },
-          glob: { type: "string", description: "Only search files matching this, e.g. '**/*.ts'." },
+          path: { type: "string", description: "Default '.'." },
+          glob: { type: "string", description: "e.g. '**/*.ts'." },
           ignore_case: { type: "boolean" },
         },
         required: ["pattern"],
@@ -196,9 +180,8 @@ const TOOLS = [
     function: {
       name: "edit_file",
       description:
-        "Replace exact text in a file. Copy old_text verbatim from a read, including " +
-        "indentation; the edit is refused if it does not appear, or if it appears more than " +
-        "once without replace_all. Prefer this over rewriting a whole file with write_file.",
+        "Replace exact text. Copy old_text verbatim from a read; refused if absent, or if " +
+        "ambiguous without replace_all.",
       parameters: {
         type: "object",
         properties: {
@@ -215,7 +198,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "bash",
-      description: "Run a shell command in the current directory.",
+      description: "Run a shell command here. Use list_dir and grep instead of ls/grep/find.",
       parameters: {
         type: "object",
         properties: { command: { type: "string" } },
