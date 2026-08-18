@@ -8,7 +8,7 @@
  * possible places for a key to end up.
  */
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { Engine } from "../src/engine.js";
@@ -266,6 +266,76 @@ describe("a price belongs to one model", () => {
     const at = (i: number, o: number) => ((tokens * 0.97) / 1e6) * i + ((tokens * 0.03) / 1e6) * o;
     assert.ok(Math.abs(at(2, 6) - 0.44) < 0.02);
     assert.ok(Math.abs(at(3, 15) - 0.69) < 0.02);
+  });
+});
+
+describe("the turn ceiling", () => {
+  const engineWith = (dir: string, over: Record<string, unknown>) =>
+    new Engine({
+      baseUrl: "http://mock/v1",
+      model: "m",
+      cwd: dir,
+      bar: null,
+      fetchFn: scriptedProvider([
+        { calls: [{ name: "read_file", args: { path: "a.txt" } }] },
+        { text: "done" },
+      ]).fetchFn,
+      ...over,
+    });
+
+  it("counts money, not tokens, when a price is known", async () => {
+    // Reported from use: a token ceiling buys forty steps on a small project
+    // and four on a large one, because the whole conversation is resent every
+    // step. It measures context size, not waste. And it ignores caching, so it
+    // charges a budget for tokens the provider is discounting.
+    const ws = workspace();
+    try {
+      writeFileSync(join(ws.dir, "a.txt"), "x\n");
+      // The scripted provider reports 100 prompt / 20 completion per call. At
+      // $2/$6 that is $0.00032 a step — far under the ceiling, so the turn runs.
+      const engine = engineWith(ws.dir, {
+        priceInPerMtok: 2,
+        priceOutPerMtok: 6,
+        maxTurnUsd: 1,
+        maxTurnTokens: 50, // would stop this turn instantly if tokens ruled
+      });
+      const events = await drain(engine.run("read it", allowAll));
+      assert.ok(
+        !events.some((e) => e.kind === "error" && /ceiling/.test(e.text)),
+        "a token ceiling overrode a money ceiling on a priced model",
+      );
+      assert.ok(events.some((e) => e.kind === "assistant_text"));
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("falls back to tokens when nothing is priced", async () => {
+    const ws = workspace();
+    try {
+      writeFileSync(join(ws.dir, "a.txt"), "x\n");
+      const engine = engineWith(ws.dir, { maxTurnTokens: 50 });
+      const events = await drain(engine.run("read it", allowAll));
+      assert.ok(
+        events.some((e) => e.kind === "error" && /ceiling/.test(e.text)),
+        "no price and no token ceiling means no ceiling at all",
+      );
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("is removed entirely by clearing the budget", async () => {
+    const ws = workspace();
+    try {
+      writeFileSync(join(ws.dir, "a.txt"), "x\n");
+      const engine = engineWith(ws.dir, { maxTurnTokens: 50, maxTurnUsd: 0.000001, priceInPerMtok: 2, priceOutPerMtok: 6 });
+      engine.setBudget(undefined);
+      const events = await drain(engine.run("read it", allowAll));
+      assert.ok(!events.some((e) => e.kind === "error" && /ceiling/.test(e.text)));
+    } finally {
+      ws.cleanup();
+    }
   });
 });
 
