@@ -32,6 +32,7 @@ export type JournalKind =
   | "autonomy"
   | "bar_run"
   | "bar_skipped"
+  | "loop_stop"
   | "shed"
   | "elide"
   | "regrow"
@@ -227,6 +228,12 @@ export class Journal {
           break;
         case "autonomy":
           out.push(`${t}  autonomy ${d.from} → ${d.to} · ${d.means}`);
+          break;
+        case "loop_stop":
+          out.push(
+            `${t}  loop stop · step ${d.step} repeated ${d.repeatedCalls} answered call(s) · ` +
+              `${d.sessionTokens} tokens spent`,
+          );
           break;
         case "bar_skipped":
           out.push(`${t}  bar skipped · ${d.reason}${d.failed ? ` · still failing: ${d.failed}` : ""}`);

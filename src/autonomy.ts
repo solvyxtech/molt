@@ -89,10 +89,24 @@ const NET_WRITE_FLAGS = [
 ];
 
 /**
+ * Redirections that cannot write anything: throwing output away, or pointing
+ * one file descriptor at another.
+ *
+ * The name must end there: `> /dev/nullx` is an ordinary file, and a pattern
+ * without that boundary would wave it through.
+ *
+ * `ls -la .molt 2>/dev/null` is how everybody writes an exploratory command,
+ * and treating its `>` as a file write sent every such call to a prompt — in a
+ * headless run, to a refusal. A model that cannot list a directory guesses
+ * filenames instead, which is worse for everyone than allowing a discard.
+ */
+const HARMLESS_REDIRECT = /(?:\d?>>?|&>)\s*\/dev\/null(?![\w/])|\d?>&\d/g;
+
+/**
  * Constructions that make a command's effect unreadable from its text.
  *
- * Substitution and redirection can write files or run words that are not in
- * the command as written, so their presence alone is enough to ask — no
+ * Substitution and redirection to a path can write files or run words that are
+ * not in the command as written, so their presence alone is enough to ask — no
  * attempt is made to reason about what is inside them.
  */
 const OPAQUE = /(\$\(|`|>|<|\bsudo\b|\bsu\b)/;
@@ -132,11 +146,14 @@ function words(segment: string): string[] {
 /** Is every part of this command line something that only reads? */
 export function isReadOnlyCommand(command: string): boolean {
   if (!command.trim()) return false;
-  // Redirection, substitution, and privilege escalation are never read-only,
-  // and are not worth parsing further.
-  if (OPAQUE.test(command)) return false;
+  // Discards come out first, so the check that follows is about redirection
+  // that could actually land bytes somewhere.
+  const bare = command.replace(HARMLESS_REDIRECT, " ");
+  // Substitution, redirection to a path, and privilege escalation are never
+  // read-only, and are not worth parsing further.
+  if (OPAQUE.test(bare)) return false;
 
-  return segments(command).every((seg) => {
+  return segments(bare).every((seg) => {
     const [cmd, ...rest] = words(seg);
     if (!cmd) return false;
     // A leading VAR=value assignment hides the real command behind it.

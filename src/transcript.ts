@@ -298,7 +298,13 @@ export class Transcript {
         if (m.role !== "tool") break;
         if (!m.content || m.content.startsWith(ELIDED_PREFIX)) continue;
         const before = estTokens(m.content);
-        const marker = `${ELIDED_PREFIX} ${reason}. Full contents remain in the archived record.`;
+        // Wording matters here. "Full contents remain in the archived record"
+        // reads, to a model, as an invitation to go and get them — which it
+        // can only do by re-reading the file, which is what elided this copy
+        // in the first place. Point at the newer copy instead.
+        const marker =
+          `${ELIDED_PREFIX} ${reason}. The current contents are further down this ` +
+          `conversation; do not read the file again to recover this.`;
         // A short result costs less than the notice explaining its absence.
         // Eliding it would drop content AND grow the context — which is how
         // the meter came to report "−-17 tokens" saved.
@@ -377,6 +383,11 @@ export function buildExuvia(dropped: Msg[], index: number): string {
 export function toolDetail(name: string, args: Record<string, unknown>): string {
   const raw =
     name === "bash" ? String(args.command ?? "") : String(args.path ?? JSON.stringify(args));
-  const oneLine = raw.replace(/\s+/g, " ").trim();
+  // A paged read says which part it is asking for. Two identical-looking
+  // read_file lines in a transcript are a loop; "src/app.tsx from line 240" is
+  // progress, and the reader should not have to guess which they are watching.
+  const part =
+    name === "read_file" && Number(args.offset) > 0 ? ` from line ${Number(args.offset) + 1}` : "";
+  const oneLine = (raw + part).replace(/\s+/g, " ").trim();
   return [...oneLine].slice(0, 80).join("");
 }

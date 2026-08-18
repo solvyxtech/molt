@@ -70,6 +70,40 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **A large file could not be read at all, and the dead end looked like a
+  model looping.** `read_file` took a path and nothing else, and every result
+  was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
+  had no mechanism whatsoever to reach the rest. Its only available move was to
+  call `read_file` again and receive the same 2KB. A reported session spent 32
+  steps re-reading four files, was stopped by the step guard, produced no
+  answer, and cost about fifty cents.
+
+  Four changes, each of which was necessary:
+  - `read_file` takes `offset` and `limit`, and a partial result says how many
+    lines remain and the offset that continues it. The dead end becomes a path.
+  - The notice saying how to continue is budgeted *inside* the byte cap. The
+    first version appended it afterwards, so truncation cut off the one
+    sentence that told the model how to proceed — the same dead end, rebuilt
+    one layer up.
+  - Caps are sized per kind of result: 16KB for a file, 8KB for command
+    output. At 2048 bytes for everything, paging through a README took nine
+    round trips, and each round trip resent the whole conversation — the tight
+    cap cost far more tokens than the large read it was avoiding.
+  - A repeated call that returns byte-identical output gets a pointer to the
+    earlier result instead of the payload, and two consecutive steps of nothing
+    but repeats stops the turn with what it spent. The step guard now reports
+    tokens and cost too, rather than a bare "loop guard".
+
+  The same request now finishes in 6 steps for $0.086, verified, instead of 32
+  steps and no answer.
+- **The elision notice invited the loop it was part of.** A superseded read was
+  replaced with "full contents remain in the archived record", which reads to a
+  model as an instruction to go and get them — possible only by re-reading the
+  file. It now points at the newer copy already in the conversation.
+- **`2>/dev/null` counted as a file write**, so ordinary exploration
+  (`ls -la .molt 2>/dev/null`) was refused at medium autonomy and a model that
+  could not list a directory guessed filenames instead. Discards and
+  descriptor redirections are allowed; redirection to a path still asks.
 - **The proof loop re-ran the bar against state nothing had touched.** A model
   that repeated its claim without calling a tool got the full four attempts,
   each paying for a complete test suite, and each necessarily reaching the
@@ -151,6 +185,40 @@ claim literally true.
 
 ### Fixed
 
+- **A large file could not be read at all, and the dead end looked like a
+  model looping.** `read_file` took a path and nothing else, and every result
+  was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
+  had no mechanism whatsoever to reach the rest. Its only available move was to
+  call `read_file` again and receive the same 2KB. A reported session spent 32
+  steps re-reading four files, was stopped by the step guard, produced no
+  answer, and cost about fifty cents.
+
+  Four changes, each of which was necessary:
+  - `read_file` takes `offset` and `limit`, and a partial result says how many
+    lines remain and the offset that continues it. The dead end becomes a path.
+  - The notice saying how to continue is budgeted *inside* the byte cap. The
+    first version appended it afterwards, so truncation cut off the one
+    sentence that told the model how to proceed — the same dead end, rebuilt
+    one layer up.
+  - Caps are sized per kind of result: 16KB for a file, 8KB for command
+    output. At 2048 bytes for everything, paging through a README took nine
+    round trips, and each round trip resent the whole conversation — the tight
+    cap cost far more tokens than the large read it was avoiding.
+  - A repeated call that returns byte-identical output gets a pointer to the
+    earlier result instead of the payload, and two consecutive steps of nothing
+    but repeats stops the turn with what it spent. The step guard now reports
+    tokens and cost too, rather than a bare "loop guard".
+
+  The same request now finishes in 6 steps for $0.086, verified, instead of 32
+  steps and no answer.
+- **The elision notice invited the loop it was part of.** A superseded read was
+  replaced with "full contents remain in the archived record", which reads to a
+  model as an instruction to go and get them — possible only by re-reading the
+  file. It now points at the newer copy already in the conversation.
+- **`2>/dev/null` counted as a file write**, so ordinary exploration
+  (`ls -la .molt 2>/dev/null`) was refused at medium autonomy and a model that
+  could not list a directory guessed filenames instead. Discards and
+  descriptor redirections are allowed; redirection to a path still asks.
 - **The proof loop re-ran the bar against state nothing had touched.** A model
   that repeated its claim without calling a tool got the full four attempts,
   each paying for a complete test suite, and each necessarily reaching the
@@ -252,6 +320,40 @@ artifact molt cannot silently edit.
 
 ### Fixed
 
+- **A large file could not be read at all, and the dead end looked like a
+  model looping.** `read_file` took a path and nothing else, and every result
+  was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
+  had no mechanism whatsoever to reach the rest. Its only available move was to
+  call `read_file` again and receive the same 2KB. A reported session spent 32
+  steps re-reading four files, was stopped by the step guard, produced no
+  answer, and cost about fifty cents.
+
+  Four changes, each of which was necessary:
+  - `read_file` takes `offset` and `limit`, and a partial result says how many
+    lines remain and the offset that continues it. The dead end becomes a path.
+  - The notice saying how to continue is budgeted *inside* the byte cap. The
+    first version appended it afterwards, so truncation cut off the one
+    sentence that told the model how to proceed — the same dead end, rebuilt
+    one layer up.
+  - Caps are sized per kind of result: 16KB for a file, 8KB for command
+    output. At 2048 bytes for everything, paging through a README took nine
+    round trips, and each round trip resent the whole conversation — the tight
+    cap cost far more tokens than the large read it was avoiding.
+  - A repeated call that returns byte-identical output gets a pointer to the
+    earlier result instead of the payload, and two consecutive steps of nothing
+    but repeats stops the turn with what it spent. The step guard now reports
+    tokens and cost too, rather than a bare "loop guard".
+
+  The same request now finishes in 6 steps for $0.086, verified, instead of 32
+  steps and no answer.
+- **The elision notice invited the loop it was part of.** A superseded read was
+  replaced with "full contents remain in the archived record", which reads to a
+  model as an instruction to go and get them — possible only by re-reading the
+  file. It now points at the newer copy already in the conversation.
+- **`2>/dev/null` counted as a file write**, so ordinary exploration
+  (`ls -la .molt 2>/dev/null`) was refused at medium autonomy and a model that
+  could not list a directory guessed filenames instead. Discards and
+  descriptor redirections are allowed; redirection to a path still asks.
 - **The proof loop re-ran the bar against state nothing had touched.** A model
   that repeated its claim without calling a tool got the full four attempts,
   each paying for a complete test suite, and each necessarily reaching the
@@ -316,6 +418,40 @@ session. Shrinking them is a rounding error.
 
 ### Fixed
 
+- **A large file could not be read at all, and the dead end looked like a
+  model looping.** `read_file` took a path and nothing else, and every result
+  was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
+  had no mechanism whatsoever to reach the rest. Its only available move was to
+  call `read_file` again and receive the same 2KB. A reported session spent 32
+  steps re-reading four files, was stopped by the step guard, produced no
+  answer, and cost about fifty cents.
+
+  Four changes, each of which was necessary:
+  - `read_file` takes `offset` and `limit`, and a partial result says how many
+    lines remain and the offset that continues it. The dead end becomes a path.
+  - The notice saying how to continue is budgeted *inside* the byte cap. The
+    first version appended it afterwards, so truncation cut off the one
+    sentence that told the model how to proceed — the same dead end, rebuilt
+    one layer up.
+  - Caps are sized per kind of result: 16KB for a file, 8KB for command
+    output. At 2048 bytes for everything, paging through a README took nine
+    round trips, and each round trip resent the whole conversation — the tight
+    cap cost far more tokens than the large read it was avoiding.
+  - A repeated call that returns byte-identical output gets a pointer to the
+    earlier result instead of the payload, and two consecutive steps of nothing
+    but repeats stops the turn with what it spent. The step guard now reports
+    tokens and cost too, rather than a bare "loop guard".
+
+  The same request now finishes in 6 steps for $0.086, verified, instead of 32
+  steps and no answer.
+- **The elision notice invited the loop it was part of.** A superseded read was
+  replaced with "full contents remain in the archived record", which reads to a
+  model as an instruction to go and get them — possible only by re-reading the
+  file. It now points at the newer copy already in the conversation.
+- **`2>/dev/null` counted as a file write**, so ordinary exploration
+  (`ls -la .molt 2>/dev/null`) was refused at medium autonomy and a model that
+  could not list a directory guessed filenames instead. Discards and
+  descriptor redirections are allowed; redirection to a path still asks.
 - **The proof loop re-ran the bar against state nothing had touched.** A model
   that repeated its claim without calling a tool got the full four attempts,
   each paying for a complete test suite, and each necessarily reaching the
@@ -382,6 +518,40 @@ against a real provider before behaviour changes.
 
 ### Fixed
 
+- **A large file could not be read at all, and the dead end looked like a
+  model looping.** `read_file` took a path and nothing else, and every result
+  was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
+  had no mechanism whatsoever to reach the rest. Its only available move was to
+  call `read_file` again and receive the same 2KB. A reported session spent 32
+  steps re-reading four files, was stopped by the step guard, produced no
+  answer, and cost about fifty cents.
+
+  Four changes, each of which was necessary:
+  - `read_file` takes `offset` and `limit`, and a partial result says how many
+    lines remain and the offset that continues it. The dead end becomes a path.
+  - The notice saying how to continue is budgeted *inside* the byte cap. The
+    first version appended it afterwards, so truncation cut off the one
+    sentence that told the model how to proceed — the same dead end, rebuilt
+    one layer up.
+  - Caps are sized per kind of result: 16KB for a file, 8KB for command
+    output. At 2048 bytes for everything, paging through a README took nine
+    round trips, and each round trip resent the whole conversation — the tight
+    cap cost far more tokens than the large read it was avoiding.
+  - A repeated call that returns byte-identical output gets a pointer to the
+    earlier result instead of the payload, and two consecutive steps of nothing
+    but repeats stops the turn with what it spent. The step guard now reports
+    tokens and cost too, rather than a bare "loop guard".
+
+  The same request now finishes in 6 steps for $0.086, verified, instead of 32
+  steps and no answer.
+- **The elision notice invited the loop it was part of.** A superseded read was
+  replaced with "full contents remain in the archived record", which reads to a
+  model as an instruction to go and get them — possible only by re-reading the
+  file. It now points at the newer copy already in the conversation.
+- **`2>/dev/null` counted as a file write**, so ordinary exploration
+  (`ls -la .molt 2>/dev/null`) was refused at medium autonomy and a model that
+  could not list a directory guessed filenames instead. Discards and
+  descriptor redirections are allowed; redirection to a path still asks.
 - **The proof loop re-ran the bar against state nothing had touched.** A model
   that repeated its claim without calling a tool got the full four attempts,
   each paying for a complete test suite, and each necessarily reaching the
@@ -482,6 +652,40 @@ can't say "done" without proving it.**
 
 ### Fixed
 
+- **A large file could not be read at all, and the dead end looked like a
+  model looping.** `read_file` took a path and nothing else, and every result
+  was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
+  had no mechanism whatsoever to reach the rest. Its only available move was to
+  call `read_file` again and receive the same 2KB. A reported session spent 32
+  steps re-reading four files, was stopped by the step guard, produced no
+  answer, and cost about fifty cents.
+
+  Four changes, each of which was necessary:
+  - `read_file` takes `offset` and `limit`, and a partial result says how many
+    lines remain and the offset that continues it. The dead end becomes a path.
+  - The notice saying how to continue is budgeted *inside* the byte cap. The
+    first version appended it afterwards, so truncation cut off the one
+    sentence that told the model how to proceed — the same dead end, rebuilt
+    one layer up.
+  - Caps are sized per kind of result: 16KB for a file, 8KB for command
+    output. At 2048 bytes for everything, paging through a README took nine
+    round trips, and each round trip resent the whole conversation — the tight
+    cap cost far more tokens than the large read it was avoiding.
+  - A repeated call that returns byte-identical output gets a pointer to the
+    earlier result instead of the payload, and two consecutive steps of nothing
+    but repeats stops the turn with what it spent. The step guard now reports
+    tokens and cost too, rather than a bare "loop guard".
+
+  The same request now finishes in 6 steps for $0.086, verified, instead of 32
+  steps and no answer.
+- **The elision notice invited the loop it was part of.** A superseded read was
+  replaced with "full contents remain in the archived record", which reads to a
+  model as an instruction to go and get them — possible only by re-reading the
+  file. It now points at the newer copy already in the conversation.
+- **`2>/dev/null` counted as a file write**, so ordinary exploration
+  (`ls -la .molt 2>/dev/null`) was refused at medium autonomy and a model that
+  could not list a directory guessed filenames instead. Discards and
+  descriptor redirections are allowed; redirection to a path still asks.
 - **The proof loop re-ran the bar against state nothing had touched.** A model
   that repeated its claim without calling a tool got the full four attempts,
   each paying for a complete test suite, and each necessarily reaching the

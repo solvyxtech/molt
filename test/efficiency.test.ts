@@ -83,7 +83,12 @@ describe("superseded tool results", () => {
     const results = t.all().filter((m) => m.role === "tool");
     assert.ok(results[0].content!.startsWith(ELIDED_PREFIX));
     assert.match(results[0].content!, /overwritten at step/);
-    assert.match(results[0].content!, /remain in the archived record/);
+    // The notice must not send the model back to the file. Earlier wording
+    // ("full contents remain in the archived record") read as an invitation to
+    // go and get them, which a model can only do by re-reading — the exact
+    // loop that made a session re-read four files thirty times.
+    assert.match(results[0].content!, /further down this conversation/);
+    assert.match(results[0].content!, /do not read the file again/i);
   });
 
   it("drops an earlier read of a path that was read again", () => {

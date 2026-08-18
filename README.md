@@ -304,7 +304,8 @@ nothing has to be typed in full or looked up.
 
 Being specific about this matters more here than anywhere else.
 
-- **Three tools** — read, write, bash. Everything else is shell. No MCP, no sub-agents, no orchestration.
+- **Three tools** — read, write, bash. Everything else is shell. No MCP, no sub-agents, no orchestration. `read_file` pages through a long file (`offset`/`limit`) and says how to continue; results are capped at 16KB for a file and 8KB for command output, and truncation is always stated.
+- **Work that goes nowhere is stopped, not billed.** A repeated tool call that returns byte-identical output gets a pointer to the earlier result rather than the payload again, and two consecutive steps of nothing but repeats end the turn with what it spent. The bar is not re-run against state the model has not touched.
 - **`files-changed` fails read-only tasks by design.** Ask a question with a leading `?` (or `/ask`, or `molt ask`) and molt runs the rest of the bar without it. molt will not decide this for you: the only party that knows whether "done" meant a change is you, and the only other candidate — asking the model whether its own claim needs proving — is precisely the decision molt exists to take away from it. If a project never verifies writes, leave the check out of your bar.
 - **A passing bar is not proof of correctness.** It proves your declared checks ran and passed against real state. A weak bar proves little — that is your call to make, visibly, in a file you commit.
 - **Not benchmarked against other harnesses yet.** `rnd/grade.mjs` runs scenarios with hidden graders against any agent CLI, and molt scores 4/4 on its own four scenarios — which is worth exactly what a self-run benchmark is worth. Four scenarios supports "harnesses differ measurably", not a ranking. Adapters and scenarios from people who are not me are the thing that makes those numbers mean anything.

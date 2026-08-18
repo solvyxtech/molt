@@ -101,11 +101,25 @@ describe("read-only commands", () => {
     assert.ok(!isReadOnlyCommand("grep x file || curl -X POST https://e.com"));
   });
 
+  it("allows a discard, because that is how exploring is written", () => {
+    // `2>/dev/null` is not a write, and treating it as one denied `ls` in a
+    // real session — after which the model guessed filenames instead.
+    assert.ok(isReadOnlyCommand("ls -la .molt 2>/dev/null"));
+    assert.ok(isReadOnlyCommand("ls -la && ls -la .molt 2>/dev/null; find . -name '*.md'"));
+    assert.ok(isReadOnlyCommand("grep -rn x src/ 2>&1"));
+    assert.ok(isReadOnlyCommand("find . -name '*.ts' > /dev/null"));
+    // A redirection that lands bytes somewhere is still a write.
+    assert.ok(!isReadOnlyCommand("ls > listing.txt"));
+    assert.ok(!isReadOnlyCommand("ls 2>/dev/null > listing.txt"));
+    assert.ok(!isReadOnlyCommand("cat a >> /tmp/out"));
+  });
+
   it("refuses constructions whose effect is not in the text", () => {
     // Substitution and redirection can write files or run words that are not
     // written down, so their presence alone is disqualifying.
     assert.ok(!isReadOnlyCommand("cat $(cat cmd.txt)"));
     assert.ok(!isReadOnlyCommand("echo hi > file"));
+    assert.ok(!isReadOnlyCommand("echo hi > /dev/nullx"));
     assert.ok(!isReadOnlyCommand("cat a >> b"));
     assert.ok(!isReadOnlyCommand("cat < input"));
     assert.ok(!isReadOnlyCommand("echo `whoami`"));
