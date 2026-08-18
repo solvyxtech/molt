@@ -107,6 +107,17 @@ export type Check = Advisory &
         expectExit: number;
         /** Portable selection labels, e.g. fast, slow, ci, local, manual. */
         tags: string[];
+        /**
+         * What this check reads, as globs.
+         *
+         * Declaring it lets molt skip a re-run when none of those files
+         * changed — four proof attempts against a ten-second suite is forty
+         * seconds of the inner loop spent re-proving the same thing. molt
+         * does not guess the scope: an undeclared check is fingerprinted
+         * against the whole project, which is correct and almost never
+         * reusable, and that is the right default for a verification tool.
+         */
+        watch?: string[];
       }
     | {
         name: string;
@@ -125,6 +136,13 @@ export type Bar = {
 
 export type CheckResult = {
   name: string;
+  /**
+   * True when this result was reused rather than re-run.
+   *
+   * Surfaced everywhere a result is, because a reused pass presented as a
+   * fresh one is exactly the quiet claim this tool exists to refuse.
+   */
+  cached?: boolean;
   /** True when a failure here reports rather than refuses. */
   advisory?: boolean;
   tags?: string[];

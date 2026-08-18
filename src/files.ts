@@ -20,6 +20,7 @@
  * Everything here is bounded and mechanical. No model summarizes anything, no
  * result is unlimited, and every truncation says what it left out.
  */
+import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
@@ -188,6 +189,47 @@ export function formatListing(
     notes.push(`[molt: skipped ${result.skipped.length} build/dependency director${result.skipped.length === 1 ? "y" : "ies"}: ${result.skipped.slice(0, 6).join(", ")}]`);
   }
   return [head, ...lines, ...notes].join("\n");
+}
+
+/**
+ * A cheap, conservative signature of the files a check reads.
+ *
+ * Path, size, and modification time — not content hashes, because this runs
+ * before every check on every attempt and reading a repository to decide
+ * whether to read a repository is not a saving. Every build tool in existence
+ * makes the same trade.
+ *
+ * The failure mode that matters is a stale *pass*, so the bias is toward
+ * over-invalidation: a file touched without changing invalidates and the check
+ * re-runs, which costs time. The reverse — a change that leaves size and mtime
+ * identical — would have to be a same-length edit written within the
+ * filesystem's timestamp granularity, and molt's own writes always move mtime.
+ */
+export function fingerprint(root: string, globs?: string[]): string {
+  const parts: string[] = [];
+  const patterns = globs?.length ? globs : [undefined];
+  const seen = new Set<string>();
+
+  for (const glob of patterns) {
+    const { entries, truncated } = walk(root, { depth: 24, glob, limit: 20_000 });
+    // A listing that hit its bound has not seen the whole scope, and a
+    // signature of an unknown subset is not a signature. Say so, and the
+    // caller treats it as never matching.
+    if (truncated) return `unbounded:${Date.now()}`;
+    for (const e of entries) {
+      if (e.kind !== "file" || seen.has(e.path)) continue;
+      seen.add(e.path);
+      let mtime = 0;
+      try {
+        mtime = statSync(join(root, e.path)).mtimeMs;
+      } catch {
+        continue;
+      }
+      parts.push(`${e.path}:${e.bytes ?? 0}:${mtime}`);
+    }
+  }
+  parts.sort();
+  return createHash("sha256").update(parts.join("\n")).digest("hex");
 }
 
 export type Match = { path: string; line: number; text: string };

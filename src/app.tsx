@@ -335,7 +335,8 @@ export function App({
         const label = r.ok ? "pass" : r.advisory ? "warn" : "FAIL";
         add(
           r.ok ? "ok" : r.advisory ? "info" : "fail",
-          `  ${label}  ${r.name}${r.exitCode !== undefined ? ` (exit ${r.exitCode})` : ""}`,
+          `  ${label}  ${r.name}${r.exitCode !== undefined ? ` (exit ${r.exitCode})` : ""}` +
+            (r.cached ? "  [reused — nothing it watches changed]" : ""),
         );
         // What the check actually ran, and how long it took. A passing check
         // that never ran the command you think it runs is the failure mode

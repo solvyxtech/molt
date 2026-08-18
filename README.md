@@ -118,6 +118,22 @@ checks:
     tags: [fast]
 ```
 
+A check can also declare what it reads:
+
+```yaml
+  - name: tests
+    run: npm test
+    watch: ["src/**", "test/**", "package.json"]
+```
+
+molt reuses that result while none of those files have moved, which is what
+stops four proof attempts from costing four test suites. It is memory-only and
+per-session, never reused across a changed command, never applied to builtins,
+and always marked as reused wherever it appears — a cached pass that looked
+like a fresh one would be the exact claim molt refuses. Without `watch`, a
+check is fingerprinted against the whole project: correct, and almost never
+reusable. molt does not guess what your commands read.
+
 Tags are optional selection labels — `fast`, `slow`, `ci`, `local`, `manual` are the conventional set. Every check runs on every completion attempt, so a five-minute suite across four attempts is twenty minutes of inner loop. `--only` and `--skip` let slow checks live in the file for CI without being paid for locally. An untagged check always runs, so omitting a tag can never quietly remove a condition.
 
 | builtin | what it proves |

@@ -18,6 +18,21 @@ a number presented with more confidence than it was earned with.
   tears the terminal) and the full detail goes to the transcript, which is
   printed once and never redrawn — so the terminal's own scrollback keeps it
   all. Opening the view also prints everything recorded before you opened it.
+- **`watch:` on a check, and result reuse.** A completion claim runs the whole
+  bar and the loop allows several attempts, so a ten-second suite costs forty
+  seconds of inner loop re-proving what could not have changed. A check that
+  declares what it reads is reused while none of it has moved: measured on a
+  bar with a five-second suite, an attempt following a docs-only edit went from
+  5.4s to 0.0s, and an attempt following a source edit re-ran everything.
+
+  This is the most dangerous feature in the project, because a wrong cache is a
+  false "verified" produced by molt itself — so it is bounded four ways. Memory
+  only, one session, never on disk. Commands only, never builtins. The command
+  and `expect_exit` are part of the key, so an edited bar cannot reuse the old
+  bar's result. And every reused result says so, in the transcript, the receipt
+  (`ran: no — reused`), and the log. Undeclared checks are fingerprinted against
+  the whole project: correct, and almost never reusable. molt does not guess
+  what a command reads.
 - **`molt init` reads the project and writes a bar that gates on it.** It wrote
   three builtins and a block of commented-out examples, leaving the important
   half to you — which is the wrong default for the one file the whole product

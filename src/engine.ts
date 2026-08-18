@@ -23,7 +23,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, resolve, relative, isAbsolute } from "node:path";
 import type { ArchiveLike } from "./archive.js";
-import { barFingerprint, formatBarFailure, runBar, type BarContext } from "./bar.js";
+import { CheckCache, barFingerprint, formatBarFailure, runBar, type BarContext } from "./bar.js";
 import {
   AUTONOMY_SUMMARY,
   DEFAULT_AUTONOMY,
@@ -507,6 +507,15 @@ export class Engine {
    * had just read.
    */
   private readPaths = new Set<string>();
+  /**
+   * Results reused while their watched files have not moved.
+   *
+   * One per session and never persisted: four proof attempts against a
+   * ten-second suite is forty seconds of the inner loop spent re-proving the
+   * same thing, and that is worth removing — but only within the process that
+   * observed it.
+   */
+  private cache = new CheckCache();
   /** User turns handled this session. Numbers the jobs the meter reports. */
   private jobCount = 0;
   /**
@@ -813,6 +822,7 @@ export class Engine {
       cwd: this.cwd,
       record: this.transcript.record(),
       read: [...this.readPaths],
+      cache: this.cache,
       ledger: this.mergedLedger(),
       liveLedger: [...this.ledger],
       archive: this.cfg.archive,
@@ -1947,6 +1957,9 @@ export class Engine {
           ok: r.ok,
           exitCode: r.exitCode ?? null,
           ms: r.durationMs,
+          // A reused result is evidence of a different kind, and the record
+          // has to say which kind it is.
+          cached: r.cached === true,
         })),
       });
       // A bar failing in exactly the same way it failed last time is a bar the

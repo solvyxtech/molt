@@ -12,14 +12,18 @@ version: 1
 checks:
   # --- ordinary commands: anything with an exit code ---
 
+  # What each command reads. molt reuses a result while none of it has moved,
+  # which is what stops four proof attempts from costing four test suites.
   - name: types
     run: npm run typecheck
     timeout: 120
+    watch: ["src/**", "test/**", "tsconfig*.json", "package.json"]
     tags: [fast]
 
   - name: tests
     run: npm test
     timeout: 300
+    watch: ["src/**", "test/**", "tsconfig*.json", "package.json"]
     tags: [slow]
 
   # --- builtins: molt runs these itself, against the session record ---

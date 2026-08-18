@@ -353,7 +353,8 @@ function printBar(result: BarResult): void {
     const tags = r.tags?.length ? `  [${r.tags.join(",")}]` : "";
     const label = r.ok ? "pass" : r.advisory ? "warn" : "FAIL";
     process.stdout.write(
-      `${label}  ${r.name}${r.exitCode !== undefined ? ` (exit ${r.exitCode})` : ""}${tags}\n`,
+      `${label}  ${r.name}${r.exitCode !== undefined ? ` (exit ${r.exitCode})` : ""}${tags}` +
+        `${r.cached ? "  [reused]" : ""}\n`,
     );
     if (!r.ok) {
       for (const line of r.output.trim().split("\n")) process.stdout.write(`      ${line}\n`);
