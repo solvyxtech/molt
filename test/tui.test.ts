@@ -324,6 +324,21 @@ describe("the transparency view", () => {
     }
   });
 
+  it("moves by words with alt+arrow", async () => {
+    const t = await mount();
+    try {
+      for (const ch of "read src/app.tsx") t.stdin.press(ch);
+      await tick(40);
+      t.stdin.press("\u001B[1;3D"); // alt+left
+      await tick(30);
+      for (const ch of "the ") t.stdin.press(ch);
+      await tick(60);
+      assert.match(t.stdout.lastFrame, /read the src\/app\.tsx/, "alt+left did not skip a word");
+    } finally {
+      t.cleanup();
+    }
+  });
+
   it("leaves a mid-sentence capital alone", async () => {
     const t = await mount();
     try {

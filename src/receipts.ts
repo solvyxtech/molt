@@ -9,7 +9,7 @@
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { redact } from "./redact.js";
+import { MIN_SECRET_CHARS, redact } from "./redact.js";
 import type { BarResult } from "./types.js";
 
 export type Receipt = {
@@ -85,7 +85,7 @@ export class Receipts {
   /** Register a value to mask in every receipt from here on. */
   protect(...values: (string | undefined)[]): void {
     for (const v of values) {
-      if (v && v.length >= 8 && !this.secrets.includes(v)) this.secrets.push(v);
+      if (v && v.length >= MIN_SECRET_CHARS && !this.secrets.includes(v)) this.secrets.push(v);
     }
   }
 

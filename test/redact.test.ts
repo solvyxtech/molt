@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { Engine } from "../src/engine.js";
 import { Journal } from "../src/journal.js";
-import { MASK, redact, redactData } from "../src/redact.js";
+import { MASK, MIN_SECRET_CHARS, redact, redactData } from "../src/redact.js";
 import { Receipts } from "../src/receipts.js";
 import { needsPriceLookup, savePricing, storedEndpoint } from "../src/providers.js";
 import { parseBar } from "../src/bar.js";
@@ -71,6 +71,24 @@ describe("redaction", () => {
     ]) {
       assert.equal(redact(ordinary), ordinary, `over-redacted: ${ordinary}`);
     }
+  });
+
+  it("is stateless across calls", () => {
+    // Every pattern carries /g. String.replace resets lastIndex, so this holds
+    // — but a global regex reached for with .test() or .exec() remembers where
+    // it stopped and silently skips the next match. This is the tripwire.
+    const text = `key sk-proj-0123456789abcdefghij and ghp_0123456789abcdefghijklmnopqrstuv`;
+    const first = redact(text);
+    for (let i = 0; i < 5; i++) assert.equal(redact(text), first, `drifted on call ${i + 2}`);
+    assert.ok(!first.includes("sk-proj"));
+  });
+
+  it("uses one threshold, not three", () => {
+    // The minimum was written out in redact, the journal, and the receipts. A
+    // guard whose threshold lives in three files eventually differs in three.
+    assert.equal(MIN_SECRET_CHARS, 8);
+    assert.equal(redact("x".repeat(MIN_SECRET_CHARS - 1), ["x".repeat(MIN_SECRET_CHARS - 1)]), "x".repeat(MIN_SECRET_CHARS - 1));
+    assert.equal(redact("y".repeat(MIN_SECRET_CHARS), ["y".repeat(MIN_SECRET_CHARS)]), MASK);
   });
 
   it("walks a whole record, at any depth", () => {
