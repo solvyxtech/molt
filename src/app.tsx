@@ -81,6 +81,8 @@ const HELP = [
   ...COMMANDS.map((c) => `  ${(c.name + (c.args ? " " + c.args : "")).padEnd(20)}${c.summary}`),
   "",
   "  type / to browse · ↑↓ to choose · tab to fill · enter to run",
+  "  start a line with ? to ask a question rather than request a change —",
+  "  checks that require a file to change are not run for that turn.",
   "  press v while molt is working (or ctrl+V any time) to watch every call,",
   "  argument, and result — the same facts the session log records to disk.",
 ].join("\n");
@@ -292,10 +294,11 @@ export function App({
       if (onlyWorkLanded) {
         add(
           "info",
-          "everything else passed. work-landed requires this turn to have changed a file,\n" +
-            "so a question, a greeting, or read-only work can never satisfy it — that is what\n" +
-            "the README means by 'files-changed fails read-only tasks by design'.\n" +
-            "for a session of questions rather than changes, start molt with --skip session.",
+          "everything else passed. work-landed requires this turn to have changed a file, so\n" +
+            "a question, a lookup, or an explanation can never satisfy it — and molt would\n" +
+            "rather refuse an honest answer than accept an invented file edit.\n" +
+            "ask questions with /ask <question>: it runs the rest of the bar and drops that\n" +
+            "one check for the turn. For a whole session of questions, start with --skip session.",
         );
       }
     },
@@ -641,6 +644,11 @@ export function App({
     [add, engine, persistEndpoint, refreshPricing],
   );
 
+  // `command` can start a turn (/ask) and `submit` dispatches commands, so
+  // one of the two has to reach the other late. A ref keeps both honest
+  // without recreating either on every render.
+  const submitRef = useRef<((text: string, opts?: { ask?: boolean }) => void) | null>(null);
+
   const command = useCallback(
     (raw: string): boolean => {
       const [cmd, ...rest] = raw.trim().split(/\s+/);
@@ -710,6 +718,15 @@ export function App({
             void refreshPricing(true);
           }
           return true;
+        case "/ask":
+        case "/q": {
+          if (!arg) {
+            add("error", "usage: /ask <question> — runs the bar without the work-landed check");
+            return true;
+          }
+          void submitRef.current?.(arg, { ask: true });
+          return true;
+        }
         case "/verbose":
         case "/detail":
           toggleVerbose();
@@ -906,23 +923,31 @@ export function App({
   );
 
   const submit = useCallback(
-    async (text: string) => {
-      if (!text.trim()) return;
-      if (text.startsWith("/")) {
-        if (!command(text)) add("error", `unknown command: ${text.split(/\s+/)[0]}`);
+    async (raw: string, opts: { ask?: boolean } = {}) => {
+      if (!raw.trim()) return;
+      if (raw.startsWith("/")) {
+        if (!command(raw)) add("error", `unknown command: ${raw.split(/\s+/)[0]}`);
         return;
       }
+      // A leading "?" marks the turn as a question. It is the shortest
+      // possible way for the PERSON to say so — and it has to be the person.
+      // molt cannot let the model decide which of its own claims need
+      // proving; that is the one decision the whole tool exists to take away
+      // from it.
+      const asking = opts.ask || /^\?\s*\S/.test(raw);
+      const text = asking ? raw.replace(/^\?\s*/, "") : raw;
+      if (!text.trim()) return;
       // Refuse rather than fire a request at an endpoint with no model. The
       // failure would otherwise surface as an opaque provider error.
       if (!engine.model) {
         add("error", "no model selected — /login to add a provider key, then /model to pick one");
         return;
       }
-      add("user", text);
+      add("user", `${asking ? "? " : ""}${text}`);
       setBusy(true);
       beginActivity("thinking");
       try {
-        for await (const ev of engine.run(text, confirm)) handleEvent(ev);
+        for await (const ev of engine.run(text, confirm, { ask: asking })) handleEvent(ev);
       } catch (e) {
         add("error", String(e));
       } finally {
@@ -931,6 +956,10 @@ export function App({
     },
     [add, beginActivity, command, confirm, engine, handleEvent],
   );
+
+  useEffect(() => {
+    submitRef.current = (text, opts) => void submit(text, opts);
+  }, [submit]);
 
   useInput((char, key) => {
     // --- permission prompt: arrows choose, enter commits, no typing ---

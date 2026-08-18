@@ -103,16 +103,105 @@ describe("the proof loop", () => {
     const events = await drain(engine.run("fix the bug", allowAll));
     const order = kinds(events);
 
-    assert.equal(
-      events.filter((e) => e.kind === "proof_refused").length,
-      2,
-      "two refusals before the limit",
-    );
     assert.ok(order.includes("proof_exhausted"), "must report exhaustion");
     assert.ok(!order.includes("assistant_text"), "a false claim must never be emitted");
 
     const err = events.find((e) => e.kind === "error");
     assert.ok(err && /reporting failure rather than success/.test((err as { text: string }).text));
+  });
+
+  it("stops re-running a bar the model cannot have changed", async () => {
+    // The model repeats its claim without touching anything. Re-running the
+    // bar can only produce the same answer, and a bar is not cheap — this
+    // one is a whole test suite in the projects molt is built for. The old
+    // loop paid for it once per attempt.
+    const dir = ws();
+    const { engine } = engineIn(dir, [{ text: "All done, tests pass." }], {
+      maxProofAttempts: 4,
+    });
+
+    const events = await drain(engine.run("fix the bug", allowAll));
+
+    assert.equal(
+      events.filter((e) => e.kind === "proof_start").length,
+      1,
+      "ran the bar more than once against identical state",
+    );
+    assert.equal(events.filter((e) => e.kind === "proof_refused").length, 1);
+    assert.ok(events.some((e) => e.kind === "proof_exhausted"));
+    // The refusal is still on the record: stopping early must not skip the
+    // receipt, or the failure becomes unauditable.
+    assert.ok(events.some((e) => e.kind === "receipt"));
+    assert.ok(
+      events.some((e) => e.kind === "info" && /changed nothing since the last check/.test(e.text)),
+      "never said why it stopped",
+    );
+  });
+
+  it("keeps looping while the model is actually doing something", async () => {
+    // The stop must trigger on inaction, not on failure. A model that acts
+    // between attempts still gets its full allowance.
+    const dir = ws();
+    const { engine } = engineIn(
+      dir,
+      [
+        { text: "All done." },
+        { calls: [{ name: "read_file", args: { path: "nope.txt" } }] },
+        { text: "All done, honest." },
+      ],
+      { maxProofAttempts: 3 },
+    );
+
+    const events = await drain(engine.run("fix the bug", allowAll));
+    assert.equal(
+      events.filter((e) => e.kind === "proof_start").length,
+      2,
+      "stopped a loop that was still making progress",
+    );
+  });
+
+  it("lets a question be answered without inventing a file to change", async () => {
+    // The reported bug: ask the weather in a repo whose bar demands a write,
+    // and molt refuses an honest, correct answer four times over — because
+    // the only way to satisfy work-landed is to fabricate an edit, which is
+    // the exact behaviour molt exists to prevent.
+    const dir = ws();
+    writeFileSync(join(dir, "check.sh"), "exit 0\n");
+    const { engine } = engineIn(dir, [{ text: "It is 64°F and sunny." }], {
+      bar: BAR_WITH_TESTS,
+    });
+
+    const events = await drain(engine.run("what is the weather", allowAll, { ask: true }));
+    const order = kinds(events);
+
+    assert.ok(!order.includes("proof_refused"), "refused a question for changing nothing");
+    assert.ok(order.includes("proof_result"), "the rest of the bar must still run");
+    assert.equal(events.filter((e) => e.kind === "assistant_text").length, 1);
+
+    // Narrowed in the open: the check that was dropped is named, and the
+    // one that still applies actually ran.
+    const start = events.find((e) => e.kind === "proof_start");
+    assert.ok(start && start.kind === "proof_start");
+    assert.deepEqual(start.names, ["suite"]);
+    assert.ok(
+      events.some((e) => e.kind === "info" && /require a file change are not run/.test(e.text)),
+      "narrowed the bar without saying so",
+    );
+  });
+
+  it("still refuses a question that fails a check it could have passed", async () => {
+    // /ask drops the write check and nothing else. A failing suite still
+    // refuses the claim — asking is not a way out of the bar.
+    const dir = ws();
+    writeFileSync(join(dir, "check.sh"), 'echo "suite is broken"\nexit 1\n');
+    const { engine } = engineIn(dir, [{ text: "It is 64°F and sunny." }], {
+      bar: BAR_WITH_TESTS,
+      maxProofAttempts: 2,
+    });
+
+    const events = await drain(engine.run("what is the weather", allowAll, { ask: true }));
+    assert.ok(kinds(events).includes("proof_refused"));
+    assert.ok(!kinds(events).includes("assistant_text"));
   });
 
   it("feeds the exact failing output back to the model", async () => {
