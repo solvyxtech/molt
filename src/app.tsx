@@ -1059,10 +1059,18 @@ export function App({
           return true;
         }
         case "/init": {
-          const p = writeDefaultBar(engine.cwd);
+          const { path, detected, existed } = writeDefaultBar(engine.cwd);
           try {
             engine.setBar(loadBar(engine.cwd));
-            add("info", `wrote ${p}`);
+            add("info", existed ? `${path} already exists, left alone` : `wrote ${path}`);
+            for (const c of detected) add("info", `  ${c.name.padEnd(8)} ${c.run.padEnd(26)} ${c.because}`);
+            if (!existed && detected.length === 0) {
+              add(
+                "info",
+                "no build or test commands found here, so this bar only proves work landed. " +
+                  "Add your own — that is where a bar gets its value.",
+              );
+            }
           } catch (e) {
             add("error", String(e));
           }

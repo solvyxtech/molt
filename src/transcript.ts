@@ -56,6 +56,8 @@ export class Transcript {
   private working: Msg[] = [];
   /** Every message ever shed, oldest batch first. Never truncated. */
   private archived: Msg[][] = [];
+  /** What this turn is for. Sent every request, shed never. */
+  private task: string | null = null;
 
   constructor(systemPrompt: string) {
     this.system = { role: "system", content: systemPrompt };
@@ -67,7 +69,10 @@ export class Transcript {
 
   /** Working context including the system prompt. Internal shape. */
   all(): Msg[] {
-    return [this.system, ...this.working];
+    const task: Msg[] = this.task
+      ? [{ role: "system", content: this.task, molt: { pinned: true } }]
+      : [];
+    return [this.system, ...task, ...this.working];
   }
 
   /**
@@ -99,6 +104,7 @@ export class Transcript {
   reset(): void {
     this.working = [];
     this.archived = [];
+    this.task = null;
   }
 
   bom(toolSchemaJson: string, session: { prompt: number; completion: number }): Bom {
@@ -106,7 +112,9 @@ export class Transcript {
       (n, m) => n + estTokens(m.content ?? "") + estTokens(JSON.stringify(m.tool_calls ?? "")),
       0,
     );
-    const systemTokens = estTokens(this.system.content ?? "");
+    // The standing note is part of every request, so it is part of the fixed
+    // cost of one — counted with the system prompt rather than hidden.
+    const systemTokens = estTokens(this.system.content ?? "") + estTokens(this.task ?? "");
     const toolSchemaTokens = estTokens(toolSchemaJson);
     return {
       systemTokens,
@@ -131,6 +139,19 @@ export class Transcript {
    * worth shedding — too few exchanges, or a digest that would grow the
    * context rather than shrink it.
    */
+  /**
+   * Set the standing note of what this turn is for.
+   *
+   * Held beside the working set rather than inside it, which is the whole
+   * trick: it cannot be shed because shedding only ever touches `working`, it
+   * cannot shift an index that a cancellation rollback depends on, and it
+   * cannot survive a rollback it should not survive. One line of state instead
+   * of a special case in three algorithms.
+   */
+  pin(content: string): void {
+    this.task = content;
+  }
+
   planShed(keepExchanges = 2): ShedPlan | null {
     const isDigest = (m: Msg) => m.molt?.digest === true;
 

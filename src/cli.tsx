@@ -570,11 +570,26 @@ function cmdProve(args: Args): number {
 }
 
 function cmdInit(args: Args): number {
-  const existed = hasBar(args.cwd);
-  const p = writeDefaultBar(args.cwd);
-  process.stdout.write(
-    existed ? `molt: ${p} already exists, left alone\n` : `molt: wrote ${p}\n\nEdit it to say what "done" means here, then run molt.\n`,
-  );
+  const { path, detected, existed } = writeDefaultBar(args.cwd);
+  if (existed) {
+    process.stdout.write(`molt: ${path} already exists, left alone\n`);
+    return 0;
+  }
+  process.stdout.write(`molt: wrote ${path}\n\n`);
+  if (detected.length === 0) {
+    process.stdout.write(
+      "molt found no build or test commands in this project, so the bar only proves\n" +
+        "that work landed. Add your own commands — that is where a bar gets its value.\n",
+    );
+    return 0;
+  }
+  // Say what was read and from where. A generated file nobody can explain is
+  // a file people delete the first time it fails.
+  process.stdout.write("read out of this project:\n");
+  for (const c of detected) {
+    process.stdout.write(`  ${c.name.padEnd(8)} ${c.run.padEnd(28)} ${c.because}\n`);
+  }
+  process.stdout.write("\nCheck it over — it is your file, and molt only wrote a first draft.\n");
   return 0;
 }
 

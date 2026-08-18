@@ -18,6 +18,26 @@ a number presented with more confidence than it was earned with.
   tears the terminal) and the full detail goes to the transcript, which is
   printed once and never redrawn — so the terminal's own scrollback keeps it
   all. Opening the view also prints everything recorded before you opened it.
+- **`molt init` reads the project and writes a bar that gates on it.** It wrote
+  three builtins and a block of commented-out examples, leaving the important
+  half to you — which is the wrong default for the one file the whole product
+  turns on. A bar of builtins alone proves a file changed and the record is
+  intact: both true, neither the thing anyone cares about, and anyone who
+  skipped uncommenting got a gate that could not fail for a reason worth
+  knowing. molt now reads `package.json` scripts (with the right runner, from
+  the lockfile), `Cargo.toml`, `go.mod`, `pyproject.toml`, and a `Makefile`,
+  and writes the commands it finds — naming, next to each check, where it came
+  from. A lint script lands as `advisory: true`, because a style opinion is
+  information rather than a contract. Nothing is proposed that the project does
+  not declare.
+- **A standing note that shedding cannot take.** Compaction is lossy by design
+  and the first thing it loses is intent: after a shed the model reads a digest
+  of its own past, re-derives what it was doing, and usually re-reads the files
+  it had just finished with. A few hundred tokens — the request, the files
+  changed so far, the last thing the bar refused — now ride along outside the
+  working set, so a compaction costs the model its notes and not its purpose.
+  It lives beside the transcript rather than in it, which is what keeps it from
+  shifting the indices a cancellation depends on.
 - **Word navigation in the prompt.** `alt+←`/`alt+→` move by word and `alt+D`
   deletes the word ahead. `ctrl+W` could already chop a long path in one
   stroke; getting back in front of it took an arrow per character.
