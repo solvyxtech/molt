@@ -106,8 +106,7 @@ const FEED_MEMORY = 5_000;
 const FEED_ROWS = 9;
 /** Finished jobs listed under the running one. */
 const JOB_ROWS = 4;
-/** Lines of an in-flight answer shown while it streams. */
-const STREAM_ROWS = 8;
+
 
 const HELP = [
   "commands",
@@ -199,6 +198,9 @@ export function App({
   const [paletteIndex, setPaletteIndex] = useState(0);
   const [tokens, setTokens] = useState(0);
   const [streamText, setStreamText] = useState("");
+  /** The line still being written, and whether anything streamed this turn. */
+  const partial = useRef("");
+  const streamed = useRef(false);
   const [cost, setCost] = useState<number | undefined>(undefined);
   const [costEstimated, setCostEstimated] = useState(false);
   const [verbose, setVerbose] = useState(startVerbose);
@@ -232,6 +234,14 @@ export function App({
   const [frame, setFrame] = useState(0);
   const nextId = useRef(0);
   const resolver = useRef<((ok: boolean) => void) | null>(null);
+
+  /** Move the half-written line into the transcript and clear the live one. */
+  const flushPartial = useCallback(() => {
+    const rest = partial.current;
+    partial.current = "";
+    setStreamText("");
+    if (rest.trim()) setLines((prev) => [...prev, { id: nextId.current++, tone: "agent", text: rest }]);
+  }, []);
 
   const add = useCallback((tone: Row["tone"], text: string) => {
     setLines((prev) => [...prev, { id: nextId.current++, tone, text }]);
@@ -385,17 +395,40 @@ export function App({
   const handleEvent = useCallback(
     (ev: EngineEvent) => {
       switch (ev.kind) {
-        case "delta":
+        case "delta": {
           beginActivity("responding");
-          setStreamText((s) => s + ev.text);
+          // Completed lines go straight into the transcript, which is printed
+          // once and never redrawn; only the line still being written stays in
+          // the live region. Capping the live region at eight rows bounded the
+          // repaint — and truncated the answer to do it, which is the wrong
+          // half to give up. This bounds the repaint to a single line instead
+          // and shows all of it.
+          partial.current += ev.text;
+          let cut = partial.current.indexOf("\n");
+          while (cut !== -1) {
+            const line = partial.current.slice(0, cut);
+            partial.current = partial.current.slice(cut + 1);
+            streamed.current = true;
+            add("agent", line);
+            cut = partial.current.indexOf("\n");
+          }
+          setStreamText(partial.current);
           break;
+        }
         case "cancelled":
-          setStreamText("");
+          flushPartial();
           add("info", "cancelled — the session is unchanged");
           break;
         case "assistant_text":
-          setStreamText("");
-          add("agent", ev.text);
+          // Streamed text is already on screen line by line, so only the tail
+          // is missing. A provider that does not stream sends nothing until
+          // now, and gets printed whole.
+          if (streamed.current || partial.current) {
+            flushPartial();
+          } else {
+            add("agent", ev.text);
+          }
+          streamed.current = false;
           break;
         case "tool_start":
           beginActivity(ev.name, ev.detail);
@@ -533,15 +566,20 @@ export function App({
           renderBar(ev.result, "bar met");
           break;
         case "proof_refused":
-          // The claim was refused, so it must leave the screen. Streaming
-          // already painted it; without this the refused text stays in the
-          // buffer and the next attempt's tokens append to it.
-          setStreamText("");
+          // The claim was refused. It was also streamed, and a terminal cannot
+          // unprint — so rather than pretend it was never said, molt closes the
+          // line and marks it. Hiding the words the model actually produced
+          // would be its own small dishonesty, and it is the thing the reader
+          // most needs to see next to the reason it was rejected.
+          flushPartial();
+          streamed.current = false;
+          add("info", "↑ that claim was refused. What follows is why.");
           renderBar(ev.result, `completion refused (attempt ${ev.attempt}) — continuing`);
           add("info", "  the failures above go back to the model; it keeps working");
           break;
         case "proof_exhausted":
-          setStreamText("");
+          flushPartial();
+          streamed.current = false;
           renderBar(ev.result, `bar not met after ${ev.attempts} attempts`);
           break;
         case "receipt":
@@ -558,7 +596,7 @@ export function App({
           break;
       }
     },
-    [add, beginActivity, note, renderBar],
+    [add, beginActivity, flushPartial, note, renderBar],
   );
 
   /** Remember the endpoint so the next bare `molt` starts where this left off. */
@@ -1475,28 +1513,16 @@ export function App({
         />
       )}
 
-      {/* An answer in flight. Capped: the full text joins the transcript
-          when it completes, and an uncapped live region is the other half
-          of the redraw problem. */}
+      {/* The line currently being written. Every completed line is already in
+          the transcript above, so this is one line at most — bounded without
+          being truncated, and wrapped rather than clipped. */}
       {streamText ? (
-        <Box marginTop={1} flexDirection="column">
-          {(() => {
-            const all = streamText.split("\n");
-            const shown = all.slice(-STREAM_ROWS);
-            return (
-              <>
-                {all.length > STREAM_ROWS && (
-                  <Text color={theme.ghost}>  ↑ {all.length - STREAM_ROWS} more line(s)</Text>
-                )}
-                {shown.map((l, i) => (
-                  <Text key={i} color={theme.accent}>
-                    {fit(l)}
-                    {i === shown.length - 1 ? <Text color={theme.dim}>▌</Text> : null}
-                  </Text>
-                ))}
-              </>
-            );
-          })()}
+        <Box marginTop={1}>
+          <Text color={theme.accent} wrap="wrap">
+            {"  "}
+            {streamText}
+            <Text color={theme.dim}>▌</Text>
+          </Text>
         </Box>
       ) : null}
 
@@ -1656,35 +1682,38 @@ export function App({
                 </>
               ) : (
                 <>
-                  <Text color={theme.dim}>{mode.kind === "login-key" ? "🔑 " : "› "}</Text>
-                  {/* A pasted key is echoed as dots — it must not survive on
-                      screen or in a scrollback buffer. */}
-                  {mode.kind === "login-key" ? (
-                    <>
-                      <Text color={theme.text}>{"•".repeat(input.length)}</Text>
-                      <Text color={theme.accent}>▌</Text>
-                    </>
-                  ) : (
-                    (() => {
-                      // The caret is drawn where it actually is: a block at the
-                      // end of the line, and the character it stands on
-                      // reversed when it is inside the text.
-                      const { before, under, after, atEnd } = split(entry);
-                      return (
-                        <>
-                          <Text color={theme.text}>{before}</Text>
-                          {atEnd ? (
-                            <Text color={theme.accent}>▌</Text>
-                          ) : (
-                            <Text color={theme.text} inverse>
-                              {under}
-                            </Text>
-                          )}
-                          <Text color={theme.text}>{after}</Text>
-                        </>
-                      );
-                    })()
-                  )}
+                  {/* One Text, not several side by side.
+                      Siblings in a Box are laid out as flex children: they sit
+                      in a row and are CLIPPED at the edge of the terminal
+                      rather than reflowed, so a prompt longer than the window
+                      lost its tail and left the caret parked at the cut. Text
+                      nested inside Text is a single inline run, which wraps —
+                      and the caret wraps with it, because it is part of the
+                      same run. A pasted key is still echoed as dots. */}
+                  <Text color={theme.text} wrap="wrap">
+                    <Text color={theme.dim}>{mode.kind === "login-key" ? "🔑 " : "› "}</Text>
+                    {mode.kind === "login-key" ? (
+                      <>
+                        {"•".repeat(input.length)}
+                        <Text color={theme.accent}>▌</Text>
+                      </>
+                    ) : (
+                      (() => {
+                        const { before, under, after, atEnd } = split(entry);
+                        return (
+                          <>
+                            {before}
+                            {atEnd ? (
+                              <Text color={theme.accent}>▌</Text>
+                            ) : (
+                              <Text inverse>{under}</Text>
+                            )}
+                            {after}
+                          </>
+                        );
+                      })()
+                    )}
+                  </Text>
                 </>
               )}
             </Box>

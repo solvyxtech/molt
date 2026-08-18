@@ -18,6 +18,21 @@ a number presented with more confidence than it was earned with.
   tears the terminal) and the full detail goes to the transcript, which is
   printed once and never redrawn — so the terminal's own scrollback keeps it
   all. Opening the view also prints everything recorded before you opened it.
+- **A prompt longer than the terminal was clipped, not wrapped.** The input row
+  was a Box of sibling Texts, which lay out as flex children — cut at the edge
+  of the window rather than reflowed — so the tail of a long prompt vanished and
+  the caret sat at the cut. Reported as "the cursor doesn't follow onto the
+  second line"; there was no second line. It is one `<Text>` with nested Texts
+  now, which is a single inline run, so it wraps and the caret wraps with it.
+- **A streamed answer was truncated to its last eight lines.** The live region
+  was capped to bound what the terminal has to repaint, which is a real
+  constraint — but it gave up the wrong half. Completed lines now go straight
+  into the transcript, which is printed once and never redrawn, and only the
+  line still being written stays live. The repaint is one line; the answer is
+  all of it. A refused claim is no longer wiped from the screen either: it was
+  streamed, a terminal cannot unprint, and hiding the words the model actually
+  produced is its own small dishonesty — it is marked instead, right above the
+  reason it was rejected.
 - **No credential-shaped literal anywhere in the source.** The redaction tests
   needed key-shaped strings and had them written out — `sk-proj-…`, `ghp_…`,
   `xai-…` — all invented, none real, and every one of them something a reader

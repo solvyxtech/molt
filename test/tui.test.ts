@@ -106,10 +106,12 @@ function slowProvider(ms: number): typeof fetch {
   }) as unknown as typeof fetch;
 }
 
-async function mount(over: Record<string, unknown> = {}) {
+async function mount(over: Record<string, unknown> = {}, columns?: number) {
   const ws = workspace();
   const stdin = new FakeStdin();
   const stdout = new FakeStdout();
+  // Set before render: Ink reads the width when it lays out, not after.
+  if (columns) stdout.columns = columns;
   const engine = new Engine({
     baseUrl: "http://provider.test/v1",
     model: "test-model",
@@ -179,6 +181,72 @@ describe("the transparency view", () => {
       assert.match(loud, /what the model is doing/);
     } finally {
       t.cleanup();
+    }
+  });
+
+  it("shows every line of a streamed answer, while it streams", async () => {
+    // The live region was capped at eight rows with a "↑ N more line(s)"
+    // marker — bounded, which the terminal needs, and truncated, which nobody
+    // asked for. Completed lines go to the transcript as they arrive, so the
+    // repaint is one line and the answer is all of it.
+    const LINES = 24;
+    const answer = Array.from({ length: LINES }, (_, i) => `answer line ${i + 1}`).join("\n");
+    const ws = workspace();
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const engine = new Engine({
+      baseUrl: "http://provider.test/v1",
+      model: "m",
+      cwd: ws.dir,
+      bar: null,
+      stream: true,
+      fetchFn: (async () => {
+        const enc = new TextEncoder();
+        const chunks = (answer.match(/[\s\S]{1,24}/g) ?? []).map((c) =>
+          `data: ${JSON.stringify({ choices: [{ delta: { content: c }, finish_reason: null }] })}\n\n`,
+        );
+        chunks.push(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`);
+        chunks.push("data: [DONE]\n\n");
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => "text/event-stream" },
+          body: new ReadableStream<Uint8Array>({
+            start(c) {
+              for (const f of chunks) c.enqueue(enc.encode(f));
+              c.close();
+            },
+          }),
+          text: async () => "",
+        } as unknown as Response;
+      }) as unknown as typeof fetch,
+    });
+    const app = render(createElement(App, { engine, version: "vtest" }), {
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      debug: true,
+      exitOnCtrlC: false,
+      patchConsole: false,
+    });
+    try {
+      await tick();
+      await submit(stdin, "say something long");
+      await tick(500);
+      const text = stdout.text;
+      for (const n of [1, 7, 15, 24]) {
+        assert.match(text, new RegExp(`answer line ${n}\\b`), `line ${n} never reached the screen`);
+      }
+      assert.ok(!text.includes("more line(s)"), "still truncating with a marker");
+      // Visible while it streams, not only once it finishes: a frame from
+      // partway through carries more than the eight rows the old cap allowed.
+      const partway = stdout.frames[Math.floor(stdout.frames.length * 0.6)] ?? "";
+      const midCount = Array.from({ length: LINES }, (_, i) => i + 1).filter((n) =>
+        partway.includes(`answer line ${n}`),
+      ).length;
+      assert.ok(midCount > 8, `only ${midCount} lines visible mid-stream`);
+    } finally {
+      app.unmount();
+      ws.cleanup();
     }
   });
 
@@ -292,6 +360,33 @@ describe("the transparency view", () => {
       t.stdin.press("V");
       await tick(600);
       assert.match(t.stdout.lastFrame, /what the model is doing/, "shift+V showed nothing");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("wraps a prompt longer than the window instead of clipping it", async () => {
+    // Reported from use: "when the chat goes into a second line the cursor
+    // doesn't follow". There was no second line — the prompt row was a Box of
+    // sibling Texts, which lay out as flex children and are cut at the edge of
+    // the terminal rather than reflowed, so the tail vanished and the caret sat
+    // at the cut. Text nested inside Text is one inline run, and wraps.
+    const t = await mount({}, 60);
+    try {
+      const long = "fix the authentication bug in src/auth.ts and also update the docs";
+      for (const ch of long) t.stdin.press(ch);
+      await tick(400);
+      const frame = t.stdout.lastFrame.replace(/\u001b\[[0-9;]*m/g, "");
+      // Wrapped, so the tail sits on a later line — the test cannot look for
+      // the whole prompt as one contiguous string, which is the point of the
+      // fix. What matters is that the tail is on screen at all.
+      assert.match(frame, /the docs/, "the end of the prompt was clipped away");
+      assert.match(frame, /also update/, "the middle of the prompt went missing");
+      assert.ok(frame.split("\n").some((l) => l.includes("› fix the")), "prompt marker lost");
+      assert.ok(
+        frame.split("\n").every((l) => l.replace(/\u001b\[[0-9;]*m/g, "").length <= 60),
+        "a line ran past the width of the terminal",
+      );
     } finally {
       t.cleanup();
     }
