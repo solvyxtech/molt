@@ -18,6 +18,23 @@ a number presented with more confidence than it was earned with.
   tears the terminal) and the full detail goes to the transcript, which is
   printed once and never redrawn — so the terminal's own scrollback keeps it
   all. Opening the view also prints everything recorded before you opened it.
+- **Checks now say what they established, and receipts say what happened.**
+  `pass work-landed` is a header, not a finding — and the finding was already
+  computed, shown only when the check failed. Every result now carries its
+  evidence on the same line: *2 files modified and verified byte-for-byte on
+  disk*, *`npm test` exited 0 in 9578ms*.
+
+  The receipt was worse: it opened with a provider name and a token count, and
+  never said what the model actually did. It now answers the two questions
+  someone reading it actually has, in that order — what changed (each file with
+  the hashes before and after, and what proves they are still there), what the
+  model ran, then each check with what it established. The session metadata
+  moved to the bottom, where it belongs.
+- **`claims-grounded` stopped seeing short filenames.** Excluding "e.g." by
+  shape — a short stem with a short extension — also excluded `a.ts` and
+  `b.js`, so a claim about a real file was no longer checked at all. The named
+  list of abbreviations was doing the work; the shape rule was only costing
+  coverage.
 - **`watch:` on a check, and result reuse.** A completion claim runs the whole
   bar and the loop allows several attempts, so a ten-second suite costs forty
   seconds of inner loop re-proving what could not have changed. A check that

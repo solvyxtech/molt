@@ -508,6 +508,14 @@ export class Engine {
    */
   private readPaths = new Set<string>();
   /**
+   * What the model did this turn, one line each, in order.
+   *
+   * The receipt is read by someone asking "what did it do, and should I
+   * believe it finished?" — and until now the answer to the first half was
+   * nowhere in the document.
+   */
+  private did: string[] = [];
+  /**
    * Results reused while their watched files have not moved.
    *
    * One per session and never persisted: four proof attempts against a
@@ -1830,6 +1838,10 @@ export class Engine {
             this.pinTask(userText);
           }
           called.push(name);
+          this.did.push(
+            `${allowed ? "" : "refused: "}${name} ${detail}` +
+              (note && note !== "repeat" ? ` [${note}]` : ""),
+          );
           if (allowed) this.actsSinceBar += 1;
           if (!decision.ask) autoRan += 1;
           // Everything that scrolls is redacted. A transcript is pasted into
@@ -1988,6 +2000,8 @@ export class Engine {
           costUsd: this.costUsd(),
           costEstimated: this.costEstimated,
           shedBatches: this.transcript.shedCount,
+          changed: this.mergedLedger().map((e) => ({ path: e.path, before: e.before, after: e.after })),
+          did: [...this.did],
         });
         log?.append("receipt", { verdict, file: receipt.path, attempt: proofAttempts });
         yield { kind: "receipt", path: receipt.path };

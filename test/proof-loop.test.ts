@@ -298,9 +298,13 @@ describe("receipts", () => {
     assert.ok(receipts.some((f) => f.includes("accepted")));
 
     const refused = readFileSync(join(dir, ".molt", "receipts", receipts[0]), "utf8");
-    assert.match(refused, /## Claim/);
+    // The receipt answers "what did it do, and should I believe it finished?"
+    // in that order, so the headings changed with it.
+    assert.match(refused, /## What the model claimed/);
     assert.match(refused, /Done\./, "the claim itself is preserved verbatim");
-    assert.match(refused, /molt refused the completion claim/);
+    assert.match(refused, /molt refused this claim/);
+    assert.match(refused, /## What the model changed/, "a receipt has to say what happened");
+    assert.match(refused, /## What was checked, and what it established/);
   });
 
   it("keeps the failing output in the receipt, not just the verdict", async () => {
