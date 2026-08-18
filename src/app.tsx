@@ -40,10 +40,26 @@ import {
   nextAutonomy,
   type Autonomy,
 } from "./autonomy.js";
+import {
+  EMPTY,
+  backspace,
+  deleteForward,
+  deleteWord,
+  end,
+  home,
+  insert,
+  killToEnd,
+  killToStart,
+  left,
+  line,
+  right,
+  split,
+  type Line,
+} from "./line.js";
 import { DEFAULT_THEME, getTheme, nextTheme } from "./theme.js";
 import type { BarResult, EngineEvent, JobOutcome } from "./types.js";
 
-type Line = {
+type Row = {
   id: number;
   tone: "user" | "agent" | "tool" | "info" | "error" | "ok" | "fail";
   text: string;
@@ -158,8 +174,14 @@ export function App({
   const [themeName, setThemeName] = useState(DEFAULT_THEME);
   const theme = getTheme(themeName);
 
-  const [lines, setLines] = useState<Line[]>([]);
-  const [input, setInput] = useState("");
+  const [lines, setLines] = useState<Row[]>([]);
+  // The prompt line carries its caret, so a typo can be fixed where it is
+  // rather than by deleting everything after it.
+  const [entry, setEntry] = useState<Line>(EMPTY);
+  const input = entry.text;
+  const setInput = useCallback((text: string) => setEntry(line(text)), []);
+  /** Apply one editing operation to the line. */
+  const edit = useCallback((op: (l: Line) => Line) => setEntry((l) => op(l)), []);
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState<{ name: string; detail: string } | null>(null);
   const [promptChoice, setPromptChoice] = useState(0);
@@ -197,7 +219,7 @@ export function App({
   const nextId = useRef(0);
   const resolver = useRef<((ok: boolean) => void) | null>(null);
 
-  const add = useCallback((tone: Line["tone"], text: string) => {
+  const add = useCallback((tone: Row["tone"], text: string) => {
     setLines((prev) => [...prev, { id: nextId.current++, tone, text }]);
   }, []);
 
@@ -1083,7 +1105,11 @@ export function App({
       return;
     }
     if (key.ctrl && (char === "a" || char === "\u0001")) {
-      cycleAutonomy();
+      // A terminal's ctrl+A means "start of line", and molt must not steal
+      // that from anyone editing. With nothing typed there is no line to go
+      // to the start of, so the key is free for the autonomy picker.
+      if (input === "" || busy || mode.kind !== "chat") cycleAutonomy();
+      else edit(home);
       return;
     }
 
@@ -1101,7 +1127,7 @@ export function App({
         setMode({ kind: "chat" });
         // Pressed by accident while starting a sentence: give the letter back
         // rather than making someone retype the line.
-        setInput((v) => v + "A");
+        edit((l) => insert(l, "A"));
         return;
       }
       const back = key.upArrow || (key.shift && key.tab);
@@ -1170,10 +1196,10 @@ export function App({
         return;
       }
       if (key.backspace || key.delete) {
-        setInput((v) => v.slice(0, -1));
+        edit(backspace);
         return;
       }
-      if (char && !key.ctrl && !key.meta) setInput((v) => v + char);
+      if (char && !key.ctrl && !key.meta) edit((l) => insert(l, char));
       return;
     }
 
@@ -1221,9 +1247,49 @@ export function App({
       void submit(text);
       return;
     }
-    if (key.backspace || key.delete) {
-      setInput((s) => s.slice(0, -1));
+
+    // --- editing the line in place ---
+    //
+    // Enough of readline to fix a mistake without retyping the sentence, and
+    // no more: this is a one-line prompt, not an editor.
+    if (key.leftArrow) {
+      edit(left);
+      return;
+    }
+    if (key.rightArrow) {
+      edit(right);
+      return;
+    }
+    if (key.backspace) {
+      edit(backspace);
       setPaletteIndex(0);
+      return;
+    }
+    if (key.delete) {
+      // Ink reports both backspace and the delete key here depending on the
+      // terminal; with a caret the two are different edits, so the one that
+      // deletes forward only does so when there is something ahead of it.
+      edit((l) => (l.at < l.text.length ? deleteForward(l) : backspace(l)));
+      setPaletteIndex(0);
+      return;
+    }
+    if (key.ctrl && char === "w") {
+      edit(deleteWord);
+      setPaletteIndex(0);
+      return;
+    }
+    if (key.ctrl && char === "k") {
+      edit(killToEnd);
+      setPaletteIndex(0);
+      return;
+    }
+    if (key.ctrl && char === "u") {
+      edit(killToStart);
+      setPaletteIndex(0);
+      return;
+    }
+    if (key.ctrl && char === "e") {
+      edit(end);
       return;
     }
     // shift+A on an empty line opens the level picker. Bound only on an empty
@@ -1235,12 +1301,12 @@ export function App({
     }
 
     if (char && !key.ctrl && !key.meta) {
-      setInput((s) => s + char);
+      edit((l) => insert(l, char));
       setPaletteIndex(0);
     }
   });
 
-  const toneColor: Record<Line["tone"], string> = {
+  const toneColor: Record<Row["tone"], string> = {
     user: theme.text,
     agent: theme.accent,
     tool: theme.dim,
@@ -1258,8 +1324,8 @@ export function App({
   //
   // The splash is held back until it stops moving, because permanent output
   // cannot be printed above something still animating.
-  const staticItems: { key: string; line?: Line }[] = settled
-    ? [{ key: "banner" }, ...lines.map((l) => ({ key: `l${l.id}`, line: l }))]
+  const staticItems: { key: string; row?: Row }[] = settled
+    ? [{ key: "banner" }, ...lines.map((l) => ({ key: `l${l.id}`, row: l }))]
     : [];
 
   const running = jobs.find((j) => j.outcome === undefined);
@@ -1269,10 +1335,10 @@ export function App({
     <Box flexDirection="column">
       <Static items={staticItems}>
         {(item) =>
-          item.line ? (
-            <Text key={item.key} color={toneColor[item.line.tone]}>
-              {item.line.tone === "user" ? "› " : item.line.tone === "tool" ? "· " : "  "}
-              {item.line.text}
+          item.row ? (
+            <Text key={item.key} color={toneColor[item.row.tone]}>
+              {item.row.tone === "user" ? "› " : item.row.tone === "tool" ? "· " : "  "}
+              {item.row.text}
             </Text>
           ) : (
             <Box key={item.key} flexDirection="column">
@@ -1476,10 +1542,32 @@ export function App({
                   <Text color={theme.dim}>{mode.kind === "login-key" ? "🔑 " : "› "}</Text>
                   {/* A pasted key is echoed as dots — it must not survive on
                       screen or in a scrollback buffer. */}
-                  <Text color={theme.text}>
-                    {mode.kind === "login-key" ? "•".repeat(input.length) : input}
-                  </Text>
-                  <Text color={theme.accent}>▌</Text>
+                  {mode.kind === "login-key" ? (
+                    <>
+                      <Text color={theme.text}>{"•".repeat(input.length)}</Text>
+                      <Text color={theme.accent}>▌</Text>
+                    </>
+                  ) : (
+                    (() => {
+                      // The caret is drawn where it actually is: a block at the
+                      // end of the line, and the character it stands on
+                      // reversed when it is inside the text.
+                      const { before, under, after, atEnd } = split(entry);
+                      return (
+                        <>
+                          <Text color={theme.text}>{before}</Text>
+                          {atEnd ? (
+                            <Text color={theme.accent}>▌</Text>
+                          ) : (
+                            <Text color={theme.text} inverse>
+                              {under}
+                            </Text>
+                          )}
+                          <Text color={theme.text}>{after}</Text>
+                        </>
+                      );
+                    })()
+                  )}
                 </>
               )}
             </Box>

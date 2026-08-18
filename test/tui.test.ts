@@ -307,6 +307,23 @@ describe("the transparency view", () => {
     }
   });
 
+  it("lets a typo be fixed where it is, not by retyping the line", async () => {
+    // Reported from use: with no caret, the only way back to a mistake was to
+    // delete everything after it.
+    const t = await mount();
+    try {
+      for (const ch of "fix the bg") t.stdin.press(ch);
+      await tick(40);
+      t.stdin.press("\u001B[D"); // left, to before the "g"
+      await tick(20);
+      t.stdin.press("u");
+      await tick(60);
+      assert.match(t.stdout.lastFrame, /fix the bug/, "the fix did not land in place");
+    } finally {
+      t.cleanup();
+    }
+  });
+
   it("leaves a mid-sentence capital alone", async () => {
     const t = await mount();
     try {
