@@ -53,10 +53,15 @@ jobs:
       - run: npm ci && npm run build
       - name: pack and install the tarball
         run: |
-          npm pack --silent
+          # Take the filename from npm rather than guessing it. The glob here
+          # was solvyxtech-molt-*.tgz — the GitHub org — while the package is
+          # scoped @solvyx, so it never matched and this job never once tested
+          # a cold install.
+          TARBALL=$(npm pack --silent)
+          echo "packed $TARBALL"
           mkdir -p /tmp/cold && cd /tmp/cold
           npm init -y >/dev/null
-          npm install "$GITHUB_WORKSPACE"/solvyxtech-molt-*.tgz
+          npm install "$GITHUB_WORKSPACE/$TARBALL"
           npx molt --help
           npx molt init
           # A fresh project has done nothing, so the bar must NOT pass.
