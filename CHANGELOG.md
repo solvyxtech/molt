@@ -18,6 +18,13 @@ a number presented with more confidence than it was earned with.
   tears the terminal) and the full detail goes to the transcript, which is
   printed once and never redrawn — so the terminal's own scrollback keeps it
   all. Opening the view also prints everything recorded before you opened it.
+- **The last of the truncation is gone.** A tool line cut the command at eighty
+  characters, so the one thing you most need to read — what molt actually ran —
+  was the thing being abbreviated. The working line cut what it was working on
+  at forty-eight. `/shed --explain` showed twelve lines of a digest and twelve
+  of an exuvia. `/archive <pattern>` stopped at five hits and 200 characters
+  each. All of it prints whole now and wraps; the transcript is written once and
+  never repainted, so there was never a rendering cost to pay for it.
 - **You can type while molt is working.** Keystrokes were swallowed for the
   whole turn, so a thought that arrived mid-run had to be held until it
   finished. The line is yours now, and enter queues it to start the moment the

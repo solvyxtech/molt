@@ -447,6 +447,9 @@ export function toolDetail(name: string, args: Record<string, unknown>): string 
           : name === "read_file" && Number(args.offset) > 0
             ? `${where} from line ${Number(args.offset) + 1}`
             : where || JSON.stringify(args);
-  const oneLine = raw.replace(/\s+/g, " ").trim();
-  return [...oneLine].slice(0, 80).join("");
+  // Not truncated. A command cut at eighty characters is a command you cannot
+  // check, and the transcript is printed once and wraps — there is no repaint
+  // cost to pay for the honesty. Whitespace is still collapsed, because a
+  // heredoc spread over twelve lines is a transcript nobody can scan.
+  return raw.replace(/\s+/g, " ").trim();
 }

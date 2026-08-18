@@ -1037,9 +1037,7 @@ export function App({
           if (arg) {
             const hits = archive.grep?.(arg) ?? [];
             if (hits.length === 0) add("info", `nothing matches /${arg}/`);
-            for (const h of hits.slice(0, 5))
-              add("info", `exuvia ${h.index}: ${h.excerpt.slice(0, 200)}`);
-            if (hits.length > 5) add("info", `… and ${hits.length - 5} more`);
+            for (const h of hits) add("info", `exuvia ${h.index}: ${h.excerpt}`);
           } else {
             const entries = archive.list();
             if (entries.length === 0) add("info", "nothing shed in this project yet");
@@ -1088,9 +1086,9 @@ export function App({
               `would shed ${plan.droppedCount} messages · ${plan.beforeTokens} → ${plan.afterTokens} tokens`,
             );
             add("info", "── stays in context (digest) ──");
-            for (const l of plan.digest.split("\n").slice(0, 12)) add("info", `  ${l}`);
+            for (const l of plan.digest.split("\n")) add("info", `  ${l}`);
             add("info", "── preserved on disk (exuvia) ──");
-            for (const l of plan.exuvia.split("\n").slice(0, 12)) add("info", `  ${l}`);
+            for (const l of plan.exuvia.split("\n")) add("info", `  ${l}`);
             return true;
           }
           try {
@@ -1533,7 +1531,7 @@ export function App({
       <Static items={staticItems}>
         {(item) =>
           item.row ? (
-            <Text key={item.key} color={toneColor[item.row.tone]}>
+            <Text key={item.key} color={toneColor[item.row.tone]} wrap="wrap">
               {item.row.tone === "user" ? "› " : item.row.tone === "tool" ? "· " : "  "}
               {item.row.text}
             </Text>
@@ -1706,9 +1704,9 @@ export function App({
                   <Text color={theme.dim}>{activity?.label ?? "working"}</Text>
                   {/* What it is working ON, not just that it is working. */}
                   {activity?.what && (
-                    <Text color={theme.dim}>
+                    <Text color={theme.dim} wrap="wrap">
                       {" \u00b7 "}
-                      {activity.what.length > 48 ? activity.what.slice(0, 47) + "…" : activity.what}
+                      {activity.what}
                     </Text>
                   )}
                   {activity && (
