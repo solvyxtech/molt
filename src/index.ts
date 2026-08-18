@@ -3,7 +3,7 @@ export { Archive, type ArchiveEntry, type ArchiveLike } from "./archive.js";
 export {
   BAR_FILENAME,
   BarError,
-  DEFAULT_BAR,
+  FALLBACK_BAR,
   barFingerprint,
   barPath,
   claimedWrites,

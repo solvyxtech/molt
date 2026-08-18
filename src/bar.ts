@@ -238,49 +238,15 @@ export function loadBar(cwd: string): Bar | null {
 }
 
 /** Written on first run so the bar exists before anyone needs it. */
-export const DEFAULT_BAR = `# What "done" means in this project.
-#
-# molt will not emit a final answer while any check below fails. Checks are
-# ordinary shell commands, so anything your CI can run, your agent must pass.
-#
-# Delete what does not apply. An empty or missing file disables the proof
-# loop entirely, which molt will warn you about on every launch.
-
-version: 1
-
-checks:
-  # - name: types
-  #   run: npm run typecheck
-  #
-  # - name: tests
-  #   run: npm test
-  #   timeout: 300
-
-  # Builtins molt runs itself, against the full session record —
-  # including context that has already been shed.
-  #
-  #   files-changed    at least one file was actually modified, and every
-  #                    write molt performed is still on disk, byte for byte
-  #   record-intact    write evidence for this session is still recoverable
-  #                    from the archive, so results stay auditable later
-  #   claims-grounded  every file the model names in its final answer either
-  #                    exists or was written here — no invented files
-  #
-  # Tags are optional selection labels. molt understands --only and --skip,
-  # so slow checks can live in the file for CI without paying for them on
-  # every completion attempt locally. An untagged check always runs.
-  - name: work-landed
-    builtin: files-changed
-    tags: [fast]
-
-  - name: record-intact
-    builtin: record-intact
-    tags: [fast]
-
-  - name: claims-grounded
-    builtin: claims-grounded
-    tags: [fast]
-`;
+/**
+ * The bar molt writes when it can find nothing to run.
+ *
+ * `proposeBar()` is the real source now — it reads the project and writes the
+ * project's own commands. This is what remains when there is nothing to read,
+ * and it exists as a named export because a fallback nobody can point at is a
+ * fallback nobody can review.
+ */
+export const FALLBACK_BAR = proposeBar("/nonexistent-so-nothing-is-detected").yaml;
 
 /**
  * Write a starter bar, with this project's own commands in it.

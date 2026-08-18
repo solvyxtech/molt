@@ -10,7 +10,7 @@ import { after, describe, it } from "node:test";
 import { Archive } from "../src/archive.js";
 import {
   BarError,
-  DEFAULT_BAR,
+  FALLBACK_BAR,
   claimedWrites,
   loadBar,
   mentionedPaths,
@@ -172,7 +172,7 @@ checks:
   }
 
   it("ships a default bar that is itself valid", () => {
-    const bar = parseBar(DEFAULT_BAR);
+    const bar = parseBar(FALLBACK_BAR);
     assert.ok(bar.checks.length >= 2);
   });
 

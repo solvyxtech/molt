@@ -253,6 +253,44 @@ asserting a secret in a prompt never reaches the log. Full content lives in
 `.molt/exuviae/` when it is shed, which is a deliberate act with a visible
 artifact rather than an automatic side effect.
 
+## A receipt, read end to end
+
+A receipt answers two questions, in the order anyone actually asks them: what
+did it do, and should I believe it finished?
+
+```markdown
+# molt receipt 0000 — accepted
+
+molt accepted this claim: every check that can block a completion passed.
+
+## What the model claimed
+> `f()` now returns 1, matching the test. `npm test` passes.
+
+## What the model changed
+| file       | before         | after          |
+| `src/m.js` | `ea7feaf511ed` | `081a66d9fd0a` |
+
+Hashes are SHA-256, taken immediately before and after molt wrote the file.
+`work-landed` re-reads each path and fails if what is there now does not match.
+
+## What the model ran
+- read_file src/m.js
+- edit_file src/m.js
+- bash npm test
+
+## What was checked, and what it established
+| tests       | pass | `npm test` exited 0 in 170ms                          |
+| work-landed | pass | 1 file(s) modified and verified byte-for-byte on disk |
+```
+
+The right-hand column is the point. "pass" is a header; *what it established*
+is the reason to believe the header, and molt used to compute that sentence and
+show it only when the check failed — which is backwards, since a failure
+explains itself and a pass is the one that has to earn belief.
+
+Session metadata — provider, model, tokens, cost — sits at the bottom, where
+whoever wants it can find it and everyone else can ignore it.
+
 ## Reconstructing a claim
 
 Given `molt` said a task was complete:

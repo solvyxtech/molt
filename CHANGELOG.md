@@ -18,6 +18,11 @@ a number presented with more confidence than it was earned with.
   tears the terminal) and the full detail goes to the transcript, which is
   printed once and never redrawn — so the terminal's own scrollback keeps it
   all. Opening the view also prints everything recorded before you opened it.
+- **One bar template instead of two.** `DEFAULT_BAR` was a hand-written
+  template that nothing generated any more, sitting next to the generator that
+  actually writes the file. It is now derived from that generator
+  (`FALLBACK_BAR`), so the thing molt writes when it can detect nothing is the
+  thing the code produces rather than a second copy that could drift from it.
 - **Checks now say what they established, and receipts say what happened.**
   `pass work-landed` is a header, not a finding — and the finding was already
   computed, shown only when the check failed. Every result now carries its
