@@ -34,7 +34,7 @@ export const DEFAULT_AUTONOMY: Autonomy = "low";
 export const AUTONOMY_SUMMARY: Record<Autonomy, string> = {
   low: "asks before every command and every write",
   medium: "runs searches, read-only commands, and writes inside the project",
-  high: "runs everything except what cannot be undone",
+  high: "runs everything except a named list of destructive commands",
 };
 
 export function isAutonomy(v: string): v is Autonomy {
@@ -111,23 +111,53 @@ const HARMLESS_REDIRECT = /(?:\d?>>?|&>)\s*\/dev\/null(?![\w/])|\d?>&\d/g;
  */
 const OPAQUE = /(\$\(|`|>|<|\bsudo\b|\bsu\b)/;
 
-/** Things that cannot be undone, and are therefore never automatic. */
+/**
+ * Operations that destroy something no later step can restore.
+ *
+ * This list is the whole content of the promise `high` makes, so it is worth
+ * being exact about what that promise is: molt asks about every construction
+ * NAMED HERE. It is not a claim to have enumerated every way a shell can lose
+ * data, and it is not a sandbox — see the note at the top of this file.
+ *
+ * The first version of this list required a flag on `rm`, which meant plain
+ * `rm secrets.env` ran unattended at high. Deleting one file by name is no
+ * more reversible than deleting a tree, and the documentation said "except
+ * what cannot be undone" — an overclaim in the one file where an overclaim
+ * matters most. Every entry below exists because probing found it missing.
+ */
 const IRREVERSIBLE = [
-  /\brm\s+(-[a-z]*[rf]|--recursive|--force)/i,
+  // Deletion, in any form. No flag required: one named file is enough.
+  /\brm\b/i,
   /\brmdir\b/i,
+  /\bunlink\b/i,
+  /\bshred\b/i,
+  /-delete\b/i,
+  /-exec\b/i, // find -exec runs an arbitrary command over many files
+  // Emptying a file in place.
+  /\btruncate\b/i,
+  /\btee\b(?!\s+-a\b)/i,
   /\bmkfs\b/i,
   /\bdd\s+.*\bof=/i,
+  // Redirection that replaces a file's contents. Appending is fine, and a
+  // discard was already stripped before this list is consulted.
+  /(?<!>)>(?!>)/,
+  // Machine state.
   /\bshutdown\b|\breboot\b|\bhalt\b/i,
   /\bsudo\b|\bdoas\b/i,
+  /\bkillall\b|\bpkill\b/i,
+  /\bchmod\s+(-[a-z]+\s+)?[0-7]*7[0-7]{2}\b/i,
+  // History and published state.
   /\bgit\s+push\b/i,
   /\bgit\s+reset\s+--hard\b/i,
   /\bgit\s+clean\s+-[a-z]*f/i,
-  /\bgit\s+checkout\s+--\s/i,
+  /\bgit\s+checkout\b.*\s--(\s|$)/i,
+  /\bgit\s+restore\b/i,
   /\bgit\s+branch\s+-D\b/i,
+  /\bgit\s+rebase\b|\bgit\s+filter-branch\b/i,
+  /\bgit\s+stash\s+(drop|clear)\b/i,
   /\bnpm\s+publish\b|\byarn\s+publish\b|\bpnpm\s+publish\b/i,
+  // A download piped into an interpreter is an unread program.
   /\|\s*(sh|bash|zsh|python|node)\b/i,
-  /\bchmod\s+(-[a-z]+\s+)?[0-7]*7[0-7]{2}\b/i,
-  /\bkillall\b|\bpkill\b/i,
   /:\(\)\s*\{/, // fork bomb, and anything else that opens with a function trap
 ];
 
@@ -172,7 +202,9 @@ export function isReadOnlyCommand(command: string): boolean {
 
 /** Would this command do something no later step could undo? */
 export function isIrreversible(command: string): boolean {
-  return IRREVERSIBLE.some((re) => re.test(command));
+  // A discard is not a write, so it must not read as one here either.
+  const bare = command.replace(HARMLESS_REDIRECT, " ");
+  return IRREVERSIBLE.some((re) => re.test(bare));
 }
 
 /** Is `p` inside `cwd` — the project molt was pointed at? */

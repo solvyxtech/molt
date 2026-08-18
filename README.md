@@ -211,7 +211,7 @@ force.
 |---|---|
 | **low** (default) | reading a file inside the project, and nothing else |
 | **medium** | reads, writes inside the project, and commands that only report |
-| **high** | everything except what cannot be undone, or what leaves the project |
+| **high** | everything except a named list of destructive commands, or leaving the project |
 
 The classifier is mechanical and conservative — a short allowlist of commands
 whose purpose is to report, judged segment by segment, with redirection and

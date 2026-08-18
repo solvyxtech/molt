@@ -85,6 +85,14 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
+  `docs/autonomy.md` both said it ran "everything except what cannot be undone".
+  The deny-list required a flag on `rm`, so deleting one named file was not on
+  it — and neither were `find -exec`, `find -delete`, `truncate`, `tee`, `>`
+  redirection to a path, `git checkout -- `, `git restore`, `git rebase`, or
+  `git stash drop`. All now ask at every level. The documented promise is now
+  "a named list", which is what the code actually implements: found by probing
+  the classifier, which is the only way this kind of gap is found.
 - **A large file could not be read at all, and the dead end looked like a
   model looping.** `read_file` took a path and nothing else, and every result
   was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
@@ -200,6 +208,14 @@ claim literally true.
 
 ### Fixed
 
+- **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
+  `docs/autonomy.md` both said it ran "everything except what cannot be undone".
+  The deny-list required a flag on `rm`, so deleting one named file was not on
+  it — and neither were `find -exec`, `find -delete`, `truncate`, `tee`, `>`
+  redirection to a path, `git checkout -- `, `git restore`, `git rebase`, or
+  `git stash drop`. All now ask at every level. The documented promise is now
+  "a named list", which is what the code actually implements: found by probing
+  the classifier, which is the only way this kind of gap is found.
 - **A large file could not be read at all, and the dead end looked like a
   model looping.** `read_file` took a path and nothing else, and every result
   was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
@@ -335,6 +351,14 @@ artifact molt cannot silently edit.
 
 ### Fixed
 
+- **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
+  `docs/autonomy.md` both said it ran "everything except what cannot be undone".
+  The deny-list required a flag on `rm`, so deleting one named file was not on
+  it — and neither were `find -exec`, `find -delete`, `truncate`, `tee`, `>`
+  redirection to a path, `git checkout -- `, `git restore`, `git rebase`, or
+  `git stash drop`. All now ask at every level. The documented promise is now
+  "a named list", which is what the code actually implements: found by probing
+  the classifier, which is the only way this kind of gap is found.
 - **A large file could not be read at all, and the dead end looked like a
   model looping.** `read_file` took a path and nothing else, and every result
   was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
@@ -433,6 +457,14 @@ session. Shrinking them is a rounding error.
 
 ### Fixed
 
+- **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
+  `docs/autonomy.md` both said it ran "everything except what cannot be undone".
+  The deny-list required a flag on `rm`, so deleting one named file was not on
+  it — and neither were `find -exec`, `find -delete`, `truncate`, `tee`, `>`
+  redirection to a path, `git checkout -- `, `git restore`, `git rebase`, or
+  `git stash drop`. All now ask at every level. The documented promise is now
+  "a named list", which is what the code actually implements: found by probing
+  the classifier, which is the only way this kind of gap is found.
 - **A large file could not be read at all, and the dead end looked like a
   model looping.** `read_file` took a path and nothing else, and every result
   was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
@@ -533,6 +565,14 @@ against a real provider before behaviour changes.
 
 ### Fixed
 
+- **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
+  `docs/autonomy.md` both said it ran "everything except what cannot be undone".
+  The deny-list required a flag on `rm`, so deleting one named file was not on
+  it — and neither were `find -exec`, `find -delete`, `truncate`, `tee`, `>`
+  redirection to a path, `git checkout -- `, `git restore`, `git rebase`, or
+  `git stash drop`. All now ask at every level. The documented promise is now
+  "a named list", which is what the code actually implements: found by probing
+  the classifier, which is the only way this kind of gap is found.
 - **A large file could not be read at all, and the dead end looked like a
   model looping.** `read_file` took a path and nothing else, and every result
   was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
@@ -667,6 +707,14 @@ can't say "done" without proving it.**
 
 ### Fixed
 
+- **`high` autonomy ran `rm secrets.env` unattended**, while this changelog and
+  `docs/autonomy.md` both said it ran "everything except what cannot be undone".
+  The deny-list required a flag on `rm`, so deleting one named file was not on
+  it — and neither were `find -exec`, `find -delete`, `truncate`, `tee`, `>`
+  redirection to a path, `git checkout -- `, `git restore`, `git rebase`, or
+  `git stash drop`. All now ask at every level. The documented promise is now
+  "a named list", which is what the code actually implements: found by probing
+  the classifier, which is the only way this kind of gap is found.
 - **A large file could not be read at all, and the dead end looked like a
   model looping.** `read_file` took a path and nothing else, and every result
   was cut to 2048 bytes — so for a 17KB README a model got the first 2KB and
