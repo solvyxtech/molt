@@ -139,6 +139,23 @@ The bottom line is the session meter and only ever climbs. **Per-job** figures
 — what one question cost — live in the view, measured as a delta against the
 session meter rather than by resetting it.
 
+## Work that goes nowhere
+
+A tool call that returns exactly what it returned before has taught the model
+nothing, and resending that answer costs what it cost the first time. molt says
+so instead:
+
+```
+· read_file  README.md  [repeat]  0ms
+  that step repeated calls molt had already answered — nothing new came back
+```
+
+The result handed back is a pointer to the earlier one, not the payload. Two
+consecutive steps of nothing but repeats end the turn, with what it spent
+stated, and `loop_stop` in the log naming the step. A long file is read with
+`offset`, and every partial result says how many lines remain and which offset
+continues it — so "read it again" is never the only move available.
+
 ## Estimated versus measured
 
 molt distinguishes the two rather than blurring them.

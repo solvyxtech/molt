@@ -64,6 +64,13 @@ export const SYSTEM_PROMPT = [
   "Use the tools to read files, write files, and run shell commands (grep/find/git via bash).",
   "Read only what you need. Be terse.",
   "",
+  "Every tool result stays in this conversation. Never read a file you have already",
+  "read unless you changed it — scroll up instead. Long files arrive one part at a",
+  "time and tell you the offset that continues them; use that offset rather than",
+  "reading the same file again, which returns the same part. If you find yourself",
+  "wanting a file you already have, you are done gathering: answer, or say what is",
+  "actually blocking you.",
+  "",
   "This project defines what 'done' means in .molt/done.yml. When you finish,",
   "those checks run automatically. If any fail you will be told exactly which,",
   "with their output, and you must fix the underlying problem and continue.",
@@ -75,11 +82,28 @@ export const SYSTEM_PROMPT = [
 ].join("\n");
 
 /**
- * Tool results are the bulk of a session's tokens: every result is resent on
- * every subsequent request. 2048 bytes is roughly 512 tokens each — still
- * enough to be useful, and truncation is always visible, never silent.
+ * How much of a tool result comes back.
+ *
+ * Tool results are the bulk of a session's tokens, because every one of them
+ * is resent on every subsequent request — which argues for a tight cap. It
+ * argued too well: at 2048 bytes for everything, reading a 17KB README took
+ * nine round trips, and each of those round trips resent the entire
+ * conversation. The tight cap cost more tokens than the large read it was
+ * avoiding, and produced a session that looked exactly like a model looping.
+ *
+ * So the cap is per kind of result, sized to how the result is used:
+ *
+ *  - A file is read to be understood, and paging through one in 2KB slices
+ *    is the expensive way to spend a context window. 16KB is roughly 4k
+ *    tokens, which holds most source files whole.
+ *  - Command output is mostly noise with a signal at one end, and a failing
+ *    suite's first 8KB says what failed.
+ *
+ * Truncation is always visible, never silent, and a truncated read always
+ * says how to continue.
  */
-export const TOOL_RESULT_MAX_BYTES = 2048;
+export const TOOL_RESULT_MAX_BYTES = 8192;
+export const READ_MAX_BYTES = 16_384;
 export const MAX_STEPS = 32;
 export const MAX_PROOF_ATTEMPTS = 4;
 export const DEFAULT_BASH_TIMEOUT_MS = 60_000;
@@ -89,10 +113,17 @@ const TOOLS = [
     type: "function",
     function: {
       name: "read_file",
-      description: "Read a UTF-8 text file.",
+      description:
+        "Read a UTF-8 text file. Long files come back one part at a time, and the result " +
+        "says how many lines remain and which offset continues it. Use that offset to read " +
+        "on; do not call this again with the same arguments, which returns the same part.",
       parameters: {
         type: "object",
-        properties: { path: { type: "string" } },
+        properties: {
+          path: { type: "string" },
+          offset: { type: "number", description: "First line to return, 0-based. Default 0." },
+          limit: { type: "number", description: "How many lines to return. Default: as many as fit." },
+        },
         required: ["path"],
       },
     },
@@ -228,6 +259,85 @@ function failedOnlyWriteChecks(result: BarResult): string | null {
   const failed = result.results.filter((r) => !r.ok);
   if (failed.length === 0) return null;
   return failed.every((r) => r.detail === "files-changed") ? failed.map((r) => r.name).join(", ") : null;
+}
+
+/**
+ * A stable identity for a tool call, so "the same question" is recognised
+ * however the model happens to spell it.
+ */
+function callKey(name: string, args: Record<string, unknown>): string {
+  const parts = Object.entries(args)
+    .filter(([, v]) => v !== undefined && v !== null && v !== "")
+    // An explicit zero offset is the default, and says nothing new.
+    .filter(([k, v]) => !((k === "offset" || k === "limit") && Number(v) === 0))
+    .map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`)
+    .sort();
+  return `${name}(${parts.join(",")})`;
+}
+
+/** A tool argument that should be a non-negative integer, or its default. */
+function num(v: unknown, fallback: number): number {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
+/**
+ * One part of a file, and how to get the next.
+ *
+ * The old read_file took a path and nothing else, and every result was cut to
+ * TOOL_RESULT_MAX_BYTES. For a 17KB README that meant the first 2KB and no way
+ * on earth to reach the rest — so a model that needed more had exactly one
+ * move available: call read_file again, and receive the same 2KB. That is not
+ * a model looping. That is a dead end with a retry button, and it cost a real
+ * session thirty steps and fifty cents.
+ *
+ * Paging turns the dead end into a path: every truncated result says how many
+ * lines are left and the offset that continues it.
+ */
+function readPart(abs: string, shown: string, offset: number, limit: number): string {
+  const raw = readFileSync(abs, "utf8").split("\n");
+  // A trailing newline is a terminator, not an empty last line. Counting it
+  // reports 401 lines for a 400-line file, and every offset the model is told
+  // to use is then one past what it means.
+  const lines = raw.length > 1 && raw.at(-1) === "" ? raw.slice(0, -1) : raw;
+  const from = Math.min(offset, lines.length);
+  const until = Math.min(lines.length, from + limit);
+
+  // The label and the continuation notice have to fit inside the same budget
+  // as the content. Filling to the cap and appending them afterwards is how
+  // the first version of this failed: truncateResult then cut the notice off
+  // the end, so the model was handed a part of a file and no way to ask for
+  // the rest — the dead end this function exists to remove, rebuilt one layer
+  // up. The reserve uses the longest form either line can take.
+  const label = `[molt: ${shown} lines ${from + 1}-${lines.length} of ${lines.length}]`;
+  const notice = `[molt: ${lines.length} more line(s). Continue with read_file offset=${lines.length}.]`;
+  const reserve = Buffer.byteLength(label + "\n" + notice + "\n", "utf8");
+  const budget = Math.max(256, READ_MAX_BYTES - reserve);
+
+  const out: string[] = [];
+  let bytes = 0;
+  let i = from;
+  for (; i < until; i++) {
+    const line = lines[i]!;
+    const size = Buffer.byteLength(line, "utf8") + 1;
+    // Always return at least one line, even an enormous one: a caller that
+    // gets nothing back cannot tell "empty" from "too big to send".
+    if (out.length > 0 && bytes + size > budget) break;
+    out.push(line);
+    bytes += size;
+  }
+
+  const whole = from === 0 && i >= lines.length;
+  if (whole) return out.join("\n");
+
+  // A part is labelled, because a model holding lines 40-80 of a file needs to
+  // know that is what it is holding.
+  const head = `[molt: ${shown} lines ${from + 1}-${i} of ${lines.length}]`;
+  const tail =
+    i < lines.length
+      ? `\n[molt: ${lines.length - i} more line(s). Continue with read_file offset=${i}.]`
+      : "";
+  return `${head}\n${out.join("\n")}${tail}`;
 }
 
 function truncateResult(s: string): { text: string; note?: string } {
@@ -623,7 +733,12 @@ export class Engine {
   private runTool(name: string, args: Record<string, unknown>, callId: string): string {
     switch (name) {
       case "read_file":
-        return readFileSync(resolve(this.cwd, String(args.path ?? "")), "utf8");
+        return readPart(
+          resolve(this.cwd, String(args.path ?? "")),
+          String(args.path ?? ""),
+          num(args.offset, 0),
+          num(args.limit, Number.MAX_SAFE_INTEGER),
+        );
 
       case "write_file": {
         const rel = String(args.path ?? "");
@@ -843,6 +958,17 @@ export class Engine {
     /** The last bar result, for deciding whether another run could differ. */
     let lastResult: BarResult | null = null;
     this.actsSinceBar = 0;
+
+    /**
+     * Every tool call made this turn, by call and by the digest of what it
+     * returned. A model that asks the same question and gets the same answer
+     * has learned nothing, and resending that answer costs the same as the
+     * first time — which is how thirty steps of re-reading four files became
+     * fifty cents.
+     */
+    const answered = new Map<string, { step: number; sha: string }>();
+    /** Consecutive steps in which every call was a repeat with nothing new. */
+    let dryStreak = 0;
 
     // A question changes nothing, so a check that demands a change can only
     // ever fail it. `ask` drops exactly those checks for this turn and runs
@@ -1135,6 +1261,7 @@ export class Engine {
       if (msg.tool_calls?.length) {
         const called: string[] = [];
         let autoRan = 0;
+        let repeated = 0;
         for (const call of msg.tool_calls) {
           const name = call.function?.name ?? "unknown";
           let args: Record<string, unknown> = {};
@@ -1164,7 +1291,12 @@ export class Engine {
             yield { kind: "tool_start", name, detail };
             const toolStartedAt = Date.now();
             try {
-              const t = truncateResult(this.runTool(name, args, call.id));
+              // read_file budgets itself, to the byte, so that the notice
+              // saying how to continue survives. Capping it again here is what
+              // cut that notice off and left the model with no way forward.
+              const raw = this.runTool(name, args, call.id);
+              const t =
+                name === "read_file" ? { text: raw, note: undefined } : truncateResult(raw);
               result = t.text;
               note = t.note;
             } catch (e) {
@@ -1172,6 +1304,27 @@ export class Engine {
               note = "error";
             }
             durationMs = Date.now() - toolStartedAt;
+
+            // The same call, returning the same bytes it returned before.
+            // Send a pointer instead of the payload: the answer is already in
+            // the conversation, and saying so is both cheaper and truer than
+            // repeating it.
+            // Canonical key: {path} and {path, offset: 0} are the same call,
+            // and a model that spells out a default must not thereby look like
+            // it is asking something new.
+            const key = callKey(name, args);
+            const sha = createHash("sha256").update(result, "utf8").digest("hex");
+            const prior = answered.get(key);
+            if (prior && prior.sha === sha) {
+              result =
+                `[molt: this is the same ${name} call you made at step ${prior.step + 1}, and ` +
+                `nothing has changed since. Its result is already above in this conversation. ` +
+                `Repeating it cannot tell you anything new — act on what you have, or say ` +
+                `plainly what is blocking you.]`;
+              note = "repeat";
+              repeated += 1;
+            }
+            answered.set(key, { step, sha });
           }
           // Both branches are recorded. A call that ran without being asked
           // about is exactly the thing an audit needs to be able to find, and
@@ -1209,6 +1362,40 @@ export class Engine {
           this.transcript.push({ role: "tool", tool_call_id: call.id, content: result });
         }
         yield summary(called, "tools");
+
+        // A step whose every call was a repeat produced no new information.
+        // One can be a stumble; two in a row is a loop, and a loop with a
+        // token meter attached has to be stopped by molt rather than by the
+        // step guard thirty steps later.
+        if (called.length > 0 && repeated === called.length) {
+          dryStreak += 1;
+          if (dryStreak === 1) {
+            yield {
+              kind: "info",
+              text: "that step repeated calls molt had already answered — nothing new came back",
+            };
+          }
+        } else {
+          dryStreak = 0;
+        }
+        if (dryStreak >= 2) {
+          log?.append("loop_stop", {
+            step,
+            repeatedCalls: called.length,
+            sessionTokens: this.sessionTokens,
+            costUsd: this.costUsd() ?? null,
+          });
+          log?.append("session_end", { reason: "no progress" });
+          yield {
+            kind: "error",
+            text:
+              `stopped: the model spent two steps repeating calls that had already been ` +
+              `answered, and no new information came back. This turn used ` +
+              `${this.sessionTokens} tokens. Nothing was claimed and nothing was verified — ` +
+              `try a narrower request, or /verbose to watch what it is reaching for.`,
+          };
+          return;
+        }
         continue; // let the model see tool results
       }
 
@@ -1318,7 +1505,14 @@ export class Engine {
       this.transcript.pushBarFailure(formatBarFailure(result, proofAttempts, maxAttempts));
     }
 
-    yield { kind: "error", text: `stopped after ${MAX_STEPS} steps (loop guard)` };
+    yield {
+      kind: "error",
+      text:
+        `stopped after ${MAX_STEPS} steps (loop guard) · ${this.sessionTokens} tokens` +
+        (this.costUsd() === undefined ? "" : ` · $${(this.costUsd() ?? 0).toFixed(3)}`) +
+        `. Nothing was claimed and nothing was verified. Narrow the request, or set ` +
+        `/budget to put a ceiling on a turn like this.`,
+    };
   }
 
   /** Preflight: is the endpoint reachable, and is the model actually there? */
