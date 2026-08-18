@@ -24,6 +24,17 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
 /**
+ * How long a search may run, and how much of a line it may examine.
+ *
+ * `bash` has a timeout. Bar checks have a timeout. `grep` had neither, and a
+ * pattern the model wrote — `(a+)+$` against a long line — hung molt with no
+ * ceiling at all: no output, no error, no way back except killing it. Anything
+ * that runs input molt did not write needs a bound.
+ */
+export const SEARCH_DEADLINE_MS = 5_000;
+export const MAX_LINE_CHARS = 2_000;
+
+/**
  * Directories that are never worth walking into.
  *
  * A build output or a dependency tree is not the project; searching them
@@ -192,17 +203,41 @@ function isText(buf: Buffer): boolean {
  * Bounded three ways: files skipped by size, matches capped, and each matching
  * line trimmed. A search that returns everything is a search nobody reads.
  */
+/**
+ * A quantifier inside a quantified group: `(a+)+`, `(\s*)*`, `([a-z]+)*`.
+ *
+ * This is the shape behind catastrophic backtracking, and JavaScript offers no
+ * way to time-limit a regex once it starts — so the only defence is to decline
+ * the pattern before running it. Refusing is safe: every such pattern has a
+ * simpler equivalent, and the message says so. Detection is conservative and
+ * will miss exotic cases, which is why the deadline below exists as well.
+ */
+export function isCatastrophic(pattern: string): boolean {
+  return /\([^)]*[+*{][^)]*\)\s*[+*{]/.test(pattern);
+}
+
 export function grepFiles(
   root: string,
   pattern: string,
   opts: { glob?: string; depth?: number; limit?: number; ignoreCase?: boolean } = {},
-): { matches: Match[]; truncated: boolean; scanned: number; invalid?: string } {
+): { matches: Match[]; truncated: boolean; scanned: number; invalid?: string; timedOut?: boolean } {
+  if (isCatastrophic(pattern)) {
+    return {
+      matches: [],
+      truncated: false,
+      scanned: 0,
+      invalid:
+        "a quantifier inside a quantified group can take exponential time to match. " +
+        "Rewrite it without the nesting — /(a+)+/ is /a+/, /(\\s*)*/ is /\\s*/",
+    };
+  }
   let re: RegExp;
   try {
     re = new RegExp(pattern, opts.ignoreCase ? "i" : undefined);
   } catch (e) {
     return { matches: [], truncated: false, scanned: 0, invalid: String(e) };
   }
+  const deadline = Date.now() + SEARCH_DEADLINE_MS;
 
   const limit = opts.limit ?? MAX_MATCHES;
   const { entries } = walk(root, {
@@ -227,7 +262,14 @@ export function grepFiles(
     scanned++;
     const lines = buf.toString("utf8").split("\n");
     for (let i = 0; i < lines.length; i++) {
-      if (!re.test(lines[i]!)) continue;
+      // Checked between lines rather than per file: one enormous file must not
+      // be able to outrun the deadline on its own.
+      if ((i & 0x3f) === 0 && Date.now() > deadline) {
+        return { matches, truncated: true, scanned, timedOut: true };
+      }
+      // A match past this column is not something anyone reads, and an
+      // unbounded line is what makes a slow pattern into a hung one.
+      if (!re.test(lines[i]!.slice(0, MAX_LINE_CHARS))) continue;
       if (matches.length >= limit) return { matches, truncated: true, scanned };
       matches.push({ path: e.path, line: i + 1, text: lines[i]!.slice(0, 240).trim() });
     }
@@ -237,9 +279,17 @@ export function grepFiles(
 
 export function formatMatches(
   pattern: string,
-  result: { matches: Match[]; truncated: boolean; scanned: number; invalid?: string },
+  result: { matches: Match[]; truncated: boolean; scanned: number; invalid?: string; timedOut?: boolean },
 ): string {
-  if (result.invalid) return `[molt: /${pattern}/ is not a valid regular expression — ${result.invalid}]`;
+  if (result.invalid) return `[molt: /${pattern}/ was not run — ${result.invalid}]`;
+  if (result.timedOut) {
+    return (
+      `[molt: the search for /${pattern}/ ran past ${SEARCH_DEADLINE_MS}ms and was stopped ` +
+      `after ${result.matches.length} match(es) in ${result.scanned} file(s). Narrow it with a ` +
+      `glob or a simpler pattern.]\n` +
+      result.matches.map((m) => `${m.path}:${m.line}: ${m.text}`).join("\n")
+    );
+  }
   if (result.matches.length === 0) {
     return `[molt: no match for /${pattern}/ in ${result.scanned} file(s) searched]`;
   }

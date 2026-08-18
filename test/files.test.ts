@@ -13,11 +13,13 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
   MAX_MATCHES,
+  SEARCH_DEADLINE_MS,
   applyEdit,
   formatListing,
   formatMatches,
   globToRegExp,
   grepFiles,
+  isCatastrophic,
   matchesGlob,
   walk,
 } from "../src/files.js";
@@ -175,7 +177,50 @@ describe("searching", () => {
     try {
       const r = grepFiles(p.dir, "unclosed(");
       assert.ok(r.invalid, "an invalid regex must be reported, not raised");
-      assert.match(formatMatches("unclosed(", r), /not a valid regular expression/);
+      assert.match(formatMatches("unclosed(", r), /was not run/);
+    } finally {
+      p.cleanup();
+    }
+  });
+
+  it("refuses a pattern that can take exponential time", () => {
+    // Found by probing: `(a+)+$` against a long line hung molt with no
+    // ceiling — no output, no error, no way back except killing it. JavaScript
+    // cannot time-limit a regex once it starts, so the pattern is declined
+    // before it runs.
+    const p = project();
+    try {
+      writeFileSync(join(p.dir, "long.txt"), "a".repeat(5000) + "b\n");
+      for (const bad of ["(a+)+$", "(\\s*)*x", "([a-z]+)*!", "(ab|a)+c"]) {
+        if (!isCatastrophic(bad)) continue;
+        const t0 = Date.now();
+        const r = grepFiles(p.dir, bad);
+        assert.ok(Date.now() - t0 < 1000, `ran a catastrophic pattern: ${bad}`);
+        assert.match(formatMatches(bad, r), /exponential time/);
+      }
+      assert.ok(isCatastrophic("(a+)+$"));
+      assert.ok(isCatastrophic("(\\s*)*"));
+      // Ordinary patterns are untouched.
+      for (const fine of ["verify", "^export function", "TODO|FIXME", "a+b*", "[a-z]+"]) {
+        assert.ok(!isCatastrophic(fine), `refused an ordinary pattern: ${fine}`);
+      }
+    } finally {
+      p.cleanup();
+    }
+  });
+
+  it("stops a search that runs too long", () => {
+    // The deadline is the backstop for slow patterns the shape check misses.
+    const p = project();
+    try {
+      for (let i = 0; i < 60; i++) {
+        writeFileSync(join(p.dir, `big${i}.txt`), ("x".repeat(3000) + "\n").repeat(400));
+      }
+      const t0 = Date.now();
+      const r = grepFiles(p.dir, "x{2,}y?z?q?");
+      const ms = Date.now() - t0;
+      assert.ok(ms < SEARCH_DEADLINE_MS * 3, `ran ${ms}ms past a ${SEARCH_DEADLINE_MS}ms deadline`);
+      if (r.timedOut) assert.match(formatMatches("x", r), /was stopped/);
     } finally {
       p.cleanup();
     }

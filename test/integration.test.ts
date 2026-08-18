@@ -350,6 +350,33 @@ describe("over a real socket", () => {
     );
   });
 
+  it("stops a model drifting its offset a few lines at a time", async () => {
+    // Found by the stress harness after the first fix: a window overlapping an
+    // earlier one by 99% and running three lines past it is not *contained* by
+    // it, so containment alone let a drifting reader run to the step guard —
+    // 32 steps and 99,000 tokens. What matters is how much of a read is new.
+    const dir = ws();
+    writeDefaultBar(dir);
+    writeFileSync(join(dir, "big.ts"), Array.from({ length: 900 }, (_, i) => `line ${i}`).join("\n"));
+    let n = 0;
+    const { url, received } = await mockProvider({
+      turns: Array.from({ length: 10 }, () => ({
+        calls: [{ name: "read_file", args: { path: "big.ts", offset: (n += 3) } }],
+      })),
+    });
+    const engine = engineAt(dir, url);
+    const events = await drain(engine.run("study it", allowAll));
+
+    assert.ok(received.length <= 5, `ran ${received.length} steps on a drifting re-reader`);
+    const tools = events.filter((e): e is Extract<EngineEvent, { kind: "tool" }> => e.kind === "tool");
+    assert.ok(tools.some((t) => t.note === "repeat"), "a three-line drift walked past the guard");
+    assert.match(
+      tools.find((t) => t.note === "repeat")?.preview ?? "",
+      /offset=\d+ or later/,
+      "told the model it was repeating without telling it where to go instead",
+    );
+  });
+
   it("keeps every part of a file it was shown, so it never re-reads one", async () => {
     // Elision was keyed on the path, so page two deleted page one and the
     // model had to fetch it again — forever.
@@ -388,12 +415,16 @@ describe("over a real socket", () => {
     writeDefaultBar(dir);
     // 400 lines plus a trailing newline: the terminator must not be counted as
     // a 401st line, or every offset molt hands back is one past what it means.
-    const lines = Array.from({ length: 400 }, (_, i) => `line ${i} ${"y".repeat(40)}`);
+    // Lines long enough that one 16KB part is ~80 of them, so offset 100 is a
+    // part the model has genuinely not been shown. (With short lines the first
+    // read returns most of the file, and asking for line 40 afterwards is a
+    // re-read — correctly flagged as one.)
+    const lines = Array.from({ length: 400 }, (_, i) => `line ${i} ${"y".repeat(190)}`);
     writeFileSync(join(dir, "big.txt"), lines.join("\n") + "\n");
     const { url } = await mockProvider({
       turns: [
         { calls: [{ name: "read_file", args: { path: "big.txt" } }] },
-        { calls: [{ name: "read_file", args: { path: "big.txt", offset: 40 } }] },
+        { calls: [{ name: "read_file", args: { path: "big.txt", offset: 100 } }] },
         { text: "read it" },
       ],
     });
@@ -409,7 +440,7 @@ describe("over a real socket", () => {
     assert.ok(!/capped/.test(tools[0]!.note ?? ""), `part was double-truncated: ${tools[0]!.note}`);
     assert.ok(!/repeat/.test(tools[1]!.note ?? ""), "a later part must not read as a repeat");
     const second = tools[1]!.preview ?? "";
-    assert.match(second, /lines 41-/, "offset did not move the window");
+    assert.match(second, /lines 101-/, "offset did not move the window");
     assert.ok(!second.includes("line 0 "), "the second part repeated the first");
   });
 

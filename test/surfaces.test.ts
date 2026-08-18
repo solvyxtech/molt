@@ -25,6 +25,43 @@ function writeBar(dir: string, yaml: string): void {
   writeFileSync(join(dir, ".molt", "done.yml"), yaml, "utf8");
 }
 
+describe("doctor", () => {
+  const endpoint = (ids: string[]) =>
+    (async (url: string) => {
+      if (String(url).endsWith("/models")) {
+        return { ok: true, json: async () => ({ data: ids.map((id) => ({ id })) }) } as unknown as Response;
+      }
+      return { ok: false, status: 404, text: async () => "" } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+  const engineWith = (dir: string, model: string, ids: string[]) =>
+    new Engine({ baseUrl: "http://mock/v1", model, cwd: dir, bar: null, fetchFn: endpoint(ids) });
+
+  it("fails when the configured model is not there", async () => {
+    // A preflight that passes on a model the endpoint does not have only fails
+    // once the work has already started, which is the one thing it exists to
+    // prevent.
+    const d = await engineWith(ws(), "does-not-exist", ["grok-4.6", "grok-4.5"]).doctor();
+    assert.equal(d.ok, false);
+    assert.equal(d.modelPresent, false);
+    assert.match(d.detail, /NOT in list/);
+  });
+
+  it("passes when it is", async () => {
+    const d = await engineWith(ws(), "grok-4.6", ["grok-4.6"]).doctor();
+    assert.equal(d.ok, true);
+    assert.equal(d.modelPresent, true);
+  });
+
+  it("does not guess when the endpoint publishes no list", async () => {
+    // Endpoints that hide /models exist. Refusing them would be a guess
+    // dressed up as a check.
+    const d = await engineWith(ws(), "anything", []).doctor();
+    assert.equal(d.ok, true);
+    assert.match(d.detail, /model list unavailable/);
+  });
+});
+
 describe("tag selection", () => {
   const bar = parseBar(`
 version: 1
