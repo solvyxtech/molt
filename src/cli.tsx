@@ -7,7 +7,7 @@
  * bar is not met, so molt can sit in CI, in a script, or in a benchmark
  * harness without a human watching.
  */
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Archive } from "./archive.js";
 import { isAutonomy, type Autonomy } from "./autonomy.js";
@@ -26,7 +26,26 @@ import {
 import { Receipts } from "./receipts.js";
 import type { BarResult, EngineEvent } from "./types.js";
 
-const VERSION = "v1.0.0-rc.4";
+/**
+ * The version, from the manifest that npm actually publishes.
+ *
+ * It was a string literal, correct today and destined to drift the next time
+ * one of the two was bumped without the other — and a tool whose pitch is
+ * "check, do not assert" should not assert its own version.
+ */
+const VERSION = `v${
+  (() => {
+    try {
+      return (
+        JSON.parse(
+          readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+        ) as { version?: string }
+      ).version;
+    } catch {
+      return undefined;
+    }
+  })() ?? "0.0.0-unknown"
+}`;
 
 const USAGE = `molt ${VERSION} — a coding agent that can't say "done" without proving it.
 

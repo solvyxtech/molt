@@ -27,6 +27,17 @@ export type ReceiptRecord = {
   provider: string;
   model: string;
   sessionTokens: number;
+  /**
+   * Which session this attempt belongs to.
+   *
+   * Session totals climb across the attempts inside one session, so the
+   * largest reading for a session is that session's spend. Without a way to
+   * tell sessions apart, stats took the largest reading across ALL of them and
+   * reported one session's spend as the project's — five sessions of real work
+   * reported as whichever was biggest. Absent on receipts written before this
+   * existed, which is why the fallback below infers boundaries instead.
+   */
+  session?: string;
   /** USD spent by the session when this claim was made, when a price is known. */
   costUsd?: number;
   shedBatches: number;
@@ -98,6 +109,8 @@ export class Receipts {
     provider: string;
     sessionTokens: number;
     shedBatches: number;
+    /** Which session this attempt belongs to, for honest totals. */
+    session?: string;
     /** What the session had cost when this claim was made. */
     costUsd?: number;
     /** True when that figure rests on molt's own token estimate. */
@@ -186,6 +199,7 @@ export class Receipts {
       provider: args.provider,
       model: args.model,
       sessionTokens: args.sessionTokens,
+      ...(args.session ? { session: args.session } : {}),
       ...(args.costUsd === undefined ? {} : { costUsd: args.costUsd }),
       shedBatches: args.shedBatches,
       barMs: args.result.durationMs,
@@ -231,10 +245,28 @@ export class Receipts {
         exhausted += r.verdict === "exhausted" ? 1 : 0;
         m.refused += 1;
       }
-      // A session's totals climb across its own attempts, so the largest
-      // reading for a session is that session's spend, not the sum of its rows.
-      totalTokens = Math.max(totalTokens, r.sessionTokens);
-      if (typeof r.costUsd === "number") totalUsd = Math.max(totalUsd ?? 0, r.costUsd);
+    }
+
+    // A session's totals climb across its own attempts, so the largest reading
+    // for a session is that session's spend — and the project's spend is the
+    // sum of those, not the largest of them. Receipts written before sessions
+    // were recorded are grouped by watching the counter reset: within a
+    // session it only rises, so a drop is a new session.
+    let group = 0;
+    let previous = -1;
+    const perSession = new Map<string, { tokens: number; usd?: number }>();
+    for (const r of rows) {
+      if (r.session === undefined && r.sessionTokens < previous) group += 1;
+      previous = r.session === undefined ? r.sessionTokens : -1;
+      const key = r.session ?? `inferred-${group}`;
+      const seen = perSession.get(key) ?? { tokens: 0 };
+      seen.tokens = Math.max(seen.tokens, r.sessionTokens);
+      if (typeof r.costUsd === "number") seen.usd = Math.max(seen.usd ?? 0, r.costUsd);
+      perSession.set(key, seen);
+    }
+    for (const { tokens, usd } of perSession.values()) {
+      totalTokens += tokens;
+      if (usd !== undefined) totalUsd = (totalUsd ?? 0) + usd;
     }
 
     return {

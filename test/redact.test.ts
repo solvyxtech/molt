@@ -213,6 +213,56 @@ describe("receipts", () => {
     }
   });
 
+  it("total a project across sessions, not just its biggest one", () => {
+    // Found by molt reviewing its own stats: session totals climb across the
+    // attempts within a session, so `max` is right per session and wrong
+    // across them. Five sessions of real work were reported as whichever was
+    // largest — and cost per verified change inherited the same lie.
+    const ws = workspace();
+    try {
+      const receipts = new Receipts(ws.dir);
+      const bar = (ok: boolean) => ({ ok, durationMs: 1, results: [] });
+      const write = (tokens: number, usd: number, session: string) =>
+        receipts.write({
+          claim: "x", result: bar(true), attempt: 1, verdict: "accepted",
+          model: "m", provider: "p", sessionTokens: tokens, costUsd: usd,
+          shedBatches: 0, session,
+        });
+      write(5_000, 0.05, "s1");
+      write(10_000, 0.10, "s1"); // same session, further along
+      write(20_000, 0.20, "s2");
+      write(30_000, 0.30, "s3");
+
+      const s = receipts.stats();
+      assert.equal(s.totalTokens, 60_000, "reported one session as the project");
+      assert.ok(Math.abs((s.totalUsd ?? 0) - 0.6) < 1e-9);
+      assert.equal(s.tokensPerVerifiedChange, 15_000); // 60k over 4 accepted
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("groups receipts written before sessions were recorded", () => {
+    // Old receipts carry no session id. Within a session the counter only
+    // rises, so a drop is a boundary — which keeps existing projects' numbers
+    // usable instead of quietly wrong.
+    const ws = workspace();
+    try {
+      const receipts = new Receipts(ws.dir);
+      const bar = (ok: boolean) => ({ ok, durationMs: 1, results: [] });
+      for (const tokens of [5_000, 10_000, 2_000, 8_000]) {
+        receipts.write({
+          claim: "x", result: bar(true), attempt: 1, verdict: "accepted",
+          model: "m", provider: "p", sessionTokens: tokens, shedBatches: 0,
+        });
+      }
+      // Two sessions: one ending at 10k, one at 8k.
+      assert.equal(receipts.stats().totalTokens, 18_000);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
   it("report cost per verified change, with the same denominator caveat", () => {
     const ws = workspace();
     try {

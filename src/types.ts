@@ -78,9 +78,12 @@ export type Spend = {
  * Not every condition worth running is a condition worth refusing over. A
  * linter's opinion, a coverage delta, a bundle-size trend — a failing one is
  * information, and treating it as a broken contract teaches people to take
- * checks out of the bar rather than to read them. Advisory failures are shown,
- * recorded in the receipt, and handed to the model, and they do not stop a
- * completion.
+ * checks out of the bar rather than to read them.
+ *
+ * An advisory failure is shown on screen and recorded in the receipt. It is
+ * deliberately NOT put in the message that goes back to the model, which says
+ * "fix these and claim again" — a check that does not gate has no business in
+ * that list, or the model spends tokens fixing theatre.
  */
 export type Advisory = { advisory?: boolean };
 
