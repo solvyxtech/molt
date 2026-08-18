@@ -10,6 +10,7 @@
  */
 import { execSync } from "node:child_process";
 import { proposeBar, type Detected } from "./detect.js";
+import { fingerprint } from "./files.js";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -46,6 +47,8 @@ export type BarContext = {
   record: Msg[];
   /** Every path the model read this session. Reading grounds a reference. */
   read?: string[];
+  /** Reuses a check result while the files it watches have not moved. */
+  cache?: CheckCache;
   /**
    * Every write this project can still prove: live memory plus everything
    * recovered from the archive. After a shed, entries for early work exist
@@ -144,6 +147,17 @@ export function parseBar(source: string): Bar {
       tags = (c.tags as string[]).map((t) => t.trim()).filter(Boolean);
     }
 
+    // `watch:` declares what a check reads, so molt can tell when re-running
+    // it could not possibly say anything new.
+    let watch: string[] | undefined;
+    if (c.watch !== undefined) {
+      if (!Array.isArray(c.watch) || c.watch.some((w) => typeof w !== "string")) {
+        throw new BarError(`done.yml: check "${name}" has a \`watch\` that is not a list of strings.`);
+      }
+      watch = (c.watch as string[]).map((w) => w.trim()).filter(Boolean);
+      if (watch.length === 0) watch = undefined;
+    }
+
     // `advisory: true` makes a failure information rather than a refusal.
     if (c.advisory !== undefined && typeof c.advisory !== "boolean") {
       throw new BarError(`done.yml: check "${name}" has a non-boolean \`advisory\`.`);
@@ -175,6 +189,7 @@ export function parseBar(source: string): Bar {
       timeoutMs: timeout === undefined ? DEFAULT_TIMEOUT_MS : timeout * 1000,
       expectExit,
       tags,
+      ...(watch ? { watch } : {}),
       ...advisory,
     };
   });
@@ -579,9 +594,59 @@ export function runCheck(check: Check, ctx: BarContext): CheckResult {
 }
 
 /** Run every check. All of them run, always — a partial bar is not a bar. */
+/**
+ * Results kept for as long as the files behind them have not moved.
+ *
+ * Four rules, and each one exists because breaking it would turn a cache into
+ * a false verification:
+ *
+ *  1. **Memory only.** Never written to disk, never shared between processes.
+ *     A cache that outlives the session outlives the environment it was true
+ *     in — a dependency install, a toolchain change, a different branch.
+ *  2. **Commands only.** Builtins read the session record rather than the
+ *     filesystem, and they are cheap. Nothing to save and everything to get
+ *     wrong.
+ *  3. **The check itself is part of the key.** Editing a command invalidates
+ *     it, so a bar that changed cannot reuse a result from the bar before it.
+ *  4. **Said out loud.** A reused result is marked in the transcript, in the
+ *     receipt, and in the log. A cached pass that looks like a fresh pass is
+ *     the exact claim molt exists to refuse.
+ */
+export class CheckCache {
+  private entries = new Map<string, { fingerprint: string; result: CheckResult }>();
+
+  private static key(check: Check): string {
+    return check.kind === "command"
+      ? `${check.name}\u0000${check.run}\u0000${check.expectExit}\u0000${(check.watch ?? []).join(",")}`
+      : `${check.name}\u0000builtin`;
+  }
+
+  get(check: Check, cwd: string): CheckResult | null {
+    if (check.kind !== "command") return null;
+    const entry = this.entries.get(CheckCache.key(check));
+    if (!entry) return null;
+    if (entry.fingerprint !== fingerprint(cwd, check.watch)) return null;
+    return { ...entry.result, cached: true };
+  }
+
+  put(check: Check, cwd: string, result: CheckResult): void {
+    if (check.kind !== "command") return;
+    this.entries.set(CheckCache.key(check), {
+      fingerprint: fingerprint(cwd, check.watch),
+      result,
+    });
+  }
+}
+
 export function runBar(bar: Bar, ctx: BarContext): BarResult {
   const t0 = Date.now();
-  const results = bar.checks.map((c) => runCheck(c, ctx));
+  const results = bar.checks.map((c) => {
+    const reused = ctx.cache?.get(c, ctx.cwd) ?? null;
+    if (reused) return reused;
+    const fresh = runCheck(c, ctx);
+    ctx.cache?.put(c, ctx.cwd, fresh);
+    return fresh;
+  });
   const warnings = results.filter((r) => !r.ok && r.advisory);
   return {
     // An advisory failure is not a failed contract. It is still reported, and

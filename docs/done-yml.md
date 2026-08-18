@@ -91,6 +91,42 @@ reference.
 It says nothing to ground rather than passing vacuously when the claim
 mentions no files.
 
+## `watch` — what a check reads
+
+```yaml
+  - name: tests
+    run: npm test
+    watch: ["src/**", "test/**", "package.json"]
+```
+
+molt reuses a check's result for as long as nothing it watches has moved. A
+completion claim runs the whole bar, and the loop allows several attempts, so a
+ten-second suite can cost forty seconds of inner loop re-proving something that
+could not have changed. Declaring the scope removes that.
+
+Four rules keep a reused result honest, and they are worth knowing before you
+rely on it:
+
+- **Memory only, one session.** Never written to disk, never shared between
+  processes. `molt prove` always measures rather than remembers.
+- **Commands only.** Builtins read the session record rather than the
+  filesystem, and they are cheap.
+- **The check is part of the key.** Change the command or `expect_exit` and the
+  previous result is not reused.
+- **It says so.** A reused result is marked in the transcript, the receipt
+  (`ran: no — reused`), and the log. A cached pass that looks like a fresh pass
+  would be the exact claim molt exists to refuse.
+
+Without `watch`, a check is fingerprinted against the whole project — correct,
+and almost never reusable. molt does not guess what a command reads; scope is
+something you declare, because a scope that is too narrow buys speed with a
+stale pass, and that trade is not molt's to make on your behalf.
+
+The signature is path, size, and modification time, not content hashes: reading
+a repository to decide whether to read a repository is not a saving. Touching a
+file without editing it re-runs the check, which is the safe direction to be
+wrong in.
+
 ## Advisory checks
 
 ```yaml

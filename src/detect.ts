@@ -30,7 +30,17 @@ export type Detected = {
   /** Why molt believes this command exists. Written into the bar as a comment. */
   because: string;
   tags?: string[];
+  /**
+   * What the check reads, so molt can skip re-running it when none of it
+   * moved. Proposed narrowly and conservatively — a scope that is too wide
+   * costs a re-run, and one that is too narrow costs a stale pass.
+   */
+  watch?: string[];
 };
+
+/** Source and configuration a build or test command in this ecosystem reads. */
+const JS_WATCH = ["src/**", "lib/**", "test/**", "tests/**", "package.json", "tsconfig*.json"];
+const PY_WATCH = ["**/*.py", "pyproject.toml", "setup.cfg", "requirements.txt"];
 
 function readJson(path: string): Record<string, unknown> | null {
   try {
@@ -76,7 +86,7 @@ export function detectChecks(cwd: string): Detected[] {
     // Type errors are the cheapest real failure to find, so they go first.
     for (const name of ["typecheck", "type-check", "types", "tsc"]) {
       if (has(name)) {
-        found.push({ name: "types", run: invoke(name), because: `package.json scripts.${name}`, tags: ["fast"] });
+        found.push({ name: "types", run: invoke(name), because: `package.json scripts.${name}`, tags: ["fast"], watch: JS_WATCH });
         break;
       }
     }
@@ -84,12 +94,12 @@ export function detectChecks(cwd: string): Detected[] {
       if (has(name)) {
         // Lint is advisory by default: a style opinion is information, and a
         // bar that refuses over it teaches people to delete the check.
-        found.push({ name: "lint", run: invoke(name), because: `package.json scripts.${name}`, tags: ["fast"] });
+        found.push({ name: "lint", run: invoke(name), because: `package.json scripts.${name}`, tags: ["fast"], watch: JS_WATCH });
         break;
       }
     }
     if (has("test")) {
-      found.push({ name: "tests", run: invoke("test"), because: "package.json scripts.test", tags: ["slow"] });
+      found.push({ name: "tests", run: invoke("test"), because: "package.json scripts.test", tags: ["slow"], watch: JS_WATCH });
     }
     if (!has("test") && !has("typecheck") && existsSync(join(cwd, "tsconfig.json"))) {
       found.push({
@@ -97,33 +107,36 @@ export function detectChecks(cwd: string): Detected[] {
         run: "npx tsc --noEmit",
         because: "tsconfig.json, with no typecheck script to call",
         tags: ["fast"],
+        watch: JS_WATCH,
       });
     }
   }
 
   // ---- Rust ----
   if (existsSync(join(cwd, "Cargo.toml"))) {
-    found.push({ name: "build", run: "cargo check", because: "Cargo.toml", tags: ["fast"] });
-    found.push({ name: "tests", run: "cargo test", because: "Cargo.toml", tags: ["slow"] });
+    const rust = ["src/**", "tests/**", "Cargo.toml"];
+    found.push({ name: "build", run: "cargo check", because: "Cargo.toml", tags: ["fast"], watch: rust });
+    found.push({ name: "tests", run: "cargo test", because: "Cargo.toml", tags: ["slow"], watch: rust });
   }
 
   // ---- Go ----
   if (existsSync(join(cwd, "go.mod"))) {
-    found.push({ name: "build", run: "go build ./...", because: "go.mod", tags: ["fast"] });
-    found.push({ name: "tests", run: "go test ./...", because: "go.mod", tags: ["slow"] });
+    const go = ["**/*.go", "go.mod", "go.sum"];
+    found.push({ name: "build", run: "go build ./...", because: "go.mod", tags: ["fast"], watch: go });
+    found.push({ name: "tests", run: "go test ./...", because: "go.mod", tags: ["slow"], watch: go });
   }
 
   // ---- Python ----
   const pyproject = readText(join(cwd, "pyproject.toml"));
   if (pyproject || existsSync(join(cwd, "setup.cfg")) || existsSync(join(cwd, "requirements.txt"))) {
     if (pyproject?.includes("[tool.ruff") ) {
-      found.push({ name: "lint", run: "ruff check .", because: "pyproject.toml [tool.ruff]", tags: ["fast"] });
+      found.push({ name: "lint", run: "ruff check .", because: "pyproject.toml [tool.ruff]", tags: ["fast"], watch: PY_WATCH });
     }
     if (pyproject?.includes("[tool.mypy")) {
-      found.push({ name: "types", run: "mypy .", because: "pyproject.toml [tool.mypy]", tags: ["fast"] });
+      found.push({ name: "types", run: "mypy .", because: "pyproject.toml [tool.mypy]", tags: ["fast"], watch: PY_WATCH });
     }
     if (pyproject?.includes("[tool.pytest") || existsSync(join(cwd, "tests")) || existsSync(join(cwd, "test"))) {
-      found.push({ name: "tests", run: "pytest -q", because: "a tests directory or pytest configuration", tags: ["slow"] });
+      found.push({ name: "tests", run: "pytest -q", because: "a tests directory or pytest configuration", tags: ["slow"], watch: PY_WATCH });
     }
   }
 
@@ -179,6 +192,10 @@ export function proposeBar(cwd: string): { yaml: string; detected: Detected[] } 
     if (c.name === "lint") {
       body.push("    # An opinion, not a contract: reported, never blocking.");
       body.push("    advisory: true");
+    }
+    if (c.watch?.length) {
+      body.push("    # What it reads. molt skips re-running a check when none of this moved.");
+      body.push(`    watch: [${c.watch.map((w) => `"${w}"`).join(", ")}]`);
     }
     if (c.tags?.length) body.push(`    tags: [${c.tags.join(", ")}]`);
     body.push("");

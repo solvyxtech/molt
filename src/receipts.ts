@@ -150,7 +150,7 @@ export class Receipts {
     const rows = args.result.results.map(
       (r) =>
         `| ${r.name} | ${r.kind} | \`${r.detail.replace(/\|/g, "\\|").slice(0, 60)}\` | ` +
-        `${r.exitCode ?? "—"} | ${r.ok ? "pass" : "**FAIL**"} | ${r.durationMs} |`,
+        `${r.exitCode ?? "—"} | ${r.ok ? "pass" : "**FAIL**"}${r.cached ? " (reused)" : ""} | ${r.durationMs} |`,
     );
 
     const detail: string[] = ["", "## Output", ""];
@@ -165,6 +165,9 @@ export class Receipts {
         `command: ${r.detail}`,
         `exit: ${r.exitCode ?? "n/a"}`,
         `result: ${r.ok ? "pass" : "fail"}`,
+        // Evidence of a different kind, and the receipt is the document handed
+        // to someone who was not there to watch it run.
+        `ran: ${r.cached ? "no — reused, nothing it watches had changed" : "yes"}`,
         `duration_ms: ${r.durationMs}`,
         "",
         "```",
