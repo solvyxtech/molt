@@ -12,10 +12,22 @@ at the edge of it, and shows the level on screen the whole time it is in force.
 xai · grok-4.6 · auto medium · 12k tokens · $0.012
 ```
 
-**shift+A** cycles low → medium → high → low, while molt is working and while
-it is asking you something — the two places the prompt takes no typing. At an
-idle prompt a capital letter is usually the start of a sentence, so there it is
-`ctrl+A`, or `/autonomy <level>`. Headlessly: `--autonomy <level>`.
+**shift+A** sets it, everywhere:
+
+| where | what it does |
+|---|---|
+| at an empty prompt | opens a picker — arrows choose, enter sets, esc cancels |
+| while molt is working | cycles low → medium → high → low immediately |
+| while molt is asking permission | cycles immediately, without answering the prompt |
+
+A terminal cannot tell `shift+A` from the `A` that starts "Add a test", so on
+an empty line the key opens a chooser and **changes nothing until you press
+enter** — and escape gives the letter back. Mid-sentence a capital is just a
+capital: "fix the Auth bug" types the way it reads. Where there is no typing to
+collide with, the key cycles outright, because that is where speed matters.
+
+`ctrl+A` and `/autonomy [level]` do the same from anywhere. Headlessly:
+`--autonomy <level>`.
 
 ## The levels
 
