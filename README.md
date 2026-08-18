@@ -157,29 +157,49 @@ molt verify     # recompute the log's hash chain
 
 ### While it is running
 
-The same facts are available live. Every step closes with one line saying
-what it did and what it cost, and **shift+V** (`ctrl+V` outside a turn, or
-`/verbose`) opens the detail behind it — the exact arguments of each call,
-the head of each result, and every check's command and duration:
+Every step closes with one line saying what it did and what it cost:
 
 ```
 · read_file  src/auth.ts  12ms
-      args {"path":"src/auth.ts"}
-      → 1841 bytes
-      │ import { verify } from "./jwt.js";
-  step 2 · read_file, bash · 3.4k in (2.1k cached) · 412 out · 6.2s · 0.31¢
+  step 2 · read_file, bash · 3.4k in (2.1k cached) · 412 out · $0.0072 · 6.2s
 
   checking 3 condition(s) from .molt/done.yml: types, tests, work-landed
   2 of 3 checks passed · 4.1s · failed: tests
   the failures above go back to the model; it keeps working
 ```
 
-Detail is recorded whether or not the view is open, so shift+V reveals what
-already happened rather than starting a recording. Nothing there is
-paraphrased — a transparency view that summarizes is one more claim to check.
-It is the same record `molt log` prints from disk afterwards.
+Press **`v`** while molt is working — `ctrl+V` any time, `/verbose` as a
+command, `--verbose` headlessly — to open the live view: what the model is
+doing right now, the exact arguments of each call, the head of each result,
+each check's command and duration, and **what every job has cost**.
+
+```
+── what the model is doing ──────────────────────────────────  v closes
+  job 3 · rewrite the auth guard · 2 step(s) · 8.0k in (3.0k cached) · 45 out · $0.012 · 4.2s
+  · read_file src/auth.ts  12ms
+      args {"path":"src/auth.ts"}
+      → 1841 bytes
+      │ import { verify } from "./jwt.js";
+    ↳ session 16k tokens · $0.024 · finish: tool_calls
+
+  job 1 verified · 2 step(s) · 4.8k in · 90 out · $0.0074 · 1.2s
+  job 2 not proven · 4 step(s) · 11k in · 210 out · $0.017 · 3.6s
+```
+
+It is a bounded panel, not an expanding scrollback: the transcript above it is
+printed once and never redrawn, which is what stops a long session from
+tearing itself apart in a terminal that cannot scroll backwards. Detail is
+recorded whether or not the view is open, so `v` shows what already happened
+rather than starting a recording. Nothing in it is paraphrased — a
+transparency view that summarizes is one more claim to check.
 
 ### What a turn cost
+
+The bottom line is the **session** meter — provider, model, tokens, price —
+and it only ever climbs. Per-job figures live in the view; a job is a lens on
+the session total, never a reset of it. The unit never changes either: cost is
+always in dollars, because a meter that reads `0.9¢` and then `$0.029` looks
+like it went down.
 
 molt reads the price of the selected model from the endpoint that will do the
 billing (xAI and OpenRouter publish theirs) and stamps it with the model it
@@ -241,7 +261,7 @@ nothing has to be typed in full or looked up.
 /bom               context bill of materials
 /wire              exact JSON of the last request
 /budget <n|off>    hard token ceiling
-/verbose           show every call, argument, and result  (shift+V)
+/verbose           watch every call, argument, and result  (press v)
 /price             what this model costs, per 1M tokens
 /model <id>        switch model
 /molt              cycle theme

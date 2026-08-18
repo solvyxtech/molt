@@ -57,7 +57,7 @@ options
   --price-in <n>     USD per 1M prompt tokens      (MOLT_PRICE_IN)
   --price-out <n>    USD per 1M completion tokens  (MOLT_PRICE_OUT)
                      omit both and molt reads the price from the provider
-  --verbose          show every call, argument, and result (shift+V in the TUI)
+  --verbose          show every call, argument, and result (press v in the TUI)
   --provider <name>  label shown in the status line
   --cwd <dir>        project directory (default: current)
   --budget <n>       hard token ceiling for the session
@@ -394,6 +394,20 @@ async function cmdRun(args: Args): Promise<number> {
             if (l.trim()) process.stdout.write(`      │ ${l}\n`);
           }
         }
+        break;
+      }
+      case "job_end": {
+        // What that one task cost, said once, next to what it produced. The
+        // session total still follows at the end; this is the per-job view of
+        // the same books.
+        const sp = ev.spend;
+        const cached = sp.cachedTokens > 0 ? ` (${sp.cachedTokens} cached)` : "";
+        process.stdout.write(
+          `· job ${ev.outcome} · ${ev.steps} step(s) · ${sp.promptTokens} in${cached} · ` +
+            `${sp.completionTokens} out · ${fmtDuration(ev.durationMs)}` +
+            (sp.costUsd === undefined ? "" : ` · ${sp.estimated ? "~" : ""}${fmtCost(sp.costUsd)}`) +
+            "\n",
+        );
         break;
       }
       case "request":

@@ -189,8 +189,26 @@ export type EngineEvent =
    * past — and so the running total is reconciled step by step rather than
    * only at the end.
    */
+  /** A user turn begins. Everything until `job_end` belongs to this job. */
+  | { kind: "job_start"; job: number; text: string }
+  /**
+   * A user turn is over, with what it cost.
+   *
+   * The session meter answers "what have I spent?"; this answers "what did
+   * that one question cost?", which is the number people actually reason
+   * about when deciding whether to ask another.
+   */
+  | {
+      kind: "job_end";
+      job: number;
+      steps: number;
+      spend: Spend;
+      durationMs: number;
+      outcome: JobOutcome;
+    }
   | {
       kind: "step_summary";
+      job: number;
       step: number;
       /** Tool names called this step, in call order. */
       tools: string[];
@@ -211,6 +229,21 @@ export type EngineEvent =
   | { kind: "shed"; before: number; after: number; dropped: number; path: string }
   | { kind: "info"; text: string }
   | { kind: "error"; text: string };
+
+/**
+ * How a job ended, in molt's own terms.
+ *
+ * "verified" is reserved for a claim that survived the bar. An answer with
+ * no bar to check it against is "unverified" — a distinction the whole tool
+ * exists to make, so it is not collapsed here for tidiness.
+ */
+export type JobOutcome =
+  | "verified"
+  | "unverified"
+  | "not proven"
+  | "cancelled"
+  | "error"
+  | "stopped";
 
 export type Confirm = (name: string, detail: string) => Promise<boolean>;
 
