@@ -540,3 +540,73 @@ describe("switching provider mid-session", () => {
     );
   });
 });
+
+describe("what molt says about caching on your own hardware", () => {
+  /** Reports usage, never reports cached tokens — as local servers do. */
+  function localServer() {
+    let n = 0;
+    return (async () => {
+      n += 1;
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        text: async () => "",
+        json: async () => ({
+          choices: [
+            {
+              message:
+                n > 6
+                  ? { role: "assistant", content: "done" }
+                  : {
+                      role: "assistant",
+                      content: "working",
+                      tool_calls: [
+                        {
+                          id: `c${n}`,
+                          type: "function",
+                          function: { name: "bash", arguments: JSON.stringify({ command: "echo hi" }) },
+                        },
+                      ],
+                    },
+            },
+          ],
+          usage: { prompt_tokens: 40_000, completion_tokens: 10 },
+        }),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+  }
+
+  const run = async (baseUrl: string) => {
+    const engine = new Engine({
+      baseUrl,
+      model: "qwen3-coder-30b-a3b",
+      cwd: ws(),
+      bar: null,
+      stream: false,
+      autonomy: "high",
+      fetchFn: localServer(),
+    });
+    return drain(engine.run("go", allowAll));
+  };
+
+  it("does not tell you a local server is re-billing you", async () => {
+    // It is not billing at all, and the advice — move to a provider with
+    // automatic caching — is the opposite of what someone running a model on
+    // their own box wants. Zero cached is not even evidence of rework there: a
+    // local server may be reusing its KV cache and simply not reporting it.
+    const events = await run("http://192.168.0.218:8080/v1");
+    assert.ok(
+      !events.some((e) => e.kind === "info" && /re-bills the whole conversation/.test(e.text)),
+      "told a self-hosted endpoint it was re-billing the conversation",
+    );
+  });
+
+  it("still says it for an endpoint that really does bill", async () => {
+    const events = await run("https://api.example.com/v1");
+    assert.ok(
+      events.some((e) => e.kind === "info" && /re-bills the whole conversation/.test(e.text)),
+      "stopped warning about a billable endpoint with no caching",
+    );
+  });
+});

@@ -2226,7 +2226,14 @@ export class Engine {
         !this.warnedNoCache &&
         this.sessionCached === 0 &&
         this.sessionPrompt > 100_000 &&
-        reportedUsage
+        reportedUsage &&
+        // Not on your own hardware. The sentence below is about a bill, and
+        // there is no bill — worse, its advice is to move to a provider with
+        // automatic caching, which is the opposite of what someone running a
+        // model locally wants to hear. A local server may well be reusing its
+        // KV cache for the same prefix and simply not reporting it in the
+        // OpenAI usage shape, so zero here is not even evidence of rework.
+        !isSelfHosted(this.cfg.baseUrl)
       ) {
         this.warnedNoCache = true;
         yield {
