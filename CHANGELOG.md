@@ -401,6 +401,16 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **Connecting to a working server said "unreachable".** Reported verbatim:
+  `unreachable: endpoint reachable · 6 models`. The line argued with itself
+  because `doctor()` folds two questions into one `ok` — did the endpoint
+  answer, and is this model on it — which is right for `molt doctor`, where
+  both must hold, and wrong immediately after `/endpoint`, which clears the
+  model on purpose. So `ok` was false for a model nobody had chosen yet, and
+  reading it as reachability called a healthy server dead. Reachability is
+  reported separately now, with the model count, and the next line says
+  `/model to pick one`.
+
 - **A build artifact could satisfy the bar.** molt found this one itself, and
   walked straight into it: a file it had written under `dist-test/` no longer
   matched its ledgered hash, because a rebuild had overwritten it. Rather than

@@ -2686,23 +2686,50 @@ export class Engine {
   }
 
   /** Preflight: is the endpoint reachable, and is the model actually there? */
-  async doctor(): Promise<{ ok: boolean; detail: string; modelPresent?: boolean }> {
+  /**
+   * `reachable` is reported separately from `ok`.
+   *
+   * `ok` folds two questions together — did the endpoint answer, and is this
+   * model on it — which is the right answer for `molt doctor`, where both must
+   * hold. It is the wrong answer immediately after switching endpoints, where
+   * no model has been chosen yet: the caller printed "unreachable" over a
+   * detail line that said "endpoint reachable · 6 models", because `ok` was
+   * false for a model that was deliberately blank.
+   */
+  async doctor(): Promise<{
+    ok: boolean;
+    reachable: boolean;
+    detail: string;
+    modelPresent?: boolean;
+    models?: string[];
+  }> {
     const fetchFn = this.cfg.fetchFn ?? fetch;
     const base = this.cfg.baseUrl.replace(/\/$/, "");
     try {
       const res = await fetchFn(`${base}/models`, { headers: authHeaders(base, this.cfg.apiKey) });
-      if (!res.ok) return { ok: false, detail: `HTTP ${res.status} from ${base}/models` };
+      if (!res.ok) {
+        return { ok: false, reachable: false, detail: `HTTP ${res.status} from ${base}/models` };
+      }
       const json = (await res.json().catch(() => null)) as { data?: { id?: string }[] } | null;
       const ids = (json?.data ?? []).map((m) => m.id).filter(Boolean) as string[];
       // No list at all is not evidence against the model; endpoints that hide
       // /models exist, and refusing them would be a guess dressed as a check.
-      if (!ids.length) return { ok: true, detail: `endpoint reachable (${base}) · model list unavailable` };
+      if (!ids.length) {
+        return {
+          ok: true,
+          reachable: true,
+          models: [],
+          detail: `endpoint reachable (${base}) · model list unavailable`,
+        };
+      }
       const has = ids.includes(this.cfg.model);
       return {
         // A preflight that passes on a model the endpoint does not have is a
         // preflight that only fails once the work has already started.
         ok: has,
+        reachable: true,
         modelPresent: has,
+        models: ids,
         detail:
           `endpoint reachable · ${ids.length} models` +
           (has
@@ -2710,7 +2737,7 @@ export class Engine {
             : ` · ⚠ '${this.cfg.model}' NOT in list (try: ${ids.slice(0, 3).join(", ")})`),
       };
     } catch (e) {
-      return { ok: false, detail: `cannot reach ${base}: ${String(e)}` };
+      return { ok: false, reachable: false, detail: `cannot reach ${base}: ${String(e)}` };
     }
   }
 
