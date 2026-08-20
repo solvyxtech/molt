@@ -4,13 +4,15 @@
  * these tests exist so that cannot silently happen again.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { Archive } from "../src/archive.js";
 import { loadBar, parseBar, selectChecks } from "../src/bar.js";
 import { Engine } from "../src/engine.js";
+import { gate } from "../src/autonomy.js";
 import { Receipts } from "../src/receipts.js";
+import type { BarResult } from "../src/types.js";
 import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
 const cleanups: (() => void)[] = [];
@@ -293,5 +295,84 @@ describe("receipt index and stats", () => {
 
     const hits = new Receipts(dir).grep("EVIDENCE-MARKER-5521");
     assert.ok(hits.length > 0, "a claim's evidence must be findable by grep");
+  });
+});
+
+describe("receipt numbers are not reused", () => {
+  it("numbers from the highest ever issued, not from how many survive", () => {
+    // `count()` is only the same as "next number" while nobody deletes one.
+    // Delete 0000 and the next write is numbered 0001 again, so two different
+    // receipts share a number and the index lists both under it. This project's
+    // own .molt reached 26 index rows over 9 files with 0000-0008 each
+    // duplicated. A receipt is the document you hand to someone who does not
+    // trust you; reusing its number is not cosmetic.
+    const dir = ws();
+    const receipts = new Receipts(dir);
+    const result: BarResult = { ok: true, results: [], durationMs: 1 };
+    const base = {
+      result,
+      attempt: 1,
+      model: "m",
+      provider: "p",
+      sessionTokens: 1,
+      shedBatches: 0,
+      changed: [],
+      did: [],
+    };
+
+    const first = receipts.write({ claim: "one", verdict: "accepted", ...base });
+    const second = receipts.write({ claim: "two", verdict: "refused", ...base });
+    assert.match(first.path, /0000-accepted\.md$/);
+    assert.match(second.path, /0001-refused\.md$/);
+
+    rmSync(first.path);
+    const third = receipts.write({ claim: "three", verdict: "accepted", ...base });
+    assert.match(third.path, /0002-accepted\.md$/, "reused a number a deleted receipt already had");
+
+    // And the index does not end up with two rows under one sequence.
+    const seqs = receipts.records().map((r) => String(r.file).slice(0, 4));
+    assert.equal(new Set(seqs).size, seqs.length, `duplicated sequence in the index: ${seqs.join(",")}`);
+  });
+
+  it("says a receipt is indexed but missing rather than absent", () => {
+    // The listing reads the index and --show reads the directory, so a receipt
+    // whose file is gone was printed by one and denied by the other.
+    const dir = ws();
+    const receipts = new Receipts(dir);
+    const r = receipts.write({
+      claim: "gone",
+      verdict: "accepted",
+      result: { ok: true, results: [], durationMs: 1 } as BarResult,
+      attempt: 1,
+      model: "m",
+      provider: "p",
+      sessionTokens: 1,
+      shedBatches: 0,
+      changed: [],
+      did: [],
+    });
+    rmSync(r.path);
+    assert.equal(receipts.list().length, 0, "the file should be gone");
+    assert.equal(receipts.records().length, 1, "the index should still remember it");
+  });
+});
+
+describe("commands that are not sessions", () => {
+  it("sort and uniq ask at medium when they are told to write", () => {
+    // Read-only in the common case, writing in the flag — the same reason sed
+    // and awk were kept off the read-only table entirely.
+    const w = ws();
+    const ask = (command: string, level: "medium" | "high") =>
+      gate(level, { name: "bash", args: { command }, cwd: w }).ask;
+
+    for (const c of ["sort -o out.txt in.txt", "sort --output=out.txt in.txt", "uniq -o out.txt", "sort -uo out.txt in.txt"]) {
+      assert.equal(ask(c, "medium"), true, `medium ran "${c}" unattended`);
+    }
+    for (const c of ["sort in.txt", "uniq in.txt", "sort -u in.txt"]) {
+      assert.equal(ask(c, "medium"), false, `medium started asking about "${c}"`);
+    }
+    // `-o` means something harmless elsewhere and must not be swept up.
+    assert.equal(ask("find . -name a -o -name b", "medium"), false, "find's boolean OR read as a write");
+    assert.equal(ask("du -o /tmp", "medium"), false, "du's mount filter read as a write");
   });
 });

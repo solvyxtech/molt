@@ -157,11 +157,15 @@ so instead:
   that step repeated calls molt had already answered — nothing new came back
 ```
 
-The result handed back is a pointer to the earlier one, not the payload. Two
-consecutive steps of nothing but repeats end the turn, with what it spent
-stated, and `loop_stop` in the log naming the step. A long file is read with
-`offset`, and every partial result says how many lines remain and which offset
-continues it — so "read it again" is never the only move available.
+The result handed back is a pointer to the earlier one, not the payload, so a
+model going in circles costs less each time round. Repeats are named on screen
+as they happen and recorded as `repeat_step` in the log, and a run of them says
+so — but they do not end the turn. Repetition is a guess at waste, and a model
+re-reading a file it just edited is repeating a call and making progress; what
+bounds a turn is what measures spend directly: `/budget`, the per-turn ceiling,
+and the step guard behind both. A long file is read with `offset`, and every
+partial result says how many lines remain and which offset continues it — so
+"read it again" is never the only move available.
 
 ## Estimated versus measured
 

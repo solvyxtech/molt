@@ -121,7 +121,7 @@ export class Receipts {
     did?: string[];
   }): Receipt {
     const iso = new Date().toISOString();
-    const seq = this.count();
+    const seq = this.nextSeq();
     const file = `${String(seq).padStart(4, "0")}-${args.verdict}.md`;
     const p = join(this.dir, file);
 
@@ -358,6 +358,36 @@ export class Receipts {
   count(): number {
     if (!existsSync(this.dir)) return 0;
     return readdirSync(this.dir).filter((f) => /^\d{4}-.*\.md$/.test(f)).length;
+  }
+
+  /**
+   * The next receipt number: one past the highest ever issued.
+   *
+   * It used to be `count()` — how many receipt files exist *now* — which is
+   * only the same thing while nobody deletes one. Delete `0000` and the next
+   * write is numbered `0001` again, so two different receipts share a number
+   * and the index lists both under it. This project's own `.molt` reached 26
+   * index rows over 9 files with sequences 0000–0008 each duplicated, and
+   * `molt receipts --show 0000-refused.md` reported no match for something the
+   * listing had just printed.
+   *
+   * A receipt is the document you hand to someone who does not trust you.
+   * Reusing its number is not a cosmetic problem.
+   *
+   * Taken from the index as well as the directory, because the index is the
+   * part that remembers what was deleted — that is the whole point of it.
+   */
+  private nextSeq(): number {
+    const seqOf = (name: string): number => {
+      const m = /^(\d{4})-/.exec(name);
+      return m ? Number(m[1]) : -1;
+    };
+    let highest = -1;
+    if (existsSync(this.dir)) {
+      for (const f of readdirSync(this.dir)) highest = Math.max(highest, seqOf(f));
+    }
+    for (const row of this.records()) highest = Math.max(highest, seqOf(row.file ?? ""));
+    return highest + 1;
   }
 
   list(): string[] {

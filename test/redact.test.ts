@@ -434,7 +434,7 @@ checks:
     advisory: ${advisory}
 `);
 
-  it("report without refusing", () => {
+  it("report without refusing", async () => {
     const ws = workspace();
     try {
       const bar = barWith(true);
@@ -446,7 +446,7 @@ checks:
         bar,
         fetchFn: scriptedProvider([{ text: "done" }]).fetchFn,
       });
-      const result = engine.proveNow()!;
+      const result = (await engine.proveNow())!;
       assert.equal(result.ok, true, "an advisory failure refused a completion");
       assert.equal(result.warnings?.length, 1);
       assert.equal(result.warnings?.[0]!.name, "opinion");
@@ -458,7 +458,7 @@ checks:
     }
   });
 
-  it("refuse when the same check is not advisory", () => {
+  it("refuse when the same check is not advisory", async () => {
     const ws = workspace();
     try {
       const engine = new Engine({
@@ -468,7 +468,7 @@ checks:
         bar: barWith(false),
         fetchFn: scriptedProvider([{ text: "done" }]).fetchFn,
       });
-      const result = engine.proveNow()!;
+      const result = (await engine.proveNow())!;
       assert.equal(result.ok, false);
       assert.equal(result.warnings, undefined);
     } finally {

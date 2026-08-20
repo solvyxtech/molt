@@ -38,6 +38,17 @@ export type Usage = {
   prompt_tokens?: number;
   completion_tokens?: number;
   prompt_tokens_details?: { cached_tokens?: number };
+  /**
+   * Anthropic's own names for the same two facts.
+   *
+   * Its compatibility layer is not guaranteed to translate them into
+   * `prompt_tokens_details`, and a meter that reads only the OpenAI shape
+   * would report a perfectly working cache as 0% — which reads as "caching is
+   * broken" and invites someone to go and break something that was fine.
+   * Cheap to accept both.
+   */
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
   completion_tokens_details?: { reasoning_tokens?: number };
   /** USD, as billed by the provider. Present on some, absent on most. */
   cost?: number;
@@ -53,6 +64,8 @@ export type StreamResult = {
   promptTokens?: number;
   completionTokens?: number;
   cachedTokens?: number;
+  /** Tokens written to the cache this request, billed above the base rate. */
+  cacheWriteTokens?: number;
   reasoningTokens?: number;
   costUsd?: number;
   finishReason?: string;
@@ -69,6 +82,8 @@ export class StreamAccumulator {
   promptTokens?: number;
   completionTokens?: number;
   cachedTokens?: number;
+  /** Tokens written to the cache this request, billed above the base rate. */
+  cacheWriteTokens?: number;
   reasoningTokens?: number;
   costUsd?: number;
   finishReason?: string;
@@ -85,6 +100,11 @@ export class StreamAccumulator {
       // nothing.
       if (typeof u.prompt_tokens_details?.cached_tokens === "number") {
         this.cachedTokens = u.prompt_tokens_details.cached_tokens;
+      } else if (typeof u.cache_read_input_tokens === "number") {
+        this.cachedTokens = u.cache_read_input_tokens;
+      }
+      if (typeof u.cache_creation_input_tokens === "number") {
+        this.cacheWriteTokens = u.cache_creation_input_tokens;
       }
       if (typeof u.completion_tokens_details?.reasoning_tokens === "number") {
         this.reasoningTokens = u.completion_tokens_details.reasoning_tokens;

@@ -8,7 +8,7 @@
  *
  * Nothing here asks a model anything. A bar result is an exit code.
  */
-import { execSync } from "node:child_process";
+import { runCommand } from "./run.js";
 import { proposeBar, type Detected } from "./detect.js";
 import { fingerprint } from "./files.js";
 import { createHash } from "node:crypto";
@@ -43,6 +43,8 @@ export class BarError extends Error {}
 
 export type BarContext = {
   cwd: string;
+  /** Kills the running check when it aborts, so ctrl+C can stop a long suite. */
+  signal?: AbortSignal;
   /** Full session record, including everything shed. */
   record: Msg[];
   /** Every path the model read this session. Reading grounds a reference. */
@@ -545,7 +547,7 @@ function runBuiltin(builtin: BuiltinCheck, ctx: BarContext): { ok: boolean; outp
   return { ok: false, output: `unknown builtin: ${builtin}` };
 }
 
-export function runCheck(check: Check, ctx: BarContext): CheckResult {
+export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResult> {
   const t0 = Date.now();
   if (check.kind === "builtin") {
     const { ok, output } = runBuiltin(check.builtin, ctx);
@@ -564,21 +566,24 @@ export function runCheck(check: Check, ctx: BarContext): CheckResult {
   let exitCode = 0;
   let output = "";
   try {
-    output = execSync(check.run, {
+    // Not execSync: a bar check is the longest thing molt runs (`npm test`,
+    // two minutes by default) and running it synchronously froze the terminal
+    // for its whole duration — including the ctrl+C that would have stopped it.
+    const r = await runCommand(check.run, {
       cwd: ctx.cwd,
-      timeout: check.timeoutMs,
+      timeoutMs: check.timeoutMs,
       maxBuffer: 8 * 1024 * 1024,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
+      signal: ctx.signal,
     });
-  } catch (e) {
-    const err = e as { stdout?: string; stderr?: string; status?: number | null; signal?: string };
-    exitCode = typeof err.status === "number" ? err.status : 1;
-    output = `${err.stdout ?? ""}${err.stderr ?? ""}`;
-    if (err.signal === "SIGTERM") {
+    output = `${r.stdout}${r.stderr}`;
+    exitCode = r.code ?? 1;
+    if (r.timedOut) {
       output = `timed out after ${check.timeoutMs}ms\n` + output;
       exitCode = 124;
     }
+  } catch (e) {
+    exitCode = 1;
+    output = String(e);
   }
   const passed = exitCode === check.expectExit;
   return {
@@ -645,15 +650,23 @@ export class CheckCache {
   }
 }
 
-export function runBar(bar: Bar, ctx: BarContext): BarResult {
+export async function runBar(bar: Bar, ctx: BarContext): Promise<BarResult> {
   const t0 = Date.now();
-  const results = bar.checks.map((c) => {
+  // In order, one at a time. Checks share a working directory and routinely
+  // build into it; running them concurrently would have them tripping over
+  // each other's output, and a bar that fails depending on scheduling is worse
+  // than a slow one.
+  const results: CheckResult[] = [];
+  for (const c of bar.checks) {
     const reused = ctx.cache?.get(c, ctx.cwd) ?? null;
-    if (reused) return reused;
-    const fresh = runCheck(c, ctx);
+    if (reused) {
+      results.push(reused);
+      continue;
+    }
+    const fresh = await runCheck(c, ctx);
     ctx.cache?.put(c, ctx.cwd, fresh);
-    return fresh;
-  });
+    results.push(fresh);
+  }
   const warnings = results.filter((r) => !r.ok && r.advisory);
   return {
     // An advisory failure is not a failed contract. It is still reported, and

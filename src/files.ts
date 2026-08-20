@@ -60,6 +60,17 @@ export const SEARCH_SKIP_DIRS = new Set([...SKIP_DIRS, ".molt"]);
 
 /** How many entries or matches a single result may carry. */
 export const MAX_ENTRIES = 400;
+/**
+ * How many directory entries a single walk may look at.
+ *
+ * The bound that was missing. `limit` caps what a walk *keeps*, which bounds
+ * nothing when a glob keeps almost nothing — a `grep` for `*.{ts,tsx}` under a
+ * home directory collected no entries at all and walked for eight minutes.
+ * This counts the syscalls instead, which is the thing that actually costs.
+ */
+export const MAX_EXAMINED = 50_000;
+/** How long a directory walk may run before it reports what it has. */
+export const WALK_DEADLINE_MS = 3_000;
 export const MAX_MATCHES = 200;
 /** Files bigger than this are not searched — they are data, not source. */
 export const MAX_SEARCH_BYTES = 2_000_000;
@@ -96,6 +107,19 @@ export function globToRegExp(pattern: string): RegExp {
       out += "[^/]";
       continue;
     }
+    // `{ts,tsx}` — an alternation, which is what everyone writing a glob means
+    // by it. These used to be escaped into literal braces, so the very common
+    // `*.{ts,tsx}` matched a file actually named that and nothing else: no
+    // error, no matches, and a full-tree walk to discover it.
+    if (c === "{") {
+      const close = pattern.indexOf("}", i);
+      if (close !== -1) {
+        const alts = pattern.slice(i + 1, close).split(",");
+        out += `(?:${alts.map((a) => a.replace(/[.+^${}()|[\]\\*?]/g, "\\$&")).join("|")})`;
+        i = close;
+        continue;
+      }
+    }
     out += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
   }
   return new RegExp(`^${out}$`);
@@ -116,22 +140,49 @@ export type Entry = { path: string; kind: "file" | "dir"; bytes?: number };
  * Walk a directory, breadth-first, skipping the noise and stopping at a
  * bound. Returns entries relative to `root`.
  */
-export function walk(
-  root: string,
-  opts: {
-    depth?: number;
-    glob?: string;
-    limit?: number;
-    dirsOnly?: boolean;
-    skip?: ReadonlySet<string>;
-  } = {},
-): { entries: Entry[]; truncated: boolean; skipped: string[] } {
+export type WalkOptions = {
+  depth?: number;
+  glob?: string;
+  limit?: number;
+  dirsOnly?: boolean;
+  skip?: ReadonlySet<string>;
+  /** Absolute ms timestamp to stop at. Bounds the walk itself, not its output. */
+  deadline?: number;
+  /**
+   * How many directory entries may be *looked at*, as opposed to kept.
+   *
+   * `limit` counts entries collected, which is not a bound on the work: with a
+   * glob, directories and non-matching files are never collected, so a
+   * selective pattern makes `limit` unreachable while the walk grinds through
+   * the whole tree. That is exactly how one `grep` with `*.{ts,tsx}` over a
+   * home directory ran for eight minutes and returned nothing.
+   */
+  examine?: number;
+};
+
+export type WalkResult = {
+  entries: Entry[];
+  /** True when the walk stopped early — by entry limit, examine cap, or time. */
+  truncated: boolean;
+  skipped: string[];
+  /** True when it was the clock that stopped it. */
+  timedOut: boolean;
+  /** How many directory entries were looked at. */
+  examined: number;
+};
+
+/**
+ * The traversal itself, as a generator so it can be drained two ways.
+ *
+ * Yields between directories. A synchronous caller drains it in one go; a
+ * caller that must not block the terminal awaits between pulls. Sharing the
+ * body means the bounds cannot drift apart between the two.
+ */
+function* walkSteps(root: string, opts: WalkOptions, out: WalkResult): Generator<void> {
   const skip = opts.skip ?? SKIP_DIRS;
   const depth = opts.depth ?? 1;
   const limit = opts.limit ?? MAX_ENTRIES;
-  const entries: Entry[] = [];
-  const skipped: string[] = [];
-  let truncated = false;
+  const examine = opts.examine ?? MAX_EXAMINED;
 
   const queue: { dir: string; level: number }[] = [{ dir: root, level: 0 }];
   while (queue.length > 0) {
@@ -143,6 +194,18 @@ export function walk(
       continue; // unreadable directory: reported by its absence, never fatal
     }
     for (const name of names) {
+      // Checked here, where the cost is: one `statSync` per entry is cheap
+      // and a million of them is not.
+      out.examined += 1;
+      if (out.examined > examine) {
+        out.truncated = true;
+        return;
+      }
+      if (opts.deadline !== undefined && (out.examined & 0xff) === 0 && Date.now() > opts.deadline) {
+        out.truncated = true;
+        out.timedOut = true;
+        return;
+      }
       const abs = join(dir, name);
       const rel = relative(root, abs).split(sep).join("/");
       let isDir = false;
@@ -156,22 +219,53 @@ export function walk(
       }
 
       if (isDir && skip.has(name)) {
-        skipped.push(rel);
+        out.skipped.push(rel);
         continue;
       }
-      if (entries.length >= limit) {
-        truncated = true;
-        return { entries, truncated, skipped };
+      if (out.entries.length >= limit) {
+        out.truncated = true;
+        return;
       }
       if (isDir) {
-        if (!opts.glob) entries.push({ path: rel + "/", kind: "dir" });
+        if (!opts.glob) out.entries.push({ path: rel + "/", kind: "dir" });
         if (level + 1 < depth) queue.push({ dir: abs, level: level + 1 });
       } else if (!opts.dirsOnly && matchesGlob(rel, opts.glob)) {
-        entries.push({ path: rel, kind: "file", bytes });
+        out.entries.push({ path: rel, kind: "file", bytes });
       }
     }
+    yield;
   }
-  return { entries, truncated, skipped };
+}
+
+function emptyWalk(): WalkResult {
+  return { entries: [], truncated: false, skipped: [], timedOut: false, examined: 0 };
+}
+
+export function walk(root: string, opts: WalkOptions = {}): WalkResult {
+  const out = emptyWalk();
+  for (const _ of walkSteps(root, opts, out)) {
+    // drained whole: callers of the sync form are bounded by `deadline`
+  }
+  return out;
+}
+
+/**
+ * The same walk, without holding the terminal.
+ *
+ * Used by everything the model can trigger. A walk is thousands of blocking
+ * syscalls, and doing them all in one turn of the event loop is what makes a
+ * search look like a hang.
+ */
+export async function walkAsync(root: string, opts: WalkOptions = {}): Promise<WalkResult> {
+  const out = emptyWalk();
+  // Every directory, not every sixteenth. A `readdirSync` on a contended disk
+  // can take a long time on its own, and batching the yields stacks however
+  // many of those land in one batch into a single stall. A `setImmediate` costs
+  // microseconds; the walk is dominated by the syscalls either way.
+  for (const _ of walkSteps(root, opts, out)) {
+    await new Promise((r) => setImmediate(r));
+  }
+  return out;
 }
 
 /** Render a listing for the model: one entry per line, sizes where they help. */
@@ -214,7 +308,17 @@ export function fingerprint(root: string, globs?: string[]): string {
   const seen = new Set<string>();
 
   for (const glob of patterns) {
-    const { entries, truncated } = walk(root, { depth: 24, glob, limit: 20_000 });
+    // Bounded like every other walk. This one runs synchronously on the
+    // check-cache path, so an unbounded version freezes the terminal exactly
+    // the way the search did — and a fingerprint that could not be taken in
+    // time is handled below as one that cannot be trusted, which is already
+    // the correct conservative answer.
+    const { entries, truncated } = walk(root, {
+      depth: 24,
+      glob,
+      limit: 20_000,
+      deadline: Date.now() + WALK_DEADLINE_MS,
+    });
     // A listing that hit its bound has not seen the whole scope, and a
     // signature of an unknown subset is not a signature. Say so, and the
     // caller treats it as never matching.
@@ -264,11 +368,21 @@ export function isCatastrophic(pattern: string): boolean {
   return /\([^)]*[+*{][^)]*\)\s*[+*{]/.test(pattern);
 }
 
-export function grepFiles(
+export type GrepResult = {
+  matches: Match[];
+  truncated: boolean;
+  scanned: number;
+  invalid?: string;
+  timedOut?: boolean;
+  /** True when the *walk* was cut short, so files exist that were never opened. */
+  partialWalk?: boolean;
+};
+
+export async function grepFiles(
   root: string,
   pattern: string,
   opts: { glob?: string; depth?: number; limit?: number; ignoreCase?: boolean } = {},
-): { matches: Match[]; truncated: boolean; scanned: number; invalid?: string; timedOut?: boolean } {
+): Promise<GrepResult> {
   if (isCatastrophic(pattern)) {
     return {
       matches: [],
@@ -288,16 +402,25 @@ export function grepFiles(
   const deadline = Date.now() + SEARCH_DEADLINE_MS;
 
   const limit = opts.limit ?? MAX_MATCHES;
-  const { entries } = walk(root, {
+  // The deadline covers the walk, which is where the time actually goes. It
+  // used to be created here and first consulted in the scan loop below — after
+  // the walk had already finished — so the one phase that could run for
+  // minutes was the one phase it did not bound.
+  const { entries, truncated: partialWalk } = await walkAsync(root, {
     depth: opts.depth ?? 12,
     glob: opts.glob,
     limit: 5000,
     skip: SEARCH_SKIP_DIRS,
+    deadline: Math.min(deadline, Date.now() + WALK_DEADLINE_MS),
   });
   const matches: Match[] = [];
   let scanned = 0;
 
   for (const e of entries) {
+    // Every file. Gating this on `scanned & 7` meant a search over eight large
+    // files yielded twice and blocked for everything in between — and reading
+    // a file off a busy disk is not reliably quick either.
+    await new Promise((r) => setImmediate(r));
     if (e.kind !== "file") continue;
     if ((e.bytes ?? 0) > MAX_SEARCH_BYTES) continue;
     let buf: Buffer;
@@ -310,26 +433,40 @@ export function grepFiles(
     scanned++;
     const lines = buf.toString("utf8").split("\n");
     for (let i = 0; i < lines.length; i++) {
+      // Inside the file too, not only between files. The cost of a search is
+      // not always in the reading: `.*with.*some.*words.*absent` over ten
+      // megabytes spends four hundred milliseconds in the regex engine, and
+      // yielding only between files froze the terminal for all of it. A model
+      // writing a pattern like that is ordinary, so this cannot depend on the
+      // pattern being cheap.
+      if (i > 0 && (i & 0x3ff) === 0) await new Promise((r) => setImmediate(r));
       // Checked between lines rather than per file: one enormous file must not
       // be able to outrun the deadline on its own.
       if ((i & 0x3f) === 0 && Date.now() > deadline) {
-        return { matches, truncated: true, scanned, timedOut: true };
+        return { matches, truncated: true, scanned, timedOut: true, partialWalk };
       }
       // A match past this column is not something anyone reads, and an
       // unbounded line is what makes a slow pattern into a hung one.
       if (!re.test(lines[i]!.slice(0, MAX_LINE_CHARS))) continue;
-      if (matches.length >= limit) return { matches, truncated: true, scanned };
+      if (matches.length >= limit) return { matches, truncated: true, scanned, partialWalk };
       matches.push({ path: e.path, line: i + 1, text: lines[i]!.slice(0, 240).trim() });
     }
   }
-  return { matches, truncated: false, scanned };
+  return { matches, truncated: Boolean(partialWalk), scanned, partialWalk };
 }
 
-export function formatMatches(
-  pattern: string,
-  result: { matches: Match[]; truncated: boolean; scanned: number; invalid?: string; timedOut?: boolean },
-): string {
+export function formatMatches(pattern: string, result: GrepResult): string {
   if (result.invalid) return `[molt: /${pattern}/ was not run — ${result.invalid}]`;
+  // A search that never reached most of the tree and found nothing is not the
+  // same answer as "it is not there", and reporting them identically is how a
+  // model concludes a symbol does not exist and acts on it.
+  if (result.partialWalk && result.matches.length === 0) {
+    return (
+      `[molt: /${pattern}/ found nothing, but the search did not reach the whole tree — it ` +
+      `stopped while listing files. This is NOT evidence the pattern is absent. Search a ` +
+      `subdirectory, or narrow it with a glob.]`
+    );
+  }
   if (result.timedOut) {
     return (
       `[molt: the search for /${pattern}/ ran past ${SEARCH_DEADLINE_MS}ms and was stopped ` +
@@ -343,7 +480,14 @@ export function formatMatches(
   }
   const head = `[molt: ${result.matches.length} match(es) for /${pattern}/ in ${result.scanned} file(s)]`;
   const lines = result.matches.map((m) => `${m.path}:${m.line}: ${m.text}`);
-  const tail = result.truncated ? [`[molt: stopped at ${MAX_MATCHES} matches — narrow the pattern or the glob]`] : [];
+  const tail = result.partialWalk
+    ? [
+        `[molt: the file listing was cut short, so there may be matches in files this search ` +
+          `never opened — narrow it to a subdirectory to be sure]`,
+      ]
+    : result.truncated
+      ? [`[molt: stopped at ${MAX_MATCHES} matches — narrow the pattern or the glob]`]
+      : [];
   return [head, ...lines, ...tail].join("\n");
 }
 

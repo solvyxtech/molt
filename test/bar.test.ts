@@ -36,7 +36,7 @@ function ctx(dir: string, over: Partial<BarContext> = {}): BarContext {
 }
 
 describe("claims-grounded grounds a read", () => {
-  it("accepts a file the model read, wherever it lives", () => {
+  it("accepts a file the model read, wherever it lives", async () => {
     // The reported failure: molt was asked to assess its own source, which is
     // installed outside the project directory. It read engine.ts, described it
     // accurately, and was told it had invented the name — then spent 1.13M
@@ -56,10 +56,10 @@ describe("claims-grounded grounds a read", () => {
     };
 
     // Nothing read: the names are unsupported, and the check says so.
-    assert.equal(runBar(bar, ctx).ok, false);
+    assert.equal((await runBar(bar, ctx)).ok, false);
 
     // Read from anywhere, including outside the project.
-    const grounded = runBar(bar, {
+    const grounded = await runBar(bar, {
       ...ctx,
       read: ["/opt/homebrew/lib/node_modules/@solvyx/molt/src/engine.ts", "/elsewhere/bar.ts"],
     });
@@ -191,59 +191,59 @@ checks:
 });
 
 describe("command checks", () => {
-  it("passes on the expected exit code and fails otherwise", () => {
+  it("passes on the expected exit code and fails otherwise", async () => {
     const dir = ws();
     const bar = parseBar(
       "version: 1\nchecks:\n  - name: ok\n    run: exit 0\n  - name: nope\n    run: exit 3\n",
     );
-    const result = runBar(bar, ctx(dir));
+    const result = await runBar(bar, ctx(dir));
     assert.equal(result.ok, false);
     assert.equal(result.results[0].ok, true);
     assert.equal(result.results[1].ok, false);
     assert.equal(result.results[1].exitCode, 3);
   });
 
-  it("honours a non-zero expected exit code", () => {
+  it("honours a non-zero expected exit code", async () => {
     const bar = parseBar("version: 1\nchecks:\n  - name: inverted\n    run: exit 7\n    expect_exit: 7\n");
-    assert.equal(runBar(bar, ctx(ws())).ok, true);
+    assert.equal((await runBar(bar, ctx(ws()))).ok, true);
   });
 
-  it("captures stderr, not just stdout", () => {
+  it("captures stderr, not just stdout", async () => {
     const bar = parseBar('version: 1\nchecks:\n  - name: e\n    run: echo "to stderr" >&2; exit 1\n');
-    assert.match(runBar(bar, ctx(ws())).results[0].output, /to stderr/);
+    assert.match((await runBar(bar, ctx(ws()))).results[0].output, /to stderr/);
   });
 
-  it("reports a timeout as a failure rather than hanging", () => {
+  it("reports a timeout as a failure rather than hanging", async () => {
     const bar = parseBar("version: 1\nchecks:\n  - name: slow\n    run: sleep 5\n    timeout: 1\n");
-    const r = runBar(bar, ctx(ws())).results[0];
+    const r = (await runBar(bar, ctx(ws()))).results[0];
     assert.equal(r.ok, false);
     assert.match(r.output, /timed out/);
   });
 
-  it("runs every check even after one fails", () => {
+  it("runs every check even after one fails", async () => {
     const bar = parseBar(
       "version: 1\nchecks:\n  - name: a\n    run: exit 1\n  - name: b\n    run: exit 1\n  - name: c\n    run: exit 0\n",
     );
-    const r = runBar(bar, ctx(ws()));
+    const r = await runBar(bar, ctx(ws()));
     assert.equal(r.results.length, 3, "a partial bar is not a bar");
   });
 });
 
 describe("builtin: files-changed", () => {
-  it("fails when nothing was written at all", () => {
+  it("fails when nothing was written at all", async () => {
     const bar = parseBar("version: 1\nchecks:\n  - name: l\n    builtin: files-changed\n");
-    const r = runBar(bar, ctx(ws()));
+    const r = await runBar(bar, ctx(ws()));
     assert.equal(r.ok, false);
     assert.match(r.results[0].output, /No file was modified/);
   });
 
-  it("fails when writes appear in the record but never landed", () => {
+  it("fails when writes appear in the record but never landed", async () => {
     const dir = ws();
     const record = [
       { role: "assistant" as const, content: null, tool_calls: [toolCall("write_file", { path: "x.ts" })] },
     ];
     const bar = parseBar("version: 1\nchecks:\n  - name: l\n    builtin: files-changed\n");
-    const r = runBar(bar, ctx(dir, { record }));
+    const r = await runBar(bar, ctx(dir, { record }));
     assert.equal(r.ok, false);
     assert.match(r.results[0].output, /none landed on disk/);
     assert.match(r.results[0].output, /x\.ts/);
@@ -260,25 +260,25 @@ describe("builtin: files-changed", () => {
 });
 
 describe("builtin: record-intact", () => {
-  it("passes when nothing has been shed", () => {
+  it("passes when nothing has been shed", async () => {
     const bar = parseBar("version: 1\nchecks:\n  - name: r\n    builtin: record-intact\n");
-    assert.equal(runBar(bar, ctx(ws())).ok, true);
+    assert.equal((await runBar(bar, ctx(ws()))).ok, true);
   });
 
-  it("fails when the session shed more than the archive holds", () => {
+  it("fails when the session shed more than the archive holds", async () => {
     const dir = ws();
     const bar = parseBar("version: 1\nchecks:\n  - name: r\n    builtin: record-intact\n");
-    const r = runBar(bar, ctx(dir, { archive: new Archive(dir), archivedBatches: 2 }));
+    const r = await runBar(bar, ctx(dir, { archive: new Archive(dir), archivedBatches: 2 }));
     assert.equal(r.ok, false);
     assert.match(r.results[0].output, /evidence chain is incomplete/);
   });
 
-  it("passes when the archive matches the session", () => {
+  it("passes when the archive matches the session", async () => {
     const dir = ws();
     const archive = new Archive(dir);
     archive.write("# e\n\n## user\n\nhello\n", 1, "hello");
     const bar = parseBar("version: 1\nchecks:\n  - name: r\n    builtin: record-intact\n");
-    assert.equal(runBar(bar, ctx(dir, { archive, archivedBatches: 1 })).ok, true);
+    assert.equal((await runBar(bar, ctx(dir, { archive, archivedBatches: 1 }))).ok, true);
   });
 });
 

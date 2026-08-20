@@ -6,7 +6,8 @@
  * work, the receipts, and the refusals, and nothing else.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Box, Static, Text, useApp, useInput, useStdout } from "ink";
+import { Box, Static, Text, render, useApp, useInput, useStdout } from "ink";
+import type { RenderOptions } from "ink";
 import { Banner, fmtCost, fmtDuration } from "./banner.js";
 import { COMMANDS, completionFor, matchCommands, windowAround, wrapIndex } from "./commands.js";
 import { StatusLine } from "./status-line.js";
@@ -66,6 +67,18 @@ type Row = {
   id: number;
   tone: "user" | "agent" | "tool" | "info" | "error" | "ok" | "fail";
   text: string;
+  /**
+   * A blank line belonging above this row.
+   *
+   * Carried here rather than pushed as a row of its own, because Ink drops a
+   * whitespace-only `<Static>` item when the items arrive one at a time —
+   * which is exactly how streamed output arrives. All at once the blanks
+   * survive; incrementally they vanish, so every paragraph break the model
+   * wrote was silently deleted and its prose came out as one dense block.
+   * Folded into the next row's text, the item is no longer whitespace-only
+   * and the break survives.
+   */
+  gap?: boolean;
 };
 
 /**
@@ -104,6 +117,7 @@ type Job = {
 const FEED_MEMORY = 5_000;
 /** Feed lines on screen at once. The panel must never outgrow the viewport. */
 const FEED_ROWS = 9;
+
 /** Finished jobs listed under the running one. */
 const JOB_ROWS = 4;
 
@@ -151,6 +165,13 @@ function spendText(s: {
   return `${tok(s.promptTokens)} in${cached} · ${tok(s.completionTokens)} out${money}`;
 }
 
+/** Bytes, at a glance: exact when small, rounded when not. */
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 /** How many palette rows to show at once. */
 const PALETTE_ROWS = 6;
 
@@ -161,18 +182,38 @@ const PALETTE_ROWS = 6;
 const SPINNER = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"];
 const SPIN_MS = 90;
 
-export function App({
-  engine,
-  version,
-  autoShed,
-  verbose: startVerbose = false,
-}: {
+export type AppProps = {
   engine: Engine;
   version: string;
   autoShed?: number;
   /** Start in the transparency view, from `--verbose`. */
   verbose?: boolean;
-}) {
+};
+
+/**
+ * Mount the TUI.
+ *
+ * The one way to start it, because one of these options is not a preference.
+ * Ink exits the process on ctrl+C on its own, beside whatever the app does
+ * with the key, so a mount that leaves the default on cannot cancel a turn —
+ * the program is already going down. molt owns that key, and the way to make
+ * that true everywhere is to leave no mount that can decide otherwise: the
+ * flag is applied last and is not overridable by a caller.
+ *
+ * The bug this closes was invisible for exactly this reason. Production
+ * mounted with the default and died on ctrl+C; the tests mounted with it off
+ * and exercised handling the real program never reached.
+ */
+export function renderApp(props: AppProps, options: RenderOptions = {}) {
+  return render(<App {...props} />, { ...options, exitOnCtrlC: false });
+}
+
+export function App({
+  engine,
+  version,
+  autoShed,
+  verbose: startVerbose = false,
+}: AppProps) {
   const { exit } = useApp();
   const { stdout } = useStdout();
   // The live panel must fit the window exactly. A line one column too long
@@ -194,14 +235,15 @@ export function App({
   /** Apply one editing operation to the line. */
   const edit = useCallback((op: (l: Line) => Line) => setEntry((l) => op(l)), []);
   const [busy, setBusy] = useState(false);
+  /** True once ctrl+C has been pressed on an empty line: the next one exits. */
+  const [quitArmed, setQuitArmed] = useState(false);
   const [pending, setPending] = useState<{ name: string; detail: string } | null>(null);
   const [promptChoice, setPromptChoice] = useState(0);
   const [paletteIndex, setPaletteIndex] = useState(0);
   const [tokens, setTokens] = useState(0);
   const [streamText, setStreamText] = useState("");
-  /** The line still being written, and whether anything streamed this turn. */
+  /** The line still being written, waiting for the newline that ends it. */
   const partial = useRef("");
-  const streamed = useRef(false);
   /** Things typed while molt was busy, waiting for the turn to end. */
   const queued = useRef<string[]>([]);
   const [cost, setCost] = useState<number | undefined>(undefined);
@@ -243,12 +285,42 @@ export function App({
     const rest = partial.current;
     partial.current = "";
     setStreamText("");
-    if (rest.trim()) setLines((prev) => [...prev, { id: nextId.current++, tone: "agent", text: rest }]);
+    if (rest.trim()) {
+      const gap = pendingGap.current;
+      pendingGap.current = false;
+      setLines((prev) => [
+        ...prev,
+        { id: nextId.current++, tone: "agent", text: rest, ...(gap ? { gap: true } : {}) },
+      ]);
+    }
   }, []);
 
-  const add = useCallback((tone: Row["tone"], text: string) => {
-    setLines((prev) => [...prev, { id: nextId.current++, tone, text }]);
+  /** A blank line seen while streaming, waiting for the row it belongs above. */
+  const pendingGap = useRef(false);
+
+  const add = useCallback((tone: Row["tone"], text: string, gap = false) => {
+    setLines((prev) => [...prev, { id: nextId.current++, tone, text, ...(gap ? { gap } : {}) }]);
   }, []);
+
+  /**
+   * A streamed line of the model's own prose, blank lines and all.
+   *
+   * A blank one is remembered rather than added: it comes back as the gap
+   * above whatever is written next, which is the only way it survives the
+   * transcript. A run of them still reads as one break — a model that leaves
+   * four blank lines did not mean four.
+   */
+  const addAgentLine = useCallback(
+    (text: string) => {
+      if (text.trim() === "") {
+        pendingGap.current = true;
+        return;
+      }
+      add("agent", text, pendingGap.current);
+      pendingGap.current = false;
+    },
+    [add],
+  );
 
   /**
    * Record a line for the live feed, and — when the view is open — for the
@@ -411,8 +483,7 @@ export function App({
           while (cut !== -1) {
             const line = partial.current.slice(0, cut);
             partial.current = partial.current.slice(cut + 1);
-            streamed.current = true;
-            add("agent", line);
+            addAgentLine(line);
             cut = partial.current.indexOf("\n");
           }
           setStreamText(partial.current);
@@ -431,16 +502,18 @@ export function App({
               : "cancelled — nothing was written, and the conversation is rolled back",
           );
           break;
+        case "message_end":
+          // The step's last line, which has no newline of its own to end it.
+          // Without this the next step's first word landed on it — one
+          // ever-growing paragraph in the live region, printed below the tools
+          // it was introducing instead of above them.
+          flushPartial();
+          break;
         case "assistant_text":
-          // Streamed text is already on screen line by line, so only the tail
-          // is missing. A provider that does not stream sends nothing until
-          // now, and gets printed whole.
-          if (streamed.current || partial.current) {
-            flushPartial();
-          } else {
-            add("agent", ev.text);
-          }
-          streamed.current = false;
+          // A streamed answer is already on screen — `message_end` closed its
+          // last line a moment ago — so this carries nothing new. A provider
+          // that does not stream sent nothing until now, and gets printed whole.
+          if (!ev.streamed) add("agent", ev.text);
           break;
         case "tool_start":
           beginActivity(ev.name, ev.detail);
@@ -452,9 +525,15 @@ export function App({
           // A call nobody was asked about says so. Autonomy is a convenience,
           // and the record of what it let through has to be readable without
           // opening the log.
+          // And how much came back. Without the view open a call said only
+          // that it happened — you could not tell a read of four hundred lines
+          // from one of four, or a command that printed nothing from one that
+          // printed a screenful. The size is the cheapest possible answer to
+          // "what did that actually do", and it costs no extra row.
+          const got = ev.bytes === undefined ? "" : `  → ${fmtBytes(ev.bytes)}`;
           add(
             "tool",
-            `${ev.name}  ${ev.detail}${ev.note ? `  [${ev.note}]` : ""}${ev.auto ? "  [auto]" : ""}${took}`,
+            `${ev.name}  ${ev.detail}${ev.note ? `  [${ev.note}]` : ""}${ev.auto ? "  [auto]" : ""}${took}${got}`,
           );
           // The exact call and the head of what came back. Verbatim: a
           // transparency view that paraphrases is one more thing to verify.
@@ -514,7 +593,11 @@ export function App({
           );
           break;
         case "request":
-          beginActivity("thinking");
+          // Say what the wait is for. "thinking · 47s" is a spinner with a
+          // clock on it; the step number and the size of the request are the
+          // difference between waiting and watching — and the request size is
+          // the number that explains the bill arriving after it.
+          beginActivity("thinking", `step ${ev.step + 1} · ~${tok(ev.estTokens)} tokens sent`);
           note(
             `→ step ${ev.step + 1} · ${ev.messages} messages · ~${tok(ev.estTokens)} tokens → ${ev.model}` +
               (ev.stream ? " · streaming" : ""),
@@ -584,14 +667,12 @@ export function App({
           // would be its own small dishonesty, and it is the thing the reader
           // most needs to see next to the reason it was rejected.
           flushPartial();
-          streamed.current = false;
           add("info", "↑ that claim was refused. What follows is why.");
           renderBar(ev.result, `completion refused (attempt ${ev.attempt}) — continuing`);
           add("info", "  the failures above go back to the model; it keeps working");
           break;
         case "proof_exhausted":
           flushPartial();
-          streamed.current = false;
           renderBar(ev.result, `bar not met after ${ev.attempts} attempts`);
           break;
         case "receipt":
@@ -1144,9 +1225,16 @@ export function App({
           return true;
         }
         case "/prove": {
-          const result = engine.proveNow();
-          if (!result) add("info", "no bar to check — /init to create one");
-          else renderBar(result, result.ok ? "bar met" : "bar not met");
+          // The bar runs off-thread now, so the command hands back immediately
+          // and the result arrives when it arrives — the prompt stays live
+          // while a two-minute suite runs.
+          void engine.proveNow().then(
+            (result) => {
+              if (!result) add("info", "no bar to check — /init to create one");
+              else renderBar(result, result.ok ? "bar met" : "bar not met");
+            },
+            (e: unknown) => add("error", String(e)),
+          );
           return true;
         }
         default:
@@ -1199,6 +1287,9 @@ export function App({
         add("error", String(e));
       } finally {
         setBusy(false);
+        // A press that cancelled this turn must not still be armed against
+        // the next one.
+        setQuitArmed(false);
       }
 
       // Anything typed while that ran goes now, in the order it was typed.
@@ -1213,6 +1304,11 @@ export function App({
   }, [submit]);
 
   useInput((char, key) => {
+    // Any other key means you did not mean to quit. Disarmed here rather than
+    // on a timer, so the offer cannot expire between reading it and acting on
+    // it — and cannot linger into a session you have gone back to using.
+    if (quitArmed && !(key.ctrl && char === "c")) setQuitArmed(false);
+
     // --- permission prompt: arrows choose, enter commits, no typing ---
     if (pending) {
       // The prompt is exactly where "stop asking me this" is decided, so the
@@ -1288,6 +1384,19 @@ export function App({
     // type it into, and a letter otherwise.
     if (busy) {
       if (key.ctrl && char === "c") {
+        // First press asks the turn to stop. If it is still running by the
+        // next press, the turn is not listening — and molt does not get to
+        // hold the terminal hostage while it decides. The second press leaves.
+        //
+        // This is a backstop, not the mechanism: a hung salvage used to make
+        // ctrl+C do nothing at all, and while that particular hang is fixed,
+        // "you can always get out" should not depend on having fixed every
+        // possible hang.
+        if (quitArmed) {
+          exit();
+          return;
+        }
+        setQuitArmed(true);
         engine.cancel();
         return;
       }
@@ -1401,8 +1510,22 @@ export function App({
       return;
     }
 
+    // ctrl+C at an idle prompt clears the line; only on an already-empty line,
+    // and only twice in a row, does it end the session. A single press used to
+    // quit outright — which threw away a half-typed prompt for the keystroke
+    // every other REPL uses to take one back.
     if (key.ctrl && char === "c") {
-      exit();
+      if (input !== "") {
+        setInput("");
+        setPaletteIndex(0);
+        setQuitArmed(false);
+        return;
+      }
+      if (quitArmed) {
+        exit();
+        return;
+      }
+      setQuitArmed(true);
       return;
     }
 
@@ -1541,8 +1664,9 @@ export function App({
         {(item) =>
           item.row ? (
             <Text key={item.key} color={toneColor[item.row.tone]} wrap="wrap">
-              {item.row.tone === "user" ? "› " : item.row.tone === "tool" ? "· " : "  "}
-              {item.row.text}
+              {(item.row.gap ? "\n" : "") +
+                (item.row.tone === "user" ? "› " : item.row.tone === "tool" ? "· " : "  ") +
+                item.row.text}
             </Text>
           ) : (
             <Box key={item.key} flexDirection="column">
@@ -1706,30 +1830,37 @@ export function App({
               <Text color={theme.ghost}>   ↑↓ choose · enter select · esc cancel</Text>
             </Box>
           ) : (
-            <Box>
+            <Box flexDirection="column">
               {busy ? (
                 <>
-                  <Text color={theme.accent}>{SPINNER[frame % SPINNER.length]} </Text>
-                  <Text color={theme.dim}>{activity?.label ?? "working"}</Text>
-                  {/* What it is working ON, not just that it is working. */}
-                  {activity?.what && (
-                    <Text color={theme.dim} wrap="wrap">
-                      {" \u00b7 "}
-                      {activity.what}
-                    </Text>
-                  )}
-                  {activity && (
+                  {/*
+                    One wrapping Text, and the typed line on a row of its own.
+                    These used to be flex siblings on a single row, which the
+                    terminal CLIPS rather than reflows — so making this line say
+                    more about what it was waiting for pushed the user's own
+                    half-typed message off the right edge and it looked like
+                    typing had stopped working. What molt has to say may not
+                    cost you sight of what you are saying.
+                  */}
+                  <Text wrap="wrap">
+                    <Text color={theme.accent}>{SPINNER[frame % SPINNER.length]} </Text>
+                    <Text color={theme.dim}>{activity?.label ?? "working"}</Text>
+                    {/* What it is working ON, not just that it is working. */}
+                    {activity?.what ? <Text color={theme.dim}>{` \u00b7 ${activity.what}`}</Text> : null}
+                    {activity ? (
+                      <Text color={theme.ghost}>
+                        {` \u00b7 ${fmtDuration(Date.now() - activity.since)}`}
+                      </Text>
+                    ) : null}
                     <Text color={theme.ghost}>
-                      {" \u00b7 "}
-                      {fmtDuration(Date.now() - activity.since)}
+                      {` \u00b7 ${verbose ? "shift+V closes" : "shift+V to watch"}`}
+                      {quitArmed ? " \u00b7 ctrl+C again to exit" : " \u00b7 ctrl+C stops this turn"}
                     </Text>
-                  )}
-                  <Text color={theme.ghost}>
-                    {" \u00b7 "}
-                    {verbose ? "shift+V closes" : "shift+V to watch"}
                   </Text>
                   {/* The line is still yours while it works. */}
-                  <Text color={theme.text}>{input ? `  › ${input}` : ""}</Text>
+                  {input ? (
+                    <Text color={theme.text} wrap="wrap">{`  › ${input}`}</Text>
+                  ) : null}
                 </>
               ) : (
                 <>
@@ -1765,6 +1896,11 @@ export function App({
                       })()
                     )}
                   </Text>
+                  {/* The offer, where the keystroke that made it is looking.
+                      A press that silently does nothing reads as a hang. */}
+                  {quitArmed && (
+                    <Text color={theme.ghost}>{"  ctrl+C again to exit"}</Text>
+                  )}
                 </>
               )}
             </Box>
