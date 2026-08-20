@@ -196,6 +196,15 @@ const MAX_PROMPT_ROWS = 4;
  */
 const RUNS_MID_TURN = new Set(["/budget", "/price"]);
 
+/**
+ * Lines of a tool result the live panel shows before it says how many remain.
+ *
+ * The panel answers "what is molt doing", and a payload is not an answer to
+ * that. Enough to judge whether the call did what it should, and a count for
+ * the rest so nothing is hidden silently.
+ */
+const PREVIEW_ROWS = 8;
+
 /** How many palette rows to show at once. */
 const PALETTE_ROWS = 6;
 
@@ -403,6 +412,46 @@ export function App({
     [],
   );
 
+  /**
+   * A tool result, bounded on screen and whole in the record.
+   *
+   * Every line used to go to the live feed, so one nine-kilobyte file read put
+   * two hundred entries into it and the panel showed the tail of a file dump
+   * rather than what the model was doing. Reported as molt spewing and filling
+   * the terminal — "not good for traceability or what the model is actually
+   * doing", which is exactly right: a payload is not an account of an action.
+   *
+   * The earlier complaint this replaced was the opposite one — a view that
+   * showed five lines of forty was asking you to trust the other thirty-five —
+   * and both are satisfied by the same rule. Truncation that names what it hid
+   * is not a sample. The panel shows the head and says how much more there is;
+   * `--verbose` still writes every line to the transcript, because that is the
+   * deliberate request for the whole thing.
+   */
+  const notePreview = useCallback(
+    (preview: string) => {
+      const lines = preview.split("\n").filter((l) => l.trim());
+      if (lines.length === 0) return;
+      for (const l of lines.slice(0, PREVIEW_ROWS)) note(`    │ ${l}`, true);
+      if (lines.length > PREVIEW_ROWS) {
+        const hidden = lines.length - PREVIEW_ROWS;
+        note(`    │ … ${hidden} more line(s) — the model received all of it`, true);
+        // The record still gets the rest when one was asked for.
+        if (mirrorToTranscript.current) {
+          setLines((prev) => [
+            ...prev,
+            ...lines.slice(PREVIEW_ROWS).map((l) => ({
+              id: nextId.current++,
+              tone: "info" as const,
+              text: `    │ ${l}`,
+            })),
+          ]);
+        }
+      }
+    },
+    [note],
+  );
+
   useEffect(() => {
     if (!engine.hasBar) {
       add(
@@ -595,11 +644,7 @@ export function App({
           if (ev.bytes !== undefined) {
             note(`    → ${ev.bytes} bytes${ev.note ? ` · ${ev.note}` : ""}`, true);
           }
-          // Every line of it. A view that shows five lines of a forty-line
-          // result is asking you to trust the other thirty-five.
-          for (const l of (ev.preview ?? "").split("\n")) {
-            if (l.trim()) note(`    │ ${l}`, true);
-          }
+          notePreview(ev.preview ?? "");
           beginActivity("thinking");
           break;
         }
