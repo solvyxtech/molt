@@ -358,6 +358,21 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **The live view showed the payload instead of the work.** Every line of every
+  tool result went into the feed, so one nine-kilobyte file read put two
+  hundred entries in it and the panel — nine rows — showed the tail of a file
+  dump with no sign of which call had produced it. Reported as molt spewing and
+  filling the terminal, *"not good for traceability or what the model is
+  actually doing"*, which names it exactly: a payload is not an account of an
+  action.
+
+  The panel shows the head of a result and then says how many lines it held
+  back and that the model received all of them. The complaint this replaced was
+  the opposite one — a view showing five lines of forty was asking you to trust
+  the other thirty-five — and the same rule settles both: truncation that names
+  what it hid is not a sample. `--verbose` still writes every line to the
+  transcript, because that is the deliberate request for the whole thing.
+
 - **The ceiling warning gave advice you could not take.** molt says *"80% of
   the ceiling — /budget raises it"* on the way up, and then queued `/budget`
   until after the turn it was warning about had already been stopped. A

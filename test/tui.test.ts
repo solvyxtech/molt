@@ -1499,3 +1499,89 @@ describe("raising the ceiling before it stops you", () => {
     }
   });
 });
+
+describe("the view shows what molt is doing, not the payload", () => {
+  /** A provider that reads a file with a great many lines in it. */
+  function bigReadProvider(dir: string, lines: number): typeof fetch {
+    writeFileSync(join(dir, "big.txt"), Array.from({ length: lines }, (_, i) => `content line ${i}`).join("\n"));
+    let n = 0;
+    return (async () => {
+      n += 1;
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        text: async () => "",
+        json: async () => ({
+          choices: [
+            {
+              message:
+                n === 1
+                  ? {
+                      role: "assistant",
+                      content: null,
+                      tool_calls: [
+                        {
+                          id: "c1",
+                          type: "function",
+                          function: { name: "read_file", arguments: JSON.stringify({ path: "big.txt" }) },
+                        },
+                      ],
+                    }
+                  : { role: "assistant", content: "read it" },
+            },
+          ],
+          usage: { prompt_tokens: 100, completion_tokens: 10 },
+        }),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+  }
+
+  it("bounds a long result and says how much it held back", async () => {
+    // Every line of every result went into the live feed, so one file read put
+    // hundreds of entries in it and the panel showed the tail of a file dump
+    // instead of what the model was doing. Reported as molt spewing and
+    // filling the terminal.
+    const ws2 = workspace();
+    try {
+      const t = await mount({ fetchFn: bigReadProvider(ws2.dir, 300), cwd: ws2.dir });
+      try {
+        await submit(t.stdin, "read the big one");
+        t.stdin.press(CTRL_V);
+        await tick(120);
+        const frame = t.stdout.lastFrame;
+        // The panel is a fixed nine rows, so counting content lines in it
+        // proves nothing — it is capped either way. What a dump actually costs
+        // is the context: three hundred lines of payload push the record of
+        // the call itself out of the window, leaving a view of a file and no
+        // account of what molt did with it.
+        assert.match(frame, /read_file/, "the payload pushed the call out of the view");
+        assert.match(frame, /more line\(s\) — the model received all of it/, "hid the rest silently");
+      } finally {
+        t.cleanup();
+      }
+    } finally {
+      ws2.cleanup();
+    }
+  });
+
+  it("keeps every line for a session started with --verbose", async () => {
+    // The deliberate request for the whole thing still gets it.
+    const ws2 = workspace();
+    try {
+      const t = await mount({ fetchFn: bigReadProvider(ws2.dir, 300), cwd: ws2.dir }, undefined, {
+        verbose: true,
+      });
+      try {
+        await submit(t.stdin, "read the big one");
+        await tick(150);
+        const all = t.stdout.text;
+        assert.ok(all.includes("content line 250"), "--verbose stopped recording the whole result");
+      } finally {
+        t.cleanup();
+      }
+    } finally {
+      ws2.cleanup();
+    }
+  });
+});
