@@ -543,3 +543,64 @@ export function applyEdit(
     replacements: replaceAll ? found : 1,
   };
 }
+
+/**
+ * How many lines of a change carry something other than a comment.
+ *
+ * Receipt 0025 was issued for this diff, and molt called it a completion:
+ *
+ *     + // molt: CLI entry point - handles command parsing and execution
+ *       export async function main(argv = process.argv.slice(2))
+ *
+ * The model said in the receipt what it was for — "to satisfy the work-landed
+ * check" — and `work-landed` had no way to disagree. It asks whether a file
+ * changed, a comment is a change, and so a sentence restating the function's
+ * own signature closed a task the model had not done.
+ *
+ * This is the cheap half of telling work from a keystroke: of the lines that
+ * differ, how many are neither blank nor purely a comment. Zero means the
+ * model moved characters without saying anything to the compiler.
+ *
+ * Two honest limitations, both in the direction of over-counting rather than
+ * refusing real work:
+ *
+ *  - Comment syntax is guessed from the line, not parsed from the language. A
+ *    line inside a block string that begins with `#` reads as a comment here.
+ *  - Lines are compared as a multiset, so a change that only *moves* code
+ *    scores zero. Reordering functions is real work that this cannot see, and
+ *    `comment-only` in done.yml is the way to say so.
+ */
+export function substanceOf(before: string, after: string): number {
+  if (before === after) return 0;
+  // Multiset difference: a line that survives in the same quantity did not
+  // change, wherever it ended up.
+  const counts = new Map<string, number>();
+  for (const line of before.split("\n")) counts.set(line, (counts.get(line) ?? 0) + 1);
+  const changed: string[] = [];
+  for (const line of after.split("\n")) {
+    const n = counts.get(line) ?? 0;
+    if (n > 0) counts.set(line, n - 1);
+    else changed.push(line);
+  }
+  // Whatever is left unmatched in `before` was removed, and a deletion is a
+  // change too — removing a function body is work, and it adds no new lines.
+  for (const [line, n] of counts) for (let i = 0; i < n; i++) changed.push(line);
+  return changed.filter(isSubstantive).length;
+}
+
+/**
+ * Does this line say anything to the compiler?
+ *
+ * Blank lines and whole-line comments do not. A line with code *and* a
+ * trailing comment does, and counts.
+ */
+function isSubstantive(line: string): boolean {
+  const t = line.trim();
+  if (t === "") return false;
+  // Line comments across the languages molt is pointed at, plus the
+  // continuation lines of a block comment, which begin with `*`.
+  if (/^(\/\/|#|--|;|%|<!--)/.test(t)) return false;
+  if (/^\/\*/.test(t) || /^\*/.test(t)) return false;
+  if (t === "*/" || t === "-->") return false;
+  return true;
+}

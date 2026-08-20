@@ -411,12 +411,23 @@ export function isSelfHosted(baseUrl: string): boolean {
 export function providerName(url: string): string {
   const match = Object.keys(PROVIDERS).find((n) => PROVIDERS[n]!.url === url);
   if (match) return match;
+  let u: URL;
   try {
-    const host = new URL(url).hostname.replace(/^(api|www)\./, "");
-    return host.split(".")[0] ?? host;
+    u = new URL(url);
   } catch {
     return "custom";
   }
+  const host = u.hostname.replace(/^(api|www)\./, "");
+  // An address is not a name. Splitting one on dots takes the first octet and
+  // calls it a provider: a receipt from a model on 127.0.0.1:8080 was filed
+  // under `provider: 127`, which identifies nothing and collides with every
+  // other loopback endpoint. Keep the host whole, and the port with it — on a
+  // LAN the port is often the only thing distinguishing two servers on one box.
+  const literal = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.startsWith("[") || host === "::1";
+  if (literal || !host.includes(".")) {
+    return u.port ? `${host}:${u.port}` : host;
+  }
+  return host.split(".")[0] ?? host;
 }
 
 export type ModelChoice = {

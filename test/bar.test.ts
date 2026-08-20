@@ -21,6 +21,9 @@ import {
 import { Engine } from "../src/engine.js";
 import { Receipts } from "../src/receipts.js";
 import type { BarContext } from "../src/bar.js";
+import { createHash } from "node:crypto";
+import { substanceOf } from "../src/files.js";
+import type { CheckResult, LedgerEntry } from "../src/types.js";
 import { allowAll, drain, kinds, scriptedProvider, toolCall, workspace } from "./helpers.js";
 
 const cleanups: (() => void)[] = [];
@@ -404,5 +407,199 @@ describe("counting what was written", () => {
 
   it("keeps first-seen order, so the names read as the work happened", () => {
     assert.deepEqual(claimedWrites([wrote("b.ts"), wrote("a.ts"), wrote("b.ts")]), ["b.ts", "a.ts"]);
+  });
+});
+
+/**
+ * The hole receipt 0025 went through.
+ *
+ * A local model was asked to read the rest of `src/cli.tsx`. It read the file,
+ * claimed completion, and `work-landed` correctly refused: nothing had changed.
+ * On the second attempt it added one line —
+ *
+ *     + // molt: CLI entry point - handles command parsing and execution
+ *
+ * — to a function whose signature already said that, and molt issued a receipt
+ * certifying the task complete. The model wrote why in the receipt: "to satisfy
+ * the work-landed check".
+ *
+ * Nothing there was a lie. A file changed, the hash matched, the tests passed.
+ * The gate asked a question too weak to be worth answering, and the change
+ * existed only because the gate asked it — which is the one thing a gate must
+ * never cause.
+ */
+describe("work landing means work, not a keystroke", () => {
+  /** Runs the files-changed builtin alone over a ledger. */
+  async function runCheckFor(
+    ledger: LedgerEntry[],
+    allowCommentOnly = false,
+  ): Promise<{ ok: boolean; output: string }> {
+    const ws = workspace();
+    try {
+      // The files must exist and hash to `after`, or the check fails earlier
+      // on grounds this test is not about.
+      const entries = ledger.map((e) => {
+        const abs = join(ws.dir, e.path);
+        mkdirSync(join(abs, ".."), { recursive: true });
+        writeFileSync(abs, `contents of ${e.path}`, "utf8");
+        return {
+          ...e,
+          after: createHash("sha256").update(`contents of ${e.path}`, "utf8").digest("hex"),
+        };
+      });
+      const bar = parseBar(
+        `version: 1\nchecks:\n  - name: work-landed\n    builtin: files-changed\n` +
+          (allowCommentOnly ? `    comment-only: allow\n` : ""),
+      );
+      const ctx: BarContext = {
+        cwd: ws.dir,
+        record: [],
+        ledger: entries,
+        archivedBatches: 0,
+      };
+      const result = await runBar(bar, ctx);
+      return { ok: result.ok, output: result.results[0]!.output };
+    } finally {
+      ws.cleanup();
+    }
+  }
+
+  const ledgerOf = (path: string, substance: number): LedgerEntry[] => [
+    { path, before: "aaa", after: "bbb", callId: "c1", substance },
+  ];
+
+  it("counts a line of code and does not count a comment", () => {
+    // The receipt 0025 diff, exactly.
+    assert.equal(
+      substanceOf(
+        "export async function main() {\n  return 0;\n}\n",
+        "// molt: CLI entry point - handles command parsing and execution\nexport async function main() {\n  return 0;\n}\n",
+      ),
+      0,
+    );
+    // The same shape of change, carrying one line that the compiler reads.
+    assert.equal(
+      substanceOf(
+        "export async function main() {\n  return 0;\n}\n",
+        "export async function main() {\n  setup();\n  return 0;\n}\n",
+      ),
+      1,
+    );
+    // Deleting a body is work, and adds no lines at all.
+    assert.ok(substanceOf("function f() {\n  doTheThing();\n}\n", "function f() {\n}\n") > 0);
+    // Blank lines are not work; neither is a block comment.
+    assert.equal(substanceOf("const a = 1;\n", "const a = 1;\n\n\n"), 0);
+    assert.equal(
+      substanceOf("const a = 1;\n", "/**\n * Explains a.\n */\nconst a = 1;\n"),
+      0,
+    );
+    // Code with a trailing comment is still code.
+    assert.equal(substanceOf("const a = 1;\n", "const a = 1;\nconst b = 2; // and b\n"), 1);
+  });
+
+  it("refuses a diff that is only comments", async () => {
+    const out = await runCheckFor(ledgerOf("src/cli.tsx", 0));
+    assert.equal(out.ok, false, "a comment-only diff may not satisfy work-landed");
+    assert.match(out.output, /only comments|comment or blank/i);
+    // The message has to offer the honest way out, or it is just a harder
+    // puzzle to cheat at.
+    assert.match(out.output, /comment-only: allow/);
+  });
+
+  it("accepts one line of real code", async () => {
+    assert.equal((await runCheckFor(ledgerOf("src/cli.tsx", 1))).ok, true);
+  });
+
+  it("lets a project say documentation is the work", async () => {
+    assert.equal((await runCheckFor(ledgerOf("docs/guide.md", 0), true)).ok, true);
+  });
+
+  it("does not judge entries recovered from an older archive", async () => {
+    // `substance` is absent on those. Unknown is not zero — holding an
+    // unjudgeable entry against the model would fail real work after a shed.
+    const old: LedgerEntry[] = [{ path: "src/a.ts", before: "a", after: "b", callId: "c1" }];
+    assert.equal((await runCheckFor(old)).ok, true);
+  });
+
+  it("stops telling the model that any edit will do", async () => {
+    const out = await runCheckFor([]);
+    assert.equal(out.ok, false);
+    // The old wording was "Nothing was done that can be shown." full stop, and
+    // a model read it as a specification for the cheapest possible edit.
+    assert.match(out.output, /say that plainly and stop|does not require a change|genuinely does not/i);
+    assert.match(out.output, /will be refused|worst of the three/i);
+  });
+});
+
+/**
+ * The same refusal, driven through the engine that has to record the evidence.
+ *
+ * The gate above is only as good as the number the engine writes into the
+ * ledger, and that wiring is a separate thing to get wrong: nothing in the
+ * check can tell "this diff was all comments" from "nobody measured it". This
+ * replays receipt 0025 end to end — a real edit_file adding a real comment to
+ * a real file on disk — and requires the refusal to come out the far side.
+ */
+describe("replaying receipt 0025 through the engine", () => {
+  const SOURCE = "export async function main() {\n  return 0;\n}\n";
+
+  async function runWithEdit(newText: string): Promise<{ refused: boolean; output: string }> {
+    const ws = workspace();
+    try {
+      writeFileSync(join(ws.dir, "cli.ts"), SOURCE, "utf8");
+      writeFileSync(
+        join(ws.dir, "done.yml"),
+        "version: 1\nchecks:\n  - name: work-landed\n    builtin: files-changed\n",
+        "utf8",
+      );
+      const p = scriptedProvider([
+        {
+          calls: [
+            {
+              name: "edit_file",
+              args: {
+                path: "cli.ts",
+                old_text: "export async function main() {",
+                new_text: newText,
+              },
+            },
+          ],
+        },
+        { text: "Done — the work-landed check is satisfied now." },
+      ]);
+      const engine = new Engine({
+        baseUrl: "http://provider.test/v1",
+        model: "m",
+        provider: "test",
+        cwd: ws.dir,
+        bar: parseBar("version: 1\nchecks:\n  - name: work-landed\n    builtin: files-changed\n"),
+        fetchFn: p.fetchFn,
+        stream: false,
+        maxProofAttempts: 1,
+      });
+      const events = await drain(engine.run("read the file", allowAll));
+      const proof = events.find((e) => e.kind === "proof_result" || e.kind === "proof_exhausted");
+      const result =
+        proof && "result" in proof ? proof.result : { ok: true, results: [] as CheckResult[] };
+      return {
+        refused: !result.ok,
+        output: result.results.map((r) => r.output).join("\n"),
+      };
+    } finally {
+      ws.cleanup();
+    }
+  }
+
+  it("refuses the comment that closed receipt 0025", async () => {
+    const out = await runWithEdit(
+      "// molt: CLI entry point - handles command parsing and execution\nexport async function main() {",
+    );
+    assert.equal(out.refused, true, "a comment written to pass the gate must not pass it");
+    assert.match(out.output, /comment or blank/i);
+  });
+
+  it("accepts the same edit carrying one line of code", async () => {
+    const out = await runWithEdit("export async function main() {\n  setup();");
+    assert.equal(out.refused, false, "one real line of code is work and must land");
   });
 });

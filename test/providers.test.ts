@@ -720,3 +720,44 @@ describe("telling your own hardware from someone's meter", () => {
     }
   });
 });
+
+/**
+ * An address is not a name.
+ *
+ * Receipt 0025 was filed under `provider: 127`. The endpoint was a model on
+ * 127.0.0.1:8080, and `providerName` had split the hostname on dots and taken
+ * the first field — which for a preset like `api.x.ai` yields "x" and for an
+ * IP address yields the first octet. Every loopback endpoint on the machine
+ * collides under that name, and none of them is identified by it, so the one
+ * field in a receipt that says where the work was done said nothing.
+ */
+describe("naming an endpoint you can point at", () => {
+  it("prefers a preset's own name", () => {
+    assert.equal(providerName("https://api.x.ai/v1"), "xai");
+    assert.equal(providerName("https://api.anthropic.com/v1"), "anthropic");
+  });
+
+  it("keeps an IP address whole, with the port that distinguishes it", () => {
+    assert.equal(providerName("http://127.0.0.1:8080/v1"), "127.0.0.1:8080");
+    assert.equal(providerName("http://192.168.0.218:8080/v1"), "192.168.0.218:8080");
+    // Two servers on one box differ only by port, so dropping it merges them.
+    assert.notEqual(
+      providerName("http://192.168.0.218:8080/v1"),
+      providerName("http://192.168.0.218:9090/v1"),
+    );
+  });
+
+  it("keeps a bare LAN hostname whole", () => {
+    assert.equal(providerName("http://workshop:11434/v1"), "workshop:11434");
+    assert.equal(providerName("http://localhost:8080/v1"), "localhost:8080");
+  });
+
+  it("still shortens a real domain", () => {
+    // The subdomain strip is what makes a vendor host readable, and it stays.
+    assert.equal(providerName("https://api.together.xyz/v1"), "together");
+  });
+
+  it("says so when the URL is not one", () => {
+    assert.equal(providerName("not a url"), "custom");
+  });
+});

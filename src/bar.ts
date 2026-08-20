@@ -173,7 +173,25 @@ export function parseBar(source: string): Bar {
           `done.yml: check "${name}" uses unknown builtin "${builtin}". Known: ${BUILTINS.join(", ")}.`,
         );
       }
-      return { name, kind: "builtin", builtin, tags, ...advisory };
+      // Only meaningful on files-changed; rejected elsewhere so a typo on the
+      // wrong check is an error rather than a setting that silently does
+      // nothing. A gate people believe is on and is not is worse than no gate.
+      if (c["comment-only"] !== undefined) {
+        if (c["comment-only"] !== "allow" && c["comment-only"] !== "refuse") {
+          throw new BarError(
+            `done.yml: check "${name}" has \`comment-only: ${JSON.stringify(c["comment-only"])}\` ` +
+              "(expected `allow` or `refuse`).",
+          );
+        }
+        if (builtin !== "files-changed") {
+          throw new BarError(
+            `done.yml: check "${name}" sets \`comment-only\`, which only applies to the ` +
+              "files-changed builtin.",
+          );
+        }
+      }
+      const commentOnly = c["comment-only"] === "allow" ? { commentOnly: "allow" as const } : {};
+      return { name, kind: "builtin", builtin, tags, ...advisory, ...commentOnly };
     }
 
     const timeout = c.timeout === undefined ? undefined : Number(c.timeout);
@@ -400,7 +418,11 @@ export function claimedWrites(record: Msg[]): string[] {
   return paths;
 }
 
-function runBuiltin(builtin: BuiltinCheck, ctx: BarContext): { ok: boolean; output: string } {
+function runBuiltin(
+  builtin: BuiltinCheck,
+  ctx: BarContext,
+  allowCommentOnly = false,
+): { ok: boolean; output: string } {
   if (builtin === "files-changed") {
     const attempted = claimedWrites(ctx.record);
     if (ctx.ledger.length === 0) {
@@ -408,7 +430,18 @@ function runBuiltin(builtin: BuiltinCheck, ctx: BarContext): { ok: boolean; outp
         ok: false,
         output:
           attempted.length === 0
-            ? "No file was modified in this session. Nothing was done that can be shown."
+            ? // This sentence is read by a model that has just been refused,
+              // and it was read as an instruction: write something, anything.
+              // One did exactly that — a comment restating a function's
+              // signature — and said so in its receipt. A gate that names the
+              // cheapest way past itself has told the model how to cheat, so
+              // this one names the honest exit instead.
+              "No file was modified in this session. Nothing was done that can be shown.\n" +
+              "If the task does require a change, make it. If it genuinely does not — a " +
+              "question, a review, a file you were only asked to read — then say that " +
+              "plainly and stop. molt records an unfinished turn honestly; it cannot " +
+              "record an invented one. Editing a file for no reason other than this " +
+              "check is the worst of the three outcomes and will be refused."
             : `${attempted.length} write(s) appear in the record but none landed on disk ` +
               `(denied, errored, or never executed): ${attempted.join(", ")}`,
       };
@@ -430,6 +463,33 @@ function runBuiltin(builtin: BuiltinCheck, ctx: BarContext): { ok: boolean; outp
       }
     }
     if (problems.length) return { ok: false, output: problems.join("\n") };
+
+    // A file changed, and every changed line was a comment or a blank.
+    //
+    // This is the hole receipt 0025 went through. `work-landed` had asked only
+    // whether a file changed; the model added a comment restating a function's
+    // signature, said in its own claim that it was "to satisfy the work-landed
+    // check", and molt issued a receipt certifying the task complete. The gate
+    // was the reason the change existed, which is the one thing a gate must
+    // never be.
+    //
+    // `substance` is absent on entries restored from an older archive. Unknown
+    // is not zero: an entry that cannot be judged is left alone rather than
+    // held against the model.
+    const judged = ctx.ledger.filter((e) => typeof e.substance === "number");
+    const total = judged.reduce((n, e) => n + (e.substance ?? 0), 0);
+    if (!allowCommentOnly && judged.length === ctx.ledger.length && total === 0) {
+      return {
+        ok: false,
+        output:
+          `Every changed line is a comment or blank: ${ctx.ledger.map((e) => e.path).join(", ")}.\n` +
+          "A comment added so this check would pass is not the task being done, and " +
+          "writing one is a worse outcome than saying the work is unfinished.\n" +
+          "If the task genuinely was documentation, set `comment-only: allow` under " +
+          "work-landed in .molt/done.yml. If it needed no file change at all, say so " +
+          "plainly and stop — molt reports that as an answer, not a failure.",
+      };
+    }
     return {
       ok: true,
       output:
@@ -562,7 +622,7 @@ function runBuiltin(builtin: BuiltinCheck, ctx: BarContext): { ok: boolean; outp
 export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResult> {
   const t0 = Date.now();
   if (check.kind === "builtin") {
-    const { ok, output } = runBuiltin(check.builtin, ctx);
+    const { ok, output } = runBuiltin(check.builtin, ctx, check.commentOnly === "allow");
     return {
       name: check.name,
       ...(check.advisory ? { advisory: true } : {}),

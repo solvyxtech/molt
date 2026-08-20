@@ -61,9 +61,38 @@ Catches:
 - writes that appear in the record but never landed (denied, errored, skipped)
 - a file written and then deleted or overwritten later in the session
 - a "fix" that rewrote a file with byte-identical contents
+- a change whose every line is a comment or a blank
+
+That last one is the check's own scar. A model asked to *read* a file was
+refused for changing nothing, and on its next attempt added the line
+
+```
+// molt: CLI entry point - handles command parsing and execution
+```
+
+above a function whose signature already said that — then wrote in its receipt
+that the edit was "to satisfy the work-landed check". Every other check passed,
+so molt certified a task nobody had done. A gate must never be the reason a
+change exists, and `files-changed` now reads the diff rather than only the hash.
+
+The measurement is deliberately crude: of the lines that differ, how many are
+neither blank nor purely a comment. It over-counts rather than refusing real
+work, with two known blind spots — comment syntax is guessed from the line
+rather than parsed, and a change that only *moves* code scores zero.
+
+```yaml
+  - name: work-landed
+    builtin: files-changed
+    comment-only: allow   # optional — a comment-only diff counts as work
+```
+
+Set `comment-only: allow` for a project where documentation genuinely is the
+task, or to work around the move-only blind spot. It is refused on any other
+builtin, so a typo is an error rather than a setting that quietly does nothing.
 
 Fails read-only tasks by design. If a task legitimately changes nothing, leave
-this check out of that project's bar.
+this check out of that project's bar — or use `molt ask`, which drops the write
+checks for the turn.
 
 #### `record-intact`
 

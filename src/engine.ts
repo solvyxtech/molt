@@ -39,6 +39,7 @@ import {
   formatListing,
   formatMatches,
   grepFiles,
+  substanceOf,
   walkAsync,
 } from "./files.js";
 import {
@@ -1246,12 +1247,30 @@ export class Engine {
         const rel = String(args.path ?? "");
         const abs = resolve(this.cwd, rel);
         const before = sha256Of(abs);
+        // The text as well as the hash: a hash proves the file changed, and
+        // only the text can say whether the change was a comment.
+        let priorText = "";
+        if (existsSync(abs)) {
+          try {
+            priorText = readFileSync(abs, "utf8");
+          } catch {
+            /* unreadable: the change scores as substantive, which never blocks work */
+          }
+        }
         mkdirSync(dirname(abs), { recursive: true });
         const content = String(args.content ?? "");
         writeFileSync(abs, content, "utf8");
         const after = createHash("sha256").update(content, "utf8").digest("hex");
         const at = isAbsolute(rel) ? relative(this.cwd, abs) : rel;
-        if (!isGenerated(at)) this.ledger.push({ path: at, before, after, callId });
+        if (!isGenerated(at)) {
+          this.ledger.push({
+            path: at,
+            before,
+            after,
+            callId,
+            substance: substanceOf(priorText, content),
+          });
+        }
         return (
           `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${rel}` +
           (isGenerated(at)
@@ -1314,6 +1333,7 @@ export class Engine {
             before,
             after: createHash("sha256").update(edit.text, "utf8").digest("hex"),
             callId,
+            substance: substanceOf(current, edit.text),
           });
         }
         const delta = Buffer.byteLength(edit.text, "utf8") - Buffer.byteLength(current, "utf8");

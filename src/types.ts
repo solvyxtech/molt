@@ -124,6 +124,14 @@ export type Check = Advisory &
         kind: "builtin";
         builtin: BuiltinCheck;
         tags: string[];
+        /**
+         * `comment-only: allow` on a files-changed check.
+         *
+         * Lets a diff of pure comments count as work landing. Off by default:
+         * the failure it guards is a model adding a comment so the gate goes
+         * green, which is how receipt 0025 was issued for no work at all.
+         */
+        commentOnly?: "allow";
       }
   );
 
@@ -175,6 +183,15 @@ export type LedgerEntry = {
   before: string | null;
   /** sha256 molt observed immediately after writing. */
   after: string;
+  /**
+   * Changed lines that are neither blank nor a comment.
+   *
+   * `work-landed` proves a write landed; it cannot, from a pair of hashes,
+   * tell a fix from a sentence added to make it pass. This is what it reads to
+   * decide. Optional because entries restored from an older archive predate
+   * the field, and an absent count is treated as unknown rather than as zero.
+   */
+  substance?: number;
   /**
    * The tool call that performed this write. Used to decide whether the
    * entry travels with a shed batch.
