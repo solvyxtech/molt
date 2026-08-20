@@ -9,6 +9,15 @@ a number presented with more confidence than it was earned with.
 
 ### Added
 
+- **`/endpoint <url>` — point molt at a model you host.** `/login` only knew
+  the six presets, so a server you run yourself was unreachable from the TUI:
+  `--url` worked headlessly and nowhere else. Anything speaking the OpenAI
+  shape now works — Ollama on this machine, llama.cpp or vLLM on another box on
+  the network. No key is asked for, because the case this exists to serve wants
+  none. molt checks the endpoint is reachable straight away rather than finding
+  out on the first turn, and a bare `host:port` is told it needs a scheme
+  rather than being informed that `192.168.0.72:` is not a scheme molt can call.
+
 - **The step guard asks too.** The other door out of a turn had the same fault
   as the ceiling: it stopped dead. A reported run reached it having spent
   1,344,777 tokens and $0.89, and got no answer for any of it — the same waste,
@@ -383,6 +392,21 @@ a number presented with more confidence than it was earned with.
   screen that it is going in circles.
 
 ### Fixed
+
+- **A build artifact could satisfy the bar.** molt found this one itself, and
+  walked straight into it: a file it had written under `dist-test/` no longer
+  matched its ledgered hash, because a rebuild had overwritten it. Rather than
+  conclude that a generated file has no business in the ledger, it **rewrote
+  the compiled artifact so the hashes would agree** — and got a green receipt
+  in 34ms, because a path under `dist-test/` is outside every `watch:` glob in
+  the bar, so the two expensive checks were reused as well.
+
+  So there was a route to "bar met" containing no verification: write into a
+  build directory, watch the checks be skipped, be accepted. Writes into
+  generated paths no longer enter the ledger — the write still happens, and the
+  result says plainly that it does not count as work and why. That closes both
+  halves: nothing under `dist/`, `dist-test/` or `node_modules/` can be work
+  landed, and nothing outside the watch globs can quietly skip the checks.
 
 - **A receipt said writes had not landed when they had.** `work-landed`
   compared a count of write *calls* against a ledger keyed by *path* — one

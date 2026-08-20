@@ -72,6 +72,12 @@ export const COMMANDS: Command[] = [
     summary: "add a provider key (anthropic, xai, …)",
     aliases: ["key", "auth", "provider", "connect"],
   },
+  {
+    name: "/endpoint",
+    args: "<url>",
+    summary: "point molt at any OpenAI-compatible server, local or on your network",
+    aliases: ["url", "host", "local", "ollama", "server"],
+  },
   { name: "/model", args: "[id]", summary: "browse models across your keys, or switch by id" },
   { name: "/molt", summary: "cycle theme" },
   { name: "/clear", summary: "reset the session" },

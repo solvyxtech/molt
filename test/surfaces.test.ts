@@ -4,7 +4,7 @@
  * these tests exist so that cannot silently happen again.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { Archive } from "../src/archive.js";
@@ -483,5 +483,89 @@ describe("commands that are not sessions", () => {
     // `-o` means something harmless elsewhere and must not be swept up.
     assert.equal(ask("find . -name a -o -name b", "medium"), false, "find's boolean OR read as a write");
     assert.equal(ask("du -o /tmp", "medium"), false, "du's mount filter read as a write");
+  });
+});
+
+describe("build output is not work", () => {
+  const base = {
+    baseUrl: "http://p.test/v1",
+    model: "m",
+    bar: null,
+    stream: false,
+    autonomy: "high" as const,
+  };
+
+  /** A model that writes `path`, then claims done. */
+  function writerFor(path: string) {
+    let n = 0;
+    return (async () => {
+      n += 1;
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        text: async () => "",
+        json: async () => ({
+          choices: [
+            {
+              message:
+                n === 1
+                  ? {
+                      role: "assistant",
+                      content: null,
+                      tool_calls: [
+                        {
+                          id: "c1",
+                          type: "function",
+                          function: {
+                            name: "write_file",
+                            arguments: JSON.stringify({ path, content: "generated\n" }),
+                          },
+                        },
+                      ],
+                    }
+                  : { role: "assistant", content: "done" },
+            },
+          ],
+          usage: { prompt_tokens: 10, completion_tokens: 2 },
+        }),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+  }
+
+  it("does not count a write into a build directory as work landed", async () => {
+    // molt hit this and reasoned its way through it: a ledgered file under
+    // dist-test/ no longer matched disk because a rebuild had overwritten it,
+    // and rather than conclude that a generated file has no business in the
+    // ledger it rewrote the compiled artifact so the hashes would agree. Bar
+    // met in 34ms — a path under dist-test/ is outside every watch glob in the
+    // bar, so the command checks were reused as well. A route to "bar met"
+    // with no verification in it is the one defect this cannot carry.
+    const dir = ws();
+    const engine = new Engine({ ...base, cwd: dir, fetchFn: writerFor("dist-test/src/x.js") });
+    await drain(engine.run("go", allowAll));
+    assert.deepEqual(
+      engine.mergedLedger().map((e) => e.path),
+      [],
+      "a build artifact was ledgered as work",
+    );
+  });
+
+  it("still writes the file, and says why it does not count", async () => {
+    // Not a refusal to touch the path — molt writes it and is plain about what
+    // the write is worth.
+    const dir = ws();
+    const engine = new Engine({ ...base, cwd: dir, fetchFn: writerFor("dist/cli.js") });
+    const events = await drain(engine.run("go", allowAll));
+    assert.ok(existsSync(join(dir, "dist/cli.js")), "the write did not happen");
+    const tool = events.find((e) => e.kind === "tool") as { preview?: string } | undefined;
+    assert.match(tool?.preview ?? "", /not counted as work/, "wrote it without saying it was free");
+  });
+
+  it("still counts an ordinary source file", async () => {
+    const dir = ws();
+    const engine = new Engine({ ...base, cwd: dir, fetchFn: writerFor("src/real.ts") });
+    await drain(engine.run("go", allowAll));
+    assert.deepEqual(engine.mergedLedger().map((e) => e.path), ["src/real.ts"]);
   });
 });

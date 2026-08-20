@@ -88,6 +88,8 @@ first run
 
 options
   --url <base>       OpenAI-compatible base URL   (MOLT_BASE_URL)
+                     any server speaking the OpenAI shape: Ollama, llama.cpp,
+                     vLLM, on this machine or another. /endpoint in the TUI.
                      default http://localhost:11434/v1
   --model <id>       model id                     (MOLT_MODEL)
                      no default — /model or --model picks one

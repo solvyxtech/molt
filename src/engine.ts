@@ -33,6 +33,7 @@ import {
 } from "./autonomy.js";
 import { redact } from "./redact.js";
 import {
+  SKIP_DIRS,
   WALK_DEADLINE_MS,
   applyEdit,
   formatListing,
@@ -493,6 +494,31 @@ function capture(s: string): string {
  * lookup, an explanation — can never satisfy one, so the refusal needs to
  * say that in the user's terms rather than read as molt malfunctioning.
  */
+/**
+ * Is this path build output rather than work?
+ *
+ * A write into a generated directory is not a change to the project, and
+ * ledgering one has two consequences, both bad. `work-landed` counts it, so a
+ * turn can satisfy the bar without touching anything a person wrote. And the
+ * ledger then holds a file the next `npm run build` overwrites, so the check
+ * fails on the *next* turn for a reason nobody can act on.
+ *
+ * Both happened. molt hit the second, correctly reported that a ledgered file
+ * no longer matched disk — and then rewrote the compiled artifact so the
+ * hashes would agree, satisfying the check rather than doing the work. It got
+ * a green receipt in 34ms, because a path under `dist-test/` is outside every
+ * `watch:` glob in the bar, so the expensive checks were reused as well.
+ *
+ * A route to "bar met" that involves no verification is the one defect this
+ * product cannot carry. The write still happens — molt is not refusing to
+ * touch these paths — it simply is not evidence of work.
+ */
+function isGenerated(rel: string): boolean {
+  return rel
+    .split(/[\\/]/)
+    .some((seg) => seg === "dist" || seg === "dist-test" || SKIP_DIRS.has(seg));
+}
+
 function failedOnlyWriteChecks(result: BarResult): string | null {
   const failed = result.results.filter((r) => !r.ok);
   if (failed.length === 0) return null;
@@ -1186,13 +1212,14 @@ export class Engine {
         const content = String(args.content ?? "");
         writeFileSync(abs, content, "utf8");
         const after = createHash("sha256").update(content, "utf8").digest("hex");
-        this.ledger.push({
-          path: isAbsolute(rel) ? relative(this.cwd, abs) : rel,
-          before,
-          after,
-          callId,
-        });
-        return `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${rel}`;
+        const at = isAbsolute(rel) ? relative(this.cwd, abs) : rel;
+        if (!isGenerated(at)) this.ledger.push({ path: at, before, after, callId });
+        return (
+          `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${rel}` +
+          (isGenerated(at)
+            ? " [build output — written, but not counted as work: the next build overwrites it]"
+            : "")
+        );
       }
 
       case "list_dir": {
@@ -1242,12 +1269,15 @@ export class Engine {
         writeFileSync(abs, edit.text, "utf8");
         // Ledgered exactly like a write, so files-changed and record-intact
         // prove a surgical edit the same way they prove a whole-file rewrite.
-        this.ledger.push({
-          path: isAbsolute(rel) ? relative(this.cwd, abs) : rel,
-          before,
-          after: createHash("sha256").update(edit.text, "utf8").digest("hex"),
-          callId,
-        });
+        const editedAt = isAbsolute(rel) ? relative(this.cwd, abs) : rel;
+        if (!isGenerated(editedAt)) {
+          this.ledger.push({
+            path: editedAt,
+            before,
+            after: createHash("sha256").update(edit.text, "utf8").digest("hex"),
+            callId,
+          });
+        }
         const delta = Buffer.byteLength(edit.text, "utf8") - Buffer.byteLength(current, "utf8");
         return (
           `replaced ${edit.replacements} occurrence(s) in ${rel} · ` +
