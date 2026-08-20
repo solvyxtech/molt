@@ -4,7 +4,7 @@
  * silently invalidates everything downstream.
  */
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { Archive } from "../src/archive.js";
@@ -326,6 +326,30 @@ describe("archive", () => {
     const index = readFileSync(join(archive.dir, "index.md"), "utf8");
     const row = index.trim().split("\n").at(-1)!;
     assert.equal(row.split(/(?<!\\)\|/).length - 1, 7, "one row, columns intact");
+  });
+
+  it("never reissues an index that already belongs to a surviving exuvia", () => {
+    // Seeding the next index from `list().length` breaks the instant a
+    // middle exuvia is gone: the count drops below the highest index still on
+    // disk, and the next write reissues that index onto a second file.
+    // `read()`/`grep()` then resolve to whichever of the two sorts first,
+    // making the *new* batch — which was never deleted or tampered with —
+    // unreachable by index. The next index must always be one past the
+    // highest that ever existed, not a count of what remains.
+    const dir = ws();
+    const archive = new Archive(dir);
+    for (let i = 0; i < 5; i++) archive.write(`# batch ${i}\n\n## user\n\nm${i}\n`, 1, `ask ${i}`);
+    const middle = readdirSync(archive.dir).find((f) => f.startsWith("0002-"))!;
+    unlinkSync(join(archive.dir, middle));
+
+    const reopened = new Archive(dir);
+    const entry = reopened.write("# new\n\n## user\n\nafter delete\n", 1, "after delete");
+    assert.equal(entry.index, 5, "the next index must be past the highest ever issued, not a count");
+
+    const indices = reopened.list().map((e) => e.index);
+    const dupes = indices.filter((v, i) => indices.indexOf(v) !== i);
+    assert.deepEqual(dupes, [], "no index should ever be shared by two files");
+    assert.match(reopened.read(5), /after delete/, "the new batch must be reachable by its own index");
   });
 });
 

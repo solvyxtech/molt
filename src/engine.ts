@@ -18,7 +18,7 @@
  *  - Shedding is two-phase: archive first, mutate second.
  *  - Nothing is summarized by a model, ever.
  */
-import { execSync } from "node:child_process";
+import { runCommand } from "./run.js";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { dirname, resolve, relative, isAbsolute } from "node:path";
@@ -33,12 +33,23 @@ import {
 } from "./autonomy.js";
 import { redact } from "./redact.js";
 import {
+  WALK_DEADLINE_MS,
   applyEdit,
   formatListing,
   formatMatches,
   grepFiles,
-  walk,
+  walkAsync,
 } from "./files.js";
+import {
+  isAnthropicNative,
+  messagesUrl,
+  readNativeStream,
+  toMessage,
+  toRequest,
+  usageFor,
+  finishReasonFor,
+} from "./anthropic.js";
+import { breakpoints, withCaching, refusedCaching, type CacheStyle, cacheStyle } from "./cache.js";
 import { Journal } from "./journal.js";
 import { authHeaders } from "./providers.js";
 import { Receipts } from "./receipts.js";
@@ -73,6 +84,10 @@ export const SYSTEM_PROMPT = [
   "You are molt, a coding agent working in the current directory.",
   "Read only what you need. Be terse.",
   "",
+  "Relative paths resolve against the working directory named below. Never guess",
+  "an absolute path — a home directory you inferred from a username is a path you",
+  "invented, and every call against it fails before it teaches you anything.",
+  "",
   "Tool results stay in this conversation. Never read a file twice unless you changed",
   "it — scroll up. If you want a file you already have, you are done gathering: answer,",
   "or say what is blocking you.",
@@ -86,6 +101,20 @@ export const SYSTEM_PROMPT = [
   "If you are unsure whether something worked, say so and check it rather than",
   "asserting it. An unverified claim costs the same as a false one.",
 ].join("\n");
+
+/**
+ * The system prompt, with the one fact only the process knows.
+ *
+ * "Working in the current directory" told the model a directory existed and
+ * not which one, so two sessions in a row invented a home from a username —
+ * `/Users/erik`, then `/Users/daniel` — and spent eight tool calls proving
+ * those paths were not there before either thought to run `pwd`. The
+ * directory is a constant for the whole session, so it costs one line once
+ * and stays inside the cached prefix.
+ */
+export function systemPromptFor(cwd: string): string {
+  return `${SYSTEM_PROMPT}\n\nThe working directory is ${cwd} — that, and not a guess, is where relative paths land.`;
+}
 
 /**
  * How much of a tool result comes back.
@@ -161,10 +190,76 @@ const CEILING_WARNINGS = [0.5, 0.8];
 export const DEFAULT_AUTO_SHED_TOKENS = 60_000;
 
 export const TOOL_RESULT_MAX_BYTES = 8192;
-export const READ_MAX_BYTES = 16_384;
+/**
+ * How much of a file one `read_file` may return.
+ *
+ * A tuning decision rather than a bug fix, but it is spent money either way.
+ * At 16KB — roughly four hundred lines — most real source files came back in
+ * pieces, and a part is not cheaper than the whole: the file ends up in the
+ * conversation regardless, only now across several steps, each of which
+ * resends everything before it. Reading molt's own `src/` cost 36 round trips
+ * at 16KB and costs 27 at 32KB, against a floor of 22 (one per file).
+ *
+ * Not larger than this, though the arithmetic keeps improving: 64KB saves only
+ * three more trips and doubles what a single careless read can dump into the
+ * context, and overflowing into a shed is far more expensive than the round
+ * trip it saved — a shed throws away the prompt cache the whole session has
+ * been riding on.
+ */
+export const READ_MAX_BYTES = 32_768;
 export const MAX_STEPS = 32;
 export const MAX_PROOF_ATTEMPTS = 4;
 export const DEFAULT_BASH_TIMEOUT_MS = 60_000;
+
+/**
+ * How many times a failed request is retried before the turn gives up.
+ *
+ * A transient network failure is not evidence about the work, and treating it
+ * as fatal is the most expensive possible reading of it: the turn's tokens are
+ * already spent, and ending on the spot buys nothing with them.
+ */
+/**
+ * Prompt size above which a collapsed cache is worth interrupting about.
+ *
+ * Below this the difference is pennies and the noise is not worth it; above it,
+ * every step re-reads a conversation that was being served from cache a moment
+ * ago.
+ */
+export const CACHE_WATCH_TOKENS = 10_000;
+
+export const NETWORK_RETRIES = 3;
+export const NETWORK_BACKOFF_MS = [500, 2_000, 5_000];
+
+/**
+ * How long a provider asked us to wait, from `Retry-After`.
+ *
+ * Sent as either a number of seconds or an HTTP date. Believed over the fixed
+ * backoff when present: guessing shorter buys a second refusal, and guessing
+ * longer spends the wait for nothing. Clamped, because a header saying "come
+ * back in an hour" is not something to sit inside a turn for.
+ */
+function retryAfterMs(res: Response): number | undefined {
+  const raw = res.headers?.get?.("retry-after");
+  if (!raw) return undefined;
+  const secs = Number(raw);
+  const ms = Number.isFinite(secs) ? secs * 1000 : Date.parse(raw) - Date.now();
+  if (!Number.isFinite(ms) || ms <= 0) return undefined;
+  return Math.min(ms, 30_000);
+}
+
+/** Wait, unless the turn is cancelled first — then return immediately. */
+function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const t = setTimeout(done, ms);
+    function done() {
+      clearTimeout(t);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
 
 const TOOLS = [
   {
@@ -282,6 +377,15 @@ export type RunOptions = {
    * exactly the behaviour molt is built to encourage.
    */
   ask?: boolean;
+  /**
+   * Asked when a turn reaches its spending ceiling, before it stops.
+   *
+   * Returning true doubles the ceiling and carries on; anything else stops the
+   * turn as it always did. Supplied only by an interactive session — a headless
+   * run has nobody to ask, and a ceiling that could be waved through
+   * unattended is not a ceiling.
+   */
+  onCeiling?: (spent: string) => Promise<boolean>;
 };
 
 /**
@@ -315,6 +419,23 @@ export type EngineConfig = {
   /** Where the prices came from — an endpoint, or "set by hand". */
   priceSource?: string;
   bashTimeoutMs?: number;
+  /**
+   * Force the native Anthropic protocol on or off. Inferred from the endpoint
+   * when unset; present so a test can drive either path against a fake.
+   */
+  nativeApi?: boolean;
+  /**
+   * Response ceiling for protocols that demand one. Anthropic's Messages API
+   * requires `max_tokens`; the OpenAI shape treats it as optional.
+   */
+  maxTokens?: number;
+  /**
+   * Backoff between retries, in ms per attempt. Injectable so tests can prove
+   * the retry policy without sitting through it — the real waits add half a
+   * minute to a suite that runs on every proof, which is molt's own bar
+   * charging the user for a nap.
+   */
+  retryBackoffMs?: number[];
   fetchFn?: typeof fetch;
   /** Stream tokens as they generate. On by default; a dead TUI reads as broken. */
   stream?: boolean;
@@ -444,27 +565,71 @@ function readPart(abs: string, shown: string, offset: number, limit: number): st
   const out: string[] = [];
   let bytes = 0;
   let i = from;
+  let lineWasCapped = false;
   for (; i < until; i++) {
     const line = lines[i]!;
     const size = Buffer.byteLength(line, "utf8") + 1;
     // Always return at least one line, even an enormous one: a caller that
-    // gets nothing back cannot tell "empty" from "too big to send".
+    // gets nothing back cannot tell "empty" from "too big to send". But
+    // "enormous" is unbounded — a single line with no newline in it (a
+    // minified bundle, a data dump, one runaway log line) can be megabytes
+    // on its own, and returning it whole defeats the entire budget this
+    // function exists to enforce. So the one line that would blow the
+    // budget by itself is capped to it, not exempted from it.
     if (out.length > 0 && bytes + size > budget) break;
+    if (size > budget) {
+      out.push(capToBytes(line, budget));
+      lineWasCapped = true;
+      i++;
+      break;
+    }
     out.push(line);
     bytes += size;
   }
 
-  const whole = from === 0 && i >= lines.length;
+  const whole = from === 0 && i >= lines.length && !lineWasCapped;
   if (whole) return out.join("\n");
 
   // A part is labelled, because a model holding lines 40-80 of a file needs to
   // know that is what it is holding.
   const head = `[molt: ${shown} lines ${from + 1}-${i} of ${lines.length}]`;
+  const cappedNotice = lineWasCapped
+    ? `\n[molt: line ${i} is too long to show whole and was cut off; its rest is lost, not just unread.]`
+    : "";
   const tail =
     i < lines.length
       ? `\n[molt: ${lines.length - i} more line(s). Continue with read_file offset=${i}.]`
       : "";
-  return `${head}\n${out.join("\n")}${tail}`;
+  return `${head}\n${out.join("\n")}${cappedNotice}${tail}`;
+}
+
+/** Cut a string to at most `maxBytes` of UTF-8, without splitting a character. */
+function capToBytes(s: string, maxBytes: number): string {
+  const buf = Buffer.from(s, "utf8");
+  if (buf.length <= maxBytes) return s;
+  // Buffer.toString("utf8") replaces a byte sequence split mid-character with
+  // U+FFFD rather than throwing, so a naive slice is safe here.
+  return buf.subarray(0, maxBytes).toString("utf8");
+}
+
+/**
+ * How many lines a read_file result actually showed, as a 0-based exclusive
+ * end.
+ *
+ * Partial reads carry a header `[molt: path lines X-Y of Z]` where Y is the
+ * 1-based end of the content returned. That Y is exactly the 0-based
+ * exclusive end the coverage map needs. Counting newlines in the whole
+ * result instead counts the header and the continuation notice as file lines,
+ * which made the map claim 1–2 extra lines were shown and told the model to
+ * continue past what it had actually seen.
+ */
+function actualReadEnd(result: string, from: number, path: string): number {
+  const escaped = path.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^\\[molt: ${escaped} lines \\d+-(\\d+) of \\d+\\]`);
+  const m = re.exec(result);
+  if (m) return Number(m[1]);
+  // Whole-file reads have no header; count the lines they returned.
+  return from + (result.match(/\n/g)?.length ?? 0) + 1;
 }
 
 function truncateResult(s: string): { text: string; note?: string } {
@@ -496,8 +661,43 @@ export class Engine {
    * field that has already been refused burns a round trip per step.
    */
   private streamUsageUnsupported = false;
+  /** True once an endpoint has refused `cache_control`. Sticky per session. */
+  private cachingUnsupported = false;
+  /**
+   * These three are derived from the endpoint, and the endpoint moves.
+   *
+   * They were fields, computed once in the constructor. `/model` then switched
+   * the base URL and the key and left them pointing at the provider the
+   * session started on, so choosing an Anthropic model sent the Anthropic key
+   * to xAI and came back "Incorrect API key provided. You can obtain an API
+   * key from console.x.ai". Getters cannot go stale.
+   */
+  private get cacheStyle(): CacheStyle {
+    return cacheStyle(this.cfg.baseUrl, this.cfg.model);
+  }
+
+  /**
+   * True when molt speaks Anthropic's own Messages API rather than the
+   * OpenAI-compatible one. Chosen by endpoint, not by model: it is the *API*
+   * that differs, and Anthropic's compatibility layer throws `cache_control`
+   * away without a word, so a session there can never cache.
+   */
+  private get native(): boolean {
+    return this.cfg.nativeApi ?? isAnthropicNative(this.cfg.baseUrl);
+  }
+
+  /** Where a completion request goes, which differs between the two APIs. */
+  private get endpoint(): string {
+    return this.native
+      ? messagesUrl(this.cfg.baseUrl)
+      : `${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`;
+  }
   /** Said once: this endpoint is not caching anything. */
   private warnedNoCache = false;
+  /** True once a step has reused a serious share of the conversation. */
+  private cacheWasWorking = false;
+  /** Said once: a cache that was working has stopped. */
+  private warnedCacheLost = false;
   /**
    * Every path the model read this session.
    *
@@ -541,6 +741,8 @@ export class Engine {
   /** sha256 of .molt/done.yml as it stood when the session began. */
   private barHash: string | null;
   private inFlight?: AbortController;
+  /** Aborts the command or bar check currently executing, if any. */
+  private running?: AbortController;
   /**
    * How many write records this session handed to the archive. Kept in
    * memory and NOT derived from the archive, so it is an independent
@@ -550,7 +752,7 @@ export class Engine {
 
   constructor(cfg: EngineConfig) {
     this.cfg = cfg;
-    this.transcript = new Transcript(SYSTEM_PROMPT);
+    this.transcript = new Transcript(systemPromptFor(this.cwd));
     this.barHash = barFingerprint(this.cwd);
     // The key molt was handed is the one secret it can mask exactly.
     cfg.journal?.protect(cfg.apiKey, process.env.MOLT_API_KEY);
@@ -633,11 +835,16 @@ export class Engine {
     this.cfg.apiKey = apiKey;
     this.cfg.journal?.protect(apiKey);
     this.cfg.provider = provider;
+    // Whatever the last endpoint would not accept says nothing about this one.
+    this.cachingUnsupported = false;
+    this.streamUsageUnsupported = false;
+    this.cacheWasWorking = false;
+    this.warnedCacheLost = false;
     this.reset();
   }
 
   reset(): void {
-    this.transcript = new Transcript(SYSTEM_PROMPT);
+    this.transcript = new Transcript(systemPromptFor(this.cwd));
     this.ledger = [];
     this.archivedWrites = 0;
     this.sessionPrompt = 0;
@@ -653,9 +860,15 @@ export class Engine {
    * Abort an in-flight request. The assistant turn is only committed to the
    * transcript once a response is complete, so cancelling mid-stream leaves
    * the session exactly as it was rather than half-written.
+   *
+   * Also kills whatever command is running, which is a separate controller
+   * because `inFlight` is cleared the moment the response lands — long before
+   * the tools it asked for have run. A ctrl+C during a ten-minute test suite
+   * that only cancelled the network would look like it had done nothing.
    */
   cancel(): void {
     this.inFlight?.abort();
+    this.running?.abort();
   }
 
   get streaming(): boolean {
@@ -828,6 +1041,8 @@ export class Engine {
   barContext(claim?: string): BarContext {
     return {
       cwd: this.cwd,
+      // So ctrl+C during a long suite kills the suite, not just the spinner.
+      signal: this.running?.signal,
       record: this.transcript.record(),
       read: [...this.readPaths],
       cache: this.cache,
@@ -942,7 +1157,17 @@ export class Engine {
     return this.budgetTokens !== undefined && this.sessionTokens >= this.budgetTokens;
   }
 
-  private runTool(name: string, args: Record<string, unknown>, callId: string): string {
+  /**
+   * Async because `bash` is: it used to run through `execSync`, which stops
+   * the event loop dead and froze the whole TUI for the life of the command.
+   * Everything else here is filesystem work measured in milliseconds and stays
+   * synchronous inside the promise.
+   */
+  private async runTool(
+    name: string,
+    args: Record<string, unknown>,
+    callId: string,
+  ): Promise<string> {
     switch (name) {
       case "read_file":
         this.readPaths.add(String(args.path ?? ""));
@@ -974,7 +1199,16 @@ export class Engine {
         const rel = String(args.path ?? ".");
         const abs = resolve(this.cwd, rel);
         this.mustBeInside(abs, rel);
-        return formatListing(rel, walk(abs, { depth: num(args.depth, 1), glob: str(args.glob) }));
+        // Bounded and off the main thread: a listing the model asks for can be
+        // pointed at anything, including a home directory.
+        return formatListing(
+          rel,
+          await walkAsync(abs, {
+            depth: num(args.depth, 1),
+            glob: str(args.glob),
+            deadline: Date.now() + WALK_DEADLINE_MS,
+          }),
+        );
       }
 
       case "grep": {
@@ -984,7 +1218,7 @@ export class Engine {
         const pattern = String(args.pattern ?? "");
         return formatMatches(
           pattern,
-          grepFiles(abs, pattern, {
+          await grepFiles(abs, pattern, {
             glob: str(args.glob),
             ignoreCase: args.ignore_case === true,
           }),
@@ -1021,26 +1255,23 @@ export class Engine {
         );
       }
 
-      case "bash":
-        try {
-          return execSync(String(args.command ?? ""), {
-            cwd: this.cwd,
-            timeout: this.cfg.bashTimeoutMs ?? DEFAULT_BASH_TIMEOUT_MS,
-            maxBuffer: 1024 * 1024,
-            encoding: "utf8",
-            env: scrubbedEnv(),
-            stdio: ["ignore", "pipe", "pipe"],
-          });
-        } catch (e) {
-          const err = e as {
-            stdout?: string;
-            stderr?: string;
-            status?: number | null;
-            signal?: string;
-          };
-          const tag = err.signal === "SIGTERM" ? "timeout" : `exit ${err.status ?? "?"}`;
-          return `${tag}\n${err.stdout ?? ""}${err.stderr ?? ""}`;
-        }
+      case "bash": {
+        const r = await runCommand(String(args.command ?? ""), {
+          cwd: this.cwd,
+          timeoutMs: this.cfg.bashTimeoutMs ?? DEFAULT_BASH_TIMEOUT_MS,
+          maxBuffer: 1024 * 1024,
+          env: scrubbedEnv(),
+          // A cancelled turn kills the command it is waiting on. Leaving a
+          // build running after the turn that asked for it was called off is
+          // the machine doing work nobody is going to read.
+          signal: this.running?.signal,
+        });
+        // Same shape execSync produced: bare stdout when it worked, and a
+        // tagged dump of both streams when it did not.
+        if (r.code === 0 && !r.timedOut) return r.stdout;
+        const tag = r.timedOut ? "timeout" : `exit ${r.code ?? r.signal ?? "?"}`;
+        return `${tag}\n${r.stdout}${r.stderr}`;
+      }
 
       default:
         return `unknown tool: ${name}`;
@@ -1068,9 +1299,20 @@ export class Engine {
     }
   }
 
-  private runBarGuarded(claim?: string, override?: Bar | null): BarResult {
+  private async runBarGuarded(claim?: string, override?: Bar | null): Promise<BarResult> {
     const bar = override ?? this.cfg.bar!;
     const t0 = Date.now();
+    // The bar is the longest-running thing molt does. It gets the same
+    // cancellation handle a tool call gets, for the same reason.
+    this.running = new AbortController();
+    try {
+      return await this.runBarInner(bar, claim, t0);
+    } finally {
+      this.running = undefined;
+    }
+  }
+
+  private async runBarInner(bar: Bar, claim: string | undefined, t0: number): Promise<BarResult> {
     const now = barFingerprint(this.cwd);
     if (this.barHash !== null && now !== this.barHash) {
       const tamper: CheckResult = {
@@ -1084,7 +1326,7 @@ export class Engine {
           "original checks, or stop and tell the user why the bar is wrong.",
         durationMs: Date.now() - t0,
       };
-      const rest = runBar(bar, this.barContext(claim));
+      const rest = await runBar(bar, this.barContext(claim));
       return {
         ok: false,
         results: [tamper, ...rest.results],
@@ -1098,7 +1340,7 @@ export class Engine {
    * Ask for an answer with what has already been paid for.
    *
    * Every guard in this loop used to end a turn by returning nothing: the step
-   * guard, the budget, the turn ceiling, the no-progress stop. A session that
+   * guard, the budget, the turn ceiling. A session that
    * read twenty files and hit a limit threw all of it away — maximum cost,
    * zero value, which is the worst outcome available and the one a user
    * actually reported.
@@ -1122,9 +1364,22 @@ export class Engine {
         `already found: what you learned, and — just as importantly — what you did not get ` +
         `to and cannot vouch for. Do not claim anything you did not verify.`,
     });
+    // Cancellable, like every other request. It was not, and that made molt
+    // unquittable at the worst moment: hitting the budget runs a salvage, and
+    // a salvage that cannot be aborted holds the turn open with no way out —
+    // ctrl+C reached a controller that had already been cleared. A safety net
+    // you cannot climb out of is a trap.
+    const controller = new AbortController();
+    this.inFlight = controller;
     try {
-      const res = await fetchFn(`${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      // The salvage is a request like any other, so it speaks whichever
+      // protocol the rest of the turn spoke — sending it to the OpenAI path
+      // while the session ran on the native one would fail the one request
+      // whose entire job is to rescue a turn that already went wrong.
+      const wire = this.transcript.wire();
+      const res = await fetchFn(this.endpoint, {
         method: "POST",
+        signal: controller.signal,
         headers: {
           "content-type": "application/json",
           ...authHeaders(this.cfg.baseUrl, this.cfg.apiKey),
@@ -1132,12 +1387,25 @@ export class Engine {
         // `tools` must be present even to say "use none of them" — a
         // tool_choice without a tools array is a 400 on at least xAI, and the
         // first version of this sent exactly that and swallowed the refusal.
-        body: JSON.stringify({
-          model: this.cfg.model,
-          messages: this.transcript.wire(),
-          tools: TOOLS,
-          tool_choice: "none",
-        }),
+        body: JSON.stringify(
+          this.native
+            ? toRequest(wire, TOOLS, {
+                model: this.cfg.model,
+                maxTokens: this.cfg.maxTokens,
+                toolChoice: "none",
+                // A fork must reuse the parent's prefix exactly or it reads
+                // none of the cache the turn has been building.
+                cacheAt: this.cacheStyle === "explicit" && !this.cachingUnsupported
+                  ? new Set(breakpoints(wire))
+                  : undefined,
+              })
+            : {
+                model: this.cfg.model,
+                messages: withCaching(wire, this.cacheStyle, !this.cachingUnsupported),
+                tools: TOOLS,
+                tool_choice: "none",
+              },
+        ),
       });
       if (!res.ok) {
         // A safety net that fails silently is not a safety net. Say so.
@@ -1152,10 +1420,14 @@ export class Engine {
       const json = (await res.json()) as {
         choices?: { message?: Msg }[];
         usage?: Usage;
+        content?: { type: string; text?: string }[];
       };
-      const text = json.choices?.[0]?.message?.content ?? "";
-      const pTok = json.usage?.prompt_tokens ?? 0;
-      const cTok = json.usage?.completion_tokens ?? 0;
+      const nativeUsage = this.native ? usageFor(json.usage as unknown as Record<string, unknown>) : undefined;
+      const text = this.native
+        ? (toMessage(json).content ?? "")
+        : (json.choices?.[0]?.message?.content ?? "");
+      const pTok = (nativeUsage ?? json.usage)?.prompt_tokens ?? 0;
+      const cTok = (nativeUsage ?? json.usage)?.completion_tokens ?? 0;
       this.sessionPrompt += pTok;
       this.sessionCompletion += cTok;
       if (typeof json.usage?.cost === "number") this.sessionBilled += json.usage.cost;
@@ -1171,8 +1443,16 @@ export class Engine {
       yield { kind: "assistant_text", text: redact(text, this.secrets()) };
     } catch (e) {
       // A courtesy that failed must not mask the real stop, but must not
-      // vanish either.
-      log?.append("error", { text: `salvage failed: ${String(e)}` });
+      // vanish either. Cancelling it is not a failure — it is being told the
+      // last word is no longer wanted.
+      if (controller.signal.aborted) {
+        log?.append("cancelled", { reason: "salvage cancelled" });
+        yield { kind: "info", text: "cancelled — no closing summary was written" };
+      } else {
+        log?.append("error", { text: `salvage failed: ${String(e)}` });
+      }
+    } finally {
+      this.inFlight = undefined;
     }
   }
 
@@ -1219,7 +1499,7 @@ export class Engine {
   }
 
   /** Run the bar without touching the loop — backs the /prove command. */
-  proveNow(claim?: string): BarResult | null {
+  async proveNow(claim?: string): Promise<BarResult | null> {
     if (!this.cfg.bar) return null;
     return this.runBarGuarded(claim);
   }
@@ -1365,7 +1645,27 @@ export class Engine {
     const turnStartTokens = this.sessionTokens;
     const turnStartCost = this.costUsd();
     let warned = 0;
-    for (let step = 0; step < MAX_STEPS; step++) {
+    // The step guard is the last way out of a turn, and it had the same fault
+    // the spending ceiling had: it stopped dead. A reported run reached it with
+    // 1,344,777 tokens and $0.89 spent and got no answer for any of it. The
+    // money is gone either way — ending there is what makes it worth nothing.
+    // So the cap is extensible on the same terms: asked once per cap, stopping
+    // the default, and only where somebody is watching.
+    let stepCap = MAX_STEPS;
+    for (let step = 0; ; step++) {
+      if (step >= stepCap) {
+        if (!opts.onCeiling) break;
+        const spent =
+          `${step} steps · ${this.sessionTokens} tokens` +
+          (this.costUsd() === undefined ? "" : ` · ${fmtUsd(this.costUsd() ?? 0)}`);
+        if (!(await opts.onCeiling(spent))) break;
+        stepCap += MAX_STEPS;
+        log?.append("note", { text: `step guard raised at ${spent} — turn continues` });
+        yield {
+          kind: "info",
+          text: `carrying on past ${spent}. Another ${MAX_STEPS} steps before molt asks again.`,
+        };
+      }
       // An explicit budget speaks for itself, and speaks first: one knob
       // should not produce two different messages.
       if (this.overBudget()) {
@@ -1408,11 +1708,44 @@ export class Engine {
         warned += 1;
         yield {
           kind: "info",
-          text: `this turn: ${ceilingLine} — ${pct}% of the ceiling. /budget raises it, /budget off removes it.`,
+          text:
+            `this turn: ${ceilingLine} — ${pct}% of the ceiling. Type /budget $5 now to raise ` +
+            `it and the turn carries on; /budget off removes it entirely.`,
         };
       }
 
       if (ceiling > 0 && used >= ceiling) {
+        // Ask, when there is someone to ask.
+        //
+        // Stopping dead at the ceiling is the most expensive outcome available:
+        // the money is already spent, and ending there converts it into nothing
+        // at all. A reported run reached $1.02 of a $1.00 ceiling twenty steps
+        // into real work and got no answer for any of it — "it seems like a
+        // bigger waste if you spend the money and never get an output".
+        //
+        // Deliberately not the `confirm` used for tools. `--yes` means "do not
+        // ask me about tool calls", and reading it as "spend without limit"
+        // would let a headless run in CI go through a budget unattended. This
+        // is a separate channel that only an interactive session provides, so
+        // where nobody is watching the ceiling still stops the turn.
+        if (opts.onCeiling) {
+          const more = await opts.onCeiling(ceilingLine);
+          if (more) {
+            // Raised by the same amount again, so continuing is a decision
+            // taken once per ceiling rather than a limit quietly removed.
+            if (priced) this.cfg.maxTurnUsd = usdCeiling * 2;
+            else this.cfg.maxTurnTokens = tokenCeiling * 2;
+            log?.append("note", { text: `ceiling raised at ${ceilingLine} — turn continues` });
+            yield {
+              kind: "info",
+              text: `carrying on past ${ceilingLine}. The ceiling is now ${
+                priced ? fmtUsd(usdCeiling * 2) : `${tokenCeiling * 2} tokens`
+              } for this turn.`,
+            };
+            warned = 0;
+            continue;
+          }
+        }
         log?.append("session_end", {
           reason: "turn ceiling",
           tokens: spentThisTurn,
@@ -1497,140 +1830,307 @@ export class Engine {
        * an estimate presented in a meter that reads as a measurement, on
        * the code path that is on by default. Asking costs one field.
        */
-      const askForUsage = stream && !this.streamUsageUnsupported;
-      const send = (withUsage: boolean): Promise<Response> =>
-        fetchFn(`${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      const askForUsage = stream && !this.streamUsageUnsupported && !this.native;
+      const send = (withUsage: boolean, withCache = !this.cachingUnsupported): Promise<Response> => {
+        const marks = withCache && this.cacheStyle === "explicit" ? new Set(breakpoints(wire)) : undefined;
+        const body = this.native
+          ? toRequest(wire, TOOLS, {
+              model: this.cfg.model,
+              maxTokens: this.cfg.maxTokens,
+              stream,
+              toolChoice: "auto",
+              cacheAt: marks,
+            })
+          : {
+              model: this.cfg.model,
+              // Breakpoints on providers that need them, nothing on providers
+              // that cache by themselves. Never a change to the text.
+              messages: withCaching(wire, this.cacheStyle, withCache),
+              tools: TOOLS,
+              tool_choice: "auto",
+              ...(stream ? { stream: true } : {}),
+              ...(withUsage ? { stream_options: { include_usage: true } } : {}),
+            };
+        return fetchFn(this.endpoint, {
           method: "POST",
           signal: controller.signal,
           headers: {
             "content-type": "application/json",
             ...authHeaders(this.cfg.baseUrl, this.cfg.apiKey),
           },
-          body: (this.lastRequestBody = JSON.stringify({
-            model: this.cfg.model,
-            messages: wire,
-            tools: TOOLS,
-            tool_choice: "auto",
-            ...(stream ? { stream: true } : {}),
-            ...(withUsage ? { stream_options: { include_usage: true } } : {}),
-          })),
+          body: (this.lastRequestBody = JSON.stringify(body)),
         });
+      };
 
-      let res: Response;
-      try {
-        res = await send(askForUsage);
-        // A server that does not implement the field rejects the request. Try
-        // once without it rather than failing a turn over a request for better
-        // bookkeeping — and only conclude the field was the problem if the
-        // retry actually works, so a genuine 400 does not quietly turn usage
-        // reporting off for the rest of the session.
-        if (!res.ok && res.status === 400 && askForUsage) {
-          const retry = await send(false);
-          if (retry.ok) {
-            this.streamUsageUnsupported = true;
-            log?.append("note", {
-              text: "provider rejected stream_options — token counts fall back to molt's estimate",
-            });
+      // A failed step is not a verdict on the work.
+      //
+      // Everything between sending the request and holding a usable message
+      // can fail in ways that say nothing about whether the work is any good:
+      // `TypeError: fetch failed` from a DNS blip or a laptop waking, a 429
+      // because the minute's quota ran out, a 502 from a proxy, a stream that
+      // dies halfway, an HTML error page where JSON was promised. Each of
+      // those used to end the turn where it stood. One reported session lost
+      // forty-nine thousand tokens of reading that way and was told only
+      // "network: TypeError: fetch failed".
+      //
+      // So they are all one policy now: retry what a second attempt could
+      // plausibly fix, and whatever happens, close the turn the way every
+      // other stop closes — by asking for an answer with what has already been
+      // paid for. A 400 or a 401 is not retried, because the conversation or
+      // the credentials being wrong does not improve by asking again, and a
+      // second identical refusal is exactly the spending this avoids.
+      let msg: Msg | undefined;
+      let usage: Usage | undefined;
+      let finishReason: string | undefined;
+      /** Whether this step's text already went out as deltas. */
+      let streamedContent = false;
+      let streamedText = "";
+      let failure:
+        | { text: string; why: string; retryable: boolean; retryAfterMs?: number }
+        | undefined;
+
+      for (let attempt = 0; ; attempt++) {
+        failure = undefined;
+        msg = undefined;
+        streamedText = "";
+        let res: Response | undefined;
+        try {
+          res = await send(askForUsage);
+          // A server that does not implement the field rejects the request. Try
+          // once without it rather than failing a turn over a request for better
+          // bookkeeping — and only conclude the field was the problem if the
+          // retry actually works, so a genuine 400 does not quietly turn usage
+          // reporting off for the rest of the session.
+          if (!res.ok && res.status === 400 && askForUsage) {
+            const retry = await send(false);
+            if (retry.ok) {
+              this.streamUsageUnsupported = true;
+              log?.append("note", {
+                text: "provider rejected stream_options — token counts fall back to molt's estimate",
+              });
+            }
+            res = retry;
           }
-          res = retry;
+
+          // The body is read once. A `Response` gives its body up exactly
+          // once, so the caching fallback below and the failure report that
+          // follows it have to share the same read rather than each taking
+          // their own.
+          let body = res.ok ? "" : (await res.text().catch(() => ""));
+
+          // An endpoint that will not take the markers must cost a retry, not
+          // a turn. Same shape as the stream_options fallback above: try once
+          // without, and only believe the markers were the problem if that
+          // works — so a genuine 400 is not quietly blamed on caching.
+          if (
+            !res.ok &&
+            res.status === 400 &&
+            this.cacheStyle === "explicit" &&
+            !this.cachingUnsupported &&
+            refusedCaching(body)
+          ) {
+            const retry = await send(askForUsage && !this.streamUsageUnsupported, false);
+            if (retry.ok) {
+              this.cachingUnsupported = true;
+              log?.append("note", {
+                text: "provider rejected cache_control — prompt caching is off for this session",
+              });
+            }
+            res = retry;
+            body = res.ok ? "" : (await res.text().catch(() => ""));
+          }
+
+          if (!res.ok) {
+            const transient = res.status === 408 || res.status === 429 || res.status >= 500;
+            failure = {
+              text: `HTTP ${res.status}: ${body.slice(0, 300)}`,
+              why: `The provider refused the request with HTTP ${res.status}.`,
+              retryable: transient,
+            };
+            // A rate limit usually says when to come back. Believe it over a
+            // fixed backoff — guessing shorter earns a second refusal, and
+            // guessing longer wastes the wait.
+            if (transient) failure.retryAfterMs = retryAfterMs(res);
+          } else {
+            const contentType = res.headers?.get?.("content-type") ?? "";
+            const isSse = stream && res.body != null && contentType.includes("event-stream");
+            if (isSse && this.native) {
+              // Anthropic's stream is block-oriented rather than
+              // choice-oriented, so it gets its own reader.
+              const fragments: string[] = [];
+              const result = await readNativeStream(res.body!, (f) => {
+                fragments.push(f);
+              });
+              msg = result.message;
+              finishReason = result.finishReason;
+              usage = {
+                prompt_tokens: result.promptTokens,
+                completion_tokens: result.completionTokens,
+                ...(result.cachedTokens === undefined
+                  ? {}
+                  : { prompt_tokens_details: { cached_tokens: result.cachedTokens } }),
+                cache_read_input_tokens: result.cachedTokens,
+                cache_creation_input_tokens: result.cacheWriteTokens,
+              };
+              streamedText = redact(fragments.join(""), this.secrets());
+            } else if (isSse) {
+              // Fragments are buffered and re-yielded after the read completes.
+              // An async generator cannot yield from inside a callback, and
+              // restructuring the whole loop into a push model to gain a few
+              // hundred milliseconds of earlier paint is not worth the
+              // complexity that would add to the proof gate below.
+              const fragments: string[] = [];
+              const result = await readStream(res.body!, (fragment) => {
+                fragments.push(fragment);
+              });
+              msg = result.message;
+              finishReason = result.finishReason;
+              usage = {
+                prompt_tokens: result.promptTokens,
+                completion_tokens: result.completionTokens,
+                ...(result.cachedTokens === undefined
+                  ? {}
+                  : { prompt_tokens_details: { cached_tokens: result.cachedTokens } }),
+                ...(result.reasoningTokens === undefined
+                  ? {}
+                  : { completion_tokens_details: { reasoning_tokens: result.reasoningTokens } }),
+                ...(result.costUsd === undefined ? {} : { cost: result.costUsd }),
+              };
+              // Redacted whole rather than fragment by fragment: a key split
+              // across two chunks matches neither half, and these are already
+              // buffered, so there is nothing to lose by masking the joined
+              // text. The screen is a distribution channel too — the same rule
+              // the tool preview below has always followed.
+              //
+              // Held rather than yielded here: a stream that dies after some
+              // text arrived is retried, and text already on screen cannot be
+              // taken back. It goes out below, once the attempt has stuck.
+              streamedText = redact(fragments.join(""), this.secrets());
+            } else {
+              type Payload = {
+                choices?: { message?: Msg; finish_reason?: string | null }[];
+                usage?: Usage;
+              };
+              let json: Payload | undefined;
+              try {
+                json = (await res.json()) as Payload;
+              } catch {
+                // Named for what it is. An HTML error page from a proxy is the
+                // usual cause, and "network: SyntaxError" sends whoever reads
+                // it to debug the wrong layer.
+                failure = {
+                  text: "provider returned non-JSON response",
+                  why: "The provider returned something that was not JSON.",
+                  retryable: true,
+                };
+              }
+              if (json && this.native) {
+                const native = json as unknown as {
+                  content?: { type: string; text?: string; id?: string; name?: string; input?: unknown }[];
+                  stop_reason?: string | null;
+                  usage?: Record<string, unknown>;
+                };
+                msg = toMessage(native);
+                finishReason = finishReasonFor(native.stop_reason);
+                usage = usageFor(native.usage);
+              } else if (json) {
+                msg = json.choices?.[0]?.message;
+                finishReason = json.choices?.[0]?.finish_reason ?? undefined;
+                usage = json.usage;
+              }
+            }
+            if (!failure && !msg) {
+              // A response shaped wrong is usually a proxy or a bad gateway
+              // answering in the provider's place, which the next attempt
+              // often gets past.
+              failure = {
+                text: "provider response missing choices[0].message",
+                why: "The provider returned a response with no assistant message in it.",
+                retryable: true,
+              };
+            }
+          }
+        } catch (e) {
+          if (controller.signal.aborted) {
+            this.inFlight = undefined;
+            this.transcript.rollbackTo(turnStart);
+            const wrote = [...new Set(this.ledger.map((e) => e.path))];
+            log?.append("cancelled", { step, rolledBack: true, filesWritten: wrote });
+            yield { kind: "cancelled", filesWritten: wrote };
+            return;
+          }
+          failure = {
+            text: `network: ${String(e)}`,
+            why: "The connection to the provider failed and could not be re-established.",
+            retryable: true,
+          };
         }
-      } catch (e) {
-        this.inFlight = undefined;
+
+        if (!failure) break;
+        if (!failure.retryable || attempt >= NETWORK_RETRIES) break;
+        const backoff = this.cfg.retryBackoffMs ?? NETWORK_BACKOFF_MS;
+        const wait = failure.retryAfterMs ?? backoff[attempt] ?? backoff.at(-1) ?? 4_000;
+        log?.append("note", { text: `${failure.text} — retrying in ${wait}ms` });
+        yield {
+          kind: "info",
+          text:
+            `${failure.text} — retrying in ${Math.round(wait / 100) / 10}s, ` +
+            `attempt ${attempt + 2} of ${NETWORK_RETRIES + 1}`,
+        };
+        await sleepUnlessAborted(wait, controller.signal);
         if (controller.signal.aborted) {
+          this.inFlight = undefined;
           this.transcript.rollbackTo(turnStart);
           const wrote = [...new Set(this.ledger.map((e) => e.path))];
           log?.append("cancelled", { step, rolledBack: true, filesWritten: wrote });
           yield { kind: "cancelled", filesWritten: wrote };
           return;
         }
-        log?.append("error", { text: `network: ${String(e)}` });
-        yield { kind: "error", text: `network: ${String(e)}` };
-        return;
-      }
-
-      if (!res.ok) {
-        this.inFlight = undefined;
-        const body = (await res.text().catch(() => "")).slice(0, 300);
-        log?.append("error", { text: `HTTP ${res.status}`, body: body.slice(0, 200) });
-        yield { kind: "error", text: `HTTP ${res.status}: ${body}` };
-        return;
-      }
-
-      let msg: Msg | undefined;
-      let usage: Usage | undefined;
-      let finishReason: string | undefined;
-      const contentType = res.headers?.get?.("content-type") ?? "";
-      const isSse = stream && res.body != null && contentType.includes("event-stream");
-
-      if (isSse) {
-        // Fragments are buffered and re-yielded after the read completes.
-        // An async generator cannot yield from inside a callback, and
-        // restructuring the whole loop into a push model to gain a few
-        // hundred milliseconds of earlier paint is not worth the complexity
-        // that would add to the proof gate below.
-        const fragments: string[] = [];
-        try {
-          const result = await readStream(res.body!, (fragment) => {
-            fragments.push(fragment);
-          });
-          msg = result.message;
-          finishReason = result.finishReason;
-          usage = {
-            prompt_tokens: result.promptTokens,
-            completion_tokens: result.completionTokens,
-            ...(result.cachedTokens === undefined
-              ? {}
-              : { prompt_tokens_details: { cached_tokens: result.cachedTokens } }),
-            ...(result.reasoningTokens === undefined
-              ? {}
-              : { completion_tokens_details: { reasoning_tokens: result.reasoningTokens } }),
-            ...(result.costUsd === undefined ? {} : { cost: result.costUsd }),
-          };
-        } catch (e) {
-          this.inFlight = undefined;
-          if (controller.signal.aborted) {
-            this.transcript.rollbackTo(turnStart);
-            yield { kind: "cancelled", filesWritten: [...new Set(this.ledger.map((e) => e.path))] };
-            return;
-          }
-          yield { kind: "error", text: `stream: ${String(e)}` };
-          return;
-        }
-        for (const f of fragments) yield { kind: "delta", text: f };
-      } else {
-        let json: {
-          choices?: { message?: Msg; finish_reason?: string | null }[];
-          usage?: Usage;
-        };
-        try {
-          json = (await res.json()) as typeof json;
-        } catch {
-          this.inFlight = undefined;
-          if (controller.signal.aborted) {
-            this.transcript.rollbackTo(turnStart);
-            yield { kind: "cancelled", filesWritten: [...new Set(this.ledger.map((e) => e.path))] };
-            return;
-          }
-          yield { kind: "error", text: "provider returned non-JSON response" };
-          return;
-        }
-        msg = json.choices?.[0]?.message;
-        finishReason = json.choices?.[0]?.finish_reason ?? undefined;
-        usage = json.usage;
       }
 
       this.inFlight = undefined;
 
-      if (!msg) {
-        yield { kind: "error", text: "provider response missing choices[0].message" };
+      if (failure || !msg) {
+        const text = failure?.text ?? "provider response missing choices[0].message";
+        log?.append("error", { text });
+        yield {
+          kind: "error",
+          text:
+            `${text}${failure?.retryable ? ` — gave up after ${NETWORK_RETRIES + 1} attempts` : ""}. ` +
+            `Nothing was verified. The work above still happened; what follows is a report ` +
+            `on it, not a completion.`,
+        };
+        // Only where a last request could plausibly do better. A 400 or a 401
+        // is the conversation, the model id, or the credentials being wrong,
+        // and a salvage would be refused in exactly the same way — paying
+        // twice to be told the same thing is the spending this avoids.
+        if (failure?.retryable !== false) {
+          yield* this.salvage(failure?.why ?? "The provider returned nothing usable.", fetchFn, log);
+        }
         return;
+      }
+
+      // The attempt stuck, so the text it produced can go to the screen.
+      //
+      // A provider that does not stream sends its prose in the message body,
+      // and nothing carried it: `assistant_text` is the turn's final answer
+      // and is only sent at the end, so with `--no-stream` every word the
+      // model wrote on the way — what it was about to do and why — was thrown
+      // away and only the tool calls showed. Sent as a delta, which is the
+      // event that means "the model is talking", so both kinds of provider
+      // reach the screen the same way.
+      const said = streamedText || redact(msg.content ?? "", this.secrets());
+      if (said) {
+        streamedContent = true;
+        yield { kind: "delta", text: said };
       }
 
       const reportedUsage =
         typeof usage?.prompt_tokens === "number" || typeof usage?.completion_tokens === "number";
       const pTok = usage?.prompt_tokens ?? estTokens(JSON.stringify(wire));
       const cTok = usage?.completion_tokens ?? estTokens(JSON.stringify(msg));
-      const cachedTok = usage?.prompt_tokens_details?.cached_tokens ?? 0;
+      const cachedTok =
+        usage?.prompt_tokens_details?.cached_tokens ?? usage?.cache_read_input_tokens ?? 0;
       const billedUsd = usage?.cost;
       const costBefore = this.costUsd();
 
@@ -1693,6 +2193,32 @@ export class Engine {
         };
       }
 
+      // A cache that stops working mid-session is worse than one that never
+      // worked, because the warning above never fires: the session total keeps
+      // the early hits and looks healthy while every new step pays full price.
+      // Observed on a real run — the hit rate held for two steps and then sat
+      // at 128 tokens against a prompt growing to 50,000, which was most of
+      // that turn's bill and nothing said so.
+      //
+      // Judged per step rather than cumulatively, and only once the prompt is
+      // large enough for the difference to be real money.
+      if (reportedUsage && pTok > CACHE_WATCH_TOKENS) {
+        const hit = cachedTok / pTok;
+        if (hit >= 0.25) this.cacheWasWorking = true;
+        else if (this.cacheWasWorking && !this.warnedCacheLost) {
+          this.warnedCacheLost = true;
+          yield {
+            kind: "info",
+            text:
+              `prompt caching stopped: this step reused ${cachedTok} of ${pTok} tokens ` +
+              `(${Math.round(hit * 100)}%) after earlier steps were reusing most of the ` +
+              `conversation. Every step from here re-bills the whole context. If it does ` +
+              `not recover, a fresh session re-establishes the cache more cheaply than ` +
+              `continuing this one.`,
+          };
+        }
+      }
+
       const spend: Spend = {
         promptTokens: pTok,
         completionTokens: cTok,
@@ -1720,6 +2246,11 @@ export class Engine {
         content: msg.content ?? null,
         ...(msg.tool_calls?.length ? { tool_calls: msg.tool_calls } : {}),
       });
+
+      // The message is complete. Said before the tool calls below, so what the
+      // model wrote appears above the work it was introducing rather than
+      // after it — and so the next step starts on a line of its own.
+      yield { kind: "message_end" };
 
       if (msg.tool_calls?.length) {
         const called: string[] = [];
@@ -1782,11 +2313,14 @@ export class Engine {
           } else {
             yield { kind: "tool_start", name, detail };
             const toolStartedAt = Date.now();
+            // Scoped to this one call, so ctrl+C reaches the command that is
+            // actually running and nothing that ran before it.
+            this.running = new AbortController();
             try {
               // read_file budgets itself, to the byte, so that the notice
               // saying how to continue survives. Capping it again here is what
               // cut that notice off and left the model with no way forward.
-              const raw = this.runTool(name, args, call.id);
+              const raw = await this.runTool(name, args, call.id);
               const t =
                 name === "read_file" ? { text: raw, note: undefined } : truncateResult(raw);
               result = t.text;
@@ -1794,6 +2328,8 @@ export class Engine {
             } catch (e) {
               result = `tool error: ${String(e)}`;
               note = "error";
+            } finally {
+              this.running = undefined;
             }
             durationMs = Date.now() - toolStartedAt;
 
@@ -1802,8 +2338,7 @@ export class Engine {
             if (name === "read_file" && note !== "error") {
               const path = String(args.path ?? "");
               const from = num(args.offset, 0);
-              const lines = (result.match(/\n/g)?.length ?? 0) + 1;
-              const to = from + lines;
+              const to = actualReadEnd(result, from, path);
               const covered = shown.get(path) ?? [];
               // How much of this window is genuinely new. Containment alone is
               // too strict: a read that overlaps an earlier one by 99% and
@@ -1903,50 +2438,51 @@ export class Engine {
         }
         yield summary(called, "tools");
 
-        // A step whose every call was a repeat produced no new information.
-        // One can be a stumble; two in a row is a loop, and a loop with a
-        // token meter attached has to be stopped by molt rather than by the
-        // step guard thirty steps later.
-        // Majority, not unanimity. A step that spends three calls on things it
-        // already had and one on something new is thrashing, and requiring
-        // every single call to be a repeat is how a loop walked past this
-        // guard for thirty-two steps and most of a dollar.
+        // A step that mostly repeated itself learned little. Worth saying —
+        // and nothing more than that.
+        //
+        // This used to end the turn on the second such step in a row. It was
+        // the wrong instrument: repetition is a *guess* at waste, and the guess
+        // is bad. A model that re-reads a file it has just edited, re-runs a
+        // suite to see it go green, or re-checks a path before writing to it is
+        // repeating a call and making progress — and the read-coverage branch
+        // above counts a largely-overlapping re-read as a repeat too. Two such
+        // steps in a row and a turn died with 384,000 tokens of real work in it
+        // and nothing to show, which is the exact "maximum cost, zero value"
+        // outcome `salvage` exists to prevent.
+        //
+        // Spend is already bounded by instruments that measure spend directly,
+        // are checked before every step, warn on the way up, and are the user's
+        // to set: `/budget` for the session, the per-turn ceiling above, and
+        // MAX_STEPS behind both. A proxy that guesses at the same thing and
+        // gets it wrong does not add safety, it just takes the turn away.
+        //
+        // What survives is the part that pays for itself: the repeated call
+        // still gets a pointer instead of its payload, so a loop gets cheaper
+        // as it goes, and the model is told plainly it is going in circles.
         if (called.length > 0 && repeated * 2 >= called.length) {
           dryStreak += 1;
-          if (dryStreak === 1) {
-            yield {
-              kind: "info",
-              text:
-                `${repeated} of ${called.length} calls that step were things molt had already ` +
-                `answered — little or nothing new came back`,
-            };
-          }
-        } else {
-          dryStreak = 0;
-        }
-        if (dryStreak >= 2) {
-          log?.append("loop_stop", {
+          log?.append("repeat_step", {
             step,
-            repeatedCalls: called.length,
+            repeated,
+            calls: called.length,
+            streak: dryStreak,
             sessionTokens: this.sessionTokens,
             costUsd: this.costUsd() ?? null,
           });
-          log?.append("session_end", { reason: "no progress" });
           yield {
-            kind: "error",
+            kind: "info",
             text:
-              `stopped: the model spent two steps repeating calls that had already been ` +
-              `answered, and no new information came back. This turn used ` +
-              `${this.sessionTokens - turnStartTokens} tokens of the session's ` +
-              `${this.sessionTokens}. Nothing was verified — try a narrower request, or ` +
-              `shift+V to watch what it is reaching for.`,
+              `${repeated} of ${called.length} calls that step were things molt had already ` +
+              `answered — little or nothing new came back` +
+              (dryStreak >= 2
+                ? `. That is ${dryStreak} steps in a row; it is spending against ` +
+                  `${this.budgetTokens === undefined ? "this turn's ceiling" : "your /budget"} ` +
+                  `without learning anything. shift+V to watch what it is reaching for.`
+                : ""),
           };
-          yield* this.salvage(
-            "You have spent two steps repeating calls that were already answered.",
-            fetchFn,
-            log,
-          );
-          return;
+        } else {
+          dryStreak = 0;
         }
         continue; // let the model see tool results
       }
@@ -1963,7 +2499,17 @@ export class Engine {
             ? "nothing left in the bar to check a question against — this answer is unverified."
             : "no .molt/done.yml — completion is unverified. run `molt init` to add a bar.",
         };
-        if (claim) yield { kind: "assistant_text", text: redact(claim, this.secrets()) };
+        // `streamed` says the deltas already carried this text. Still sent, so
+        // that "the model gave a final answer" stays one event a caller can
+        // wait on — `molt run`'s exit code turns on it — but a surface that
+        // already printed it knows not to print it twice.
+        if (claim) {
+          yield {
+            kind: "assistant_text",
+            text: redact(claim, this.secrets()),
+            streamed: streamedContent,
+          };
+        }
         return;
       }
 
@@ -1992,7 +2538,7 @@ export class Engine {
         checks: bar.checks.length,
         names: bar.checks.map((c) => c.name),
       };
-      const result = this.runBarGuarded(claim, bar);
+      const result = await this.runBarGuarded(claim, bar);
       this.actsSinceBar = 0;
       lastResult = result;
       log?.append("bar_run", {
@@ -2050,7 +2596,17 @@ export class Engine {
       if (result.ok) {
         log?.append("session_end", { reason: "bar met", attempts: proofAttempts });
         yield { kind: "proof_result", result, attempt: proofAttempts };
-        if (claim) yield { kind: "assistant_text", text: redact(claim, this.secrets()) };
+        // `streamed` says the deltas already carried this text. Still sent, so
+        // that "the model gave a final answer" stays one event a caller can
+        // wait on — `molt run`'s exit code turns on it — but a surface that
+        // already printed it knows not to print it twice.
+        if (claim) {
+          yield {
+            kind: "assistant_text",
+            text: redact(claim, this.secrets()),
+            streamed: streamedContent,
+          };
+        }
         return;
       }
 

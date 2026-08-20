@@ -237,6 +237,43 @@ export function openrouterPricing(json: unknown, model: string): Pricing | null 
  * bill a session at a rate nobody can check — the exact failure this
  * function exists to remove.
  */
+/**
+ * Anthropic's published rates, in USD per million tokens.
+ *
+ * Carried here because Anthropic has no price endpoint to ask — every other
+ * provider molt talks to publishes one, and the meter simply read "no price
+ * for this model", which on the endpoint where caching does the most work is
+ * the least useful place to go quiet.
+ *
+ * Standard rates, deliberately, even where an introductory rate is currently
+ * lower: a promotional price expires and a budget that under-counts stops you
+ * too late. Over-counting stops you early, which is the safe direction for a
+ * ceiling. `/price` overrides both numbers when you want the real ones.
+ *
+ * Cache reads bill at a tenth of the input rate — which is the whole reason
+ * the native protocol was worth writing.
+ */
+const ANTHROPIC_PRICES: { match: RegExp; in: number; out: number }[] = [
+  { match: /^claude-(fable|mythos)-5/, in: 10, out: 50 },
+  { match: /^claude-opus-/, in: 5, out: 25 },
+  { match: /^claude-sonnet-/, in: 3, out: 15 },
+  { match: /^claude-haiku-/, in: 1, out: 5 },
+];
+
+/** The published rate for an Anthropic model, or null if it is not one. */
+export function anthropicPricing(model: string): Pricing | null {
+  const id = model.replace(/^anthropic\//, "").toLowerCase();
+  const row = ANTHROPIC_PRICES.find((r) => r.match.test(id));
+  if (!row) return null;
+  return {
+    in: row.in,
+    out: row.out,
+    // A tenth of input, per Anthropic's published cache-read rate.
+    cached: row.in / 10,
+    source: "published rates (standard, not introductory) — /price to override",
+  };
+}
+
 export async function fetchPricing(
   baseUrl: string,
   model: string,
@@ -245,6 +282,12 @@ export async function fetchPricing(
 ): Promise<Pricing | null> {
   if (!model) return null;
   const base = baseUrl.replace(/\/$/, "");
+  // Asked before the network, because there is nothing to ask: Anthropic
+  // publishes no price list to fetch.
+  if (/anthropic\.com$/.test((() => { try { return new URL(base).hostname; } catch { return ""; } })())) {
+    const known = anthropicPricing(model);
+    if (known) return known;
+  }
   const host = (() => {
     try {
       return new URL(base).hostname;

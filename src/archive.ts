@@ -56,7 +56,14 @@ export class Archive implements ArchiveLike {
     this.dir = join(root, ".molt", "exuviae");
     this.indexPath = join(this.dir, "index.md");
     mkdirSync(this.dir, { recursive: true });
-    this.seq = this.list().length;
+    // Not `.length`: an exuvia deleted out of the middle (the exact tamper
+    // record-intact exists to catch) makes the count fall below the highest
+    // index already on disk. Seeding the next write from the count then
+    // reissues that index — two files answer to the same number, and
+    // `read()`/`grep()` resolve to whichever sorts first, making the *new*
+    // batch's content unreachable even though nothing about it was tampered
+    // with. The next index has to be one past the highest that ever existed.
+    this.seq = this.list().reduce((max, e) => Math.max(max, e.index + 1), 0);
     if (!existsSync(this.indexPath)) {
       writeFileSync(
         this.indexPath,

@@ -76,10 +76,39 @@ const READ_ONLY: Record<string, true> = {
  * since every entry is a promise that a word cannot write.
  */
 const GIT_READ_ONLY: Record<string, true> = {
-  status: true, log: true, diff: true, show: true, branch: true, remote: true,
+  status: true, log: true, diff: true, show: true,
   "ls-files": true, "rev-parse": true, blame: true, describe: true,
   shortlog: true, "cat-file": true, "show-ref": true, "symbolic-ref": true,
 };
+
+/**
+ * `git branch` and `git remote` read with no arguments, or with flags that
+ * only list — and write the moment either is given a name. `branch` and
+ * `remote` used to sit in `GIT_READ_ONLY` unconditionally, which is the same
+ * bug `stash`/`config`/`tag` were caught for: `git branch feature` creates a
+ * ref, `git branch -d old` deletes one, and `git remote add origin url`
+ * rewrites `.git/config` — all of it ran unattended at medium. Checked apart
+ * from the map above because the verb alone does not decide it here; the
+ * argument after it does.
+ */
+function gitBranchOrRemoteIsRead(sub: string, rest: string[]): boolean {
+  if (sub === "branch") {
+    const WRITE_FLAGS = new Set(["-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy"]);
+    if (rest.some((w) => WRITE_FLAGS.has(w))) return false;
+    // Any bare word is a branch (and optionally a start-point) to create or
+    // target — `git branch` with zero positional args is the only case that
+    // just lists.
+    return !rest.some((w) => !w.startsWith("-"));
+  }
+  if (sub === "remote") {
+    const WRITE_SUBS = new Set([
+      "add", "remove", "rm", "rename", "set-url", "set-branches", "set-head", "prune", "update",
+    ]);
+    const first = rest[0];
+    return !(first && WRITE_SUBS.has(first));
+  }
+  return false;
+}
 
 /** Package-manager subcommands that run project scripts rather than mutate deps. */
 const PKG_SCRIPTS: Record<string, true> = { test: true, run: true, ls: true, why: true, outdated: true, view: true };
@@ -91,6 +120,25 @@ const PKG_SCRIPTS: Record<string, true> = { test: true, run: true, ls: true, why
  * upload, or an `-o` that lands a file on disk is not, so any of these send
  * the call back to a prompt.
  */
+/**
+ * Listed commands that read by default and write when given `-o`.
+ *
+ * Kept as an explicit set rather than checking `-o` everywhere, because `-o`
+ * means something harmless on plenty of others — `find -o` is a boolean OR,
+ * `du -o` is a mount-point filter — and refusing those would push exploration
+ * back to guesswork, which is how this list earned its members in the first
+ * place.
+ */
+const OUTPUT_FLAG_WRITERS: Record<string, true> = { sort: true, uniq: true, tee: true };
+
+/** `-o file`, `--output file`, `--output=file`, and the clustered `-uo file`. */
+function isOutputFlag(w: string): boolean {
+  if (w === "-o" || w === "--output") return true;
+  if (w.startsWith("--output=")) return true;
+  // Clustered short flags: `sort -uo out.txt` writes just as surely.
+  return /^-[A-Za-z]*o$/.test(w);
+}
+
 const NET_WRITE_FLAGS = [
   "-X", "--request", "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
   "-F", "--form", "-T", "--upload-file", "-o", "--output", "-O", "--remote-name",
@@ -204,8 +252,21 @@ export function isReadOnlyCommand(command: string): boolean {
     if (!cmd) return false;
     // A leading VAR=value assignment hides the real command behind it.
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(cmd)) return false;
-    if (READ_ONLY[cmd]) return true;
-    if (cmd === "git") return Boolean(rest[0] && GIT_READ_ONLY[rest[0]]);
+    if (READ_ONLY[cmd]) {
+      // Read-only in the common case, writing in the flag — the same reason
+      // `sed` and `awk` were kept off the table entirely. `sort -o out.txt` and
+      // `uniq -o out.txt` overwrite a named file, and being on this list meant
+      // medium ran them unattended.
+      if (OUTPUT_FLAG_WRITERS[cmd] && rest.some(isOutputFlag)) return false;
+      return true;
+    }
+    if (cmd === "git") {
+      const sub = rest[0];
+      if (!sub) return false;
+      if (GIT_READ_ONLY[sub]) return true;
+      if (sub === "branch" || sub === "remote") return gitBranchOrRemoteIsRead(sub, rest.slice(1));
+      return false;
+    }
     if (cmd === "npm" || cmd === "pnpm" || cmd === "yarn" || cmd === "npx") {
       return Boolean(rest[0] && PKG_SCRIPTS[rest[0]]);
     }
