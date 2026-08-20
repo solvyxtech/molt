@@ -469,3 +469,79 @@ describe("the ceiling asks before it gives up", () => {
     }
   });
 });
+
+describe("the step guard asks too", () => {
+  /** Never finishes on its own, so the guard is the only way out. */
+  function endless() {
+    let n = 0;
+    return (async () => {
+      n += 1;
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        text: async () => "",
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: "working",
+                tool_calls: [
+                  {
+                    id: `c${n}`,
+                    type: "function",
+                    function: { name: "bash", arguments: JSON.stringify({ command: `echo ${n}` }) },
+                  },
+                ],
+              },
+            },
+          ],
+          usage: { prompt_tokens: 100, completion_tokens: 10 },
+        }),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+  }
+
+  const engineFor = (dir: string) =>
+    engineWith(dir, { fetchFn: endless(), stream: false, autonomy: "high" });
+
+  it("offers to carry on rather than stopping dead", async () => {
+    // A reported run reached the guard with 1,344,777 tokens and $0.89 spent
+    // and got nothing for any of it — the same waste the spending ceiling used
+    // to produce, reached by the other door.
+    const ws = workspace();
+    try {
+      const engine = engineFor(ws.dir);
+      let asked = 0;
+      const events = [];
+      for await (const ev of engine.run("grind", allowAll, {
+        onCeiling: async () => {
+          asked += 1;
+          return asked < 2;
+        },
+      })) {
+        events.push(ev);
+      }
+      assert.equal(asked, 2, `asked ${asked} time(s); the guard should return at each new cap`);
+      assert.ok(
+        events.some((e) => e.kind === "info" && /carrying on past/.test(e.text)),
+        "carried on without saying so",
+      );
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("stops at the guard when nobody is there to ask", async () => {
+    const ws = workspace();
+    try {
+      const engine = engineFor(ws.dir);
+      const events = await drain(engine.run("grind", allowAll));
+      const err = events.find((e) => e.kind === "error") as { text: string } | undefined;
+      assert.match(err?.text ?? "", /loop guard/, "ran past the guard with nobody watching");
+    } finally {
+      ws.cleanup();
+    }
+  });
+});

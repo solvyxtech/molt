@@ -9,6 +9,14 @@ a number presented with more confidence than it was earned with.
 
 ### Added
 
+- **The step guard asks too.** The other door out of a turn had the same fault
+  as the ceiling: it stopped dead. A reported run reached it having spent
+  1,344,777 tokens and $0.89, and got no answer for any of it — the same waste,
+  by the other route, and reached precisely because `/budget off` had removed
+  the ceiling that would otherwise have asked first. The cap is extensible on
+  the same terms now: asked once per cap, stopping the default, and only where
+  somebody is watching.
+
 - **The spending ceiling asks before it gives up.** Stopping dead at the
   ceiling is the most expensive outcome molt has: the money is already spent,
   and ending there converts it into nothing at all. A reported run reached

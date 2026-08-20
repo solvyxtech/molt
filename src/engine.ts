@@ -1621,7 +1621,27 @@ export class Engine {
     const turnStartTokens = this.sessionTokens;
     const turnStartCost = this.costUsd();
     let warned = 0;
-    for (let step = 0; step < MAX_STEPS; step++) {
+    // The step guard is the last way out of a turn, and it had the same fault
+    // the spending ceiling had: it stopped dead. A reported run reached it with
+    // 1,344,777 tokens and $0.89 spent and got no answer for any of it. The
+    // money is gone either way — ending there is what makes it worth nothing.
+    // So the cap is extensible on the same terms: asked once per cap, stopping
+    // the default, and only where somebody is watching.
+    let stepCap = MAX_STEPS;
+    for (let step = 0; ; step++) {
+      if (step >= stepCap) {
+        if (!opts.onCeiling) break;
+        const spent =
+          `${step} steps · ${this.sessionTokens} tokens` +
+          (this.costUsd() === undefined ? "" : ` · ${fmtUsd(this.costUsd() ?? 0)}`);
+        if (!(await opts.onCeiling(spent))) break;
+        stepCap += MAX_STEPS;
+        log?.append("note", { text: `step guard raised at ${spent} — turn continues` });
+        yield {
+          kind: "info",
+          text: `carrying on past ${spent}. Another ${MAX_STEPS} steps before molt asks again.`,
+        };
+      }
       // An explicit budget speaks for itself, and speaks first: one knob
       // should not produce two different messages.
       if (this.overBudget()) {
