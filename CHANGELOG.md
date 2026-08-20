@@ -384,6 +384,30 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **A receipt said writes had not landed when they had.** `work-landed`
+  compared a count of write *calls* against a ledger keyed by *path* — one
+  entry per file, merging the first hash with the last. A turn that edited four
+  files nine times between them therefore recorded *"5 further write(s) in the
+  record did not land"*, and nothing had failed to land. Two counts, different
+  units; the same mistake the cache breakpoints made with blocks and messages.
+  A receipt is the document handed to someone who does not trust you, and that
+  sentence was false in one.
+
+- **molt's own bar was intermittently failing on a timing test.** Found by molt
+  itself, mid-task, and correctly diagnosed as unrelated to the change it was
+  making — but not harmless: a spurious bar failure costs a whole proof
+  attempt, which is ninety seconds and a turn. The responsiveness checks
+  measure wall-clock scheduling, and a transient burst beside them can
+  deschedule the test process for longer than molt would ever block.
+
+  Two changes. The stall bound is calibrated against the same machine's idle
+  noise, taken in the same process immediately before the work, so a busy box
+  raises the threshold instead of failing the test. And a bad first measurement
+  is taken again before it is believed — safe here for a reason specific to
+  this defect: blocking is deterministic, so a real regression fails both
+  attempts, while a scheduling burst does not repeat. Confirmed by mutation:
+  restoring the blocking implementation still fails all five checks.
+
 - **The live view showed the payload instead of the work.** Every line of every
   tool result went into the feed, so one nine-kilobyte file read put two
   hundred entries in it and the panel — nine rows — showed the tail of a file

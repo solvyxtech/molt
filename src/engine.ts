@@ -565,27 +565,51 @@ function readPart(abs: string, shown: string, offset: number, limit: number): st
   const out: string[] = [];
   let bytes = 0;
   let i = from;
+  let lineWasCapped = false;
   for (; i < until; i++) {
     const line = lines[i]!;
     const size = Buffer.byteLength(line, "utf8") + 1;
     // Always return at least one line, even an enormous one: a caller that
-    // gets nothing back cannot tell "empty" from "too big to send".
+    // gets nothing back cannot tell "empty" from "too big to send". But
+    // "enormous" is unbounded — a single line with no newline in it (a
+    // minified bundle, a data dump, one runaway log line) can be megabytes
+    // on its own, and returning it whole defeats the entire budget this
+    // function exists to enforce. So the one line that would blow the
+    // budget by itself is capped to it, not exempted from it.
     if (out.length > 0 && bytes + size > budget) break;
+    if (size > budget) {
+      out.push(capToBytes(line, budget));
+      lineWasCapped = true;
+      i++;
+      break;
+    }
     out.push(line);
     bytes += size;
   }
 
-  const whole = from === 0 && i >= lines.length;
+  const whole = from === 0 && i >= lines.length && !lineWasCapped;
   if (whole) return out.join("\n");
 
   // A part is labelled, because a model holding lines 40-80 of a file needs to
   // know that is what it is holding.
   const head = `[molt: ${shown} lines ${from + 1}-${i} of ${lines.length}]`;
+  const cappedNotice = lineWasCapped
+    ? `\n[molt: line ${i} is too long to show whole and was cut off; its rest is lost, not just unread.]`
+    : "";
   const tail =
     i < lines.length
       ? `\n[molt: ${lines.length - i} more line(s). Continue with read_file offset=${i}.]`
       : "";
-  return `${head}\n${out.join("\n")}${tail}`;
+  return `${head}\n${out.join("\n")}${cappedNotice}${tail}`;
+}
+
+/** Cut a string to at most `maxBytes` of UTF-8, without splitting a character. */
+function capToBytes(s: string, maxBytes: number): string {
+  const buf = Buffer.from(s, "utf8");
+  if (buf.length <= maxBytes) return s;
+  // Buffer.toString("utf8") replaces a byte sequence split mid-character with
+  // U+FFFD rather than throwing, so a naive slice is safe here.
+  return buf.subarray(0, maxBytes).toString("utf8");
 }
 
 /**

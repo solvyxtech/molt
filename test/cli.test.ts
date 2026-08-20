@@ -52,6 +52,14 @@ describe("parseArgs", () => {
     assert.ok(parseArgs(["-h"]).help);
     assert.ok(parseArgs(["--help"]).help);
   });
+
+  it("parses --version", () => {
+    assert.ok(parseArgs(["--version"]).version);
+  });
+
+  it("still rejects an unknown option, --version having not swallowed it", () => {
+    assert.throws(() => parseArgs(["--nope"]), /unknown option/);
+  });
 });
 
 describe("streaming flags", () => {

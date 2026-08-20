@@ -108,6 +108,7 @@ options
                      high runs everything except what cannot be undone
   --yes              auto-approve every tool call (same as --autonomy high)
   --json             machine-readable output (run/prove/stats/receipts)
+  --version          print the version and exit
   --no-stream        disable token streaming (default: streaming on)
   --only <tags>      run only checks with these tags (comma separated)
   --skip <tags>      skip checks with these tags
@@ -147,6 +148,7 @@ type Args = {
   yes: boolean;
   json: boolean;
   help: boolean;
+  version: boolean;
 };
 
 /** Parse a price, rejecting junk rather than letting NaN reach the meter. */
@@ -205,6 +207,7 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
     yes: false,
     json: false,
     help: false,
+    version: false,
   };
   const positional: string[] = [];
 
@@ -232,6 +235,9 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
       case "--help":
       case "-h":
         out.help = true;
+        break;
+      case "--version":
+        out.version = true;
         break;
       case "--url":
         out.url = next();
@@ -947,6 +953,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
 
   if (args.help) {
     process.stdout.write(USAGE + "\n");
+    return 0;
+  }
+  if (args.version) {
+    process.stdout.write(VERSION + "\n");
     return 0;
   }
   if (!existsSync(args.cwd)) {

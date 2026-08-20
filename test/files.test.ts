@@ -451,4 +451,35 @@ describe("the tools, through the engine", () => {
       p.cleanup();
     }
   });
+
+  it("caps a single line that is bigger than the whole read budget", async () => {
+    // read_file pages by line and bounds the page to READ_MAX_BYTES — except
+    // for one line that is itself larger than the budget, where "always
+    // return at least one line, even an enormous one" meant returning it
+    // *whole*, uncapped, bypassing the budget entirely. A file with one 5MB
+    // line (no newline in it at all — a minified bundle, a data dump, a log
+    // line a process never terminated) came back as a single 5,242,880-byte
+    // tool result: no truncation, no note, no ceiling of any kind. A hostile
+    // or merely careless file blows the token budget the paging exists to
+    // enforce.
+    const p = project();
+    try {
+      const big = "x".repeat(5 * 1024 * 1024);
+      writeFileSync(join(p.dir, "oneline.txt"), big);
+      const engine = engineIn(p.dir, [
+        { calls: [{ name: "read_file", args: { path: "oneline.txt" } }] },
+        { text: "read it" },
+      ]);
+      const events = await drain(engine.run("read the file", allowAll));
+      const tool = events.find((e) => e.kind === "tool" && e.name === "read_file");
+      assert.ok(tool && tool.kind === "tool");
+      const bytes = tool!.kind === "tool" ? (tool.bytes ?? 0) : 0;
+      assert.ok(
+        bytes <= 40_000,
+        `a single line escaped the read budget entirely: got ${bytes} bytes back for a 5MB line`,
+      );
+    } finally {
+      p.cleanup();
+    }
+  });
 });
