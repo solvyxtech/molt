@@ -218,6 +218,15 @@ export const DEFAULT_BASH_TIMEOUT_MS = 60_000;
  * as fatal is the most expensive possible reading of it: the turn's tokens are
  * already spent, and ending on the spot buys nothing with them.
  */
+/**
+ * Prompt size above which a collapsed cache is worth interrupting about.
+ *
+ * Below this the difference is pennies and the noise is not worth it; above it,
+ * every step re-reads a conversation that was being served from cache a moment
+ * ago.
+ */
+export const CACHE_WATCH_TOKENS = 10_000;
+
 export const NETWORK_RETRIES = 3;
 export const NETWORK_BACKOFF_MS = [500, 2_000, 5_000];
 
@@ -634,6 +643,10 @@ export class Engine {
   private readonly endpoint: string;
   /** Said once: this endpoint is not caching anything. */
   private warnedNoCache = false;
+  /** True once a step has reused a serious share of the conversation. */
+  private cacheWasWorking = false;
+  /** Said once: a cache that was working has stopped. */
+  private warnedCacheLost = false;
   /**
    * Every path the model read this session.
    *
@@ -2074,6 +2087,32 @@ export class Engine {
             `endpoint re-bills the whole conversation on every step. Providers with ` +
             `automatic caching charge a fraction of this for the same work.`,
         };
+      }
+
+      // A cache that stops working mid-session is worse than one that never
+      // worked, because the warning above never fires: the session total keeps
+      // the early hits and looks healthy while every new step pays full price.
+      // Observed on a real run — the hit rate held for two steps and then sat
+      // at 128 tokens against a prompt growing to 50,000, which was most of
+      // that turn's bill and nothing said so.
+      //
+      // Judged per step rather than cumulatively, and only once the prompt is
+      // large enough for the difference to be real money.
+      if (reportedUsage && pTok > CACHE_WATCH_TOKENS) {
+        const hit = cachedTok / pTok;
+        if (hit >= 0.25) this.cacheWasWorking = true;
+        else if (this.cacheWasWorking && !this.warnedCacheLost) {
+          this.warnedCacheLost = true;
+          yield {
+            kind: "info",
+            text:
+              `prompt caching stopped: this step reused ${cachedTok} of ${pTok} tokens ` +
+              `(${Math.round(hit * 100)}%) after earlier steps were reusing most of the ` +
+              `conversation. Every step from here re-bills the whole context. If it does ` +
+              `not recover, a fresh session re-establishes the cache more cheaply than ` +
+              `continuing this one.`,
+          };
+        }
       }
 
       const spend: Spend = {

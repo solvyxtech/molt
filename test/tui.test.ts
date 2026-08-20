@@ -1173,3 +1173,68 @@ describe("the delete keys", () => {
     assert.equal(after, "src/app.tsx and", `alt+Backspace produced "${after}"`);
   });
 });
+
+describe("pasting more than one line", () => {
+  it("keeps the prompt one line tall however much is pasted", async () => {
+    // A paste arrives in several reads, and the prompt is a live region: an
+    // eight-line block re-rendered it at eight different heights on the way in,
+    // and the terminal — which repaints by erasing a line count — interleaved
+    // the result. Reported from use as lines overwritten, fragments in the
+    // wrong order, and whole lines missing.
+    const t = await mount();
+    try {
+      const before = t.stdout.lastFrame.split("\n").length;
+      const paste = Array.from({ length: 8 }, (_, i) => `line ${i + 1} of the pasted block`).join("\n");
+      for (const chunk of paste.match(/[\s\S]{1,30}/g) ?? []) {
+        t.stdin.press(chunk);
+        await tick(25);
+      }
+      await tick(60);
+      const heights = t.stdout.frames.slice(-6).map((f) => f.split("\n").length);
+      assert.equal(
+        new Set(heights).size,
+        1,
+        `the prompt changed height while the paste arrived: ${heights.join(" -> ")}`,
+      );
+      assert.ok(
+        t.stdout.lastFrame.split("\n").length <= before + 1,
+        "a pasted block made the live region taller",
+      );
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("says how much was pasted rather than hiding it", async () => {
+    const t = await mount();
+    try {
+      const paste = "first line\nsecond line\nthird line";
+      t.stdin.press(paste);
+      await tick(80);
+      const frame = t.stdout.lastFrame;
+      assert.match(frame, /first line/, "the first line is not shown");
+      assert.match(frame, /\+2 more lines/, "did not say how much more there was");
+      assert.ok(!frame.includes("third line"), "still drawing the whole block");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("sends every character that was pasted", async () => {
+    // Bounding the display must not bound the message.
+    const t = await mount();
+    try {
+      const paste = "explain this trace:\n  at foo (a.ts:1)\n  at bar (b.ts:2)";
+      t.stdin.press(paste);
+      await tick(60);
+      t.stdin.press("\r");
+      await tick(300);
+      const text = t.stdout.text;
+      for (const fragment of ["explain this trace:", "at foo (a.ts:1)", "at bar (b.ts:2)"]) {
+        assert.ok(text.includes(fragment), `"${fragment}" never reached the transcript`);
+      }
+    } finally {
+      t.cleanup();
+    }
+  });
+});

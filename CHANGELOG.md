@@ -358,6 +358,28 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **Pasting more than one line tore the display.** The prompt is a live region,
+  and a paste arrives in several reads, so an eight-line block re-rendered it at
+  eight different heights on the way in — 10 rows to 15 in a measured run. A
+  terminal repaints that region by erasing a line count, so the result came out
+  interleaved: lines overwritten, fragments in the wrong order, whole lines
+  gone. Reported from use, with a pasted list that lost two of its seven points
+  and merged three others.
+
+  The text is kept in full and drawn on one line: the first line, then how many
+  more there are and how many characters. Frame height now holds constant while
+  a paste arrives, and every character still reaches the model — bounding the
+  display must not bound the message.
+
+- **A cache that stopped working said nothing.** Worse than one that never
+  worked, because the never-cached warning cannot fire: the session total keeps
+  the early hits and looks healthy while every new step pays full price.
+  Observed on a real run against xAI — two steps reusing most of the
+  conversation, then 128 tokens reused against a prompt growing to 50,000,
+  which was most of that turn's bill. molt now says so once, per step rather
+  than cumulatively, and only above 10,000 prompt tokens where the difference
+  is real money.
+
 - **Cache breakpoints were spaced in the wrong unit.** The rolling markers were
   placed every twelve *messages*, but Anthropic's lookback is denominated in
   *content blocks*, and molt holds one message where the wire carries several —
