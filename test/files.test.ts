@@ -85,7 +85,7 @@ describe("listing", () => {
     }
   });
 
-  it("lists molt's own directory but does not search it", () => {
+  it("lists molt's own directory but does not search it", async () => {
     // done.yml is the most relevant file in a molt project; hiding it from a
     // listing hides the bar the agent is judged against. The session logs
     // under it are prose, and searching them buries the answer in molt's own
@@ -100,7 +100,7 @@ describe("listing", () => {
       assert.ok(listed.includes(".molt/"), "hid the project's own bar directory");
       assert.ok(listed.includes(".molt/done.yml"));
 
-      const hits = grepFiles(p.dir, "verify").matches.map((m) => m.path);
+      const hits = (await grepFiles(p.dir, "verify")).matches.map((m) => m.path);
       assert.ok(!hits.some((h) => h.startsWith(".molt")), "searched molt's own logs");
     } finally {
       p.cleanup();
@@ -147,10 +147,10 @@ describe("listing", () => {
 });
 
 describe("searching", () => {
-  it("finds matches with their line numbers, outside the noise", () => {
+  it("finds matches with their line numbers, outside the noise", async () => {
     const p = project();
     try {
-      const r = grepFiles(p.dir, "verify");
+      const r = await grepFiles(p.dir, "verify");
       const hits = r.matches.map((m) => `${m.path}:${m.line}`);
       assert.ok(hits.includes("README.md:2"));
       assert.ok(hits.includes("src/auth.ts:1"));
@@ -161,10 +161,10 @@ describe("searching", () => {
     }
   });
 
-  it("narrows by glob", () => {
+  it("narrows by glob", async () => {
     const p = project();
     try {
-      const r = grepFiles(p.dir, "verify", { glob: "**/*.ts" });
+      const r = await grepFiles(p.dir, "verify", { glob: "**/*.ts" });
       assert.ok(r.matches.every((m) => m.path.endsWith(".ts")));
       assert.ok(r.matches.length > 0);
     } finally {
@@ -172,10 +172,10 @@ describe("searching", () => {
     }
   });
 
-  it("reports a bad pattern instead of throwing", () => {
+  it("reports a bad pattern instead of throwing", async () => {
     const p = project();
     try {
-      const r = grepFiles(p.dir, "unclosed(");
+      const r = await grepFiles(p.dir, "unclosed(");
       assert.ok(r.invalid, "an invalid regex must be reported, not raised");
       assert.match(formatMatches("unclosed(", r), /was not run/);
     } finally {
@@ -183,7 +183,7 @@ describe("searching", () => {
     }
   });
 
-  it("refuses a pattern that can take exponential time", () => {
+  it("refuses a pattern that can take exponential time", async () => {
     // Found by probing: `(a+)+$` against a long line hung molt with no
     // ceiling — no output, no error, no way back except killing it. JavaScript
     // cannot time-limit a regex once it starts, so the pattern is declined
@@ -194,7 +194,7 @@ describe("searching", () => {
       for (const bad of ["(a+)+$", "(\\s*)*x", "([a-z]+)*!", "(ab|a)+c"]) {
         if (!isCatastrophic(bad)) continue;
         const t0 = Date.now();
-        const r = grepFiles(p.dir, bad);
+        const r = await grepFiles(p.dir, bad);
         assert.ok(Date.now() - t0 < 1000, `ran a catastrophic pattern: ${bad}`);
         assert.match(formatMatches(bad, r), /exponential time/);
       }
@@ -209,7 +209,7 @@ describe("searching", () => {
     }
   });
 
-  it("stops a search that runs too long", () => {
+  it("stops a search that runs too long", async () => {
     // The deadline is the backstop for slow patterns the shape check misses.
     const p = project();
     try {
@@ -217,7 +217,7 @@ describe("searching", () => {
         writeFileSync(join(p.dir, `big${i}.txt`), ("x".repeat(3000) + "\n").repeat(400));
       }
       const t0 = Date.now();
-      const r = grepFiles(p.dir, "x{2,}y?z?q?");
+      const r = await grepFiles(p.dir, "x{2,}y?z?q?");
       const ms = Date.now() - t0;
       assert.ok(ms < SEARCH_DEADLINE_MS * 3, `ran ${ms}ms past a ${SEARCH_DEADLINE_MS}ms deadline`);
       if (r.timedOut) assert.match(formatMatches("x", r), /was stopped/);
@@ -226,10 +226,10 @@ describe("searching", () => {
     }
   });
 
-  it("says plainly when there is nothing to find", () => {
+  it("says plainly when there is nothing to find", async () => {
     const p = project();
     try {
-      const r = grepFiles(p.dir, "nothing-here-at-all");
+      const r = await grepFiles(p.dir, "nothing-here-at-all");
       assert.equal(r.matches.length, 0);
       assert.match(formatMatches("nothing-here-at-all", r), /no match/);
       assert.match(formatMatches("nothing-here-at-all", r), /file\(s\) searched/);
@@ -238,11 +238,11 @@ describe("searching", () => {
     }
   });
 
-  it("caps its own output", () => {
+  it("caps its own output", async () => {
     const p = project();
     try {
       writeFileSync(join(p.dir, "many.txt"), Array.from({ length: MAX_MATCHES + 50 }, () => "hit").join("\n"));
-      const r = grepFiles(p.dir, "hit");
+      const r = await grepFiles(p.dir, "hit");
       assert.equal(r.matches.length, MAX_MATCHES);
       assert.equal(r.truncated, true);
       assert.match(formatMatches("hit", r), /stopped at \d+ matches/);
@@ -251,11 +251,11 @@ describe("searching", () => {
     }
   });
 
-  it("does not search a binary file", () => {
+  it("does not search a binary file", async () => {
     const p = project();
     try {
       writeFileSync(join(p.dir, "blob.bin"), Buffer.from([0x68, 0x69, 0x00, 0x68, 0x69]));
-      const r = grepFiles(p.dir, "hi");
+      const r = await grepFiles(p.dir, "hi");
       assert.ok(!r.matches.some((m) => m.path === "blob.bin"));
     } finally {
       p.cleanup();
@@ -447,6 +447,37 @@ describe("the tools, through the engine", () => {
       const events = await drain(engine.run("look around", allowAll));
       const tool = events.find((e) => e.kind === "tool");
       assert.match(tool?.kind === "tool" ? (tool.preview ?? "") : "", /outside this project/);
+    } finally {
+      p.cleanup();
+    }
+  });
+
+  it("caps a single line that is bigger than the whole read budget", async () => {
+    // read_file pages by line and bounds the page to READ_MAX_BYTES — except
+    // for one line that is itself larger than the budget, where "always
+    // return at least one line, even an enormous one" meant returning it
+    // *whole*, uncapped, bypassing the budget entirely. A file with one 5MB
+    // line (no newline in it at all — a minified bundle, a data dump, a log
+    // line a process never terminated) came back as a single 5,242,880-byte
+    // tool result: no truncation, no note, no ceiling of any kind. A hostile
+    // or merely careless file blows the token budget the paging exists to
+    // enforce.
+    const p = project();
+    try {
+      const big = "x".repeat(5 * 1024 * 1024);
+      writeFileSync(join(p.dir, "oneline.txt"), big);
+      const engine = engineIn(p.dir, [
+        { calls: [{ name: "read_file", args: { path: "oneline.txt" } }] },
+        { text: "read it" },
+      ]);
+      const events = await drain(engine.run("read the file", allowAll));
+      const tool = events.find((e) => e.kind === "tool" && e.name === "read_file");
+      assert.ok(tool && tool.kind === "tool");
+      const bytes = tool!.kind === "tool" ? (tool.bytes ?? 0) : 0;
+      assert.ok(
+        bytes <= 40_000,
+        `a single line escaped the read budget entirely: got ${bytes} bytes back for a 5MB line`,
+      );
     } finally {
       p.cleanup();
     }

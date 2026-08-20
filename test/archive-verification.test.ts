@@ -300,7 +300,7 @@ describe("deleting the archive changes an outcome", () => {
     assert.ok(engine.shedBatches > 0);
 
     // With the archive present, both checks pass.
-    const before = engine.proveNow()!;
+    const before = (await engine.proveNow())!;
     assert.equal(before.ok, true, `expected a clean bar, got: ${JSON.stringify(before.results)}`);
 
     // Delete the exuviae. Nothing else changes — same files on disk, same
@@ -310,7 +310,7 @@ describe("deleting the archive changes an outcome", () => {
       if (f.endsWith(".md") && f !== "index.md") rmSync(join(exuviae, f));
     }
 
-    const after = engine.proveNow()!;
+    const after = (await engine.proveNow())!;
     assert.equal(after.ok, false, "losing the archive must change the verdict");
     const intact = after.results.find((r) => r.name === "intact")!;
     assert.equal(intact.ok, false);
@@ -323,7 +323,7 @@ describe("deleting the archive changes an outcome", () => {
     const dir = ws();
     writeBar(dir, "version: 1\nchecks:\n  - name: intact\n    builtin: record-intact\n");
     const { engine } = await sessionWithShedWrite(dir);
-    assert.equal(engine.proveNow()!.ok, true, "clean to begin with");
+    assert.equal((await engine.proveNow())!.ok, true, "clean to begin with");
 
     const exuviae = join(dir, ".molt", "exuviae");
     let stripped = 0;
@@ -337,7 +337,7 @@ describe("deleting the archive changes an outcome", () => {
     }
     assert.ok(stripped > 0, "there was evidence to strip");
 
-    const result = engine.proveNow()!;
+    const result = (await engine.proveNow())!;
     assert.equal(result.ok, false, "same batch count, missing evidence, still caught");
     assert.match(result.results[0].output, /remain recoverable|evidence chain is incomplete|missing from the archive/);
   });
@@ -362,7 +362,7 @@ describe("deleting the archive changes an outcome", () => {
       );
     }
 
-    const result = engine.proveNow()!;
+    const result = (await engine.proveNow())!;
     assert.equal(result.ok, false, "unparseable evidence is absent evidence");
   });
 });
@@ -373,27 +373,27 @@ describe("claims-grounded", () => {
   }
   const bar = parseBar("version: 1\nchecks:\n  - name: grounded\n    builtin: claims-grounded\n");
 
-  it("fails a claim that names a file which was never created", () => {
-    const r = runBar(bar, ctx({ claim: "Done — I added the fix in src/auth-refresh.ts." }));
+  it("fails a claim that names a file which was never created", async () => {
+    const r = await runBar(bar, ctx({ claim: "Done — I added the fix in src/auth-refresh.ts." }));
     assert.equal(r.ok, false);
     assert.match(r.results[0].output, /src\/auth-refresh\.ts/);
     assert.match(r.results[0].output, /do not exist and were never written/);
   });
 
-  it("passes when the named file was written this session", () => {
+  it("passes when the named file was written this session", async () => {
     const dir = ws();
     const ledger: LedgerEntry[] = [
       { path: "src/auth.ts", before: null, after: "abc", callId: "c1" },
     ];
-    const r = runBar(bar, ctx({ cwd: dir, claim: "Updated `src/auth.ts` as requested.", ledger }));
+    const r = await runBar(bar, ctx({ cwd: dir, claim: "Updated `src/auth.ts` as requested.", ledger }));
     assert.equal(r.ok, true);
   });
 
-  it("passes when the named file merely exists on disk", () => {
+  it("passes when the named file merely exists on disk", async () => {
     const dir = ws();
     mkdirSync(join(dir, "docs"), { recursive: true });
     writeFileSync(join(dir, "docs", "guide.md"), "hi\n");
-    const r = runBar(bar, ctx({ cwd: dir, claim: "See docs/guide.md for details." }));
+    const r = await runBar(bar, ctx({ cwd: dir, claim: "See docs/guide.md for details." }));
     assert.equal(r.ok, true);
   });
 
@@ -408,14 +408,14 @@ describe("claims-grounded", () => {
     assert.ok(engine.shedBatches > 0);
     assert.ok(kinds(events).length > 0);
 
-    const result = engine.proveNow("Done. The change is in shed-me.ts.")!;
+    const result = (await engine.proveNow("Done. The change is in shed-me.ts."))!;
     const grounded = result.results.find((r) => r.name === "grounded")!;
     assert.equal(grounded.ok, true, "the archive alone grounds the claim");
   });
 
-  it("says nothing to ground rather than passing vacuously", () => {
-    assert.match(runBar(bar, ctx({ claim: "" })).results[0].output, /nothing to ground/i);
-    assert.match(runBar(bar, ctx({ claim: "All finished." })).results[0].output, /no files/i);
+  it("says nothing to ground rather than passing vacuously", async () => {
+    assert.match((await runBar(bar, ctx({ claim: "" }))).results[0].output, /nothing to ground/i);
+    assert.match((await runBar(bar, ctx({ claim: "All finished." }))).results[0].output, /no files/i);
   });
 });
 
@@ -502,7 +502,7 @@ describe("cross-session archive integrity", () => {
         bar: loadBar(dir),
         archive: new Archive(dir),
       });
-    assert.equal(fresh().proveNow()!.ok, true, "clean to begin with, in a new process");
+    assert.equal((await fresh().proveNow())!.ok, true, "clean to begin with, in a new process");
 
     // Delete one exuvia. In-memory expectation is gone with the old process;
     // only the journal remembers.
@@ -510,7 +510,7 @@ describe("cross-session archive integrity", () => {
     const victim = readdirSync(exuviae).find((f) => /^\d{4}-.*\.md$/.test(f))!;
     rmSync(join(exuviae, victim));
 
-    const after = fresh().proveNow()!;
+    const after = (await fresh().proveNow())!;
     assert.equal(after.ok, false, "a later session must still notice the loss");
     assert.match(after.results[0].output, /missing from the archive/);
     assert.match(after.results[0].output, new RegExp(victim.replace(/\./g, "\\.")));
@@ -528,7 +528,7 @@ describe("cross-session archive integrity", () => {
       archive: new Archive(dir),
       journal,
     });
-    assert.equal(engine.proveNow()!.ok, true, "a project that never shed is intact");
+    assert.equal((await engine.proveNow())!.ok, true, "a project that never shed is intact");
   });
 });
 
@@ -554,14 +554,14 @@ describe("integrity when a shed batch held no writes", () => {
     const shed = engine.shed();
     assert.ok(shed, "expected a shed");
     assert.equal(engine.mergedLedger().length, 0, "and no writes in it");
-    assert.equal(engine.proveNow()!.ok, true, "clean to begin with");
+    assert.equal((await engine.proveNow())!.ok, true, "clean to begin with");
 
     const exuviae = join(dir, ".molt", "exuviae");
     for (const f of readdirSync(exuviae)) {
       if (/^\d{4}-.*\.md$/.test(f)) rmSync(join(exuviae, f));
     }
 
-    const after = engine.proveNow()!;
+    const after = (await engine.proveNow())!;
     assert.equal(after.ok, false, "losing archived conversation must still fail");
     assert.match(after.results[0].output, /evidence chain is incomplete/);
   });
@@ -591,14 +591,14 @@ describe("integrity without a journal", () => {
     });
     await drain(engine.run("build it", allowAll));
     assert.ok(engine.shedBatches > 0);
-    assert.equal(engine.proveNow()!.ok, true, "clean to begin with");
+    assert.equal((await engine.proveNow())!.ok, true, "clean to begin with");
     assert.deepEqual(Journal.expectedArchives(dir), [], "and no journal expectation exists");
 
     const exuviae = join(dir, ".molt", "exuviae");
     const victim = readdirSync(exuviae).find((f) => /^\d{4}-.*\.md$/.test(f))!;
     rmSync(join(exuviae, victim));
 
-    const after = engine.proveNow()!;
+    const after = (await engine.proveNow())!;
     assert.equal(after.ok, false, "the session's own batch count must catch it");
     assert.match(after.results[0].output, /evidence chain is incomplete|remain recoverable/);
   });

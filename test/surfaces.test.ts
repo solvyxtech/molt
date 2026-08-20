@@ -4,13 +4,15 @@
  * these tests exist so that cannot silently happen again.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { Archive } from "../src/archive.js";
 import { loadBar, parseBar, selectChecks } from "../src/bar.js";
 import { Engine } from "../src/engine.js";
+import { gate } from "../src/autonomy.js";
 import { Receipts } from "../src/receipts.js";
+import type { BarResult } from "../src/types.js";
 import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
 const cleanups: (() => void)[] = [];
@@ -293,5 +295,193 @@ describe("receipt index and stats", () => {
 
     const hits = new Receipts(dir).grep("EVIDENCE-MARKER-5521");
     assert.ok(hits.length > 0, "a claim's evidence must be findable by grep");
+  });
+});
+
+describe("receipt numbers are not reused", () => {
+  it("numbers from the highest ever issued, not from how many survive", () => {
+    // `count()` is only the same as "next number" while nobody deletes one.
+    // Delete 0000 and the next write is numbered 0001 again, so two different
+    // receipts share a number and the index lists both under it. This project's
+    // own .molt reached 26 index rows over 9 files with 0000-0008 each
+    // duplicated. A receipt is the document you hand to someone who does not
+    // trust you; reusing its number is not cosmetic.
+    const dir = ws();
+    const receipts = new Receipts(dir);
+    const result: BarResult = { ok: true, results: [], durationMs: 1 };
+    const base = {
+      result,
+      attempt: 1,
+      model: "m",
+      provider: "p",
+      sessionTokens: 1,
+      shedBatches: 0,
+      changed: [],
+      did: [],
+    };
+
+    const first = receipts.write({ claim: "one", verdict: "accepted", ...base });
+    const second = receipts.write({ claim: "two", verdict: "refused", ...base });
+    assert.match(first.path, /0000-accepted\.md$/);
+    assert.match(second.path, /0001-refused\.md$/);
+
+    rmSync(first.path);
+    const third = receipts.write({ claim: "three", verdict: "accepted", ...base });
+    assert.match(third.path, /0002-accepted\.md$/, "reused a number a deleted receipt already had");
+
+    // And the index does not end up with two rows under one sequence.
+    const seqs = receipts.records().map((r) => String(r.file).slice(0, 4));
+    assert.equal(new Set(seqs).size, seqs.length, `duplicated sequence in the index: ${seqs.join(",")}`);
+  });
+
+  it("says a receipt is indexed but missing rather than absent", () => {
+    // The listing reads the index and --show reads the directory, so a receipt
+    // whose file is gone was printed by one and denied by the other.
+    const dir = ws();
+    const receipts = new Receipts(dir);
+    const r = receipts.write({
+      claim: "gone",
+      verdict: "accepted",
+      result: { ok: true, results: [], durationMs: 1 } as BarResult,
+      attempt: 1,
+      model: "m",
+      provider: "p",
+      sessionTokens: 1,
+      shedBatches: 0,
+      changed: [],
+      did: [],
+    });
+    rmSync(r.path);
+    assert.equal(receipts.list().length, 0, "the file should be gone");
+    assert.equal(receipts.records().length, 1, "the index should still remember it");
+  });
+});
+
+describe("receipts --repair", () => {
+  const result: BarResult = { ok: true, results: [], durationMs: 1 };
+  const base = {
+    result,
+    attempt: 1,
+    model: "m",
+    provider: "p",
+    sessionTokens: 1,
+    shedBatches: 0,
+    changed: [] as { path: string; before: string | null; after: string }[],
+    did: [] as string[],
+  };
+
+  it("leaves a healthy index untouched", () => {
+    // Repair is reconciliation, not a rewrite. A project whose files match
+    // its index must be able to run this twice — or once — and find the
+    // bytes of the audit trail exactly where they were.
+    const dir = ws();
+    const receipts = new Receipts(dir);
+    receipts.write({ claim: "one", verdict: "accepted", ...base });
+    receipts.write({ claim: "two", verdict: "refused", ...base });
+    const index = join(dir, ".molt", "receipts", "index.jsonl");
+    const before = readFileSync(index);
+
+    const report = receipts.repair();
+
+    assert.equal(report.marked, 0);
+    assert.equal(report.kept, 2);
+    assert.deepEqual(readFileSync(index), before, "rewrote an index that already matched disk");
+    assert.equal(receipts.records().every((r) => !r.missing), true);
+  });
+
+  it("marks a ghost row missing rather than deleting it", () => {
+    // The record of a receipt is itself evidence. Silently dropping a row
+    // whose file is gone would be the tool editing its own audit trail —
+    // the same shape of hole this index exists to prevent.
+    const dir = ws();
+    const receipts = new Receipts(dir);
+    const kept = receipts.write({ claim: "stays", verdict: "accepted", ...base });
+    const ghost = receipts.write({ claim: "gone", verdict: "refused", ...base });
+    const index = join(dir, ".molt", "receipts", "index.jsonl");
+    const keptLine = readFileSync(index, "utf8")
+      .split("\n")
+      .find((l) => l.includes(kept.path.slice(kept.path.lastIndexOf("/") + 1)));
+    rmSync(ghost.path);
+
+    const report = receipts.repair();
+
+    const rows = receipts.records();
+    assert.equal(rows.length, 2, "deleted a row instead of marking it");
+    assert.equal(rows[0].missing, undefined, "touched a row whose file exists");
+    assert.equal(rows[1].missing, true);
+    assert.equal(report.marked, 1);
+    assert.equal(report.kept, 1);
+    assert.ok(
+      readFileSync(index, "utf8").includes(keptLine!),
+      "rewrote a row whose file exists",
+    );
+  });
+
+  it("changes nothing the second time it runs", () => {
+    const dir = ws();
+    const receipts = new Receipts(dir);
+    const ghost = receipts.write({ claim: "gone", verdict: "refused", ...base });
+    rmSync(ghost.path);
+    receipts.repair();
+    const index = join(dir, ".molt", "receipts", "index.jsonl");
+    const afterFirst = readFileSync(index);
+    const rowsFirst = receipts.records();
+
+    const report = receipts.repair();
+
+    assert.equal(report.marked, 0, "marked the same ghost twice");
+    assert.deepEqual(readFileSync(index), afterFirst);
+    assert.deepEqual(receipts.records(), rowsFirst);
+  });
+});
+
+describe("stats over receipts that still exist", () => {
+  it("does not compute a false-claim rate over files that are gone", () => {
+    // `molt stats` used to treat every index row as checkable evidence.
+    // Sixteen of this project's own rows pointed at files that were not
+    // there; the rate was a number nobody could open.
+    const dir = ws();
+    const receipts = new Receipts(dir);
+    const result: BarResult = { ok: true, results: [], durationMs: 1 };
+    const base = {
+      result,
+      attempt: 1,
+      model: "m",
+      provider: "p",
+      sessionTokens: 100,
+      shedBatches: 0,
+      changed: [] as { path: string; before: string | null; after: string }[],
+      did: [] as string[],
+    };
+    receipts.write({ claim: "keep", verdict: "accepted", ...base });
+    const ghost = receipts.write({ claim: "gone", verdict: "refused", ...base });
+    rmSync(ghost.path);
+
+    const s = receipts.stats();
+    assert.equal(s.attempts, 2, "the index still recorded both");
+    assert.equal(s.present, 1, "conflated recorded attempts with receipts still on disk");
+    assert.equal(s.accepted, 1);
+    assert.equal(s.refused, 0, "counted a refused receipt nobody can open");
+    assert.equal(s.falseClaimRate, 0, "rate used a receipt that is gone");
+  });
+});
+
+describe("commands that are not sessions", () => {
+  it("sort and uniq ask at medium when they are told to write", () => {
+    // Read-only in the common case, writing in the flag — the same reason sed
+    // and awk were kept off the read-only table entirely.
+    const w = ws();
+    const ask = (command: string, level: "medium" | "high") =>
+      gate(level, { name: "bash", args: { command }, cwd: w }).ask;
+
+    for (const c of ["sort -o out.txt in.txt", "sort --output=out.txt in.txt", "uniq -o out.txt", "sort -uo out.txt in.txt"]) {
+      assert.equal(ask(c, "medium"), true, `medium ran "${c}" unattended`);
+    }
+    for (const c of ["sort in.txt", "uniq in.txt", "sort -u in.txt"]) {
+      assert.equal(ask(c, "medium"), false, `medium started asking about "${c}"`);
+    }
+    // `-o` means something harmless elsewhere and must not be swept up.
+    assert.equal(ask("find . -name a -o -name b", "medium"), false, "find's boolean OR read as a write");
+    assert.equal(ask("du -o /tmp", "medium"), false, "du's mount filter read as a write");
   });
 });

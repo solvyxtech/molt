@@ -188,9 +188,36 @@ export type LedgerEntry = {
 };
 
 export type EngineEvent =
-  | { kind: "assistant_text"; text: string }
+  /**
+   * The model's final answer for the turn — the one event that says a turn
+   * produced an answer at all, which is why `molt run` reads its exit code
+   * from this and not from the deltas.
+   *
+   * `streamed` means the same text already went out as `delta` events. The
+   * text is still carried here (redacted, and whole) so a caller that ignored
+   * the deltas is not left without it, but a surface that rendered them must
+   * not render it again — doing so is what printed the final answer twice in
+   * `molt run`.
+   */
+  | { kind: "assistant_text"; text: string; streamed?: boolean }
   /** A fragment as it arrives. Render incrementally; do not accumulate twice. */
   | { kind: "delta"; text: string }
+  /**
+   * The assistant's message for this step is complete.
+   *
+   * Streamed prose does not end in a newline, so without an explicit end a
+   * surface cannot tell the model's last word from its next one. Both used to
+   * guess and both guessed wrong: the TUI ran every step's narration into the
+   * next ("…product defects.The workspace is…") and printed the lot below the
+   * tools it was describing, and the CLI closed the line on whatever event
+   * happened to come next. The boundary is the engine's to state — it is the
+   * only party that knows where the message ended.
+   *
+   * Emitted once per step, after the message is on the transcript and before
+   * the tool calls it asked for, so narration lands above the work it
+   * introduces.
+   */
+  | { kind: "message_end" }
   /**
    * A turn was cancelled. The transcript is rolled back; the filesystem is
    * not, because molt cannot un-write a file it already wrote — so any paths

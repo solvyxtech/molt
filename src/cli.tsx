@@ -7,7 +7,7 @@
  * bar is not met, so molt can sit in CI, in a script, or in a benchmark
  * harness without a human watching.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Archive } from "./archive.js";
 import { isAutonomy, type Autonomy } from "./autonomy.js";
@@ -47,6 +47,24 @@ const VERSION = `v${
   })() ?? "0.0.0-unknown"
 }`;
 
+/**
+ * Which build is actually running, as opposed to which version it claims.
+ *
+ * Every session on this machine logged `v1.0.0-rc.4` across builds that
+ * differed by hundreds of lines, because the global `molt` is a symlink into
+ * a working tree and runs whatever `dist/` was last compiled. A receipt that
+ * cannot name the code that produced it is not evidence, so the mtime of the
+ * running file goes in the record beside the version. Cheap, needs no git,
+ * and changes exactly when the build does.
+ */
+function buildStamp(): string | undefined {
+  try {
+    return statSync(new URL(import.meta.url)).mtime.toISOString();
+  } catch {
+    return undefined;
+  }
+}
+
 const USAGE = `molt ${VERSION} — a coding agent that can't say "done" without proving it.
 
 usage
@@ -57,7 +75,7 @@ usage
   molt init                 write a starter .molt/done.yml
   molt doctor               check the endpoint and model
 
-  molt receipts             list completion attempts (--grep, --show <file>)
+  molt receipts             list completion attempts (--grep, --show <file>, --repair)
   molt archive              list shed batches (--grep, --show <n>, --explain)
   molt stats                false-claim rate and tokens per verified change
   molt log                  what the model actually did, from the session log
@@ -90,6 +108,7 @@ options
                      high runs everything except what cannot be undone
   --yes              auto-approve every tool call (same as --autonomy high)
   --json             machine-readable output (run/prove/stats/receipts)
+  --version          print the version and exit
   --no-stream        disable token streaming (default: streaming on)
   --only <tags>      run only checks with these tags (comma separated)
   --skip <tags>      skip checks with these tags
@@ -122,6 +141,7 @@ type Args = {
   skip?: string[];
   grep?: string;
   show?: string;
+  repair?: boolean;
   explain: boolean;
   session?: string;
   raw: boolean;
@@ -129,6 +149,7 @@ type Args = {
   yes: boolean;
   json: boolean;
   help: boolean;
+  version: boolean;
 };
 
 /** Parse a price, rejecting junk rather than letting NaN reach the meter. */
@@ -136,6 +157,30 @@ function num(v: string | undefined): number | undefined {
   if (v === undefined) return undefined;
   const n = Number(v);
   return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+
+/**
+ * A number a flag can actually mean, or an error naming the flag.
+ *
+ * `--budget`, `--auto-shed` and `--attempts` already refused NaN. They still
+ * took `0` and `1.5`: `--attempts 0` let the first failed bar exhaust
+ * immediately, and `--budget 0` parsed as zero and was then read back as
+ * "no budget set", so the flag did the opposite of what it said.
+ */
+function positiveInt(flag: string, raw: string | undefined): number {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`${flag} needs a whole number of 1 or more, got "${raw ?? ""}"`);
+  }
+  return n;
+}
+
+function positiveNum(flag: string, raw: string | undefined): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`${flag} needs a positive number, got "${raw ?? ""}"`);
+  }
+  return n;
 }
 
 /**
@@ -163,16 +208,37 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
     yes: false,
     json: false,
     help: false,
+    version: false,
   };
   const positional: string[] = [];
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    const next = () => argv[++i];
+    /**
+     * The value belonging to `a`, or an error naming what is missing.
+     *
+     * `next()` used to hand back whatever came after, including the next flag
+     * and including nothing at all. `--model --yes` set the model to "--yes"
+     * and dropped `--yes` on the floor, and that request went to a real
+     * endpoint and came back 404. Others turned into `undefined` and either
+     * vanished silently or surfaced as a Node type error from deep inside
+     * `resolve()`, which names neither the flag nor the mistake.
+     */
+    const next = (): string => {
+      const v = argv[++i];
+      if (v === undefined) throw new Error(`${a} needs a value`);
+      // A value that is itself a flag is a forgotten value, not a value. Only
+      // `--` is treated this way: a lone `-` can legitimately start one.
+      if (v.startsWith("--")) throw new Error(`${a} needs a value, but got the flag "${v}"`);
+      return v;
+    };
     switch (a) {
       case "--help":
       case "-h":
         out.help = true;
+        break;
+      case "--version":
+        out.version = true;
         break;
       case "--url":
         out.url = next();
@@ -187,41 +253,25 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         out.provider = next();
         break;
       case "--price-in":
-        out.priceIn = num(next());
+        // Was silently ignored when it did not parse, so a typo left the meter
+        // quoting the previous model's rate.
+        out.priceIn = positiveNum("--price-in", next());
         break;
       case "--price-out":
-        out.priceOut = num(next());
+        out.priceOut = positiveNum("--price-out", next());
         break;
       case "--cwd":
         out.cwd = resolve(next());
         break;
-      case "--budget": {
-        // Rejected rather than turned into NaN, which compares false against
-        // everything and silently switched the limit off.
-        const raw = next();
-        const value = num(raw);
-        if (value === undefined) throw new Error(`--budget needs a non-negative number, got "${raw}"`);
-        out.budget = value;
+      case "--budget":
+        out.budget = positiveInt("--budget", next());
         break;
-      }
-      case "--auto-shed": {
-        // Rejected rather than turned into NaN, which compares false against
-        // everything and silently switched the limit off.
-        const raw = next();
-        const value = num(raw);
-        if (value === undefined) throw new Error(`--auto-shed needs a non-negative number, got "${raw}"`);
-        out.autoShed = value;
+      case "--auto-shed":
+        out.autoShed = positiveInt("--auto-shed", next());
         break;
-      }
-      case "--attempts": {
-        // Rejected rather than turned into NaN, which compares false against
-        // everything and silently switched the limit off.
-        const raw = next();
-        const value = num(raw);
-        if (value === undefined) throw new Error(`--attempts needs a non-negative number, got "${raw}"`);
-        out.attempts = value;
+      case "--attempts":
+        out.attempts = positiveInt("--attempts", next());
         break;
-      }
       case "--only":
         out.only = next().split(",").map((t) => t.trim()).filter(Boolean);
         break;
@@ -233,6 +283,9 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         break;
       case "--show":
         out.show = next();
+        break;
+      case "--repair":
+        out.repair = true;
         break;
       case "--explain":
         out.explain = true;
@@ -287,7 +340,16 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
   return out;
 }
 
-function buildEngine(args: Args): Engine {
+/**
+ * `session` says whether this invocation is a session worth journalling.
+ *
+ * It used to always be. `prove`, `doctor`, `archive --explain` and `verify`
+ * each opened a log and wrote a `session_start` into it, so this project
+ * accumulated 68 logs of which 54 held that one line and nothing else — and
+ * `molt verify` then walked all of them. The journal answers "what did this
+ * thing do?", and a doctor invocation did not do a session.
+ */
+function buildEngine(args: Args, session = false): Engine {
   let bar = null;
   try {
     bar = loadBar(args.cwd);
@@ -305,10 +367,11 @@ function buildEngine(args: Args): Engine {
       process.exit(2);
     }
   }
-  const journal = new Journal(args.cwd);
-  journal.append("session_start", {
+  const journal = session ? new Journal(args.cwd) : undefined;
+  journal?.append("session_start", {
     sessionId: journal.sessionId,
     molt: VERSION,
+    build: buildStamp(),
     provider: args.provider ?? providerName(args.url),
     model: args.model,
     endpoint: args.url,
@@ -362,7 +425,17 @@ async function priceEngine(engine: Engine, args: Args): Promise<void> {
   savePricing(args.model, p);
 }
 
-function printBar(result: BarResult): void {
+/**
+ * `from` decides which explanation a work-landed failure gets.
+ *
+ * There are two true answers and they are not interchangeable. Under `prove`
+ * there is no session, so the check fails by definition and the reader needs
+ * to be told to stop worrying. Under `run` there *was* a session and it really
+ * did not write anything, which usually means the task was a question — and
+ * telling that reader about `molt prove` sends them to debug a command they
+ * did not run. This printer was context-blind and always said the second.
+ */
+function printBar(result: BarResult, from: "run" | "prove"): void {
   const passed = result.results.filter((r) => r.ok).length;
   process.stdout.write(
     `${passed} of ${result.results.length} checks passed · ${fmtDuration(result.durationMs)}\n`,
@@ -394,10 +467,16 @@ function printBar(result: BarResult): void {
     result.results.some((r) => !r.ok && r.detail === "files-changed");
   if (onlyWorkLanded) {
     process.stdout.write(
-      "\nwork-landed requires a file to have changed in this session. `molt prove` runs\n" +
-        "standalone, so there is no session and no write for it to find — it fails here by\n" +
-        "definition, not because anything is wrong. Run `molt prove --skip session` to check\n" +
-        "the command checks on their own.\n",
+      from === "prove"
+        ? "\nwork-landed requires a file to have changed in this session. `molt prove` runs\n" +
+            "standalone, so there is no session and no write for it to find — it fails here by\n" +
+            "definition, not because anything is wrong. Run `molt prove --skip session` to check\n" +
+            "the command checks on their own.\n"
+        : "\neverything else passed. work-landed requires this turn to have changed a file, so a\n" +
+            "question, a lookup, or an explanation can never satisfy it — and molt would rather\n" +
+            "refuse an honest answer than accept an invented file edit.\n" +
+            'ask questions with `molt ask "<question>"`, which runs the rest of the bar and drops\n' +
+            "that one check for the turn. For a whole run of questions, add --skip session.\n",
     );
   }
 }
@@ -419,7 +498,7 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
     );
     return 2;
   }
-  const engine = buildEngine(args);
+  const engine = buildEngine(args, true);
   if (args.budget) engine.setBudget(args.budget);
   await priceEngine(engine, args);
 
@@ -444,6 +523,10 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         process.stdout.write(ev.text);
         midLine = !ev.text.endsWith("\n");
         break;
+      case "message_end":
+        // Handled by the midLine break above; the case is here so a streamed
+        // step does not fall through to a default that prints something.
+        break;
       case "cancelled":
         process.stderr.write(
           ev.filesWritten?.length
@@ -453,7 +536,10 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         );
         break;
       case "assistant_text":
-        process.stdout.write(`\n${ev.text}\n`);
+        // A streamed answer was already written by the deltas; printing it
+        // again here is what emitted the whole final answer twice. The event
+        // still counts as the answer for the exit code below.
+        if (!ev.streamed) process.stdout.write(`\n${ev.text}\n`);
         break;
       case "tool": {
         const took = ev.durationMs === undefined ? "" : `  ${fmtDuration(ev.durationMs)}`;
@@ -513,14 +599,14 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         break;
       case "proof_refused":
         process.stdout.write(`completion refused (attempt ${ev.attempt})\n`);
-        printBar(ev.result);
+        printBar(ev.result, "run");
         break;
       case "proof_result":
-        printBar(ev.result);
+        printBar(ev.result, "run");
         break;
       case "proof_exhausted":
         process.stdout.write(`bar not met after ${ev.attempts} attempts\n`);
-        printBar(ev.result);
+        printBar(ev.result, "run");
         break;
       case "shed":
         process.stdout.write(`· shed ${ev.dropped} msgs ${ev.before}→${ev.after} tok → ${ev.path}\n`);
@@ -578,18 +664,18 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   return 0;
 }
 
-function cmdProve(args: Args): number {
+async function cmdProve(args: Args): Promise<number> {
   if (!hasBar(args.cwd)) {
     process.stderr.write("molt: no .molt/done.yml here. run `molt init` first.\n");
     return 2;
   }
   const engine = buildEngine(args);
-  const result = engine.proveNow();
+  const result = await engine.proveNow();
   if (!result) return 2;
   if (args.json) {
     process.stdout.write(JSON.stringify(result, null, 2) + "\n");
   } else {
-    printBar(result);
+    printBar(result, "prove");
   }
   return result.ok ? 0 : 1;
 }
@@ -631,9 +717,45 @@ async function cmdDoctor(args: Args): Promise<number> {
 function cmdReceipts(args: Args): number {
   const receipts = new Receipts(args.cwd);
 
+  if (args.repair) {
+    const report = receipts.repair();
+    if (args.json) {
+      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+      return 0;
+    }
+    process.stdout.write(
+      `${report.marked} marked missing (file gone; row kept as evidence)\n` +
+        `${report.kept} left alone (file exists)\n` +
+        `${report.alreadyMissing} already marked missing\n`,
+    );
+    process.stdout.write(
+      report.marked === 0
+        ? "\nNothing changed. Safe to run again.\n"
+        : "\nGhost rows are marked, not deleted — the record of a receipt is itself evidence.\n" +
+            "Run again is a no-op. Repair does not rewrite receipt files or renumber anything.\n",
+    );
+    return 0;
+  }
+
   if (args.show) {
     const file = receipts.list().find((f) => f === args.show || f.startsWith(args.show!));
     if (!file) {
+      // The listing reads the index and `--show` reads the directory, so a
+      // receipt whose file is gone was printed by one and denied by the other:
+      // "no match" for something you were just shown. Say which of the two it
+      // is — a missing file is a different problem from a wrong name, and only
+      // one of them is the reader's mistake.
+      const indexed = receipts
+        .records()
+        .find((r) => r.file === args.show || String(r.file ?? "").startsWith(args.show!));
+      if (indexed) {
+        process.stderr.write(
+          `molt: "${indexed.file}" is in the receipts index but its file is missing from ` +
+            `${join(args.cwd, ".molt", "receipts")}. The record of it survives; the receipt ` +
+            `itself does not.\n`,
+        );
+        return 2;
+      }
       process.stderr.write(`molt: no receipt matching "${args.show}"\n`);
       return 2;
     }
@@ -662,10 +784,12 @@ function cmdReceipts(args: Args): number {
     process.stdout.write("no completion attempts recorded yet\n");
     return 0;
   }
+  const onDisk = new Set(receipts.list());
   for (const r of rows) {
     const failed = r.failed.length ? `  failed: ${r.failed.join(", ")}` : "";
+    const gone = onDisk.has(r.file) ? "" : "  MISSING";
     process.stdout.write(
-      `${r.file}  ${r.verdict.padEnd(9)} attempt ${r.attempt}  ${r.model}  ${r.sessionTokens} tok${failed}\n`,
+      `${r.file}  ${r.verdict.padEnd(9)} attempt ${r.attempt}  ${r.model}  ${r.sessionTokens} tok${failed}${gone}\n`,
     );
   }
   return 0;
@@ -743,13 +867,20 @@ function cmdStats(args: Args): number {
     process.stdout.write("no completion attempts recorded yet\n");
     return 0;
   }
+  const missing = s.attempts - s.present;
+  const rate =
+    s.present === 0
+      ? "—  (no receipts left on disk to check)"
+      : `${(s.falseClaimRate * 100).toFixed(1)}%  ` +
+        `(share of on-disk claims that did not survive the bar` +
+        (missing === 0 ? ")" : `; ${missing} recorded attempt(s) have no file)`);
   process.stdout.write(
-    `completion attempts     ${s.attempts}\n` +
+    `completion attempts     ${s.attempts} recorded\n` +
+      `  still on disk         ${s.present}\n` +
       `  accepted              ${s.accepted}\n` +
       `  refused               ${s.refused}\n` +
       `  exhausted             ${s.exhausted}\n\n` +
-      `false-claim rate        ${(s.falseClaimRate * 100).toFixed(1)}%  ` +
-      `(share of claims that did not survive the bar)\n` +
+      `false-claim rate        ${rate}\n` +
       `tokens per verified change  ${s.tokensPerVerifiedChange ?? "—"}\n` +
       `cost per verified change    ${s.usdPerVerifiedChange === undefined ? "—" : `$${s.usdPerVerifiedChange.toFixed(4)}`}\n\n`,
   );
@@ -765,21 +896,38 @@ function cmdStats(args: Args): number {
   return 0;
 }
 
-function resolveSession(args: Args): string | null {
+/**
+ * The log to read, or why there isn't one.
+ *
+ * "No logs at all" and "no log by that name" used to collapse into the same
+ * null, so `molt log --session nosuch` reported "no session log in this
+ * project yet" — with 68 of them on disk — and exited 0. A lookup that misses
+ * is not the same fact as an empty project, and neither is a success.
+ */
+function resolveSession(args: Args): { file: string } | { miss: "empty" | "unknown"; count: number } {
   const files = Journal.sessions(args.cwd);
-  if (files.length === 0) return null;
+  if (files.length === 0) return { miss: "empty", count: 0 };
   const pick = args.session
     ? files.find((f) => f.startsWith(args.session!))
     : files[files.length - 1];
-  return pick ? join(args.cwd, ".molt", "log", pick) : null;
+  if (!pick) return { miss: "unknown", count: files.length };
+  return { file: join(args.cwd, ".molt", "log", pick) };
 }
 
 function cmdLog(args: Args): number {
-  const file = resolveSession(args);
-  if (!file) {
-    process.stdout.write("no session log in this project yet\n");
-    return 0;
+  const found = resolveSession(args);
+  if ("miss" in found) {
+    if (found.miss === "empty") {
+      process.stdout.write("no session log in this project yet\n");
+      return 0;
+    }
+    process.stderr.write(
+      `molt: no session log starting "${args.session}" — ${found.count} session(s) in ` +
+        `${join(args.cwd, ".molt", "log")}. \`molt log\` alone reads the most recent.\n`,
+    );
+    return 2;
   }
+  const { file } = found;
   const entries = Journal.read(file);
   if (args.json) {
     process.stdout.write(JSON.stringify(entries, null, 2) + "\n");
@@ -840,6 +988,10 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     process.stdout.write(USAGE + "\n");
     return 0;
   }
+  if (args.version) {
+    process.stdout.write(VERSION + "\n");
+    return 0;
+  }
   if (!existsSync(args.cwd)) {
     process.stderr.write(`molt: no such directory: ${args.cwd}\n`);
     return 2;
@@ -851,7 +1003,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     case "ask":
       return cmdRun(args, true);
     case "prove":
-      return cmdProve(args);
+      return await cmdProve(args);
     case "init":
       return cmdInit(args);
     case "doctor":
@@ -884,19 +1036,17 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   // Ink and React are loaded only here. Importing them at module top made
   // `molt prove` pay ~450ms of startup for a UI it never renders, which
   // matters because the bar wants to live in CI and in git hooks.
-  const [{ render }, { App }] = await Promise.all([import("ink"), import("./app.js")]);
-  // <App /> creates an element for React to render. Calling App(...) directly
-  // executes the component outside React's render phase, so the first hook it
-  // reaches finds a null dispatcher: "Invalid hook call ... reading
-  // 'useContext'". The TUI could not start at all.
-  const { waitUntilExit } = render(
-    <App
-      engine={engine}
-      version={VERSION}
-      autoShed={args.autoShed}
-      verbose={args.verbose}
-    />,
-  );
+  const { renderApp } = await import("./app.js");
+  // renderApp, not render(<App/>), because the mount options are part of the
+  // behaviour: Ink exits on ctrl+C unless told not to, which made "ctrl+C
+  // cancels the turn" dead code and killed molt outright, mid-request and
+  // half-typed line and all.
+  const { waitUntilExit } = renderApp({
+    engine,
+    version: VERSION,
+    autoShed: args.autoShed,
+    verbose: args.verbose,
+  });
   await waitUntilExit();
   return 0;
 }

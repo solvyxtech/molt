@@ -16,7 +16,7 @@ export {
   writeDefaultBar,
   type BarContext,
 } from "./bar.js";
-export { Engine, SYSTEM_PROMPT, MAX_PROOF_ATTEMPTS, type EngineConfig } from "./engine.js";
+export { Engine, SYSTEM_PROMPT, systemPromptFor, MAX_PROOF_ATTEMPTS, type EngineConfig } from "./engine.js";
 export { Receipts, type Receipt } from "./receipts.js";
 export {
   Transcript,

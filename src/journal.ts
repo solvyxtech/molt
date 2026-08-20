@@ -33,6 +33,13 @@ export type JournalKind =
   | "autonomy"
   | "bar_run"
   | "bar_skipped"
+  /** A step that mostly repeated itself. Recorded, never fatal. */
+  | "repeat_step"
+  /**
+   * Retired. molt used to end a turn after two repeated steps; spend is
+   * bounded by /budget and the turn ceiling instead. Kept in the union so
+   * journals written before that still read back.
+   */
   | "loop_stop"
   | "salvage"
   | "shed"
@@ -253,6 +260,12 @@ export class Journal {
           break;
         case "salvage":
           out.push(`${t}  salvage · ${d.reason} · ${d.promptTokens} in / ${d.completionTokens} out`);
+          break;
+        case "repeat_step":
+          out.push(
+            `${t}  repeat · step ${d.step} · ${d.repeated} of ${d.calls} call(s) already ` +
+              `answered · streak ${d.streak} · ${d.sessionTokens} tokens spent`,
+          );
           break;
         case "loop_stop":
           out.push(

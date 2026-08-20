@@ -44,6 +44,24 @@ export type ReceiptRecord = {
   barMs: number;
   failed: string[];
   file: string;
+  /**
+   * Set when the receipt file is gone but the index row remains.
+   *
+   * The record of a receipt is itself evidence. Repair marks a ghost rather
+   * than deleting it — silently dropping the row would be the tool editing
+   * its own audit trail.
+   */
+  missing?: boolean;
+};
+
+/** What `repair()` changed, and what it left alone. */
+export type RepairReport = {
+  /** Rows newly marked missing this run. */
+  marked: number;
+  /** Rows whose files exist, left exactly as recorded. */
+  kept: number;
+  /** Rows already marked missing, left alone. */
+  alreadyMissing: number;
 };
 
 /**
@@ -54,11 +72,19 @@ export type ReceiptRecord = {
  * Reported per verified change, never per attempt.
  */
 export type Stats = {
+  /** Every index row — including receipts whose files are gone. */
   attempts: number;
+  /** Index rows whose receipt file still exists on disk. */
+  present: number;
   accepted: number;
   refused: number;
   exhausted: number;
-  /** Share of completion claims that did not survive the bar. */
+  /**
+   * Share of *present* completion claims that did not survive the bar.
+   *
+   * Computed only over receipts still on disk. A rate over files that are
+   * gone is a number nobody can check.
+   */
   falseClaimRate: number;
   totalTokens: number;
   /** Tokens spent per ACCEPTED completion. Undefined with nothing accepted. */
@@ -121,7 +147,7 @@ export class Receipts {
     did?: string[];
   }): Receipt {
     const iso = new Date().toISOString();
-    const seq = this.count();
+    const seq = this.nextSeq();
     const file = `${String(seq).padStart(4, "0")}-${args.verdict}.md`;
     const p = join(this.dir, file);
 
@@ -265,6 +291,54 @@ export class Receipts {
     return { path: p, attempt: args.attempt, verdict: args.verdict };
   }
 
+  /**
+   * Reconcile the index against the files on disk.
+   *
+   * A row whose file exists is left exactly as it is. A row whose file is
+   * gone is marked missing rather than deleted: the record of a receipt is
+   * itself evidence, and silently dropping it would be the tool editing its
+   * own audit trail. Safe to run twice — the second pass finds nothing to
+   * change.
+   */
+  repair(): RepairReport {
+    if (!existsSync(this.indexPath)) return { marked: 0, kept: 0, alreadyMissing: 0 };
+    const lines = readFileSync(this.indexPath, "utf8").split("\n").filter((l) => l.trim());
+    const out: string[] = [];
+    let marked = 0;
+    let kept = 0;
+    let alreadyMissing = 0;
+    let changed = false;
+    for (const line of lines) {
+      let row: ReceiptRecord;
+      try {
+        row = JSON.parse(line) as ReceiptRecord;
+      } catch {
+        // An unparseable line is not ours to "fix". Leave the bytes.
+        out.push(line);
+        continue;
+      }
+      // Existence is the only thing repair is allowed to notice. A present
+      // file means the recorded row is still the receipt; a missing one
+      // means the row becomes the evidence that it ever existed.
+      const onDisk = typeof row.file === "string" && existsSync(join(this.dir, row.file));
+      if (onDisk) {
+        kept += 1;
+        out.push(line);
+        continue;
+      }
+      if (row.missing) {
+        alreadyMissing += 1;
+        out.push(line);
+        continue;
+      }
+      marked += 1;
+      changed = true;
+      out.push(JSON.stringify({ ...row, missing: true }));
+    }
+    if (changed) writeFileSync(this.indexPath, out.join("\n") + "\n");
+    return { marked, kept, alreadyMissing };
+  }
+
   records(): ReceiptRecord[] {
     if (!existsSync(this.indexPath)) return [];
     return readFileSync(this.indexPath, "utf8")
@@ -281,6 +355,12 @@ export class Receipts {
 
   stats(): Stats {
     const rows = this.records();
+    // Verdicts, rates, and cost are computed over receipts still on disk.
+    // Counting a gone file as a refused claim produces a rate nobody can
+    // open; the index still records the attempt.
+    const presentRows = rows.filter(
+      (r) => typeof r.file === "string" && existsSync(join(this.dir, r.file)),
+    );
     const byModel: Stats["byModel"] = {};
     let accepted = 0;
     let refused = 0;
@@ -288,7 +368,7 @@ export class Receipts {
     let totalTokens = 0;
     let totalUsd: number | undefined;
 
-    for (const r of rows) {
+    for (const r of presentRows) {
       const m = (byModel[r.model] ??= { attempts: 0, accepted: 0, refused: 0 });
       m.attempts += 1;
       if (r.verdict === "accepted") {
@@ -309,7 +389,7 @@ export class Receipts {
     let group = 0;
     let previous = -1;
     const perSession = new Map<string, { tokens: number; usd?: number }>();
-    for (const r of rows) {
+    for (const r of presentRows) {
       if (r.session === undefined && r.sessionTokens < previous) group += 1;
       previous = r.session === undefined ? r.sessionTokens : -1;
       const key = r.session ?? `inferred-${group}`;
@@ -325,10 +405,11 @@ export class Receipts {
 
     return {
       attempts: rows.length,
+      present: presentRows.length,
       accepted,
       refused,
       exhausted,
-      falseClaimRate: rows.length ? (refused + exhausted) / rows.length : 0,
+      falseClaimRate: presentRows.length ? (refused + exhausted) / presentRows.length : 0,
       totalTokens,
       tokensPerVerifiedChange: accepted ? Math.round(totalTokens / accepted) : undefined,
       totalUsd,
@@ -358,6 +439,36 @@ export class Receipts {
   count(): number {
     if (!existsSync(this.dir)) return 0;
     return readdirSync(this.dir).filter((f) => /^\d{4}-.*\.md$/.test(f)).length;
+  }
+
+  /**
+   * The next receipt number: one past the highest ever issued.
+   *
+   * It used to be `count()` — how many receipt files exist *now* — which is
+   * only the same thing while nobody deletes one. Delete `0000` and the next
+   * write is numbered `0001` again, so two different receipts share a number
+   * and the index lists both under it. This project's own `.molt` reached 26
+   * index rows over 9 files with sequences 0000–0008 each duplicated, and
+   * `molt receipts --show 0000-refused.md` reported no match for something the
+   * listing had just printed.
+   *
+   * A receipt is the document you hand to someone who does not trust you.
+   * Reusing its number is not a cosmetic problem.
+   *
+   * Taken from the index as well as the directory, because the index is the
+   * part that remembers what was deleted — that is the whole point of it.
+   */
+  private nextSeq(): number {
+    const seqOf = (name: string): number => {
+      const m = /^(\d{4})-/.exec(name);
+      return m ? Number(m[1]) : -1;
+    };
+    let highest = -1;
+    if (existsSync(this.dir)) {
+      for (const f of readdirSync(this.dir)) highest = Math.max(highest, seqOf(f));
+    }
+    for (const row of this.records()) highest = Math.max(highest, seqOf(row.file ?? ""));
+    return highest + 1;
   }
 
   list(): string[] {

@@ -110,6 +110,10 @@ function engineAt(dir: string, url: string, over: Record<string, unknown> = {}) 
     bar: loadBar(dir),
     archive: new Archive(dir),
     receipts: new Receipts(dir),
+    // These prove what molt does with a bad response, not how patiently it
+    // waits between asking again. The real backoff added eight seconds to each
+    // of three tests, on a suite that runs on every proof attempt.
+    retryBackoffMs: [5, 5, 5],
     ...over,
   });
 }
@@ -273,9 +277,7 @@ describe("over a real socket", () => {
       turns: [{ calls: [{ name: "bash", args: { command: "echo loop" } }] }],
     });
     const engine = engineAt(dir, url);
-    // Each mocked turn reports 290 tokens. 400 stops it on the third check,
-    // before the no-progress guard has seen two dry steps — the two limits are
-    // independent and both have to work.
+    // Each mocked turn reports 290 tokens, so 400 stops it on the third check.
     engine.setBudget(400);
 
     const events = await drain(engine.run("spin", allowAll));
@@ -284,9 +286,42 @@ describe("over a real socket", () => {
     assert.ok(received.length <= 3, `budget should cap requests, saw ${received.length}`);
   });
 
-  it("stops a model that keeps asking a question it has already answered", async () => {
-    // The reported failure: thirty steps of re-reading the same four files,
-    // stopped only by the step guard, at a real cost of about fifty cents.
+  it("names a model repeating itself, and does not end the turn over it", async () => {
+    // molt used to kill the turn on the second repeated step. Repetition is a
+    // guess at waste and a bad one — re-reading a file you just edited is a
+    // repeat and is progress — and the guess cost a real session 384,000
+    // tokens of work for nothing. Spend is bounded by the instruments that
+    // measure spend; this one only has to be visible.
+    const dir = ws();
+    writeDefaultBar(dir);
+    writeFileSync(join(dir, "notes.md"), "the same content every time\n");
+    const { url } = await mockProvider({
+      turns: [{ calls: [{ name: "read_file", args: { path: "notes.md" } }] }],
+    });
+    const engine = engineAt(dir, url);
+
+    const events = await drain(engine.run("study the notes", allowAll));
+
+    // Named while it happens, every time it happens.
+    assert.ok(
+      events.some((e) => e.kind === "info" && /nothing new came back/.test(e.text)),
+      "repetition passed in silence",
+    );
+    // And named as a streak once it is one, so it is legible without the log.
+    assert.ok(
+      events.some((e) => e.kind === "info" && /steps in a row/.test(e.text)),
+      "never said it was going in circles",
+    );
+    const err = events.find((e) => e.kind === "error") as { text: string } | undefined;
+    assert.ok(
+      !err || !/repeating calls/.test(err.text),
+      `still ending the turn on the repeat heuristic: ${err?.text}`,
+    );
+  });
+
+  it("lets the budget be what stops a model going in circles", async () => {
+    // What replaces the removed guard: a limit the user set, measured in the
+    // unit they set it in, checked before every step.
     const dir = ws();
     writeDefaultBar(dir);
     writeFileSync(join(dir, "notes.md"), "the same content every time\n");
@@ -294,17 +329,17 @@ describe("over a real socket", () => {
       turns: [{ calls: [{ name: "read_file", args: { path: "notes.md" } }] }],
     });
     const engine = engineAt(dir, url);
+    engine.setBudget(400);
 
     const events = await drain(engine.run("study the notes", allowAll));
     const err = events.find((e) => e.kind === "error") as { text: string } | undefined;
-
-    assert.ok(err && /repeating calls/.test(err.text), `wrong stop: ${err?.text}`);
+    assert.ok(err && /budget hit/.test(err.text), `wrong stop: ${err?.text}`);
+    assert.ok(received.length <= 3, `budget should cap requests, saw ${received.length}`);
+    // The turn still hands back what it paid for rather than throwing it away.
     assert.ok(
-      received.length <= 4,
-      `should stop within a few steps, not ${received.length} (the step guard is 32)`,
+      events.some((e) => e.kind === "assistant_text" || e.kind === "info"),
+      "stopped without reporting anything it had found",
     );
-    // The waste is named while it is happening, not only at the end.
-    assert.ok(events.some((e) => e.kind === "info" && /nothing new came back/.test(e.text)));
   });
 
   it("does not resend a result the model already has", async () => {
@@ -334,7 +369,7 @@ describe("over a real socket", () => {
     writeDefaultBar(dir);
     writeFileSync(join(dir, "big.txt"), Array.from({ length: 300 }, (_, i) => `line ${i}`).join("\n"));
     let n = 0;
-    const { url, received } = await mockProvider({
+    const { url } = await mockProvider({
       turns: Array.from({ length: 8 }, () => ({
         // Each turn asks for a window inside what it has already been shown.
         calls: [{ name: "read_file", args: { path: "big.txt", offset: (n += 1) } }],
@@ -343,13 +378,19 @@ describe("over a real socket", () => {
     const engine = engineAt(dir, url);
     const events = await drain(engine.run("study it", allowAll));
 
-    const err = events.find((e) => e.kind === "error") as { text: string } | undefined;
-    assert.ok(err && /repeating calls|already/.test(err.text), `wrong stop: ${err?.text}`);
-    assert.ok(received.length <= 5, `should stop early, not after ${received.length} steps`);
     const tools = events.filter((e): e is Extract<EngineEvent, { kind: "tool" }> => e.kind === "tool");
     assert.ok(
       tools.some((t) => t.note === "repeat"),
-      "a shifted offset walked straight past the guard",
+      "a shifted offset walked straight past the detection",
+    );
+    // Detection is what earns its keep: the re-read gets a pointer instead of
+    // the bytes, so a model circling costs less each time round rather than
+    // having its turn taken away.
+    const repeat = tools.find((t) => t.note === "repeat")!;
+    const first = tools.find((t) => t.note === undefined)!;
+    assert.ok(
+      (repeat.bytes ?? 0) < (first.bytes ?? 0),
+      "resent the payload it had already sent",
     );
   });
 
@@ -362,7 +403,7 @@ describe("over a real socket", () => {
     writeDefaultBar(dir);
     writeFileSync(join(dir, "big.ts"), Array.from({ length: 900 }, (_, i) => `line ${i}`).join("\n"));
     let n = 0;
-    const { url, received } = await mockProvider({
+    const { url } = await mockProvider({
       turns: Array.from({ length: 10 }, () => ({
         calls: [{ name: "read_file", args: { path: "big.ts", offset: (n += 3) } }],
       })),
@@ -370,13 +411,55 @@ describe("over a real socket", () => {
     const engine = engineAt(dir, url);
     const events = await drain(engine.run("study it", allowAll));
 
-    assert.ok(received.length <= 5, `ran ${received.length} steps on a drifting re-reader`);
     const tools = events.filter((e): e is Extract<EngineEvent, { kind: "tool" }> => e.kind === "tool");
-    assert.ok(tools.some((t) => t.note === "repeat"), "a three-line drift walked past the guard");
+    assert.ok(tools.some((t) => t.note === "repeat"), "a three-line drift walked past the detection");
     assert.match(
       tools.find((t) => t.note === "repeat")?.preview ?? "",
       /offset=\d+ or later/,
       "told the model it was repeating without telling it where to go instead",
+    );
+  });
+
+  it("reports the actual line range in a repeat warning, not the header lines", async () => {
+    // `read_file` results are prefixed with a header and may end with a
+    // continuation notice. The coverage tracker used to count those lines as
+    // file content, so a one-line read was reported as covering three lines,
+    // and the guidance told the model to continue past what it had actually
+    // seen. This matters most when a model reads a file in tiny parts and the
+    // wrong range accumulates into a skipped section.
+    const dir = ws();
+    writeDefaultBar(dir);
+    writeFileSync(join(dir, "sample.txt"), Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n"));
+    const { url } = await mockProvider({
+      turns: [
+        { calls: [{ name: "read_file", args: { path: "sample.txt", offset: 0, limit: 2 } }] },
+        { calls: [{ name: "read_file", args: { path: "sample.txt", offset: 1, limit: 1 } }] },
+        { text: "done" },
+      ],
+    });
+    const engine = engineAt(dir, url);
+    const events = await drain(engine.run("read it carefully", allowAll));
+
+    const tools = events.filter((e): e is Extract<EngineEvent, { kind: "tool" }> => e.kind === "tool");
+    const repeat = tools.find((t) => t.note === "repeat");
+    assert.ok(repeat, "the overlapping read should have been flagged as a repeat");
+    // The second read asked for line 2 (offset 1, 1-based). The warning must
+    // say that exact line was already shown, not inflate the range with the
+    // header/tail lines. And the continuation hint must point at the real next
+    // unread line (offset 2), not beyond it.
+    assert.match(
+      repeat.preview ?? "",
+      /lines 2-2 of sample\.txt/,
+      "reported the wrong line range for the repeated read",
+    );
+    assert.match(
+      repeat.preview ?? "",
+      /offset=2 or later/,
+      "told the model to continue past what it had actually shown",
+    );
+    assert.ok(
+      !/lines 2-\d{2,}/.test(repeat.preview ?? ""),
+      "the range must not include the header or continuation notice as content lines",
     );
   });
 

@@ -87,12 +87,18 @@ Four properties make it worth trusting:
   bytes the model received — capping a result on its way to the person watching
   means the two of you are looking at different things, which is the one thing
   a transparency view cannot do.
-- **Bounded on screen, not in content.** The panel is a fixed height, because a
-  live region that grows is a live region a terminal cannot repaint without
-  tearing. The full detail goes into the transcript instead, which is printed
-  once and never redrawn — so your terminal's own scrollback holds all of it,
-  at full width. Opening the view also prints everything recorded before you
-  opened it.
+- **Bounded on screen, and it leaves no trace.** The panel is a fixed height,
+  because a live region that grows is a live region a terminal cannot repaint
+  without tearing. It shows the tail of what has been recorded, including what
+  happened before you pressed the key.
+
+  Opening it writes nothing into the transcript. It used to: the detail was
+  mirrored into the chat so that scrollback would hold all of it, which meant a
+  glance at what molt was doing permanently interleaved every argument and byte
+  count with what the model had said — and the transcript is printed once and
+  never redrawn, so closing the view could take none of it back. Looking and
+  recording are different acts. Start with `--verbose` when you want all of it
+  in the scrollback.
 - **The same facts as the log.** Nothing on screen is derived from anything
   the log does not also record — with the exception that the log stores
   digests where the screen shows content, deliberately (see below).
@@ -157,11 +163,15 @@ so instead:
   that step repeated calls molt had already answered — nothing new came back
 ```
 
-The result handed back is a pointer to the earlier one, not the payload. Two
-consecutive steps of nothing but repeats end the turn, with what it spent
-stated, and `loop_stop` in the log naming the step. A long file is read with
-`offset`, and every partial result says how many lines remain and which offset
-continues it — so "read it again" is never the only move available.
+The result handed back is a pointer to the earlier one, not the payload, so a
+model going in circles costs less each time round. Repeats are named on screen
+as they happen and recorded as `repeat_step` in the log, and a run of them says
+so — but they do not end the turn. Repetition is a guess at waste, and a model
+re-reading a file it just edited is repeating a call and making progress; what
+bounds a turn is what measures spend directly: `/budget`, the per-turn ceiling,
+and the step guard behind both. A long file is read with `offset`, and every
+partial result says how many lines remain and which offset continues it — so
+"read it again" is never the only move available.
 
 ## Estimated versus measured
 

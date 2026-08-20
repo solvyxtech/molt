@@ -5,10 +5,20 @@
  * terminal interface earns its keep by getting out of the way — showing the
  * work, the receipts, and the refusals, and nothing else.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Box, Static, Text, useApp, useInput, useStdout } from "ink";
-import { Banner, fmtCost, fmtDuration } from "./banner.js";
-import { COMMANDS, completionFor, matchCommands, windowAround, wrapIndex } from "./commands.js";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { Box, Static, Text, render, useApp, useInput, useStdout } from "ink";
+import type { RenderOptions } from "ink";
+import { Banner, fmtCost, fmtDuration, fmtTokens } from "./banner.js";
+import {
+  COMMANDS,
+  COMMAND_COL,
+  commandLabel,
+  completionFor,
+  matchCommands,
+  windowAround,
+  wrapIndex,
+} from "./commands.js";
+import { RemappedStdin } from "./keys.js";
 import { StatusLine } from "./status-line.js";
 import { loadBar, writeDefaultBar, BarError } from "./bar.js";
 import type { Engine } from "./engine.js";
@@ -66,6 +76,18 @@ type Row = {
   id: number;
   tone: "user" | "agent" | "tool" | "info" | "error" | "ok" | "fail";
   text: string;
+  /**
+   * A blank line belonging above this row.
+   *
+   * Carried here rather than pushed as a row of its own, because Ink drops a
+   * whitespace-only `<Static>` item when the items arrive one at a time —
+   * which is exactly how streamed output arrives. All at once the blanks
+   * survive; incrementally they vanish, so every paragraph break the model
+   * wrote was silently deleted and its prose came out as one dense block.
+   * Folded into the next row's text, the item is no longer whitespace-only
+   * and the break survives.
+   */
+  gap?: boolean;
 };
 
 /**
@@ -104,13 +126,14 @@ type Job = {
 const FEED_MEMORY = 5_000;
 /** Feed lines on screen at once. The panel must never outgrow the viewport. */
 const FEED_ROWS = 9;
+
 /** Finished jobs listed under the running one. */
 const JOB_ROWS = 4;
 
 
 const HELP = [
   "commands",
-  ...COMMANDS.map((c) => `  ${(c.name + (c.args ? " " + c.args : "")).padEnd(20)}${c.summary}`),
+  ...COMMANDS.map((c) => `  ${commandLabel(c).padEnd(COMMAND_COL)}${c.summary}`),
   "",
   "  type / to browse · ↑↓ to choose · tab to fill · enter to run",
   "  start a line with ? to ask a question rather than request a change —",
@@ -124,11 +147,7 @@ const HELP = [
 ].join("\n");
 
 /** Tokens, at a width that does not make the line jitter as it climbs. */
-function tok(n: number): string {
-  if (n < 1000) return `${n}`;
-  const k = n / 1000;
-  return `${k < 10 ? k.toFixed(1) : Math.round(k)}k`;
-}
+const tok = fmtTokens;
 
 /**
  * Tokens and money, in one phrasing used everywhere.
@@ -151,6 +170,114 @@ function spendText(s: {
   return `${tok(s.promptTokens)} in${cached} · ${tok(s.completionTokens)} out${money}`;
 }
 
+/** Bytes, at a glance: exact when small, rounded when not. */
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * How many rows the prompt may occupy before it summarises instead.
+ *
+ * The prompt is a live region and a region that changes height is one the
+ * terminal cannot repaint without tearing. Four leaves room for an ordinary
+ * long sentence to wrap — which is wanted, since the text is yours and you are
+ * still editing it — while bounding the pasted block that would otherwise take
+ * twenty.
+ */
+const MAX_PROMPT_ROWS = 4;
+
+/**
+ * Draw the prompt: a summarised paste, or the line with its caret.
+ *
+ * Shared by the idle prompt and the mid-turn one. The mid-turn line used to
+ * dump the whole string with no caret, so a typo three words back had to be
+ * deleted from the end even though the same keys already moved the caret.
+ * Same editor, same drawing.
+ */
+function PromptBody({
+  entry,
+  room,
+  secret,
+  theme,
+}: {
+  entry: Line;
+  room: number;
+  secret?: boolean;
+  theme: { accent: string; ghost: string };
+}): ReactNode {
+  if (secret) {
+    return (
+      <>
+        {"•".repeat(entry.text.length)}
+        <Text color={theme.accent}>▌</Text>
+      </>
+    );
+  }
+  const rows = entry.text.split("\n");
+  // Summarised when it has newlines, and also when one line alone would fill
+  // more of the window than a prompt should. A chunked paste arrives before
+  // its first newline does, so four hundred characters of a single line grew
+  // the prompt to six rows and then collapsed it when the newline landed —
+  // the same height oscillation, reached without a newline in sight. Ordinary
+  // typing stays under this and still wraps, which is what you want when the
+  // text is yours.
+  const overlong = entry.text.length > room * MAX_PROMPT_ROWS;
+  if (rows.length > 1 || overlong) {
+    // The count goes first, deliberately. Showing the opening words and
+    // trailing "+10 more lines" read as truncation — reported as "it only
+    // pastes some of the text, or I can't see the whole text" — when every
+    // character was in fact held and sent. Leading with what molt has says
+    // so before the eye reaches anything that looks cut off.
+    const tag =
+      rows.length > 1
+        ? `[${rows.length} lines, ${entry.text.length} chars] `
+        : `[${entry.text.length} chars] `;
+    // Trimmed to the window rather than wrapped: the whole point is a prompt
+    // that does not change height while a paste arrives in a dozen reads, and
+    // a long first line wraps to two rows on its own.
+    const preview = rows[0]!.slice(0, Math.max(8, room - tag.length - 2));
+    return (
+      <>
+        <Text color={theme.ghost}>{tag}</Text>
+        {preview}
+        {preview.length < rows[0]!.length ? <Text color={theme.ghost}>…</Text> : null}
+        <Text color={theme.accent}>▌</Text>
+      </>
+    );
+  }
+  const { before, under, after, atEnd } = split(entry);
+  return (
+    <>
+      {before}
+      {atEnd ? <Text color={theme.accent}>▌</Text> : <Text inverse>{under}</Text>}
+      {after}
+    </>
+  );
+}
+
+/**
+ * Commands that take effect while a turn is running, rather than waiting.
+ *
+ * Deliberately only the spending limits. They change what molt is allowed to
+ * do next and nothing about the conversation, so applying one halfway through
+ * is safe — and it is the only way to act on a ceiling warning before the
+ * ceiling arrives. Anything that moves the model, the endpoint or the
+ * transcript stays queued: doing that mid-conversation is its own kind of
+ * wrong.
+ */
+const RUNS_MID_TURN = new Set(["/budget", "/price"]);
+
+/**
+ * Lines of a tool result the live panel shows before it says how many remain.
+ *
+ * The panel answers "what is molt doing", and a payload is not an answer to
+ * that. Enough to judge whether the call did what it should, and a count for
+ * the rest so nothing is hidden silently.
+ */
+const PREVIEW_ROWS = 8;
+
 /** How many palette rows to show at once. */
 const PALETTE_ROWS = 6;
 
@@ -161,18 +288,46 @@ const PALETTE_ROWS = 6;
 const SPINNER = ["\u280b", "\u2819", "\u2839", "\u2838", "\u283c", "\u2834", "\u2826", "\u2827", "\u2807", "\u280f"];
 const SPIN_MS = 90;
 
-export function App({
-  engine,
-  version,
-  autoShed,
-  verbose: startVerbose = false,
-}: {
+export type AppProps = {
   engine: Engine;
   version: string;
   autoShed?: number;
   /** Start in the transparency view, from `--verbose`. */
   verbose?: boolean;
-}) {
+};
+
+/**
+ * Mount the TUI.
+ *
+ * The one way to start it, because one of these options is not a preference.
+ * Ink exits the process on ctrl+C on its own, beside whatever the app does
+ * with the key, so a mount that leaves the default on cannot cancel a turn —
+ * the program is already going down. molt owns that key, and the way to make
+ * that true everywhere is to leave no mount that can decide otherwise: the
+ * flag is applied last and is not overridable by a caller.
+ *
+ * The bug this closes was invisible for exactly this reason. Production
+ * mounted with the default and died on ctrl+C; the tests mounted with it off
+ * and exercised handling the real program never reached.
+ */
+export function renderApp(props: AppProps, options: RenderOptions = {}) {
+  const stdin = options.stdin ?? process.stdin;
+  return render(<App {...props} />, {
+    ...options,
+    // Ink labels the Backspace key `delete` and cannot tell it apart from the
+    // real forward-delete. Untangled in the bytes on the way in, so both keys
+    // mean what they say. See src/keys.ts.
+    stdin: new RemappedStdin(stdin as NodeJS.ReadStream) as unknown as NodeJS.ReadStream,
+    exitOnCtrlC: false,
+  });
+}
+
+export function App({
+  engine,
+  version,
+  autoShed,
+  verbose: startVerbose = false,
+}: AppProps) {
   const { exit } = useApp();
   const { stdout } = useStdout();
   // The live panel must fit the window exactly. A line one column too long
@@ -194,14 +349,29 @@ export function App({
   /** Apply one editing operation to the line. */
   const edit = useCallback((op: (l: Line) => Line) => setEntry((l) => op(l)), []);
   const [busy, setBusy] = useState(false);
-  const [pending, setPending] = useState<{ name: string; detail: string } | null>(null);
+  /** True once ctrl+C has been pressed on an empty line: the next one exits. */
+  const [quitArmed, setQuitArmed] = useState(false);
+  const [pending, setPending] = useState<
+    { name: string; detail: string; kind?: "spend" } | null
+  >(null);
   const [promptChoice, setPromptChoice] = useState(0);
   const [paletteIndex, setPaletteIndex] = useState(0);
   const [tokens, setTokens] = useState(0);
+  /**
+   * Estimated size of the request currently in flight. Lives on the meter,
+   * not only the working line, because the splash is gone by then and the
+   * working line is competing with what you are typing.
+   */
+  const [pendingEst, setPendingEst] = useState<number | undefined>(undefined);
+  /**
+   * Whether a key is already stored. Read once, then updated when /login
+   * succeeds — a disk read on every render of the status line is the kind
+   * of work a footer should never do.
+   */
+  const [hasKey, setHasKey] = useState(() => Object.keys(readAuth()).length > 0);
   const [streamText, setStreamText] = useState("");
-  /** The line still being written, and whether anything streamed this turn. */
+  /** The line still being written, waiting for the newline that ends it. */
   const partial = useRef("");
-  const streamed = useRef(false);
   /** Things typed while molt was busy, waiting for the turn to end. */
   const queued = useRef<string[]>([]);
   const [cost, setCost] = useState<number | undefined>(undefined);
@@ -211,6 +381,13 @@ export function App({
   // Read inside `note`, which must not be rebuilt every time the view opens or
   // closes — a new identity there would re-run every effect that depends on it.
   const verboseRef = useRef(startVerbose);
+  /**
+   * Whether the live detail is also written into the permanent transcript.
+   *
+   * Fixed at startup by `--verbose` and never moved by the shift+V toggle: one
+   * is a request for a record, the other is a look.
+   */
+  const mirrorToTranscript = useRef(startVerbose);
   const [jobs, setJobs] = useState<Job[]>([]);
   // The splash is the one moving thing on screen at startup, and the
   // transcript cannot be printed permanently above something still moving.
@@ -243,12 +420,42 @@ export function App({
     const rest = partial.current;
     partial.current = "";
     setStreamText("");
-    if (rest.trim()) setLines((prev) => [...prev, { id: nextId.current++, tone: "agent", text: rest }]);
+    if (rest.trim()) {
+      const gap = pendingGap.current;
+      pendingGap.current = false;
+      setLines((prev) => [
+        ...prev,
+        { id: nextId.current++, tone: "agent", text: rest, ...(gap ? { gap: true } : {}) },
+      ]);
+    }
   }, []);
 
-  const add = useCallback((tone: Row["tone"], text: string) => {
-    setLines((prev) => [...prev, { id: nextId.current++, tone, text }]);
+  /** A blank line seen while streaming, waiting for the row it belongs above. */
+  const pendingGap = useRef(false);
+
+  const add = useCallback((tone: Row["tone"], text: string, gap = false) => {
+    setLines((prev) => [...prev, { id: nextId.current++, tone, text, ...(gap ? { gap } : {}) }]);
   }, []);
+
+  /**
+   * A streamed line of the model's own prose, blank lines and all.
+   *
+   * A blank one is remembered rather than added: it comes back as the gap
+   * above whatever is written next, which is the only way it survives the
+   * transcript. A run of them still reads as one break — a model that leaves
+   * four blank lines did not mean four.
+   */
+  const addAgentLine = useCallback(
+    (text: string) => {
+      if (text.trim() === "") {
+        pendingGap.current = true;
+        return;
+      }
+      add("agent", text, pendingGap.current);
+      pendingGap.current = false;
+    },
+    [add],
+  );
 
   /**
    * Record a line for the live feed, and — when the view is open — for the
@@ -271,11 +478,65 @@ export function App({
         const next = [...prev, { id, text, dim }];
         return next.length > FEED_MEMORY ? next.slice(-FEED_MEMORY) : next;
       });
-      if (verboseRef.current) {
+      // Only when the session was *started* with --verbose, not when someone
+      // has the view open.
+      //
+      // The transcript is permanent: it is printed once and never redrawn, so
+      // anything written into it is in the conversation for good. Mirroring
+      // the feed there while the view was open meant a glance at what molt was
+      // doing permanently interleaved every argument, byte count and line of
+      // every result with what the model had said — and closing the view could
+      // not take any of it back. Reported as the view ruining the chat log and
+      // pushing the model's own words out of sight.
+      //
+      // So looking and recording are separate acts now. shift+V is a live
+      // view that leaves no trace; `--verbose` at launch is the deliberate
+      // choice to have all of it in the scrollback.
+      if (mirrorToTranscript.current) {
         setLines((prev) => [...prev, { id: nextId.current++, tone: "info", text: `  ${text}` }]);
       }
     },
     [],
+  );
+
+  /**
+   * A tool result, bounded on screen and whole in the record.
+   *
+   * Every line used to go to the live feed, so one nine-kilobyte file read put
+   * two hundred entries into it and the panel showed the tail of a file dump
+   * rather than what the model was doing. Reported as molt spewing and filling
+   * the terminal — "not good for traceability or what the model is actually
+   * doing", which is exactly right: a payload is not an account of an action.
+   *
+   * The earlier complaint this replaced was the opposite one — a view that
+   * showed five lines of forty was asking you to trust the other thirty-five —
+   * and both are satisfied by the same rule. Truncation that names what it hid
+   * is not a sample. The panel shows the head and says how much more there is;
+   * `--verbose` still writes every line to the transcript, because that is the
+   * deliberate request for the whole thing.
+   */
+  const notePreview = useCallback(
+    (preview: string) => {
+      const lines = preview.split("\n").filter((l) => l.trim());
+      if (lines.length === 0) return;
+      for (const l of lines.slice(0, PREVIEW_ROWS)) note(`    │ ${l}`, true);
+      if (lines.length > PREVIEW_ROWS) {
+        const hidden = lines.length - PREVIEW_ROWS;
+        note(`    │ … ${hidden} more line(s) — the model received all of it`, true);
+        // The record still gets the rest when one was asked for.
+        if (mirrorToTranscript.current) {
+          setLines((prev) => [
+            ...prev,
+            ...lines.slice(PREVIEW_ROWS).map((l) => ({
+              id: nextId.current++,
+              tone: "info" as const,
+              text: `    │ ${l}`,
+            })),
+          ]);
+        }
+      }
+    },
+    [note],
   );
 
   useEffect(() => {
@@ -411,14 +672,14 @@ export function App({
           while (cut !== -1) {
             const line = partial.current.slice(0, cut);
             partial.current = partial.current.slice(cut + 1);
-            streamed.current = true;
-            add("agent", line);
+            addAgentLine(line);
             cut = partial.current.indexOf("\n");
           }
           setStreamText(partial.current);
           break;
         }
         case "cancelled":
+          setPendingEst(undefined);
           flushPartial();
           // "The session is unchanged" was true of the transcript and false of
           // the disk. molt cannot un-write a file, and saying otherwise is the
@@ -431,16 +692,18 @@ export function App({
               : "cancelled — nothing was written, and the conversation is rolled back",
           );
           break;
+        case "message_end":
+          // The step's last line, which has no newline of its own to end it.
+          // Without this the next step's first word landed on it — one
+          // ever-growing paragraph in the live region, printed below the tools
+          // it was introducing instead of above them.
+          flushPartial();
+          break;
         case "assistant_text":
-          // Streamed text is already on screen line by line, so only the tail
-          // is missing. A provider that does not stream sends nothing until
-          // now, and gets printed whole.
-          if (streamed.current || partial.current) {
-            flushPartial();
-          } else {
-            add("agent", ev.text);
-          }
-          streamed.current = false;
+          // A streamed answer is already on screen — `message_end` closed its
+          // last line a moment ago — so this carries nothing new. A provider
+          // that does not stream sent nothing until now, and gets printed whole.
+          if (!ev.streamed) add("agent", ev.text);
           break;
         case "tool_start":
           beginActivity(ev.name, ev.detail);
@@ -452,9 +715,15 @@ export function App({
           // A call nobody was asked about says so. Autonomy is a convenience,
           // and the record of what it let through has to be readable without
           // opening the log.
+          // And how much came back. Without the view open a call said only
+          // that it happened — you could not tell a read of four hundred lines
+          // from one of four, or a command that printed nothing from one that
+          // printed a screenful. The size is the cheapest possible answer to
+          // "what did that actually do", and it costs no extra row.
+          const got = ev.bytes === undefined ? "" : `  → ${fmtBytes(ev.bytes)}`;
           add(
             "tool",
-            `${ev.name}  ${ev.detail}${ev.note ? `  [${ev.note}]` : ""}${ev.auto ? "  [auto]" : ""}${took}`,
+            `${ev.name}  ${ev.detail}${ev.note ? `  [${ev.note}]` : ""}${ev.auto ? "  [auto]" : ""}${took}${got}`,
           );
           // The exact call and the head of what came back. Verbatim: a
           // transparency view that paraphrases is one more thing to verify.
@@ -463,11 +732,7 @@ export function App({
           if (ev.bytes !== undefined) {
             note(`    → ${ev.bytes} bytes${ev.note ? ` · ${ev.note}` : ""}`, true);
           }
-          // Every line of it. A view that shows five lines of a forty-line
-          // result is asking you to trust the other thirty-five.
-          for (const l of (ev.preview ?? "").split("\n")) {
-            if (l.trim()) note(`    │ ${l}`, true);
-          }
+          notePreview(ev.preview ?? "");
           beginActivity("thinking");
           break;
         }
@@ -514,7 +779,12 @@ export function App({
           );
           break;
         case "request":
-          beginActivity("thinking");
+          // Say what the wait is for. "thinking · 47s" is a spinner with a
+          // clock on it; the step number and the size of the request are the
+          // difference between waiting and watching — and the request size is
+          // the number that explains the bill arriving after it.
+          setPendingEst(ev.estTokens);
+          beginActivity("thinking", `step ${ev.step + 1} · ~${tok(ev.estTokens)} tokens sent`);
           note(
             `→ step ${ev.step + 1} · ${ev.messages} messages · ~${tok(ev.estTokens)} tokens → ${ev.model}` +
               (ev.stream ? " · streaming" : ""),
@@ -566,6 +836,7 @@ export function App({
           setTokens(ev.sessionTokens);
           setCost(ev.costUsd);
           if (ev.estimated) setCostEstimated(true);
+          setPendingEst(undefined);
           break;
         case "proof_start":
           beginActivity("checking the bar");
@@ -584,14 +855,12 @@ export function App({
           // would be its own small dishonesty, and it is the thing the reader
           // most needs to see next to the reason it was rejected.
           flushPartial();
-          streamed.current = false;
           add("info", "↑ that claim was refused. What follows is why.");
           renderBar(ev.result, `completion refused (attempt ${ev.attempt}) — continuing`);
           add("info", "  the failures above go back to the model; it keeps working");
           break;
         case "proof_exhausted":
           flushPartial();
-          streamed.current = false;
           renderBar(ev.result, `bar not met after ${ev.attempts} attempts`);
           break;
         case "receipt":
@@ -657,25 +926,13 @@ export function App({
   const toggleVerbose = useCallback(() => {
     setVerbose((v) => {
       verboseRef.current = !v;
-      // Opening the view prints everything it has been recording, so what you
-      // get is the session so far and not just the session from here on.
-      if (!v) {
-        setFeed((current) => {
-          setLines((prev) => [
-            ...prev,
-            { id: nextId.current++, tone: "info", text: "── everything recorded so far ──" },
-            ...current.map((f) => ({ id: nextId.current++, tone: "info" as const, text: `  ${f.text}` })),
-            { id: nextId.current++, tone: "info", text: "── live from here ──" },
-          ]);
-          return current;
-        });
-      }
       // Said in the feed, not the transcript: a keypress that permanently
       // prints a line into the record is a keypress people stop pressing.
       note(
         v
           ? "view closed — shift+V while working, ctrl+V any time"
-          : "view open: every call, argument, and result, as recorded in .molt/log",
+          : "view open: every call, argument, and result — live only, nothing added to the chat. " +
+            "--verbose at launch keeps it all in the scrollback instead.",
       );
       return !v;
     });
@@ -779,6 +1036,7 @@ export function App({
         setCost(undefined);
         setCostEstimated(false);
       }
+      if (ok) setHasKey(true);
       add(
         ok ? "ok" : "error",
         ok
@@ -1144,9 +1402,16 @@ export function App({
           return true;
         }
         case "/prove": {
-          const result = engine.proveNow();
-          if (!result) add("info", "no bar to check — /init to create one");
-          else renderBar(result, result.ok ? "bar met" : "bar not met");
+          // The bar runs off-thread now, so the command hands back immediately
+          // and the result arrives when it arrives — the prompt stays live
+          // while a two-minute suite runs.
+          void engine.proveNow().then(
+            (result) => {
+              if (!result) add("info", "no bar to check — /init to create one");
+              else renderBar(result, result.ok ? "bar met" : "bar not met");
+            },
+            (e: unknown) => add("error", String(e)),
+          );
           return true;
         }
         default:
@@ -1194,11 +1459,27 @@ export function App({
       setBusy(true);
       beginActivity("thinking");
       try {
-        for await (const ev of engine.run(text, confirm, { ask: asking })) handleEvent(ev);
+        for await (const ev of engine.run(text, confirm, {
+          ask: asking,
+          // Stopping dead at the ceiling is the most expensive outcome there
+          // is: the money is already spent, and ending there turns it into
+          // nothing. Only offered here, where a person is watching — a
+          // headless run has nobody to ask and the ceiling still stops it.
+          onCeiling: (spent) =>
+            new Promise<boolean>((resolve) => {
+              setPending({ name: "spend", detail: spent, kind: "spend" });
+              setPromptChoice(1); // stopping is the default; carrying on is deliberate
+              resolver.current = resolve;
+            }),
+        })) handleEvent(ev);
       } catch (e) {
         add("error", String(e));
       } finally {
         setBusy(false);
+        setPendingEst(undefined);
+        // A press that cancelled this turn must not still be armed against
+        // the next one.
+        setQuitArmed(false);
       }
 
       // Anything typed while that ran goes now, in the order it was typed.
@@ -1213,6 +1494,11 @@ export function App({
   }, [submit]);
 
   useInput((char, key) => {
+    // Any other key means you did not mean to quit. Disarmed here rather than
+    // on a timer, so the offer cannot expire between reading it and acting on
+    // it — and cannot linger into a session you have gone back to using.
+    if (quitArmed && !(key.ctrl && char === "c")) setQuitArmed(false);
+
     // --- permission prompt: arrows choose, enter commits, no typing ---
     if (pending) {
       // The prompt is exactly where "stop asking me this" is decided, so the
@@ -1288,6 +1574,19 @@ export function App({
     // type it into, and a letter otherwise.
     if (busy) {
       if (key.ctrl && char === "c") {
+        // First press asks the turn to stop. If it is still running by the
+        // next press, the turn is not listening — and molt does not get to
+        // hold the terminal hostage while it decides. The second press leaves.
+        //
+        // This is a backstop, not the mechanism: a hung salvage used to make
+        // ctrl+C do nothing at all, and while that particular hang is fixed,
+        // "you can always get out" should not depend on having fixed every
+        // possible hang.
+        if (quitArmed) {
+          exit();
+          return;
+        }
+        setQuitArmed(true);
         engine.cancel();
         return;
       }
@@ -1303,15 +1602,29 @@ export function App({
         const text = input.trim();
         if (text) {
           setInput("");
-          queued.current.push(text);
-          add("info", `queued — molt will start this when the current turn ends: ${text}`);
+          // A few commands are worth running *now*, and the ceiling warning is
+          // the reason. molt says "this turn: $0.53 of $1.00 — /budget raises
+          // it" on the way up, and then queued the answer until after the turn
+          // it was warning about had already been stopped. The advice was
+          // impossible to take.
+          //
+          // The engine reads the ceiling at the top of every step, so a limit
+          // raised mid-turn applies to the next one. Only limits, though:
+          // switching model or endpoint halfway through a conversation is a
+          // different thing entirely and still waits its turn.
+          if (RUNS_MID_TURN.has(text.split(/\s+/)[0]!.toLowerCase())) {
+            command(text);
+          } else {
+            queued.current.push(text);
+            add("info", `queued — molt will start this when the current turn ends: ${text}`);
+          }
         }
         return;
       }
       if (key.leftArrow) return edit(key.meta || key.ctrl ? wordLeft : left);
       if (key.rightArrow) return edit(key.meta || key.ctrl ? wordRight : right);
-      if (key.backspace) return edit(backspace);
-      if (key.delete) return edit((l) => (l.at < l.text.length ? deleteForward(l) : backspace(l)));
+      if (key.backspace) return edit(key.meta ? deleteWord : backspace);
+      if (key.delete) return edit(deleteForward);
       if (key.ctrl && char === "w") return edit(deleteWord);
       if (key.ctrl && char === "u") return edit(killToStart);
       if (key.ctrl && char === "k") return edit(killToEnd);
@@ -1401,8 +1714,22 @@ export function App({
       return;
     }
 
+    // ctrl+C at an idle prompt clears the line; only on an already-empty line,
+    // and only twice in a row, does it end the session. A single press used to
+    // quit outright — which threw away a half-typed prompt for the keystroke
+    // every other REPL uses to take one back.
     if (key.ctrl && char === "c") {
-      exit();
+      if (input !== "") {
+        setInput("");
+        setPaletteIndex(0);
+        setQuitArmed(false);
+        return;
+      }
+      if (quitArmed) {
+        exit();
+        return;
+      }
+      setQuitArmed(true);
       return;
     }
 
@@ -1465,15 +1792,21 @@ export function App({
       return;
     }
     if (key.backspace) {
-      edit(backspace);
+      // alt+Backspace deletes the word behind the caret, the way every shell
+      // does. It was unreachable before: the terminal sends `ESC 0x7f`, which
+      // Ink called meta+delete, so it fell into the forward-delete guess below
+      // and took a single character off the front instead.
+      edit(key.meta ? deleteWord : backspace);
       setPaletteIndex(0);
       return;
     }
     if (key.delete) {
-      // Ink reports both backspace and the delete key here depending on the
-      // terminal; with a caret the two are different edits, so the one that
-      // deletes forward only does so when there is something ahead of it.
-      edit((l) => (l.at < l.text.length ? deleteForward(l) : backspace(l)));
+      // Only the real forward-delete reaches here now: Backspace is remapped to
+      // 0x08 on the way in, so it arrives above as `key.backspace`. This used to
+      // guess between the two from the caret position, which is why it deleted
+      // the right character at the end of a line and the wrong one everywhere
+      // else.
+      edit(deleteForward);
       setPaletteIndex(0);
       return;
     }
@@ -1541,8 +1874,9 @@ export function App({
         {(item) =>
           item.row ? (
             <Text key={item.key} color={toneColor[item.row.tone]} wrap="wrap">
-              {item.row.tone === "user" ? "› " : item.row.tone === "tool" ? "· " : "  "}
-              {item.row.text}
+              {(item.row.gap ? "\n" : "") +
+                (item.row.tone === "user" ? "› " : item.row.tone === "tool" ? "· " : "  ") +
+                item.row.text}
             </Text>
           ) : (
             <Box key={item.key} flexDirection="column">
@@ -1620,11 +1954,14 @@ export function App({
 
       {pending ? (
         <Box flexDirection="column" marginTop={1}>
-          <Text color={theme.warn}>
-            allow {pending.name}: {pending.detail}
+          <Text color={theme.warn} wrap="wrap">
+            {pending.kind === "spend"
+              ? `this turn has spent ${pending.detail} — its ceiling. Carrying on doubles it; ` +
+                `stopping keeps what has been found so far and reports it.`
+              : `allow ${pending.name}: ${pending.detail}`}
           </Text>
           <Box>
-            {["allow", "deny"].map((label, i) => (
+            {(pending.kind === "spend" ? ["carry on", "stop here"] : ["allow", "deny"]).map((label, i) => (
               <Text
                 key={label}
                 color={promptChoice === i ? theme.accent : theme.dim}
@@ -1651,7 +1988,11 @@ export function App({
                       {active ? " ▸ " : "   "}
                       {p.name.padEnd(14)}
                     </Text>
-                    {p.hasKey && <Text color={theme.ghost}>key stored — will overwrite</Text>}
+                    {p.hasKey && (
+                      <Text color={theme.ghost}>
+                        {fit("key stored — will overwrite")}
+                      </Text>
+                    )}
                   </Box>
                 );
               })}
@@ -1684,52 +2025,80 @@ export function App({
             </Box>
           ) : mode.kind === "model-select" ? (
             <Box flexDirection="column">
-              {windowRows(mode.rows, mode.index).map(({ row, i }) =>
-                row.kind === "header" ? (
-                  // The provider header carries the same bright colour the
-                  // highlighted row gets, so the grouping reads at a glance.
-                  <Text key={`h${i}`} color={theme.accent} bold>
-                    {"  "}
-                    {row.provider}
-                  </Text>
-                ) : (
-                  <Text
-                    key={`m${i}`}
-                    color={i === mode.index ? theme.accent : theme.dim}
-                    bold={i === mode.index}
-                  >
-                    {i === mode.index ? "   ▸ " : "     "}
-                    {row.choice.id}
-                  </Text>
-                ),
-              )}
+              {(() => {
+                const win = windowRows(mode.rows, mode.index);
+                const above = win[0]?.i ?? 0;
+                const below = mode.rows.length - 1 - (win.at(-1)?.i ?? 0);
+                return (
+                  <>
+                    {above > 0 && <Text color={theme.ghost}>   ↑ {above} more</Text>}
+                    {win.map(({ row, i }) =>
+                      row.kind === "header" ? (
+                        // The provider header carries the same bright colour the
+                        // highlighted row gets, so the grouping reads at a glance.
+                        <Text key={`h${i}`} color={theme.accent} bold>
+                          {"  "}
+                          {row.provider}
+                        </Text>
+                      ) : (
+                        <Text
+                          key={`m${i}`}
+                          color={i === mode.index ? theme.accent : theme.dim}
+                          bold={i === mode.index}
+                        >
+                          {i === mode.index ? "   ▸ " : "     "}
+                          {fit(row.choice.id)}
+                          {row.choice.id === engine.model &&
+                          row.choice.provider === engine.provider ? (
+                            <Text color={theme.ghost}>{"  ← now"}</Text>
+                          ) : null}
+                        </Text>
+                      ),
+                    )}
+                    {below > 0 && <Text color={theme.ghost}>   ↓ {below} more</Text>}
+                  </>
+                );
+              })()}
               <Text color={theme.ghost}>   ↑↓ choose · enter select · esc cancel</Text>
             </Box>
           ) : (
-            <Box>
+            <Box flexDirection="column">
               {busy ? (
                 <>
-                  <Text color={theme.accent}>{SPINNER[frame % SPINNER.length]} </Text>
-                  <Text color={theme.dim}>{activity?.label ?? "working"}</Text>
-                  {/* What it is working ON, not just that it is working. */}
-                  {activity?.what && (
-                    <Text color={theme.dim} wrap="wrap">
-                      {" \u00b7 "}
-                      {activity.what}
-                    </Text>
-                  )}
-                  {activity && (
+                  {/*
+                    One wrapping Text, and the typed line on a row of its own.
+                    These used to be flex siblings on a single row, which the
+                    terminal CLIPS rather than reflows — so making this line say
+                    more about what it was waiting for pushed the user's own
+                    half-typed message off the right edge and it looked like
+                    typing had stopped working. What molt has to say may not
+                    cost you sight of what you are saying.
+                  */}
+                  <Text wrap="wrap">
+                    <Text color={theme.accent}>{SPINNER[frame % SPINNER.length]} </Text>
+                    <Text color={theme.dim}>{activity?.label ?? "working"}</Text>
+                    {/* What it is working ON, not just that it is working. */}
+                    {activity?.what ? <Text color={theme.dim}>{` \u00b7 ${activity.what}`}</Text> : null}
+                    {activity ? (
+                      <Text color={theme.ghost}>
+                        {` \u00b7 ${fmtDuration(Date.now() - activity.since)}`}
+                      </Text>
+                    ) : null}
                     <Text color={theme.ghost}>
-                      {" \u00b7 "}
-                      {fmtDuration(Date.now() - activity.since)}
+                      {` \u00b7 ${verbose ? "shift+V closes" : "shift+V to watch"}`}
+                      {quitArmed ? " \u00b7 ctrl+C again to exit" : " \u00b7 ctrl+C stops this turn"}
                     </Text>
-                  )}
-                  <Text color={theme.ghost}>
-                    {" \u00b7 "}
-                    {verbose ? "shift+V closes" : "shift+V to watch"}
                   </Text>
-                  {/* The line is still yours while it works. */}
-                  <Text color={theme.text}>{input ? `  › ${input}` : ""}</Text>
+                  {/* The line is still yours while it works. Same editor as
+                      the idle prompt, including the caret: the keys already
+                      moved it, and drawing without it made a mid-turn typo
+                      look unfixable. */}
+                  {input ? (
+                    <Text color={theme.text} wrap="wrap">
+                      <Text color={theme.dim}>{"  › "}</Text>
+                      <PromptBody entry={entry} room={Math.max(8, room - 4)} theme={theme} />
+                    </Text>
+                  ) : null}
                 </>
               ) : (
                 <>
@@ -1742,29 +2111,19 @@ export function App({
                       and the caret wraps with it, because it is part of the
                       same run. A pasted key is still echoed as dots. */}
                   <Text color={theme.text} wrap="wrap">
-                    <Text color={theme.dim}>{mode.kind === "login-key" ? "🔑 " : "› "}</Text>
-                    {mode.kind === "login-key" ? (
-                      <>
-                        {"•".repeat(input.length)}
-                        <Text color={theme.accent}>▌</Text>
-                      </>
-                    ) : (
-                      (() => {
-                        const { before, under, after, atEnd } = split(entry);
-                        return (
-                          <>
-                            {before}
-                            {atEnd ? (
-                              <Text color={theme.accent}>▌</Text>
-                            ) : (
-                              <Text inverse>{under}</Text>
-                            )}
-                            {after}
-                          </>
-                        );
-                      })()
-                    )}
+                    <Text color={theme.dim}>{mode.kind === "login-key" ? "key " : "› "}</Text>
+                    <PromptBody
+                      entry={entry}
+                      room={room}
+                      secret={mode.kind === "login-key"}
+                      theme={theme}
+                    />
                   </Text>
+                  {/* The offer, where the keystroke that made it is looking.
+                      A press that silently does nothing reads as a hang. */}
+                  {quitArmed && (
+                    <Text color={theme.ghost}>{"  ctrl+C again to exit"}</Text>
+                  )}
                 </>
               )}
             </Box>
@@ -1785,7 +2144,7 @@ export function App({
                         <Box key={c.name}>
                           <Text color={active ? theme.accent : theme.dim} bold={active}>
                             {active ? " ▸ " : "   "}
-                            {(c.name + (c.args ? " " + c.args : "")).padEnd(20)}
+                            {commandLabel(c).padEnd(COMMAND_COL)}
                           </Text>
                           <Text color={active ? theme.text : theme.ghost}>{c.summary}</Text>
                         </Box>
@@ -1813,8 +2172,9 @@ export function App({
           autonomy,
           // A key already stored means the next step is choosing a model, not
           // logging in again.
-          hint: Object.keys(readAuth()).length > 0 ? "/model" : "/login",
+          hint: hasKey ? "/model" : "/login",
           budgetTokens: engine.budgetTokens,
+          pendingEst,
         }}
       />
     </Box>
