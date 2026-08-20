@@ -1646,3 +1646,65 @@ describe("pointing molt at a model you host", () => {
     }
   });
 });
+
+describe("/login offers the machine you host on", () => {
+  // Up from the top wraps to the last row, which is the local one however
+  // many providers happen to be listed. Counting downwards wraps past it.
+  const UP = "\x1b[A";
+
+  it("lists a local option, because /login is where people look", async () => {
+    // Reported from use: "I just tried /login and didn't see the option to add
+    // localhost". There wasn't one. The picker lists providers that need a
+    // key, so Ollama — which needs none — never appeared, and `/endpoint` was
+    // a command nobody would think to type.
+    const t = await mount();
+    try {
+      await submit(t.stdin, "/login");
+      await tick(120);
+      assert.match(t.stdout.lastFrame, /local or self-hosted/, "no way in for a model you run");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("takes a URL from the picker and points molt at it", async () => {
+    const t = await mount();
+    try {
+      await submit(t.stdin, "/login");
+      await tick(120);
+      t.stdin.press(UP);
+      await tick(80);
+      t.stdin.press("\r");
+      await tick(120);
+      assert.match(t.stdout.lastFrame, /enter the base URL/, "selecting it did not ask for a URL");
+
+      for (const ch of "http://192.168.0.72:11434/v1") t.stdin.press(ch);
+      await tick(120);
+      // A URL is not a secret, so it is shown rather than echoed as dots.
+      assert.match(t.stdout.lastFrame, /192\.168\.0\.72/, "the URL was hidden like a key");
+      t.stdin.press("\r");
+      await tick(200);
+      assert.equal(t.engine.baseUrl, "http://192.168.0.72:11434/v1");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("leaves the endpoint alone when the entry is cancelled", async () => {
+    const t = await mount();
+    try {
+      const was = t.engine.baseUrl;
+      await submit(t.stdin, "/login");
+      await tick(120);
+      t.stdin.press(UP);
+      await tick(80);
+      t.stdin.press("\r");
+      await tick(100);
+      t.stdin.press("\x1b");
+      await tick(120);
+      assert.equal(t.engine.baseUrl, was, "escape moved the endpoint anyway");
+    } finally {
+      t.cleanup();
+    }
+  });
+});

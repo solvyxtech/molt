@@ -279,6 +279,9 @@ const RUNS_MID_TURN = new Set(["/budget", "/price"]);
 const PREVIEW_ROWS = 8;
 
 /** How many palette rows to show at once. */
+/** The `/login` row that is not a provider: a server you run yourself. */
+const LOCAL_ROW = "local or self-hosted…";
+
 const PALETTE_ROWS = 6;
 
 /**
@@ -400,6 +403,7 @@ export function App({
     | { kind: "chat" }
     | { kind: "login-select"; providers: { name: string; hasKey: boolean }[]; index: number }
     | { kind: "login-key"; provider: string }
+    | { kind: "login-url" }
     | { kind: "model-select"; rows: PickerRow[]; index: number }
     | { kind: "autonomy-select"; index: number };
   const [mode, setMode] = useState<Mode>({ kind: "chat" });
@@ -1008,10 +1012,18 @@ export function App({
         return;
       }
       if (arg) add("info", `unknown provider '${arg}'`);
-      add("info", "add a key — choose a provider:");
+      add("info", "choose a provider, or point molt at a server you run:");
       setMode({
         kind: "login-select",
-        providers: keyedProviders().map((name) => ({ name, hasKey: Boolean(stored[name]) })),
+        // The last row is not a provider and takes no key. It is here because
+        // `/login` is where people look to connect molt to something, and a
+        // model you host yourself had no door in: the keyed providers are the
+        // only ones listed, so Ollama — which needs no key — never appeared,
+        // and `/endpoint` was a command nobody would think to type.
+        providers: [
+          ...keyedProviders().map((name) => ({ name, hasKey: Boolean(stored[name]) })),
+          { name: LOCAL_ROW, hasKey: false },
+        ],
         index: 0,
       });
     },
@@ -1111,6 +1123,56 @@ export function App({
   // without recreating either on every render.
   const submitRef = useRef<((text: string, opts?: { ask?: boolean }) => void) | null>(null);
 
+  /**
+   * Point molt at any OpenAI-compatible server.
+   *
+   * Shared by `/endpoint <url>` and the "local or self-hosted…" row in
+   * `/login`, because the command alone was not enough: `/login` is where
+   * people look to connect molt to something, and a model you run yourself
+   * had no door in there at all.
+   */
+  const connectEndpoint = useCallback(
+    (arg: string) => {
+          // `host:port` is the shape people type, and `new URL` does not
+          // reject it — it reads `192.168.0.72:` as the scheme. Checking for
+          // the separator first means the message names the actual mistake
+          // rather than complaining about a scheme the user never wrote.
+          if (!arg.includes("://")) {
+            add("error", `${arg} needs the scheme too, e.g. http://${arg.replace(/^\/+/, "")}`);
+            return;
+          }
+          let url: URL;
+          try {
+            url = new URL(arg);
+          } catch {
+            add("error", `not a URL: ${arg} — try http://localhost:11434/v1`);
+            return;
+          }
+          if (url.protocol !== "http:" && url.protocol !== "https:") {
+            add("error", `${url.protocol} is not a scheme molt can call — use http or https`);
+            return;
+          }
+          // A key is not asked for: the case this exists to serve is a server
+          // you run, which wants none. Use /login for a provider that does.
+          engine.setBaseUrl(arg.replace(/\/$/, ""), undefined, url.hostname);
+          setTokens(0);
+          setCost(undefined);
+          setCostEstimated(false);
+          persistEndpoint();
+          add("ok", `endpoint → ${arg}`);
+          // Reachability said now rather than discovered on the first turn.
+          void engine.doctor().then(
+            (d) => {
+              add(d.ok ? "ok" : "error", `${d.ok ? "reachable" : "unreachable"}: ${d.detail}`);
+              if (d.ok) add("info", "/model to pick one of its models");
+            },
+            (e: unknown) => add("error", `could not reach it: ${String(e)}`),
+          );
+          return;
+    },
+    [add, engine, persistEndpoint],
+  );
+
   const command = useCallback(
     (raw: string): boolean => {
       const [cmd, ...rest] = raw.trim().split(/\s+/);
@@ -1191,50 +1253,12 @@ export function App({
           startLogin(arg || undefined);
           return true;
         case "/endpoint": {
-          // `/login` only knows the presets, so a model you host yourself was
-          // unreachable from the TUI — you could pass `--url` headlessly and
-          // nowhere else. Anything speaking the OpenAI shape works: Ollama on
-          // this machine, llama.cpp or vLLM on another box on the network.
           if (!arg) {
             add("info", "usage: /endpoint http://192.168.0.72:11434/v1 — any OpenAI-compatible server");
             add("info", `now: ${engine.baseUrl}`);
             return true;
           }
-          // `host:port` is the shape people type, and `new URL` does not
-          // reject it — it reads `192.168.0.72:` as the scheme. Checking for
-          // the separator first means the message names the actual mistake
-          // rather than complaining about a scheme the user never wrote.
-          if (!arg.includes("://")) {
-            add("error", `${arg} needs the scheme too, e.g. http://${arg.replace(/^\/+/, "")}`);
-            return true;
-          }
-          let url: URL;
-          try {
-            url = new URL(arg);
-          } catch {
-            add("error", `not a URL: ${arg} — try http://localhost:11434/v1`);
-            return true;
-          }
-          if (url.protocol !== "http:" && url.protocol !== "https:") {
-            add("error", `${url.protocol} is not a scheme molt can call — use http or https`);
-            return true;
-          }
-          // A key is not asked for: the case this exists to serve is a server
-          // you run, which wants none. Use /login for a provider that does.
-          engine.setBaseUrl(arg.replace(/\/$/, ""), undefined, url.hostname);
-          setTokens(0);
-          setCost(undefined);
-          setCostEstimated(false);
-          persistEndpoint();
-          add("ok", `endpoint → ${arg}`);
-          // Reachability said now rather than discovered on the first turn.
-          void engine.doctor().then(
-            (d) => {
-              add(d.ok ? "ok" : "error", `${d.ok ? "reachable" : "unreachable"}: ${d.detail}`);
-              if (d.ok) add("info", "/model to pick one of its models");
-            },
-            (e: unknown) => add("error", `could not reach it: ${String(e)}`),
-          );
+          connectEndpoint(arg);
           return true;
         }
         case "/model":
@@ -1717,6 +1741,15 @@ export function App({
         }
         if (key.return) {
           const provider = mode.providers[mode.index]!.name;
+          if (provider === LOCAL_ROW) {
+            add(
+              "info",
+              "enter the base URL — e.g. http://localhost:11434/v1, or http://192.168.0.72:11434/v1 " +
+                "for a box on your network. enter to connect, esc to cancel",
+            );
+            setMode({ kind: "login-url" });
+            return;
+          }
           add("info", `paste API key for ${provider} — input hidden, enter to save, esc to cancel`);
           const hint = PROVIDERS[provider]?.hint;
           if (hint) add("info", `note: ${hint}`);
@@ -1739,6 +1772,28 @@ export function App({
     }
 
     // --- key entry: the one picker step that takes typing, and hides it ---
+    if (mode.kind === "login-url") {
+      if (key.escape || (key.ctrl && char === "c")) {
+        setInput("");
+        setMode({ kind: "chat" });
+        add("info", "cancelled");
+        return;
+      }
+      if (key.return) {
+        const value = input.trim();
+        setInput("");
+        setMode({ kind: "chat" });
+        if (value) connectEndpoint(value);
+        return;
+      }
+      if (key.backspace || key.delete) {
+        edit(key.meta ? deleteWord : backspace);
+        return;
+      }
+      if (char && !key.ctrl && !key.meta) edit((l) => insert(l, char));
+      return;
+    }
+
     if (mode.kind === "login-key") {
       if (key.escape || (key.ctrl && char === "c")) {
         setInput("");
@@ -2158,7 +2213,9 @@ export function App({
                       and the caret wraps with it, because it is part of the
                       same run. A pasted key is still echoed as dots. */}
                   <Text color={theme.text} wrap="wrap">
-                    <Text color={theme.dim}>{mode.kind === "login-key" ? "key " : "› "}</Text>
+                    <Text color={theme.dim}>
+                      {mode.kind === "login-key" ? "key " : mode.kind === "login-url" ? "url " : "› "}
+                    </Text>
                     <PromptBody
                       entry={entry}
                       room={room}
