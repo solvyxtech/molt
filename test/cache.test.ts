@@ -362,3 +362,94 @@ describe("what actually goes on the wire", () => {
     }
   });
 });
+
+describe("a cache that stops working", () => {
+  /** A provider whose cache hit rate follows `rates`, one per step. */
+  function fadingProvider(rates: number[]) {
+    let n = 0;
+    const fetchFn = (async () => {
+      const rate = rates[Math.min(n, rates.length - 1)]!;
+      n += 1;
+      const prompt = 20_000;
+      const last = n >= rates.length;
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        text: async () => "",
+        json: async () => ({
+          choices: [
+            {
+              message: last
+                ? { role: "assistant", content: "done" }
+                : {
+                    role: "assistant",
+                    content: "working",
+                    tool_calls: [
+                      {
+                        id: `c${n}`,
+                        type: "function",
+                        function: { name: "bash", arguments: JSON.stringify({ command: "echo hi" }) },
+                      },
+                    ],
+                  },
+            },
+          ],
+          usage: {
+            prompt_tokens: prompt,
+            completion_tokens: 10,
+            prompt_tokens_details: { cached_tokens: Math.round(prompt * rate) },
+          },
+        }),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    return fetchFn;
+  }
+
+  const run = async (rates: number[]) => {
+    const engine = new Engine({
+      baseUrl: "https://api.x.ai/v1",
+      model: "grok-4.6",
+      cwd: ws(),
+      bar: null,
+      stream: false,
+      autonomy: "high",
+      fetchFn: fadingProvider(rates),
+    });
+    return drain(engine.run("go", allowAll));
+  };
+
+  it("says so when the hit rate falls away mid-session", async () => {
+    // Worse than never caching, because the never-cached warning cannot fire:
+    // the session total keeps the early hits and looks healthy while every new
+    // step pays full price. Seen on a real run — two good steps, then 128
+    // tokens reused against a prompt growing to 50,000, in silence.
+    const events = await run([0.9, 0.9, 0.006, 0.006, 0.006]);
+    const said = events.find(
+      (e) => e.kind === "info" && /caching stopped/.test(e.text),
+    ) as { text: string } | undefined;
+    assert.ok(said, "a cache that collapsed mid-session was never mentioned");
+    assert.match(said.text, /re-bills the whole context/);
+  });
+
+  it("says it once, not on every step after", async () => {
+    const events = await run([0.9, 0.006, 0.006, 0.006, 0.006]);
+    const times = events.filter((e) => e.kind === "info" && /caching stopped/.test(e.text)).length;
+    assert.equal(times, 1, `warned ${times} times about the same thing`);
+  });
+
+  it("stays quiet when the cache is working", async () => {
+    const events = await run([0.9, 0.9, 0.9, 0.9]);
+    assert.ok(
+      !events.some((e) => e.kind === "info" && /caching stopped/.test(e.text)),
+      "warned about a cache that was doing its job",
+    );
+  });
+
+  it("stays quiet when it never worked, which the other warning covers", async () => {
+    // Nothing to have lost. Reporting a collapse here would send someone
+    // looking for a regression that never happened.
+    const events = await run([0.006, 0.006, 0.006, 0.006]);
+    assert.ok(!events.some((e) => e.kind === "info" && /caching stopped/.test(e.text)));
+  });
+});

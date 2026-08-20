@@ -1874,7 +1874,14 @@ export function App({
                   </Text>
                   {/* The line is still yours while it works. */}
                   {input ? (
-                    <Text color={theme.text} wrap="wrap">{`  › ${input}`}</Text>
+                    // Summarised for the same reason as the idle prompt: this
+                    // is a live region, and a pasted block that made it taller
+                    // on every chunk is what tore the display.
+                    <Text color={theme.text} wrap="wrap">
+                      {input.includes("\n")
+                        ? `  › ${input.split("\n")[0]}  ⏎ +${input.split("\n").length - 1} more`
+                        : `  › ${input}`}
+                    </Text>
                   ) : null}
                 </>
               ) : (
@@ -1896,6 +1903,35 @@ export function App({
                       </>
                     ) : (
                       (() => {
+                        // A pasted block keeps every character but is drawn on
+                        // one line.
+                        //
+                        // The prompt is a live region, and a live region that
+                        // changes height is one the terminal cannot repaint
+                        // without tearing — the failure this file has fought
+                        // before. A paste arrives in several reads, so an
+                        // eight-line block re-rendered the prompt at eight
+                        // different heights on the way in and the result came
+                        // out interleaved: lines overwritten, fragments in the
+                        // wrong order, whole lines gone. Reported from use.
+                        //
+                        // So the text is held in full and summarised here. The
+                        // caret sits at the end, because a single-line editor
+                        // has nothing useful to say about a caret three lines
+                        // up anyway.
+                        const rows = entry.text.split("\n");
+                        if (rows.length > 1) {
+                          const rest = rows.length - 1;
+                          return (
+                            <>
+                              {rows[0]}
+                              <Text color={theme.accent}>▌</Text>
+                              <Text color={theme.ghost}>
+                                {`  ⏎ +${rest} more line${rest === 1 ? "" : "s"}, ${entry.text.length} chars`}
+                              </Text>
+                            </>
+                          );
+                        }
                         const { before, under, after, atEnd } = split(entry);
                         return (
                           <>
