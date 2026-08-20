@@ -9,6 +9,14 @@ a number presented with more confidence than it was earned with.
 
 ### Added
 
+- **`/login` offers the machine you host on.** Adding `/endpoint` was not
+  enough, and the report said so plainly: *"I just tried /login and didn't see
+  the option to add localhost."* There wasn't one. The picker lists providers
+  that need a key, so Ollama — which needs none — never appeared at all, and
+  `/endpoint` was a command nobody would think to type. `/login` now ends with
+  **local or self-hosted…**, which asks for a base URL and shows it as you type,
+  because a URL is not a secret. Same path as the command; one place to look.
+
 - **`/endpoint <url>` — point molt at a model you host.** `/login` only knew
   the six presets, so a server you run yourself was unreachable from the TUI:
   `--url` worked headlessly and nowhere else. Anything speaking the OpenAI
