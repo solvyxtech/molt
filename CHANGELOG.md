@@ -358,6 +358,18 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **`/model` moved the model but not the endpoint.** Choosing an Anthropic
+  model after starting on xAI sent the Anthropic key to `api.x.ai` and came
+  back *"Incorrect API key provided. You can obtain an API key from
+  console.x.ai"* — a confusing message about the wrong provider entirely.
+  `applyModel` was doing the right thing; the endpoint, the protocol choice and
+  the caching style were computed once in the constructor and never moved
+  again, so switching provider left all three pointing at the session's first
+  one. They are derived from the configuration now, which cannot go stale. A
+  provider switch also clears what the previous endpoint had refused —
+  `cache_control` or `stream_options` — since that says nothing about the new
+  one.
+
 - **Pasting more than one line tore the display.** The prompt is a live region,
   and a paste arrives in several reads, so an eight-line block re-rendered it at
   eight different heights on the way in — 10 rows to 15 in a measured run. A

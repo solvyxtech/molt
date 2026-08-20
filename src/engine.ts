@@ -630,17 +630,35 @@ export class Engine {
   private streamUsageUnsupported = false;
   /** True once an endpoint has refused `cache_control`. Sticky per session. */
   private cachingUnsupported = false;
-  /** Whether this endpoint caches on request or on its own. */
-  private readonly cacheStyle: CacheStyle;
+  /**
+   * These three are derived from the endpoint, and the endpoint moves.
+   *
+   * They were fields, computed once in the constructor. `/model` then switched
+   * the base URL and the key and left them pointing at the provider the
+   * session started on, so choosing an Anthropic model sent the Anthropic key
+   * to xAI and came back "Incorrect API key provided. You can obtain an API
+   * key from console.x.ai". Getters cannot go stale.
+   */
+  private get cacheStyle(): CacheStyle {
+    return cacheStyle(this.cfg.baseUrl, this.cfg.model);
+  }
+
   /**
    * True when molt speaks Anthropic's own Messages API rather than the
    * OpenAI-compatible one. Chosen by endpoint, not by model: it is the *API*
    * that differs, and Anthropic's compatibility layer throws `cache_control`
    * away without a word, so a session there can never cache.
    */
-  private readonly native: boolean;
+  private get native(): boolean {
+    return this.cfg.nativeApi ?? isAnthropicNative(this.cfg.baseUrl);
+  }
+
   /** Where a completion request goes, which differs between the two APIs. */
-  private readonly endpoint: string;
+  private get endpoint(): string {
+    return this.native
+      ? messagesUrl(this.cfg.baseUrl)
+      : `${this.cfg.baseUrl.replace(/\/$/, "")}/chat/completions`;
+  }
   /** Said once: this endpoint is not caching anything. */
   private warnedNoCache = false;
   /** True once a step has reused a serious share of the conversation. */
@@ -701,11 +719,6 @@ export class Engine {
 
   constructor(cfg: EngineConfig) {
     this.cfg = cfg;
-    this.cacheStyle = cacheStyle(cfg.baseUrl, cfg.model);
-    this.native = cfg.nativeApi ?? isAnthropicNative(cfg.baseUrl);
-    this.endpoint = this.native
-      ? messagesUrl(cfg.baseUrl)
-      : `${cfg.baseUrl.replace(/\/$/, "")}/chat/completions`;
     this.transcript = new Transcript(systemPromptFor(this.cwd));
     this.barHash = barFingerprint(this.cwd);
     // The key molt was handed is the one secret it can mask exactly.
@@ -789,6 +802,11 @@ export class Engine {
     this.cfg.apiKey = apiKey;
     this.cfg.journal?.protect(apiKey);
     this.cfg.provider = provider;
+    // Whatever the last endpoint would not accept says nothing about this one.
+    this.cachingUnsupported = false;
+    this.streamUsageUnsupported = false;
+    this.cacheWasWorking = false;
+    this.warnedCacheLost = false;
     this.reset();
   }
 

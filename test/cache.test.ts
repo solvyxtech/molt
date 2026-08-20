@@ -453,3 +453,90 @@ describe("a cache that stops working", () => {
     assert.ok(!events.some((e) => e.kind === "info" && /caching stopped/.test(e.text)));
   });
 });
+
+describe("switching provider mid-session", () => {
+  /** Records where each request went and which key it carried. */
+  function recorder() {
+    const sent: { url: string; auth: string; model: string }[] = [];
+    const fetchFn = (async (url: string, init?: RequestInit) => {
+      const h = (init?.headers ?? {}) as Record<string, string>;
+      sent.push({
+        url,
+        auth: h["x-api-key"] ?? h.authorization ?? "",
+        model: (JSON.parse(String(init?.body ?? "{}")) as { model: string }).model,
+      });
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        text: async () => "",
+        json: async () => ({
+          // Shaped for both protocols, so one fake serves either path.
+          choices: [{ message: { role: "assistant", content: "done" } }],
+          content: [{ type: "text", text: "done" }],
+          stop_reason: "end_turn",
+          usage: { prompt_tokens: 10, completion_tokens: 2, input_tokens: 10, output_tokens: 2 },
+        }),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    return { fetchFn, sent };
+  }
+
+  it("moves the endpoint and the key together when /model changes provider", async () => {
+    // Reported from use: choosing an Anthropic model after starting on xAI
+    // sent the Anthropic key to api.x.ai and came back "Incorrect API key
+    // provided. You can obtain an API key from console.x.ai". The endpoint was
+    // computed once in the constructor and never moved again.
+    const r = recorder();
+    const engine = new Engine({
+      baseUrl: "https://api.x.ai/v1",
+      model: "grok-4.6",
+      apiKey: "xai-key",
+      cwd: ws(),
+      bar: null,
+      stream: false,
+      fetchFn: r.fetchFn,
+    });
+    await drain(engine.run("first", allowAll));
+
+    engine.setBaseUrl("https://api.anthropic.com/v1", "anthropic-key", "anthropic");
+    engine.setModel("claude-sonnet-5");
+    await drain(engine.run("second", allowAll));
+
+    const [before, after] = [r.sent[0]!, r.sent.at(-1)!];
+    assert.match(before.url, /api\.x\.ai/, "the first request did not go to the endpoint it started on");
+    assert.match(
+      after.url,
+      /api\.anthropic\.com/,
+      `after switching provider the request still went to ${after.url}`,
+    );
+    assert.match(after.auth, /anthropic-key/, "carried the old provider's key to the new endpoint");
+    assert.equal(after.model, "claude-sonnet-5");
+  });
+
+  it("switches protocol with the endpoint, not just the URL", async () => {
+    // Anthropic's own API is a different wire format, so the path has to move
+    // too — the native endpoint, and a body with a top-level `system`.
+    const r = recorder();
+    const engine = new Engine({
+      baseUrl: "https://api.x.ai/v1",
+      model: "grok-4.6",
+      apiKey: "xai-key",
+      cwd: ws(),
+      bar: null,
+      stream: false,
+      fetchFn: r.fetchFn,
+    });
+    await drain(engine.run("first", allowAll));
+    engine.setBaseUrl("https://api.anthropic.com/v1", "anthropic-key", "anthropic");
+    engine.setModel("claude-sonnet-5");
+    await drain(engine.run("second", allowAll));
+
+    assert.match(r.sent[0]!.url, /\/chat\/completions$/, "started on the wrong path");
+    assert.match(
+      r.sent.at(-1)!.url,
+      /\/messages$/,
+      "kept talking to the compatibility endpoint after moving to Anthropic",
+    );
+  });
+});
