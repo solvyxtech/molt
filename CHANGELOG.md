@@ -358,6 +358,30 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **Cache breakpoints were spaced in the wrong unit.** The rolling markers were
+  placed every twelve *messages*, but Anthropic's lookback is denominated in
+  *content blocks*, and molt holds one message where the wire carries several —
+  an assistant turn with three tool calls is one message and four blocks. The
+  ratio runs from about 1.5× at one tool call per step to 1.9× at ten, so a
+  twelve-message stride reached twenty-four blocks under parallel tool calls,
+  past the window, silently. Spacing is counted in blocks now.
+
+  The test that was supposed to catch this asserted the wrong property — the
+  gap between markers within a single request — and in message units, so it
+  passed because its fixture made one call per step. What actually has to stay
+  inside the window is how far the *tip* marker moves between consecutive
+  requests, since that is the distance it reaches back to find the entry the
+  last request wrote. Measured on the native wire: 3 blocks per step at one
+  tool call, 7 at three, 13 at six. It is asserted at each of those now, and
+  the test also requires the marker to advance at all — pinning it to the front
+  satisfied a ceiling-only assertion while caching nothing past the system
+  prompt, which is what the first rewrite of it did.
+
+  Known limit, stated rather than papered over: a marker can only sit on a
+  message carrying text, so an assistant turn making ten parallel calls is
+  twenty-one blocks that no marker can land inside. Such a step overshoots the
+  window, that one request pays full price, and the next recovers.
+
 - **Backspace deleted forwards.** Terminals send DEL (0x7f) for the Backspace
   key, and Ink labels that `key.delete` — its own source carries a TODO calling
   the split a mistake — while the real forward-delete (`ESC [ 3 ~`) arrives as

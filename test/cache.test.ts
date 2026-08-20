@@ -36,19 +36,29 @@ function ws(): string {
   return w.dir;
 }
 
-/** A conversation shaped the way an agent loop actually builds one. */
-function conversation(steps: number): Omit<Msg, "molt">[] {
+/**
+ * A conversation shaped the way an agent loop actually builds one.
+ *
+ * `parallel` matters: an assistant turn making several calls at once is one
+ * message and several wire blocks, and that ratio is what decides whether a
+ * marker placed by message index lands inside the block-denominated lookback.
+ */
+function conversation(steps: number, parallel = 1): Omit<Msg, "molt">[] {
   const out: Omit<Msg, "molt">[] = [{ role: "system", content: "the system prompt" }];
   out.push({ role: "user", content: "do the thing" });
   for (let i = 0; i < steps; i++) {
     out.push({
       role: "assistant",
-      content: null,
-      tool_calls: [
-        { id: `c${i}`, type: "function", function: { name: "read_file", arguments: "{}" } },
-      ],
+      content: "working",
+      tool_calls: Array.from({ length: parallel }, (_, k) => ({
+        id: `c${i}_${k}`,
+        type: "function" as const,
+        function: { name: "read_file", arguments: "{}" },
+      })),
     });
-    out.push({ role: "tool", tool_call_id: `c${i}`, content: `result ${i}` });
+    for (let k = 0; k < parallel; k++) {
+      out.push({ role: "tool", tool_call_id: `c${i}_${k}`, content: `result ${i}_${k}` });
+    }
   }
   return out;
 }
@@ -92,20 +102,47 @@ describe("where the breakpoints go", () => {
     }
   });
 
-  it("keeps a marker within the lookback window of the tip", () => {
-    // A breakpoint walks back at most 20 blocks to find a prior entry. An
-    // agent step appends an assistant turn plus one result per tool call, so a
-    // busy step can push the previous marker out of range — and the miss is
-    // silent: a full-price request that looks exactly like a cheap one.
-    for (const steps of [10, 40, 120]) {
-      const msgs = conversation(steps);
-      const bp = breakpoints(msgs);
-      const tail = bp.filter((i) => i > 0);
-      for (let i = 1; i < tail.length; i++) {
+  it("moves the tip no further than the lookback between requests", () => {
+    // The guarantee that matters, and not the one this used to assert.
+    //
+    // A breakpoint walks back at most 20 *blocks* to find a prior entry. What
+    // has to stay inside that window is how far the tip marker moves from one
+    // request to the next — consecutive requests differ by a single agent step
+    // — not the gap between the markers within one request. The first version
+    // of this test asserted the latter, in molt messages rather than wire
+    // blocks, and passed only because the fixture made one tool call per step.
+    //
+    // Blocks, because molt counts one message where the wire counts several.
+    const cost = (m: Omit<Msg, "molt">): number =>
+      m.role === "assistant"
+        ? (typeof m.content === "string" && m.content ? 1 : 0) + (m.tool_calls?.length ?? 0)
+        : 1;
+    const tipBlock = (msgs: Omit<Msg, "molt">[]): number => {
+      const tip = breakpoints(msgs).at(-1)!;
+      return msgs.slice(0, tip + 1).reduce((n, m) => n + cost(m), 0);
+    };
+
+    for (const parallel of [1, 3, 6]) {
+      let msgs = conversation(6, parallel);
+      let prev = tipBlock(msgs);
+      for (let step = 6; step < 16; step++) {
+        msgs = conversation(step + 1, parallel);
+        const now = tipBlock(msgs);
+        // It has to move: a marker pinned to the front never falls out of the
+        // window and would satisfy the bound below while caching nothing past
+        // the system prompt. Asserting only the ceiling let exactly that
+        // through when this was first written.
         assert.ok(
-          tail[i]! - tail[i - 1]! <= LOOKBACK_BLOCKS,
-          `${steps} steps: markers ${tail[i - 1]} and ${tail[i]} are further apart than the ${LOOKBACK_BLOCKS}-block lookback`,
+          now > prev,
+          `${parallel} parallel call(s) per step: the tip marker did not advance with the ` +
+            `conversation, so nothing past the system prompt is ever cached`,
         );
+        assert.ok(
+          now - prev <= LOOKBACK_BLOCKS,
+          `${parallel} parallel call(s) per step: the tip moved ${now - prev} blocks between ` +
+            `requests, past the ${LOOKBACK_BLOCKS}-block lookback — that request reads nothing`,
+        );
+        prev = now;
       }
     }
   });
