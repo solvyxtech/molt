@@ -358,6 +358,26 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **Backspace deleted forwards.** Terminals send DEL (0x7f) for the Backspace
+  key, and Ink labels that `key.delete` — its own source carries a TODO calling
+  the split a mistake — while the real forward-delete (`ESC [ 3 ~`) arrives as
+  `key.delete` too, with an empty `input` in both cases. Nothing in Ink's public
+  API tells them apart, so molt had been guessing from the caret position:
+  forward if anything was ahead of the caret, backwards otherwise. That is why
+  it looked erratic rather than simply wrong — correct at the end of a line, and
+  eating the wrong character everywhere else.
+
+  A guess cannot be fixed by guessing better, so the distinction is restored
+  where it still exists: 0x7f becomes 0x08 on the way in, before Ink classifies
+  it. Backspace now arrives as `key.backspace` and `key.delete` means only the
+  key that actually deletes forward. alt+Backspace deletes the word behind the
+  caret, which had been unreachable for the same reason.
+
+  The remap lives in `renderApp` beside the ctrl+C setting, and the test helper
+  now mounts through it rather than calling `render` itself — a helper that
+  mounts its own way tests something the real program never runs, which is
+  exactly how the ctrl+C bug survived a whole suite.
+
 - **A flag with no value ate the next flag.** `next()` returned whatever came
   after, including another flag and including nothing. `molt run x --model
   --yes` set the model to `--yes`, dropped `--yes`, and sent that to a live

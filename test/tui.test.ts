@@ -127,13 +127,19 @@ async function mount(over: Record<string, unknown> = {}, columns?: number) {
     priceOutPerMtok: 6,
     ...over,
   });
-  const app = render(createElement(App, { engine, version: "vtest" }), {
-    stdin: stdin as unknown as NodeJS.ReadStream,
-    stdout: stdout as unknown as NodeJS.WriteStream,
-    debug: true,
-    exitOnCtrlC: false,
-    patchConsole: false,
-  });
+  // renderApp, not a bare render: the mount options are behaviour, not
+  // preference. ctrl+C and the delete-key remap both live there, and a helper
+  // that mounts its own way tests something the real program never runs — which
+  // is exactly how the ctrl+C bug survived a whole suite.
+  const app = renderApp(
+    { engine, version: "vtest" },
+    {
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      debug: true,
+      patchConsole: false,
+    },
+  );
   await tick();
   return {
     stdin,
@@ -1108,5 +1114,62 @@ describe("getting out", () => {
       app.unmount();
       ws.cleanup();
     }
+  });
+});
+
+describe("the delete keys", () => {
+  /** What a terminal really sends for each of them. */
+  const BACKSPACE = "\x7f";
+  const FORWARD_DELETE = "\x1b[3~";
+  const ALT_BACKSPACE = "\x1b\x7f";
+  const LEFT = "\x1b[D";
+
+  /** Type `text`, move the caret left `back` times, then press `key`. */
+  async function afterPressing(text: string, back: number, key: string): Promise<string> {
+    const t = await mount();
+    try {
+      for (const ch of text) t.stdin.press(ch);
+      await tick(60);
+      for (let i = 0; i < back; i++) t.stdin.press(LEFT);
+      await tick(60);
+      t.stdin.press(key);
+      await tick(80);
+      // The prompt line, with molt's caret glyphs and marker stripped out.
+      const line = t.stdout.lastFrame
+        .split("\n")
+        .find((l) => l.includes("›") && !l.includes("step"))
+        ?.replace(/[›▌]/g, "")
+        .trim();
+      return line ?? "";
+    } finally {
+      t.cleanup();
+    }
+  }
+
+  it("deletes backwards when you press Backspace mid-line", async () => {
+    // Reported from use: "the delete key deletes forward for some reason".
+    // Ink labels the Backspace key `delete` — its own source has a TODO about
+    // it — and molt guessed between the two from the caret position, so at the
+    // end of a line it did the right thing and everywhere else it ate the
+    // character in front instead of the one behind.
+    const after = await afterPressing("abcdef", 2, BACKSPACE);
+    assert.equal(after, "abcef", `Backspace mid-line produced "${after}"`);
+  });
+
+  it("still deletes backwards at the end of a line", async () => {
+    const after = await afterPressing("abcdef", 0, BACKSPACE);
+    assert.equal(after, "abcde", `Backspace at the end produced "${after}"`);
+  });
+
+  it("deletes forwards when you press the forward-delete key", async () => {
+    // The other half: these two arrive from Ink indistinguishable, so fixing
+    // one by guessing would always have broken the other.
+    const after = await afterPressing("abcdef", 2, FORWARD_DELETE);
+    assert.equal(after, "abcdf", `forward Delete produced "${after}"`);
+  });
+
+  it("keeps alt+Backspace deleting the word behind the caret", async () => {
+    const after = await afterPressing("src/app.tsx and more", 0, ALT_BACKSPACE);
+    assert.equal(after, "src/app.tsx and", `alt+Backspace produced "${after}"`);
   });
 });
