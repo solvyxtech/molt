@@ -1297,3 +1297,74 @@ describe("pasting more than one line", () => {
     }
   });
 });
+
+describe("what a terminal actually sends for a newline", () => {
+  it("treats carriage returns inside a paste as line breaks", async () => {
+    // A terminal sends CR for a line ending — Return sends `\r`, and so does
+    // every newline inside a pasted block. The prompt splits on `\n`, so a
+    // paste read as one enormous line and its summary never fired; worse, the
+    // raw CRs reached the screen, where they mean "return to column one", and
+    // each pasted line was drawn over the one before it. Reported three times
+    // as text that was interleaved and half missing. It was never missing.
+    const t = await mount();
+    try {
+      t.stdin.press("first line\rsecond line\rthird line");
+      await tick(90);
+      const prompt = t.stdout.lastFrame.split("\n").filter((l) => l.includes("›")).at(-1) ?? "";
+      assert.match(prompt, /\[3 lines, 33 chars\]/, "carriage returns did not read as line breaks");
+      assert.ok(!prompt.includes("\r"), "a raw carriage return reached the screen");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("handles the CRLF pair as one line break, not two", async () => {
+    const t = await mount();
+    try {
+      t.stdin.press("alpha\r\nbeta\r\ngamma");
+      await tick(90);
+      const prompt = t.stdout.lastFrame.split("\n").filter((l) => l.includes("›")).at(-1) ?? "";
+      assert.match(prompt, /\[3 lines/, "CRLF counted as two line breaks");
+      assert.ok(!prompt.includes("\r"), "the CR half of the pair reached the screen");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("still submits when Return is pressed on its own", async () => {
+    // The one carriage return that must stay a carriage return. Rewriting it
+    // would leave the prompt with no way to be sent at all.
+    const t = await mount();
+    try {
+      for (const ch of "hello") t.stdin.press(ch);
+      await tick(60);
+      t.stdin.press("\r");
+      await tick(300);
+      assert.match(t.stdout.text, /›\s*hello/, "pressing Return did not submit the line");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("sends the pasted block with its line breaks intact", async () => {
+    const t = await mount();
+    try {
+      t.stdin.press("explain this:\rline A\rline B");
+      await tick(60);
+      t.stdin.press("\r");
+      await tick(300);
+      for (const fragment of ["explain this:", "line A", "line B"]) {
+        assert.ok(t.stdout.text.includes(fragment), `"${fragment}" never reached the transcript`);
+      }
+      // And as line breaks, not as carriage returns. A CR that survives this
+      // far is drawn on the screen, where it overwrites the row it lands on —
+      // the text is all present and none of it is readable.
+      assert.ok(
+        !t.stdout.text.includes("\r"),
+        "the pasted block still carries carriage returns into the transcript",
+      );
+    } finally {
+      t.cleanup();
+    }
+  });
+});
