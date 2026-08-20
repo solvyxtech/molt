@@ -270,3 +270,75 @@ describe("a refusal molt cannot argue with", () => {
     }
   });
 });
+
+describe("a ceiling raised mid-turn", () => {
+  /** A provider that keeps calling tools, so the turn runs long enough to hit a limit. */
+  function grinder(costPerStep: number) {
+    let n = 0;
+    const fetchFn = (async () => {
+      n += 1;
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        text: async () => "",
+        json: async () => ({
+          choices: [
+            {
+              message:
+                n > 12
+                  ? { role: "assistant", content: "finished" }
+                  : {
+                      role: "assistant",
+                      content: "working",
+                      tool_calls: [
+                        {
+                          id: `c${n}`,
+                          type: "function",
+                          function: { name: "bash", arguments: JSON.stringify({ command: "echo hi" }) },
+                        },
+                      ],
+                    },
+            },
+          ],
+          usage: { prompt_tokens: costPerStep, completion_tokens: 10 },
+        }),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    return { fetchFn, steps: () => n };
+  }
+
+  it("carries the turn past the limit that would have stopped it", async () => {
+    // The point of raising it. The engine reads the ceiling at the top of each
+    // step, so the change lands on the next one — but only if something can
+    // deliver it while the turn is running.
+    const ws = workspace();
+    try {
+      const g = grinder(20_000);
+      const engine = engineWith(ws.dir, {
+        fetchFn: g.fetchFn,
+        stream: false,
+        autonomy: "high",
+        maxTurnTokens: 60_000,
+        priceInPerMtok: undefined,
+        priceOutPerMtok: undefined,
+      });
+      const events: string[] = [];
+      for await (const ev of engine.run("grind", allowAll)) {
+        events.push(ev.kind);
+        // Raise it the moment molt says the ceiling is close, the way a person
+        // reading the warning would.
+        if (ev.kind === "info" && /% of the ceiling/.test(ev.text)) {
+          engine.setBudget(500_000);
+        }
+      }
+      assert.ok(
+        !events.includes("error"),
+        "the turn stopped at a ceiling that had already been raised",
+      );
+      assert.ok(g.steps() > 4, `only ran ${g.steps()} steps, so nothing was actually rescued`);
+    } finally {
+      ws.cleanup();
+    }
+  });
+});

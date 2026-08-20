@@ -1454,3 +1454,48 @@ describe("looking is not the same as recording", () => {
     }
   });
 });
+
+describe("raising the ceiling before it stops you", () => {
+  it("applies /budget while the turn is still running", async () => {
+    // molt warns on the way up — "50% of the ceiling, /budget raises it" — and
+    // then queued the answer until after the turn it was warning about had
+    // been stopped. The advice was impossible to take. The engine re-reads the
+    // ceiling at the top of every step, so a limit raised now applies to the
+    // next one.
+    const t = await mount({ fetchFn: slowProvider(300) });
+    try {
+      void submit(t.stdin, "read the seed");
+      await tick(120);
+      for (const ch of "/budget $9") t.stdin.press(ch);
+      await tick(60);
+      t.stdin.press("\r");
+      await tick(120);
+      assert.match(t.stdout.text, /per-turn ceiling: \$9/, "the new ceiling never took effect");
+      assert.ok(
+        !/queued —/.test(t.stdout.lastFrame),
+        "the ceiling change was queued until after the turn it was meant to save",
+      );
+      await tick(600);
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("still queues anything that would move the conversation", async () => {
+    // Switching model or endpoint halfway through a conversation is a
+    // different thing entirely, and waits.
+    const t = await mount({ fetchFn: slowProvider(300) });
+    try {
+      void submit(t.stdin, "read the seed");
+      await tick(120);
+      for (const ch of "and then summarise it") t.stdin.press(ch);
+      await tick(60);
+      t.stdin.press("\r");
+      await tick(80);
+      assert.match(t.stdout.text, /queued —/, "a follow-up message was not queued");
+      await tick(600);
+    } finally {
+      t.cleanup();
+    }
+  });
+});
