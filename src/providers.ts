@@ -389,12 +389,34 @@ export type ModelChoice = {
 };
 
 /** Everywhere you hold a key, plus anything local that needs none. */
+/**
+ * Every endpoint the picker should ask for models.
+ *
+ * `current` is the endpoint molt is pointed at right now, and it belongs in
+ * the list whether or not it is one of the presets. Without it, connecting to
+ * a server you run and then opening `/model` showed the providers you hold
+ * keys for and nothing from the machine you had just connected to — reported
+ * as "/model only shows anthropic and xai, not the models being hosted". The
+ * endpoint you are using is the one whose models you most obviously want.
+ *
+ * Listed first, for the same reason, and never twice: a preset you are already
+ * pointed at is matched by URL rather than by name, so `/endpoint` to Ollama's
+ * default address does not produce two Ollamas.
+ */
 export function modelSources(
   auth: Record<string, string>,
+  current?: { url: string; key?: string; name?: string },
 ): { name: string; url: string; key?: string }[] {
-  return Object.entries(PROVIDERS)
+  const presets = Object.entries(PROVIDERS)
     .filter(([name, p]) => !p.needsKey || auth[name])
     .map(([name, p]) => ({ name, url: p.url, key: auth[name] }));
+  if (!current?.url) return presets;
+  const same = (a: string, b: string): boolean => a.replace(/\/$/, "") === b.replace(/\/$/, "");
+  if (presets.some((p) => same(p.url, current.url))) return presets;
+  return [
+    { name: current.name || providerName(current.url), url: current.url, key: current.key },
+    ...presets,
+  ];
 }
 
 /**

@@ -788,6 +788,14 @@ export class Engine {
   get model(): string {
     return this.cfg.model;
   }
+  /**
+   * The key in use, so the model picker can ask this endpoint for its list.
+   * Never rendered: the picker needs it to authenticate, not to show it.
+   */
+  get apiKey(): string | undefined {
+    return this.cfg.apiKey;
+  }
+
   get baseUrl(): string {
     return this.cfg.baseUrl;
   }

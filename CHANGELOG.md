@@ -401,6 +401,15 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **`/model` ignored the endpoint you were pointed at.** Reported from use:
+  *"/model only shows anthropic and xai, not the models being hosted."* The
+  picker built its list from `modelSources`, which enumerated the presets you
+  hold keys for — so a server you had just connected to was invisible in the
+  one place you would go to choose one of its models. The current endpoint is
+  now a source in its own right, listed first, matched by URL so pointing at a
+  preset's address does not produce two of it, and carrying its key so a
+  private gateway can still be asked.
+
 - **Connecting to a working server said "unreachable".** Reported verbatim:
   `unreachable: endpoint reachable · 6 models`. The line argued with itself
   because `doctor()` folds two questions into one `ok` — did the endpoint
