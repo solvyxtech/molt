@@ -1655,7 +1655,9 @@ export class Engine {
         warned += 1;
         yield {
           kind: "info",
-          text: `this turn: ${ceilingLine} — ${pct}% of the ceiling. /budget raises it, /budget off removes it.`,
+          text:
+            `this turn: ${ceilingLine} — ${pct}% of the ceiling. Type /budget $5 now to raise ` +
+            `it and the turn carries on; /budget off removes it entirely.`,
         };
       }
 

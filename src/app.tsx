@@ -184,6 +184,18 @@ function fmtBytes(n: number): string {
  */
 const MAX_PROMPT_ROWS = 4;
 
+/**
+ * Commands that take effect while a turn is running, rather than waiting.
+ *
+ * Deliberately only the spending limits. They change what molt is allowed to
+ * do next and nothing about the conversation, so applying one halfway through
+ * is safe — and it is the only way to act on a ceiling warning before the
+ * ceiling arrives. Anything that moves the model, the endpoint or the
+ * transcript stays queued: doing that mid-conversation is its own kind of
+ * wrong.
+ */
+const RUNS_MID_TURN = new Set(["/budget", "/price"]);
+
 /** How many palette rows to show at once. */
 const PALETTE_ROWS = 6;
 
@@ -1441,8 +1453,22 @@ export function App({
         const text = input.trim();
         if (text) {
           setInput("");
-          queued.current.push(text);
-          add("info", `queued — molt will start this when the current turn ends: ${text}`);
+          // A few commands are worth running *now*, and the ceiling warning is
+          // the reason. molt says "this turn: $0.53 of $1.00 — /budget raises
+          // it" on the way up, and then queued the answer until after the turn
+          // it was warning about had already been stopped. The advice was
+          // impossible to take.
+          //
+          // The engine reads the ceiling at the top of every step, so a limit
+          // raised mid-turn applies to the next one. Only limits, though:
+          // switching model or endpoint halfway through a conversation is a
+          // different thing entirely and still waits its turn.
+          if (RUNS_MID_TURN.has(text.split(/\s+/)[0]!.toLowerCase())) {
+            command(text);
+          } else {
+            queued.current.push(text);
+            add("info", `queued — molt will start this when the current turn ends: ${text}`);
+          }
         }
         return;
       }

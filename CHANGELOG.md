@@ -358,6 +358,20 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **The ceiling warning gave advice you could not take.** molt says *"80% of
+  the ceiling — /budget raises it"* on the way up, and then queued `/budget`
+  until after the turn it was warning about had already been stopped. A
+  reported run typed `/budget off` at 80%, watched it come back *"queued — molt
+  will start this when the current turn ends"*, and lost the turn at $1.02 of
+  $1.00 with nothing verified.
+
+  The engine already re-read the ceiling at the top of every step, so a limit
+  raised mid-turn would have applied to the next one — nothing could deliver
+  it. `/budget` and `/price` now run while a turn is going. Only those two:
+  they change what molt may do next and nothing about the conversation, whereas
+  moving the model or the endpoint halfway through is its own kind of wrong and
+  still waits.
+
 - **Opening the transparency view wrote itself into the chat.** shift+V dumped
   everything recorded so far into the transcript and then mirrored every note
   after it — each argument, byte count and line of every result — interleaved
