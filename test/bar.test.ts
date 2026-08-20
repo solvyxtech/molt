@@ -372,3 +372,37 @@ describe("YAML scalar handling", () => {
     assert.throws(() => parseBar('version: 1\nchecks:\n  - name: c\n    run: "   "\n'), /empty/);
   });
 });
+
+describe("counting what was written", () => {
+  const wrote = (path: string, name = "write_file") => ({
+    role: "assistant" as const,
+    content: null,
+    tool_calls: [
+      { id: `c${path}${Math.random()}`, type: "function" as const, function: { name, arguments: JSON.stringify({ path }) } },
+    ],
+  });
+
+  it("counts files, not calls, because that is what it is compared against", () => {
+    // The ledger is keyed by path — one entry per file, merging the first
+    // `before` with the last `after`. Counting calls here compares two
+    // different units, and a turn that edited four files nine times between
+    // them wrote "5 further write(s) in the record did not land" into a
+    // receipt while everything had landed.
+    const record = [
+      wrote("src/cli.tsx"),
+      wrote("test/cli.test.ts"),
+      wrote("src/cli.tsx", "edit_file"),
+      wrote("src/cli.tsx", "edit_file"),
+      wrote("test/cli.test.ts", "edit_file"),
+    ];
+    assert.deepEqual(
+      claimedWrites(record),
+      ["src/cli.tsx", "test/cli.test.ts"],
+      "repeated edits to one file counted as separate writes",
+    );
+  });
+
+  it("keeps first-seen order, so the names read as the work happened", () => {
+    assert.deepEqual(claimedWrites([wrote("b.ts"), wrote("a.ts"), wrote("b.ts")]), ["b.ts", "a.ts"]);
+  });
+});

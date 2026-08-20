@@ -80,14 +80,33 @@ function watchStalls(): { stop: () => number } {
   };
 }
 
+/**
+ * The worst gap this machine produces while the loop has nothing to do.
+ *
+ * The floor under every measurement here. A quarter second is the right
+ * promise to make about molt, but `npm run check` runs `tsc` beside a dozen
+ * parallel test processes, and a test process descheduled by a busy machine
+ * has not been blocked by anything molt did. Comparing against a fixed number
+ * measures the machine; comparing against the machine's own idle noise
+ * measures molt.
+ */
+async function idleStall(ms = 200): Promise<number> {
+  const w = watchStalls();
+  await new Promise((r) => setTimeout(r, ms));
+  return w.stop();
+}
+
 async function stallDuring<T>(
   work: () => Promise<T>,
-): Promise<{ stalledMs: number; elapsed: number; value: T }> {
+): Promise<{ stalledMs: number; elapsed: number; baseline: number; value: T }> {
+  // Taken immediately before, in the same process and under whatever load is
+  // on the box right now.
+  const baseline = await idleStall();
   const w = watchStalls();
   const t0 = Date.now();
   try {
     const value = await work();
-    return { stalledMs: w.stop(), elapsed: Date.now() - t0, value };
+    return { stalledMs: w.stop(), elapsed: Date.now() - t0, baseline, value };
   } catch (e) {
     w.stop();
     throw e;
@@ -109,15 +128,60 @@ async function stallDuring<T>(
  */
 const MIN_MEASURABLE_MS = 150;
 
-function assertResponsive(what: string, r: { stalledMs: number; elapsed: number }): void {
+/**
+ * Measure the work, and measure it again if the first look was bad.
+ *
+ * These assertions are about wall-clock scheduling, and a transient burst — a
+ * `tsc` finishing beside them, a disk flush — can deschedule the test process
+ * for longer than molt would ever block. Calibrating against idle noise helped
+ * and did not settle it: the bar failed twice in a row of five while `npm run
+ * check` on the very same commit passed 762/762.
+ *
+ * A retry is safe here for a reason specific to this defect. Blocking is
+ * *deterministic*: `execSync` stalls for the whole command every single time,
+ * so a real regression fails both attempts. A scheduling burst does not
+ * repeat. Retrying therefore drops the false alarms without hiding the bug —
+ * verified by mutation, which still fails after the retry.
+ *
+ * A flaky check in molt's own bar is not cosmetic: it costs a whole proof
+ * attempt, which is ninety seconds and a turn.
+ */
+async function measureResponsive<T>(
+  what: string,
+  work: () => Promise<T>,
+): Promise<{ stalledMs: number; elapsed: number; baseline: number; value: T }> {
+  const first = await stallDuring(work);
+  const bad = first.stalledMs >= Math.max(MAX_STALL_MS, first.baseline * 3) ||
+    first.stalledMs >= first.elapsed * 0.5;
+  if (!bad) return first;
+  process.stderr.write(
+    `  (${what}: ${first.stalledMs}ms stall on the first look — measuring again before failing)\n`,
+  );
+  return stallDuring(work);
+}
+
+function assertResponsive(
+  what: string,
+  r: { stalledMs: number; elapsed: number; baseline: number },
+): void {
   assert.ok(
     r.elapsed > MIN_MEASURABLE_MS,
     `${what} finished in ${r.elapsed}ms — too fast to prove anything about stalling`,
   );
+  // The absolute bound is the promise; the baseline raises it when the machine
+  // itself is the thing stalling. Reported from a real run: this test failed
+  // once inside `npm run check` and passed alone on retry, which is a test
+  // measuring load, not molt — and a flaky check in molt's own bar costs a
+  // whole turn to re-prove.
+  const allowed = Math.max(MAX_STALL_MS, r.baseline * 3);
   assert.ok(
-    r.stalledMs < MAX_STALL_MS && r.stalledMs < r.elapsed * 0.5,
+    // The proportional bound is the one that catches the defect: blocking
+    // stalls for the entire operation whatever the machine is doing. The
+    // absolute one only has to avoid firing on noise.
+    r.stalledMs < allowed && r.stalledMs < r.elapsed * 0.5,
     `${what}: molt stopped responding for ${r.stalledMs}ms of ${r.elapsed}ms ` +
-      `(${Math.round((100 * r.stalledMs) / r.elapsed)}% of the operation)`,
+      `(${Math.round((100 * r.stalledMs) / r.elapsed)}% of the operation; ` +
+      `this machine's idle noise is ${r.baseline}ms, so anything under ${allowed}ms is the machine)`,
   );
 }
 
@@ -131,7 +195,10 @@ describe("runCommand", () => {
   });
 
   it("keeps the loop turning while it waits", async () => {
-    assertResponsive("a one-second command", await stallDuring(() => runCommand("sleep 1", { cwd: ws() })));
+    assertResponsive(
+      "a one-second command",
+      await measureResponsive("a one-second command", () => runCommand("sleep 1", { cwd: ws() })),
+    );
   });
 
   it("kills a command that runs past its timeout", async () => {
@@ -173,8 +240,15 @@ describe("molt while it works", () => {
 
   it("stays responsive while a tool runs", async () => {
     // The reported symptom: "molt freezes up while running its programs".
-    const engine = engineRunning(ws(), "sleep 1");
-    assertResponsive("a tool call", await stallDuring(() => drain(engine.run("run it", allowAll))));
+    // A fresh engine per attempt: measureResponsive may run the work twice,
+    // and a turn cannot be replayed through an engine that has already had one.
+    const dir = ws();
+    assertResponsive(
+      "a tool call",
+      await measureResponsive("a tool call", () =>
+        drain(engineRunning(dir, "sleep 1").run("run it", allowAll)),
+      ),
+    );
   });
 
   it("stays responsive while the bar runs", async () => {
@@ -195,7 +269,7 @@ describe("molt while it works", () => {
       stream: false,
       fetchFn: scriptedProvider([{ text: "done" }]).fetchFn,
     });
-    const r = await stallDuring(() => engine.proveNow());
+    const r = await measureResponsive("a bar check", () => engine.proveNow());
     assert.ok(r.value?.ok, "the check did not actually run");
     assertResponsive("a bar check", r);
   });
@@ -321,7 +395,7 @@ describe("searching a big tree", () => {
     // that backtracks, so the cost is in the CPU rather than in the disk. Ten
     // megabytes of fixture rather than the hundreds it would take to make a
     // plain literal search last as long.
-    const r = await stallDuring(() =>
+    const r = await measureResponsive("a search", () =>
       grepFiles(dir, ".*with.*some.*words.*absent", { glob: "*.ts" }),
     );
     assert.equal(r.value.matches.length, 0);

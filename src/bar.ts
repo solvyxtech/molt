@@ -371,15 +371,27 @@ export function mentionedPaths(claim: string): string[] {
  * `write_file`, so a session whose edits all failed reported "no file was
  * modified" instead of naming the edits that did not land — a correct refusal
  * with a misleading reason, which is its own kind of wrong.
+ *
+ * **Unique paths, not calls.** The ledger this is compared against is keyed by
+ * path — one entry per file, merging the first `before` with the last `after`
+ * — so counting calls here compares two different units. A turn that edited
+ * four files nine times between them reported "5 further write(s) in the
+ * record did not land" into a receipt, and nothing had failed to land: the
+ * model had simply edited the same files more than once. A receipt is the
+ * document handed to someone who does not trust you, and that sentence was
+ * false in it.
  */
 export function claimedWrites(record: Msg[]): string[] {
   const paths: string[] = [];
+  const seen = new Set<string>();
   for (const m of record) {
     for (const c of m.tool_calls ?? []) {
       if (c.function.name !== "write_file" && c.function.name !== "edit_file") continue;
       try {
         const args = JSON.parse(c.function.arguments || "{}") as Record<string, unknown>;
-        if (typeof args.path === "string") paths.push(args.path);
+        if (typeof args.path !== "string" || seen.has(args.path)) continue;
+        seen.add(args.path);
+        paths.push(args.path);
       } catch {
         /* malformed args are visible in the record; not this check's job */
       }
