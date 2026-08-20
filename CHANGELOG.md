@@ -358,6 +358,22 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **A pasted block was drawn on top of itself.** A terminal sends carriage
+  return for a line ending — pressing Return sends `\r`, and so does every
+  newline inside a paste. Nothing downstream expected it: the prompt splits on
+  `\n`, so a pasted block read as one enormous line and never summarised, and
+  the raw `\r` characters reached the screen, where they mean *return to column
+  one*. Each pasted line was therefore painted over the one before it. That is
+  the interleaved, half-missing text reported three times — and it was never
+  missing, only overwritten.
+
+  Carriage returns become newlines on the way in, `\r\n` collapsing to one, but
+  only in chunks longer than a single character: a chunk that *is* `\r` is the
+  Return key, and rewriting that would leave the prompt with no way to be sent.
+  Done byte by byte rather than through a string, because a chunk can split a
+  multi-byte character and decoding half of one turns pasted text into
+  replacement characters.
+
 - **`/model` moved the model but not the endpoint.** Choosing an Anthropic
   model after starting on xAI sent the Anthropic key to `api.x.ai` and came
   back *"Incorrect API key provided. You can obtain an API key from

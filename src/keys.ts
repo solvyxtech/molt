@@ -43,16 +43,56 @@ import { EventEmitter } from "node:events";
 const DEL = 0x7f;
 /** BS, which is what Ink is willing to call a backspace. */
 const BS = 0x08;
+/** CR, which is what a terminal sends for a line ending. */
+const CR = 0x0d;
+/** LF, which is what everything above this file means by one. */
+const LF = 0x0a;
 
-/** Rewrite DEL to BS in one chunk of terminal input, Buffer or string alike. */
-export function remapDelete<T extends Buffer | string>(chunk: T): T {
+/**
+ * Rewrite one chunk of terminal input into the alphabet the editor reads.
+ *
+ * Two substitutions, both because a terminal does not speak quite the same
+ * language as the program above it.
+ *
+ * **DEL becomes BS**, so the Backspace key stops arriving labelled as
+ * forward-delete. See the note at the top of this file.
+ *
+ * **CR becomes LF, inside a paste only.** A terminal sends carriage return for
+ * a line ending: pressing Return sends `\r`, and so does every newline inside
+ * a pasted block. Nothing downstream expected that. The prompt splits on `\n`,
+ * so a pasted block read as one enormous line and its summary never fired —
+ * and worse, the raw `\r` characters reached the screen, where they mean
+ * "return to column one", so each pasted line was drawn on top of the one
+ * before it. That is the interleaved, half-missing text reported three times.
+ * The input was never lost; it was overwritten in place.
+ *
+ * Only in chunks longer than one character. A chunk that *is* `\r` is the
+ * Return key, and turning that into a newline would leave the prompt with no
+ * way to be submitted at all.
+ */
+export function remapInput<T extends Buffer | string>(chunk: T): T {
+  const paste = chunk.length > 1;
   if (typeof chunk === "string") {
-    return chunk.replace(/\x7f/g, "\b") as T;
+    const swapped = chunk.replace(/\x7f/g, "\b");
+    // `\r\n` collapses to a single newline; a bare `\r` becomes one.
+    return (paste ? swapped.replace(/\r\n?/g, "\n") : swapped) as T;
   }
-  if (!chunk.includes(DEL)) return chunk;
-  const out = Buffer.from(chunk);
-  for (let i = 0; i < out.length; i++) if (out[i] === DEL) out[i] = BS;
-  return out as T;
+  if (!chunk.includes(DEL) && !(paste && chunk.includes(CR))) return chunk;
+  // Byte by byte rather than through a string: a chunk can split a multi-byte
+  // character down the middle, and decoding half of one turns pasted text into
+  // replacement characters.
+  const out = Buffer.alloc(chunk.length);
+  let n = 0;
+  for (let i = 0; i < chunk.length; i++) {
+    const b = chunk[i]!;
+    if (b === DEL) out[n++] = BS;
+    else if (paste && b === CR) {
+      out[n++] = LF;
+      // Skip the LF of a CRLF pair, so one line ending stays one newline.
+      if (chunk[i + 1] === LF) i++;
+    } else out[n++] = b;
+  }
+  return out.subarray(0, n) as T;
 }
 
 /**
@@ -81,7 +121,7 @@ export class RemappedStdin extends EventEmitter {
 
   read(): Buffer | string | null {
     const chunk = this.real.read() as Buffer | string | null;
-    return chunk === null ? null : remapDelete(chunk);
+    return chunk === null ? null : remapInput(chunk);
   }
 
   setRawMode(mode: boolean): this {
