@@ -37,6 +37,7 @@ import {
   saveEndpoint,
   saveKey,
   savePricing,
+  isSelfHosted,
   storedEndpoint,
   windowRows,
   type ModelChoice,
@@ -1181,6 +1182,15 @@ export function App({
               }
               const n = d.models?.length;
               add("ok", n === undefined ? "reachable" : `reachable · ${n} model(s)`);
+              // Said, rather than left to be noticed. A missing ceiling is
+              // exactly the kind of silent change that reads as a bug later.
+              if (isSelfHosted(arg)) {
+                add(
+                  "info",
+                  "your hardware, so no spending ceiling and no budget — nobody is billing you " +
+                    "for it. /budget <tokens> still sets one if you want a stop.",
+                );
+              }
               add("info", "/model to pick one");
             },
             (e: unknown) => add("error", `could not reach it: ${String(e)}`),

@@ -545,3 +545,101 @@ describe("the step guard asks too", () => {
     }
   });
 });
+
+describe("no ceiling on hardware you own", () => {
+  /** Never stops on its own, so only a ceiling or the guard can end it. */
+  function endless() {
+    let n = 0;
+    return (async () => {
+      n += 1;
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        text: async () => "",
+        json: async () => ({
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: "working",
+                tool_calls: [
+                  {
+                    id: `c${n}`,
+                    type: "function",
+                    function: { name: "bash", arguments: JSON.stringify({ command: `echo ${n}` }) },
+                  },
+                ],
+              },
+            },
+          ],
+          usage: { prompt_tokens: 40_000, completion_tokens: 10 },
+        }),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+  }
+
+  it("does not stop a local model at a spending ceiling", async () => {
+    // A ceiling exists to stop a bill, and a box you own does not send one.
+    // Stopping there spends nothing and throws away the work, which is the
+    // most expensive way to spend nothing.
+    const ws = workspace();
+    try {
+      const engine = engineWith(ws.dir, {
+        baseUrl: "http://192.168.0.218:8080/v1",
+        fetchFn: endless(),
+        stream: false,
+        autonomy: "high",
+      });
+      const events = await drain(engine.run("grind", allowAll));
+      const err = events.find((e) => e.kind === "error") as { text: string } | undefined;
+      assert.ok(
+        !/ceiling for a single turn/.test(err?.text ?? ""),
+        "stopped a local model at a spending ceiling",
+      );
+      // The step guard still ends it — that one is about loops, not money.
+      assert.match(err?.text ?? "", /loop guard/, "nothing stopped it at all");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("still stops a remote one", async () => {
+    const ws = workspace();
+    try {
+      const engine = engineWith(ws.dir, {
+        baseUrl: "https://api.x.ai/v1",
+        fetchFn: endless(),
+        stream: false,
+        autonomy: "high",
+      });
+      const events = await drain(engine.run("grind", allowAll));
+      const err = events.find((e) => e.kind === "error") as { text: string } | undefined;
+      assert.match(err?.text ?? "", /ceiling for a single turn/, "a billable endpoint ran uncapped");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("honours a ceiling you set yourself, local or not", async () => {
+    // The default is removed, not the control.
+    const ws = workspace();
+    try {
+      const engine = engineWith(ws.dir, {
+        baseUrl: "http://localhost:11434/v1",
+        fetchFn: endless(),
+        stream: false,
+        autonomy: "high",
+      });
+      engine.setBudget(120_000);
+      const events = await drain(engine.run("grind", allowAll));
+      const err = events.find((e) => e.kind === "error") as { text: string } | undefined;
+      assert.ok(
+        /budget hit|ceiling for a single turn/.test(err?.text ?? ""),
+        `a budget set by hand was ignored on a local endpoint: ${err?.text}`,
+      );
+    } finally {
+      ws.cleanup();
+    }
+  });
+});

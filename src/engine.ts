@@ -52,7 +52,7 @@ import {
 } from "./anthropic.js";
 import { breakpoints, withCaching, refusedCaching, type CacheStyle, cacheStyle } from "./cache.js";
 import { Journal } from "./journal.js";
-import { authHeaders } from "./providers.js";
+import { authHeaders, isSelfHosted } from "./providers.js";
 import { Receipts } from "./receipts.js";
 import { readStream, type Usage } from "./stream.js";
 import { Transcript, toolDetail } from "./transcript.js";
@@ -1722,8 +1722,15 @@ export class Engine {
       const spentThisTurn = this.sessionTokens - turnStartTokens;
       const usdThisTurn =
         turnStartCost === undefined ? undefined : (this.costUsd() ?? 0) - turnStartCost;
-      const usdCeiling = this.cfg.maxTurnUsd ?? DEFAULT_TURN_USD;
-      const tokenCeiling = this.cfg.maxTurnTokens ?? DEFAULT_TURN_TOKENS;
+      // No default ceiling on your own hardware. A spending ceiling exists to
+      // stop a bill, and a model running on a box you own does not send one —
+      // so the default stops work that costs nothing but electricity, and stops
+      // it in the middle, which is the most expensive way to spend nothing.
+      // A ceiling you set yourself still binds: this removes the default, not
+      // the control.
+      const free = isSelfHosted(this.cfg.baseUrl);
+      const usdCeiling = this.cfg.maxTurnUsd ?? (free ? 0 : DEFAULT_TURN_USD);
+      const tokenCeiling = this.cfg.maxTurnTokens ?? (free ? 0 : DEFAULT_TURN_TOKENS);
       const priced = usdThisTurn !== undefined && usdCeiling > 0;
       const used = priced ? usdThisTurn : spentThisTurn;
       const ceiling = priced ? usdCeiling : tokenCeiling;

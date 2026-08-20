@@ -369,6 +369,20 @@ a number presented with more confidence than it was earned with.
 
 ### Changed
 
+- **No default spending ceiling on hardware you own.** A ceiling exists to stop
+  a bill, and a model running on your own box does not send one — so the
+  default was stopping work that costs nothing but electricity, and stopping it
+  halfway, which is the most expensive way to spend nothing.
+
+  Decided on the address rather than on whether molt knows a price. Absence of
+  a price is not absence of a cost: Anthropic had no published rate here until
+  one was added, and it was billing the whole time. A loopback or private
+  address is different in kind, so `localhost`, `127.0.0.1`, `::1`, the RFC1918
+  ranges, `.local` and bare LAN hostnames get no default ceiling, and anything
+  routable on the public internet keeps one. `/budget` still binds wherever you
+  set it — the default is removed, not the control — and connecting to a local
+  endpoint says so rather than leaving a missing ceiling to be noticed later.
+
 - **`EngineConfig.retryBackoffMs`** overrides the wait between retries. Added
   because the real backoff put half a minute into molt's own suite, which runs
   on every proof attempt — up to four of those in a turn.
