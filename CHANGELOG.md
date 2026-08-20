@@ -9,6 +9,24 @@ a number presented with more confidence than it was earned with.
 
 ### Added
 
+- **The spending ceiling asks before it gives up.** Stopping dead at the
+  ceiling is the most expensive outcome molt has: the money is already spent,
+  and ending there converts it into nothing at all. A reported run reached
+  $1.02 of a $1.00 ceiling twenty steps into real work and got no answer for
+  any of it — *"it seems like a bigger waste if you spend the money and never
+  get an output"*, which is exactly right.
+
+  An interactive session is now offered the choice: **carry on** doubles the
+  ceiling and the turn continues, **stop here** does what it always did and
+  reports what was found. Stopping is the default, and the question returns at
+  each new ceiling — carrying on is a decision taken once per limit, not a
+  limit quietly switched off.
+
+  Deliberately not routed through the `confirm` used for tool permission.
+  `--yes` means "do not ask me about tool calls", and reading it as "spend
+  without limit" would let a headless run go through a budget unattended. A
+  turn with nobody watching still stops at the ceiling.
+
 - **Anthropic's native Messages API, because the compatible one cannot cache.**
   molt reached Anthropic through its OpenAI-compatible `/chat/completions`,
   which accepts `cache_control` and throws it away. Measured against the live

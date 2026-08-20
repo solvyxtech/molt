@@ -97,7 +97,7 @@ export type FrameOptions = {
   version?: string;
 };
 
-function fmtTokens(n: number): string {
+export function fmtTokens(n: number): string {
   if (n < 1000) return `${n}`;
   if (n < 1e6) {
     const k = n / 1000;

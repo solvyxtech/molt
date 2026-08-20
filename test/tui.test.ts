@@ -405,6 +405,20 @@ describe("the transparency view", () => {
     }
   });
 
+  it("keeps /help's command column from running into the summaries", async () => {
+    const t = await mount();
+    try {
+      await submit(t.stdin, "/help");
+      const frame = t.stdout.lastFrame;
+      assert.match(frame, /\/price \[<in> <out>\|refresh\|off\]/, "the longest command was clipped");
+      assert.match(frame, /what this model costs/, "/price's summary was swallowed by its args");
+      assert.match(frame, /\/autonomy \[low\|medium\|high\]/);
+      assert.match(frame, /how much molt does without asking/);
+    } finally {
+      t.cleanup();
+    }
+  });
+
   it("does not eat a letter typed into a message", async () => {
     const t = await mount();
     try {
@@ -538,6 +552,9 @@ describe("the transparency view", () => {
       for (const ch of "and then summarise it") t.stdin.press(ch);
       await tick(60);
       assert.match(t.stdout.lastFrame, /and then summarise it/, "typing was swallowed mid-turn");
+      // The keys already moved the caret mid-turn; drawing without it made a
+      // typo look unfixable even though it was not.
+      assert.match(t.stdout.lastFrame, /▌/, "mid-turn typing had no caret");
 
       t.stdin.press("\r");
       await tick(60);

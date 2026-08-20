@@ -5,11 +5,19 @@
  * terminal interface earns its keep by getting out of the way — showing the
  * work, the receipts, and the refusals, and nothing else.
  */
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Box, Static, Text, render, useApp, useInput, useStdout } from "ink";
 import type { RenderOptions } from "ink";
-import { Banner, fmtCost, fmtDuration } from "./banner.js";
-import { COMMANDS, completionFor, matchCommands, windowAround, wrapIndex } from "./commands.js";
+import { Banner, fmtCost, fmtDuration, fmtTokens } from "./banner.js";
+import {
+  COMMANDS,
+  COMMAND_COL,
+  commandLabel,
+  completionFor,
+  matchCommands,
+  windowAround,
+  wrapIndex,
+} from "./commands.js";
 import { RemappedStdin } from "./keys.js";
 import { StatusLine } from "./status-line.js";
 import { loadBar, writeDefaultBar, BarError } from "./bar.js";
@@ -125,7 +133,7 @@ const JOB_ROWS = 4;
 
 const HELP = [
   "commands",
-  ...COMMANDS.map((c) => `  ${(c.name + (c.args ? " " + c.args : "")).padEnd(20)}${c.summary}`),
+  ...COMMANDS.map((c) => `  ${commandLabel(c).padEnd(COMMAND_COL)}${c.summary}`),
   "",
   "  type / to browse · ↑↓ to choose · tab to fill · enter to run",
   "  start a line with ? to ask a question rather than request a change —",
@@ -139,11 +147,7 @@ const HELP = [
 ].join("\n");
 
 /** Tokens, at a width that does not make the line jitter as it climbs. */
-function tok(n: number): string {
-  if (n < 1000) return `${n}`;
-  const k = n / 1000;
-  return `${k < 10 ? k.toFixed(1) : Math.round(k)}k`;
-}
+const tok = fmtTokens;
 
 /**
  * Tokens and money, in one phrasing used everywhere.
@@ -183,6 +187,75 @@ function fmtBytes(n: number): string {
  * twenty.
  */
 const MAX_PROMPT_ROWS = 4;
+
+/**
+ * Draw the prompt: a summarised paste, or the line with its caret.
+ *
+ * Shared by the idle prompt and the mid-turn one. The mid-turn line used to
+ * dump the whole string with no caret, so a typo three words back had to be
+ * deleted from the end even though the same keys already moved the caret.
+ * Same editor, same drawing.
+ */
+function PromptBody({
+  entry,
+  room,
+  secret,
+  theme,
+}: {
+  entry: Line;
+  room: number;
+  secret?: boolean;
+  theme: { accent: string; ghost: string };
+}): ReactNode {
+  if (secret) {
+    return (
+      <>
+        {"•".repeat(entry.text.length)}
+        <Text color={theme.accent}>▌</Text>
+      </>
+    );
+  }
+  const rows = entry.text.split("\n");
+  // Summarised when it has newlines, and also when one line alone would fill
+  // more of the window than a prompt should. A chunked paste arrives before
+  // its first newline does, so four hundred characters of a single line grew
+  // the prompt to six rows and then collapsed it when the newline landed —
+  // the same height oscillation, reached without a newline in sight. Ordinary
+  // typing stays under this and still wraps, which is what you want when the
+  // text is yours.
+  const overlong = entry.text.length > room * MAX_PROMPT_ROWS;
+  if (rows.length > 1 || overlong) {
+    // The count goes first, deliberately. Showing the opening words and
+    // trailing "+10 more lines" read as truncation — reported as "it only
+    // pastes some of the text, or I can't see the whole text" — when every
+    // character was in fact held and sent. Leading with what molt has says
+    // so before the eye reaches anything that looks cut off.
+    const tag =
+      rows.length > 1
+        ? `[${rows.length} lines, ${entry.text.length} chars] `
+        : `[${entry.text.length} chars] `;
+    // Trimmed to the window rather than wrapped: the whole point is a prompt
+    // that does not change height while a paste arrives in a dozen reads, and
+    // a long first line wraps to two rows on its own.
+    const preview = rows[0]!.slice(0, Math.max(8, room - tag.length - 2));
+    return (
+      <>
+        <Text color={theme.ghost}>{tag}</Text>
+        {preview}
+        {preview.length < rows[0]!.length ? <Text color={theme.ghost}>…</Text> : null}
+        <Text color={theme.accent}>▌</Text>
+      </>
+    );
+  }
+  const { before, under, after, atEnd } = split(entry);
+  return (
+    <>
+      {before}
+      {atEnd ? <Text color={theme.accent}>▌</Text> : <Text inverse>{under}</Text>}
+      {after}
+    </>
+  );
+}
 
 /**
  * Commands that take effect while a turn is running, rather than waiting.
@@ -278,10 +351,24 @@ export function App({
   const [busy, setBusy] = useState(false);
   /** True once ctrl+C has been pressed on an empty line: the next one exits. */
   const [quitArmed, setQuitArmed] = useState(false);
-  const [pending, setPending] = useState<{ name: string; detail: string } | null>(null);
+  const [pending, setPending] = useState<
+    { name: string; detail: string; kind?: "spend" } | null
+  >(null);
   const [promptChoice, setPromptChoice] = useState(0);
   const [paletteIndex, setPaletteIndex] = useState(0);
   const [tokens, setTokens] = useState(0);
+  /**
+   * Estimated size of the request currently in flight. Lives on the meter,
+   * not only the working line, because the splash is gone by then and the
+   * working line is competing with what you are typing.
+   */
+  const [pendingEst, setPendingEst] = useState<number | undefined>(undefined);
+  /**
+   * Whether a key is already stored. Read once, then updated when /login
+   * succeeds — a disk read on every render of the status line is the kind
+   * of work a footer should never do.
+   */
+  const [hasKey, setHasKey] = useState(() => Object.keys(readAuth()).length > 0);
   const [streamText, setStreamText] = useState("");
   /** The line still being written, waiting for the newline that ends it. */
   const partial = useRef("");
@@ -592,6 +679,7 @@ export function App({
           break;
         }
         case "cancelled":
+          setPendingEst(undefined);
           flushPartial();
           // "The session is unchanged" was true of the transcript and false of
           // the disk. molt cannot un-write a file, and saying otherwise is the
@@ -695,6 +783,7 @@ export function App({
           // clock on it; the step number and the size of the request are the
           // difference between waiting and watching — and the request size is
           // the number that explains the bill arriving after it.
+          setPendingEst(ev.estTokens);
           beginActivity("thinking", `step ${ev.step + 1} · ~${tok(ev.estTokens)} tokens sent`);
           note(
             `→ step ${ev.step + 1} · ${ev.messages} messages · ~${tok(ev.estTokens)} tokens → ${ev.model}` +
@@ -747,6 +836,7 @@ export function App({
           setTokens(ev.sessionTokens);
           setCost(ev.costUsd);
           if (ev.estimated) setCostEstimated(true);
+          setPendingEst(undefined);
           break;
         case "proof_start":
           beginActivity("checking the bar");
@@ -946,6 +1036,7 @@ export function App({
         setCost(undefined);
         setCostEstimated(false);
       }
+      if (ok) setHasKey(true);
       add(
         ok ? "ok" : "error",
         ok
@@ -1368,11 +1459,24 @@ export function App({
       setBusy(true);
       beginActivity("thinking");
       try {
-        for await (const ev of engine.run(text, confirm, { ask: asking })) handleEvent(ev);
+        for await (const ev of engine.run(text, confirm, {
+          ask: asking,
+          // Stopping dead at the ceiling is the most expensive outcome there
+          // is: the money is already spent, and ending there turns it into
+          // nothing. Only offered here, where a person is watching — a
+          // headless run has nobody to ask and the ceiling still stops it.
+          onCeiling: (spent) =>
+            new Promise<boolean>((resolve) => {
+              setPending({ name: "spend", detail: spent, kind: "spend" });
+              setPromptChoice(1); // stopping is the default; carrying on is deliberate
+              resolver.current = resolve;
+            }),
+        })) handleEvent(ev);
       } catch (e) {
         add("error", String(e));
       } finally {
         setBusy(false);
+        setPendingEst(undefined);
         // A press that cancelled this turn must not still be armed against
         // the next one.
         setQuitArmed(false);
@@ -1850,11 +1954,14 @@ export function App({
 
       {pending ? (
         <Box flexDirection="column" marginTop={1}>
-          <Text color={theme.warn}>
-            allow {pending.name}: {pending.detail}
+          <Text color={theme.warn} wrap="wrap">
+            {pending.kind === "spend"
+              ? `this turn has spent ${pending.detail} — its ceiling. Carrying on doubles it; ` +
+                `stopping keeps what has been found so far and reports it.`
+              : `allow ${pending.name}: ${pending.detail}`}
           </Text>
           <Box>
-            {["allow", "deny"].map((label, i) => (
+            {(pending.kind === "spend" ? ["carry on", "stop here"] : ["allow", "deny"]).map((label, i) => (
               <Text
                 key={label}
                 color={promptChoice === i ? theme.accent : theme.dim}
@@ -1881,7 +1988,11 @@ export function App({
                       {active ? " ▸ " : "   "}
                       {p.name.padEnd(14)}
                     </Text>
-                    {p.hasKey && <Text color={theme.ghost}>key stored — will overwrite</Text>}
+                    {p.hasKey && (
+                      <Text color={theme.ghost}>
+                        {fit("key stored — will overwrite")}
+                      </Text>
+                    )}
                   </Box>
                 );
               })}
@@ -1914,25 +2025,40 @@ export function App({
             </Box>
           ) : mode.kind === "model-select" ? (
             <Box flexDirection="column">
-              {windowRows(mode.rows, mode.index).map(({ row, i }) =>
-                row.kind === "header" ? (
-                  // The provider header carries the same bright colour the
-                  // highlighted row gets, so the grouping reads at a glance.
-                  <Text key={`h${i}`} color={theme.accent} bold>
-                    {"  "}
-                    {row.provider}
-                  </Text>
-                ) : (
-                  <Text
-                    key={`m${i}`}
-                    color={i === mode.index ? theme.accent : theme.dim}
-                    bold={i === mode.index}
-                  >
-                    {i === mode.index ? "   ▸ " : "     "}
-                    {row.choice.id}
-                  </Text>
-                ),
-              )}
+              {(() => {
+                const win = windowRows(mode.rows, mode.index);
+                const above = win[0]?.i ?? 0;
+                const below = mode.rows.length - 1 - (win.at(-1)?.i ?? 0);
+                return (
+                  <>
+                    {above > 0 && <Text color={theme.ghost}>   ↑ {above} more</Text>}
+                    {win.map(({ row, i }) =>
+                      row.kind === "header" ? (
+                        // The provider header carries the same bright colour the
+                        // highlighted row gets, so the grouping reads at a glance.
+                        <Text key={`h${i}`} color={theme.accent} bold>
+                          {"  "}
+                          {row.provider}
+                        </Text>
+                      ) : (
+                        <Text
+                          key={`m${i}`}
+                          color={i === mode.index ? theme.accent : theme.dim}
+                          bold={i === mode.index}
+                        >
+                          {i === mode.index ? "   ▸ " : "     "}
+                          {fit(row.choice.id)}
+                          {row.choice.id === engine.model &&
+                          row.choice.provider === engine.provider ? (
+                            <Text color={theme.ghost}>{"  ← now"}</Text>
+                          ) : null}
+                        </Text>
+                      ),
+                    )}
+                    {below > 0 && <Text color={theme.ghost}>   ↓ {below} more</Text>}
+                  </>
+                );
+              })()}
               <Text color={theme.ghost}>   ↑↓ choose · enter select · esc cancel</Text>
             </Box>
           ) : (
@@ -1963,18 +2089,14 @@ export function App({
                       {quitArmed ? " \u00b7 ctrl+C again to exit" : " \u00b7 ctrl+C stops this turn"}
                     </Text>
                   </Text>
-                  {/* The line is still yours while it works. */}
+                  {/* The line is still yours while it works. Same editor as
+                      the idle prompt, including the caret: the keys already
+                      moved it, and drawing without it made a mid-turn typo
+                      look unfixable. */}
                   {input ? (
-                    // Summarised for the same reason as the idle prompt: this
-                    // is a live region, and a pasted block that made it taller
-                    // on every chunk is what tore the display.
                     <Text color={theme.text} wrap="wrap">
-                      {input.includes("\n")
-                        ? fit(
-                            `  › [${input.split("\n").length} lines, ${input.length} chars] ` +
-                              input.split("\n")[0],
-                          )
-                        : `  › ${input}`}
+                      <Text color={theme.dim}>{"  › "}</Text>
+                      <PromptBody entry={entry} room={Math.max(8, room - 4)} theme={theme} />
                     </Text>
                   ) : null}
                 </>
@@ -1989,83 +2111,13 @@ export function App({
                       and the caret wraps with it, because it is part of the
                       same run. A pasted key is still echoed as dots. */}
                   <Text color={theme.text} wrap="wrap">
-                    <Text color={theme.dim}>{mode.kind === "login-key" ? "🔑 " : "› "}</Text>
-                    {mode.kind === "login-key" ? (
-                      <>
-                        {"•".repeat(input.length)}
-                        <Text color={theme.accent}>▌</Text>
-                      </>
-                    ) : (
-                      (() => {
-                        // A pasted block keeps every character but is drawn on
-                        // one line.
-                        //
-                        // The prompt is a live region, and a live region that
-                        // changes height is one the terminal cannot repaint
-                        // without tearing — the failure this file has fought
-                        // before. A paste arrives in several reads, so an
-                        // eight-line block re-rendered the prompt at eight
-                        // different heights on the way in and the result came
-                        // out interleaved: lines overwritten, fragments in the
-                        // wrong order, whole lines gone. Reported from use.
-                        //
-                        // So the text is held in full and summarised here. The
-                        // caret sits at the end, because a single-line editor
-                        // has nothing useful to say about a caret three lines
-                        // up anyway.
-                        const rows = entry.text.split("\n");
-                        // Summarised when it has newlines, and also when one
-                        // line alone would fill more of the window than a
-                        // prompt should. A chunked paste arrives before its
-                        // first newline does, so four hundred characters of a
-                        // single line grew the prompt to six rows and then
-                        // collapsed it when the newline landed — the same
-                        // height oscillation, reached without a newline in
-                        // sight. Ordinary typing stays under this and still
-                        // wraps, which is what you want when the text is yours.
-                        const overlong = entry.text.length > room * MAX_PROMPT_ROWS;
-                        if (rows.length > 1 || overlong) {
-                          // The count goes first, deliberately. Showing the
-                          // opening words and trailing "+10 more lines" read as
-                          // truncation — reported as "it only pastes some of
-                          // the text, or I can't see the whole text" — when
-                          // every character was in fact held and sent. Leading
-                          // with what molt has says so before the eye reaches
-                          // anything that looks cut off.
-                          const tag =
-                            rows.length > 1
-                              ? `[${rows.length} lines, ${entry.text.length} chars] `
-                              : `[${entry.text.length} chars] `;
-                          // Trimmed to the window rather than wrapped: the
-                          // whole point is a prompt that does not change height
-                          // while a paste arrives in a dozen reads, and a long
-                          // first line wraps to two rows on its own.
-                          const preview = rows[0]!.slice(0, Math.max(8, room - tag.length - 2));
-                          return (
-                            <>
-                              <Text color={theme.ghost}>{tag}</Text>
-                              {preview}
-                              {preview.length < rows[0]!.length ? (
-                                <Text color={theme.ghost}>…</Text>
-                              ) : null}
-                              <Text color={theme.accent}>▌</Text>
-                            </>
-                          );
-                        }
-                        const { before, under, after, atEnd } = split(entry);
-                        return (
-                          <>
-                            {before}
-                            {atEnd ? (
-                              <Text color={theme.accent}>▌</Text>
-                            ) : (
-                              <Text inverse>{under}</Text>
-                            )}
-                            {after}
-                          </>
-                        );
-                      })()
-                    )}
+                    <Text color={theme.dim}>{mode.kind === "login-key" ? "key " : "› "}</Text>
+                    <PromptBody
+                      entry={entry}
+                      room={room}
+                      secret={mode.kind === "login-key"}
+                      theme={theme}
+                    />
                   </Text>
                   {/* The offer, where the keystroke that made it is looking.
                       A press that silently does nothing reads as a hang. */}
@@ -2092,7 +2144,7 @@ export function App({
                         <Box key={c.name}>
                           <Text color={active ? theme.accent : theme.dim} bold={active}>
                             {active ? " ▸ " : "   "}
-                            {(c.name + (c.args ? " " + c.args : "")).padEnd(20)}
+                            {commandLabel(c).padEnd(COMMAND_COL)}
                           </Text>
                           <Text color={active ? theme.text : theme.ghost}>{c.summary}</Text>
                         </Box>
@@ -2120,8 +2172,9 @@ export function App({
           autonomy,
           // A key already stored means the next step is choosing a model, not
           // logging in again.
-          hint: Object.keys(readAuth()).length > 0 ? "/model" : "/login",
+          hint: hasKey ? "/model" : "/login",
           budgetTokens: engine.budgetTokens,
+          pendingEst,
         }}
       />
     </Box>
