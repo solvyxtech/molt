@@ -9,10 +9,12 @@
  */
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { createElement } from "react";
 import { describe, it } from "node:test";
 import { render } from "ink";
-import { App } from "../src/app.js";
+import { App, renderApp } from "../src/app.js";
 import { Engine } from "../src/engine.js";
 import type { Msg } from "../src/types.js";
 import { workspace } from "./helpers.js";
@@ -20,6 +22,7 @@ import { workspace } from "./helpers.js";
 /** What a terminal sends for ctrl+V and ctrl+A. */
 const CTRL_V = String.fromCharCode(22);
 const CTRL_A = String.fromCharCode(1);
+const CTRL_C = String.fromCharCode(3);
 
 /**
  * A terminal's input side. Ink reads keys by listening for "readable" and
@@ -535,6 +538,27 @@ describe("the transparency view", () => {
     }
   });
 
+  it("does not let its own status line crowd out what you are typing", async () => {
+    // These were flex siblings on one row, and a row is CLIPPED at the window
+    // edge rather than reflowed. Giving the status line more to say about what
+    // it was waiting for pushed the typed message off the right edge, and it
+    // read as typing having stopped working. Narrow window, long message: the
+    // case where the two actually compete.
+    const t = await mount({ fetchFn: slowProvider(400) }, 60);
+    try {
+      void submit(t.stdin, "read the seed");
+      await tick(120);
+      const typed = "and then summarise what it says about the proof gate";
+      for (const ch of typed) t.stdin.press(ch);
+      await tick(120);
+      assert.match(t.stdout.lastFrame, /summarise what it says about the proof gate/,
+        "the status line clipped the user's own message off the screen");
+      await tick(600);
+    } finally {
+      t.cleanup();
+    }
+  });
+
   it("keeps shift+V and shift+A on an empty line only", async () => {
     // A letter is a command when there is nothing to type it into, and a
     // letter otherwise — the same rule at an idle prompt and mid-turn.
@@ -604,6 +628,485 @@ describe("the transparency view", () => {
       assert.match(frame, /job 2 unverified · 1 step\(s\) · 1\.2k in · 30 out · \$0\.003/);
     } finally {
       t.cleanup();
+    }
+  });
+});
+
+describe("narration across steps", () => {
+  /**
+   * A model that talks before each tool call, the way every real one does:
+   * a sentence of narration, then the call. The content never ends in a
+   * newline, because prose does not.
+   */
+  function narratingProvider(turns: { text: string; call?: string }[]): typeof fetch {
+    let n = 0;
+    return (async () => {
+      const turn = turns[Math.min(n, turns.length - 1)]!;
+      n += 1;
+      const enc = new TextEncoder();
+      const frames: string[] = [];
+      for (const piece of turn.text.match(/[\s\S]{1,17}/g) ?? []) {
+        frames.push(
+          `data: ${JSON.stringify({ choices: [{ delta: { content: piece } }] })}\n\n`,
+        );
+      }
+      if (turn.call) {
+        frames.push(
+          `data: ${JSON.stringify({
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: `c${n}`,
+                      type: "function",
+                      function: { name: "read_file", arguments: JSON.stringify({ path: turn.call }) },
+                    },
+                  ],
+                },
+              },
+            ],
+          })}\n\n`,
+        );
+      }
+      frames.push(
+        `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: turn.call ? "tool_calls" : "stop" }], usage: { prompt_tokens: 100, completion_tokens: 20 } })}\n\n`,
+      );
+      frames.push("data: [DONE]\n\n");
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "text/event-stream" },
+        body: new ReadableStream<Uint8Array>({
+          start(c) {
+            for (const f of frames) c.enqueue(enc.encode(f));
+            c.close();
+          },
+        }),
+        text: async () => "",
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+  }
+
+  it("never runs one step's last sentence into the next step's first", async () => {
+    const ws = workspace();
+    writeFileSync(join(ws.dir, "a.txt"), "alpha\n");
+    writeFileSync(join(ws.dir, "b.txt"), "beta\n");
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const engine = new Engine({
+      baseUrl: "http://provider.test/v1",
+      model: "m",
+      cwd: ws.dir,
+      bar: null,
+      stream: true,
+      autonomy: "high",
+      fetchFn: narratingProvider([
+        { text: "Mapping the repo and hunting for real bugs and product defects.", call: "a.txt" },
+        { text: "The workspace is the home directory, not molt itself.", call: "b.txt" },
+        { text: "Source lives under the installed package." },
+      ]),
+    });
+    const app = render(createElement(App, { engine, version: "vtest" }), {
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      debug: true,
+      exitOnCtrlC: false,
+      patchConsole: false,
+    });
+    try {
+      await tick();
+      await submit(stdin, "review the repo");
+      await tick(600);
+      const text = stdout.text;
+      assert.ok(
+        !/defects\.\s*The workspace/.test(text.replace(/\n/g, "")),
+        "step 1's narration ran straight into step 2's",
+      );
+      assert.ok(
+        !/itself\.\s*Source lives/.test(text.replace(/\n/g, "")),
+        "step 2's narration ran straight into step 3's",
+      );
+    } finally {
+      app.unmount();
+      ws.cleanup();
+    }
+  });
+});
+
+describe("ctrl+C", () => {
+  /**
+   * Ink exits on ctrl+C by itself unless told not to, beside whatever the app
+   * does with the key. These mount with the flag left at its default — the
+   * production setting — because passing exitOnCtrlC:false in the harness is
+   * exactly what hid this: the app's own handling was tested, and the key that
+   * reached it in the real program was not.
+   */
+  async function mountReal(over: Record<string, unknown> = {}) {
+    const ws = workspace();
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const engine = new Engine({
+      baseUrl: "http://provider.test/v1",
+      model: "test-model",
+      provider: "test",
+      cwd: ws.dir,
+      bar: null,
+      fetchFn: provider(),
+      stream: false,
+      ...over,
+    });
+    // Mounted exactly the way `molt` mounts it. The point of the helper is
+    // that the ctrl+C option is not a knob a caller can get wrong.
+    const app = renderApp(
+      { engine, version: "vtest" },
+      {
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream,
+        debug: true,
+        patchConsole: false,
+      },
+    );
+    let exited = false;
+    void app.waitUntilExit().then(() => {
+      exited = true;
+    });
+    await tick();
+    return { stdin, stdout, engine, exited: () => exited, cleanup: () => { app.unmount(); ws.cleanup(); } };
+  }
+
+  it("takes the line back instead of killing the session", async () => {
+    const t = await mountReal();
+    try {
+      for (const ch of "a half-written thought") t.stdin.press(ch);
+      await tick(60);
+      t.stdin.press(CTRL_C);
+      await tick(80);
+      assert.equal(t.exited(), false, "one ctrl+C ended the whole session");
+      assert.ok(
+        !t.stdout.lastFrame.includes("half-written"),
+        "kept the line it was asked to clear",
+      );
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("exits on the second press, not the first", async () => {
+    const t = await mountReal();
+    try {
+      t.stdin.press(CTRL_C);
+      await tick(80);
+      assert.equal(t.exited(), false, "quit on the first press of an empty line");
+      assert.match(t.stdout.lastFrame, /ctrl\+C again to exit/, "offered nothing, just sat there");
+      t.stdin.press(CTRL_C);
+      await tick(120);
+      assert.equal(t.exited(), true, "would not exit even on the second press");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("forgets the offer as soon as you carry on typing", async () => {
+    const t = await mountReal();
+    try {
+      t.stdin.press(CTRL_C);
+      await tick(60);
+      t.stdin.press("h");
+      await tick(60);
+      assert.ok(
+        !t.stdout.lastFrame.includes("ctrl+C again"),
+        "still armed after a keystroke that meant carry on",
+      );
+      t.stdin.press(CTRL_C);
+      await tick(100);
+      assert.equal(t.exited(), false, "a stale offer exited on a fresh first press");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("stops the turn without stopping molt", async () => {
+    // Hangs until the signal fires, so the cancellation is the only thing that
+    // can end the request — a provider that just returns slowly would finish on
+    // its own and prove nothing.
+    const hangingProvider = (async (_url: string, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+        });
+      })) as unknown as typeof fetch;
+    const t = await mountReal({ fetchFn: hangingProvider });
+    try {
+      for (const ch of "read the seed") t.stdin.press(ch);
+      await tick(40);
+      t.stdin.press("\r");
+      await tick(120);
+      t.stdin.press(CTRL_C);
+      await tick(300);
+      assert.equal(t.exited(), false, "cancelling a turn took the session down with it");
+      assert.match(t.stdout.text, /cancelled/, "the turn was never actually cancelled");
+    } finally {
+      t.cleanup();
+    }
+  });
+});
+
+describe("what the transcript keeps", () => {
+  /** Streams `text`, then optionally a tool call, then stops. */
+  function sayingProvider(turns: { text: string; call?: string }[], stream = true): typeof fetch {
+    let n = 0;
+    return (async () => {
+      const t = turns[Math.min(n, turns.length - 1)]!;
+      n += 1;
+      const calls = t.call
+        ? [
+            {
+              id: `c${n}`,
+              type: "function" as const,
+              function: { name: "read_file", arguments: JSON.stringify({ path: t.call }) },
+            },
+          ]
+        : undefined;
+      if (!stream) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => "application/json" },
+          json: async () => ({
+            choices: [
+              { message: { role: "assistant", content: t.text, ...(calls ? { tool_calls: calls } : {}) } },
+            ],
+            usage: { prompt_tokens: 10, completion_tokens: 2 },
+          }),
+          text: async () => "",
+        } as unknown as Response;
+      }
+      const enc = new TextEncoder();
+      const frames = (t.text.match(/[\s\S]{1,9}/g) ?? []).map(
+        (p) => `data: ${JSON.stringify({ choices: [{ delta: { content: p } }] })}\n\n`,
+      );
+      if (calls) {
+        frames.push(
+          `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: calls.map((c, i) => ({ index: i, ...c })) } }] })}\n\n`,
+        );
+      }
+      frames.push(
+        `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: calls ? "tool_calls" : "stop" }], usage: { prompt_tokens: 10, completion_tokens: 2 } })}\n\n`,
+      );
+      frames.push("data: [DONE]\n\n");
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "text/event-stream" },
+        body: new ReadableStream<Uint8Array>({
+          start(c) {
+            for (const f of frames) c.enqueue(enc.encode(f));
+            c.close();
+          },
+        }),
+        text: async () => "",
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+  }
+
+  async function transcriptOf(fetchFn: typeof fetch): Promise<string[]> {
+    const ws = workspace();
+    writeFileSync(join(ws.dir, "a.txt"), "alpha\n");
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const engine = new Engine({
+      baseUrl: "http://p.test/v1",
+      model: "m",
+      cwd: ws.dir,
+      bar: null,
+      autonomy: "high",
+      fetchFn,
+      stream: true,
+    });
+    const app = renderApp(
+      { engine, version: "vtest" },
+      {
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream,
+        debug: true,
+        patchConsole: false,
+      },
+    );
+    try {
+      await tick(80);
+      await submit(stdin, "go");
+      await tick(500);
+      return (stdout.frames.at(-1) ?? "").split("\n");
+    } finally {
+      app.unmount();
+      ws.cleanup();
+    }
+  }
+
+  it("keeps the blank line the model put between its paragraphs", async () => {
+    // Ink drops a whitespace-only `<Static>` item when items arrive one at a
+    // time, which is exactly how streamed output arrives — so every paragraph
+    // break the model wrote was deleted and its prose arrived as one block.
+    const lines = await transcriptOf(
+      sayingProvider([{ text: "First thought.\n\nSecond thought." }]),
+    );
+    const first = lines.findIndex((l) => l.includes("First thought."));
+    const second = lines.findIndex((l) => l.includes("Second thought."));
+    assert.ok(first !== -1 && second !== -1, "the prose never reached the screen");
+    assert.equal(second, first + 2, "the paragraph break was swallowed");
+    assert.equal(lines[first + 1]!.trim(), "", "expected a blank line between the paragraphs");
+  });
+
+  it("does not turn a run of blank lines into a run of blank rows", async () => {
+    // A model that leaves four blank lines did not mean four.
+    const lines = await transcriptOf(sayingProvider([{ text: "One.\n\n\n\n\nTwo." }]));
+    const one = lines.findIndex((l) => l.includes("One."));
+    const two = lines.findIndex((l) => l.includes("Two."));
+    assert.equal(two, one + 2, `expected one blank line between them, got ${two - one - 1}`);
+  });
+
+  it("shows what the model said before a tool call, streaming or not", async () => {
+    for (const streaming of [true, false]) {
+      const lines = await transcriptOf(
+        sayingProvider([{ text: "Reading the file first.", call: "a.txt" }, { text: "Done." }], streaming),
+      );
+      assert.ok(
+        lines.some((l) => l.includes("Reading the file first.")),
+        `${streaming ? "streamed" : "non-streamed"}: the model's reason for the call was dropped`,
+      );
+      const said = lines.findIndex((l) => l.includes("Reading the file first."));
+      const call = lines.findIndex((l) => l.includes("read_file"));
+      assert.ok(said < call, "the narration landed below the call it was introducing");
+    }
+  });
+});
+
+describe("getting out", () => {
+  it("escapes a salvage that will not finish", async () => {
+    // The reported bug: hitting the budget runs a salvage, the salvage's
+    // request was the one request molt never made cancellable, and ctrl+C
+    // reached a controller that had already been cleared. molt sat there
+    // busy and unquittable at exactly the moment you wanted out.
+    const ws = workspace();
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    let hung = 0;
+    const fetchFn = (async (_url: string, init?: RequestInit) => {
+      // The first request answers; the salvage that follows never does.
+      if (hung++ === 0) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => "application/json" },
+          json: async () => ({
+            choices: [{ message: { role: "assistant", content: "spending" } }],
+            usage: { prompt_tokens: 900, completion_tokens: 40 },
+          }),
+          text: async () => "",
+        } as unknown as Response;
+      }
+      return new Promise((_res, rej) => {
+        init?.signal?.addEventListener("abort", () =>
+          rej(Object.assign(new Error("aborted"), { name: "AbortError" })),
+        );
+      });
+    }) as unknown as typeof fetch;
+    const engine = new Engine({
+      baseUrl: "http://p.test/v1",
+      model: "m",
+      cwd: ws.dir,
+      bar: null,
+      stream: false,
+      fetchFn,
+    });
+    engine.setBudget(500);
+    const app = renderApp(
+      { engine, version: "vtest" },
+      {
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream,
+        debug: true,
+        patchConsole: false,
+      },
+    );
+    let exited = false;
+    void app.waitUntilExit().then(() => {
+      exited = true;
+    });
+    try {
+      await tick(80);
+      await submit(stdin, "spend it");
+      // Second turn: over budget, so it errors and salvages — into the hang.
+      void submit(stdin, "again");
+      await tick(400);
+      assert.match(stdout.lastFrame, /thinking|working|responding/, "the turn was not actually running");
+
+      stdin.press(CTRL_C);
+      await tick(400);
+      // One press is enough now that the salvage can be aborted: the turn ends
+      // and the prompt comes back.
+      assert.equal(exited, false, "the first press took the whole session down");
+      assert.ok(
+        !/shift\+V to watch/.test(stdout.lastFrame),
+        "still busy after ctrl+C — the hung request was never cancelled",
+      );
+      // And molt is usable again rather than wedged: it can still be quit.
+      stdin.press(CTRL_C);
+      await tick(120);
+      stdin.press(CTRL_C);
+      await tick(300);
+      assert.equal(exited, true, "molt was left in a state it could not be quit from");
+    } finally {
+      app.unmount();
+      ws.cleanup();
+    }
+  });
+  it("leaves even when the request ignores being cancelled", async () => {
+    // The backstop. Aborting the salvage fixed the hang that was reported, but
+    // "you can always get out" should not rest on having fixed every possible
+    // hang — so a second press leaves regardless of what the turn is doing.
+    const ws = workspace();
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    // Never resolves, and pays no attention to the signal.
+    const fetchFn = (async () => new Promise(() => {})) as unknown as typeof fetch;
+    const engine = new Engine({
+      baseUrl: "http://p.test/v1",
+      model: "m",
+      cwd: ws.dir,
+      bar: null,
+      stream: false,
+      fetchFn,
+    });
+    const app = renderApp(
+      { engine, version: "vtest" },
+      {
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream,
+        debug: true,
+        patchConsole: false,
+      },
+    );
+    let exited = false;
+    void app.waitUntilExit().then(() => {
+      exited = true;
+    });
+    try {
+      await tick(80);
+      void submit(stdin, "hang");
+      await tick(300);
+      stdin.press(CTRL_C);
+      await tick(200);
+      assert.equal(exited, false, "one press should ask, not quit");
+      assert.match(stdout.lastFrame, /ctrl\+C again to exit/, "never offered the way out");
+      stdin.press(CTRL_C);
+      await tick(300);
+      assert.equal(exited, true, "molt held the terminal hostage");
+    } finally {
+      app.unmount();
+      ws.cleanup();
     }
   });
 });

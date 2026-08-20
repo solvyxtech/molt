@@ -92,6 +92,31 @@ describe("read-only commands", () => {
     }
   });
 
+  it("does not let a git verb alone decide it for branch and remote", () => {
+    // `branch` and `remote` used to sit in the read-only subcommand map
+    // unconditionally — the same bug already caught and fixed for `stash`,
+    // `config`, and `tag`. `git branch <name>` creates a ref, `git branch -d`
+    // deletes one, and `git remote add/remove/set-url` rewrites .git/config;
+    // none of that is a report.
+    for (const c of [
+      "git branch feature/x",
+      "git branch -d old",
+      "git branch -D old",
+      "git branch -m old new",
+      "git remote add origin https://example.com/repo.git",
+      "git remote remove origin",
+      "git remote rm origin",
+      "git remote rename old new",
+      "git remote set-url origin https://example.com/repo.git",
+      "git remote prune origin",
+    ]) {
+      assert.ok(!isReadOnlyCommand(c), `should not be read-only: ${c}`);
+    }
+    for (const c of ["git branch", "git branch -a", "git branch -v", "git remote", "git remote -v", "git remote show origin"]) {
+      assert.ok(isReadOnlyCommand(c), `should be read-only: ${c}`);
+    }
+  });
+
   it("judges a chain by its worst link", () => {
     // Every segment has to be a read, because every segment runs.
     assert.ok(isReadOnlyCommand("cat a.txt | grep x | head -5"));

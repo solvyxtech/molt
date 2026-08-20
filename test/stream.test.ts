@@ -317,3 +317,95 @@ describe("streaming through the engine", () => {
     );
   });
 });
+
+describe("what a streamed turn hands the surfaces", () => {
+  /** A provider that streams `text` in small pieces and then stops. */
+  function streamingProvider(text: string): typeof fetch {
+    return (async () => {
+      const enc = new TextEncoder();
+      const frames = (text.match(/[\s\S]{1,7}/g) ?? []).map(
+        (piece) => `data: ${JSON.stringify({ choices: [{ delta: { content: piece } }] })}\n\n`,
+      );
+      frames.push(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`);
+      frames.push("data: [DONE]\n\n");
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "text/event-stream" },
+        body: new ReadableStream<Uint8Array>({
+          start(c) {
+            for (const f of frames) c.enqueue(enc.encode(f));
+            c.close();
+          },
+        }),
+        text: async () => "",
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+  }
+
+  it("says where the message ended, so a surface need not guess", async () => {
+    // Streamed prose does not end in a newline. Without an explicit end, the
+    // TUI ran each step's last sentence into the next step's first.
+    const engine = new Engine({
+      baseUrl: "http://p.test/v1",
+      model: "m",
+      cwd: ws(),
+      bar: null,
+      stream: true,
+      fetchFn: streamingProvider("All done here."),
+    });
+    const events = await drain(engine.run("go", allowAll));
+    assert.ok(kinds(events).includes("message_end"), "no message boundary was ever stated");
+    const ends = events.findIndex((e) => e.kind === "message_end");
+    const lastDelta = events.map((e) => e.kind).lastIndexOf("delta");
+    assert.ok(lastDelta !== -1 && ends > lastDelta, "the boundary came before the text it closes");
+  });
+
+  it("does not send the final answer twice", async () => {
+    // The deltas carried it and `assistant_text` repeated it, so `molt run`
+    // printed the whole final answer, then printed it again.
+    const engine = new Engine({
+      baseUrl: "http://p.test/v1",
+      model: "m",
+      cwd: ws(),
+      bar: null,
+      stream: true,
+      fetchFn: streamingProvider("The file says alpha."),
+    });
+    const events = await drain(engine.run("go", allowAll));
+    const streamedText = events
+      .filter((e): e is { kind: "delta"; text: string } => e.kind === "delta")
+      .map((e) => e.text)
+      .join("");
+    assert.equal(streamedText, "The file says alpha.");
+    const answer = events.find((e) => e.kind === "assistant_text");
+    assert.ok(answer, "the turn no longer says it produced an answer — molt run reads its exit code from this");
+    assert.equal(
+      (answer as { streamed?: boolean }).streamed,
+      true,
+      "did not mark the answer as already streamed, so a surface will print it twice",
+    );
+  });
+
+  it("redacts a key the model echoes back, streamed or not", async () => {
+    // "Everything that scrolls is redacted" was true of the tool preview and
+    // false of the streamed text, which is the default path.
+    const key = "sk-live-abcdef0123456789";
+    const engine = new Engine({
+      baseUrl: "http://p.test/v1",
+      model: "m",
+      apiKey: key,
+      cwd: ws(),
+      bar: null,
+      stream: true,
+      fetchFn: streamingProvider(`Your key is ${key} — I used it.`),
+    });
+    const events = await drain(engine.run("go", allowAll));
+    const shown = events
+      .filter((e): e is { kind: "delta"; text: string } => e.kind === "delta")
+      .map((e) => e.text)
+      .join("");
+    assert.ok(!shown.includes(key), `the key went to the screen in the clear: ${shown}`);
+    assert.match(shown, /\[redacted\]/);
+  });
+});
