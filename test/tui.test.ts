@@ -1708,3 +1708,53 @@ describe("/login offers the machine you host on", () => {
     }
   });
 });
+
+describe("connecting to an endpoint says what is true", () => {
+  /** A server that answers /models with `ids`. */
+  function serverWith(ids: string[]): typeof fetch {
+    return (async (url: string) => {
+      if (String(url).endsWith("/models")) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => "application/json" },
+          json: async () => ({ data: ids.map((id) => ({ id })) }),
+          text: async () => "",
+        } as unknown as Response;
+      }
+      return { ok: false, status: 404, headers: { get: () => "" }, text: async () => "", json: async () => ({}) } as unknown as Response;
+    }) as unknown as typeof fetch;
+  }
+
+  it("does not call a reachable endpoint unreachable", async () => {
+    // Reported from use: "unreachable: endpoint reachable · 6 models". The
+    // endpoint had answered fine — switching endpoints clears the model on
+    // purpose, so doctor's `ok` was false for a model nobody had chosen yet,
+    // and reading that as reachability printed a line that argued with itself.
+    const t = await mount({ fetchFn: serverWith(["qwen3-coder", "llama31-8b", "gpt-oss-20b"]) });
+    try {
+      await submit(t.stdin, "/endpoint http://192.168.0.218:8080/v1");
+      await tick(250);
+      const text = t.stdout.text;
+      assert.ok(!/unreachable/.test(text), `called a working endpoint unreachable: ${text.slice(-200)}`);
+      assert.match(text, /reachable · 3 model\(s\)/, "did not say what it found");
+      assert.match(text, /\/model to pick one/);
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("still says unreachable when it really is", async () => {
+    const dead = (async () => {
+      throw new TypeError("fetch failed");
+    }) as unknown as typeof fetch;
+    const t = await mount({ fetchFn: dead });
+    try {
+      await submit(t.stdin, "/endpoint http://192.168.0.99:9999/v1");
+      await tick(250);
+      assert.match(t.stdout.text, /unreachable/, "a dead endpoint was reported as fine");
+    } finally {
+      t.cleanup();
+    }
+  });
+});

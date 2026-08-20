@@ -1160,11 +1160,20 @@ export function App({
           setCostEstimated(false);
           persistEndpoint();
           add("ok", `endpoint → ${arg}`);
-          // Reachability said now rather than discovered on the first turn.
+          // Reachability said now rather than discovered on the first turn —
+          // and reported on `reachable`, not `ok`. Switching endpoint clears
+          // the model on purpose, so `ok` is false here for a model nobody has
+          // chosen yet, and reading it as reachability printed "unreachable"
+          // above a line saying the endpoint answered with six models.
           void engine.doctor().then(
             (d) => {
-              add(d.ok ? "ok" : "error", `${d.ok ? "reachable" : "unreachable"}: ${d.detail}`);
-              if (d.ok) add("info", "/model to pick one of its models");
+              if (!d.reachable) {
+                add("error", `unreachable: ${d.detail}`);
+                return;
+              }
+              const n = d.models?.length;
+              add("ok", n === undefined ? "reachable" : `reachable · ${n} model(s)`);
+              add("info", "/model to pick one");
             },
             (e: unknown) => add("error", `could not reach it: ${String(e)}`),
           );
