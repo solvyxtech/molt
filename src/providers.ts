@@ -370,6 +370,44 @@ export function resolveProvider(sel: string): string | null {
  * to "api", which names the subdomain rather than the provider and reads the
  * same for every vendor that fronts their API that way.
  */
+/**
+ * Is this endpoint a machine you run?
+ *
+ * Decided on the address, deliberately, and not on whether molt knows a price.
+ * A provider molt has no rate for still bills you — Anthropic did, until its
+ * published rates were added — so absence of a price is not absence of a cost.
+ * A loopback or private address is different in kind: nobody is invoicing you
+ * for your own hardware, and a spending ceiling there protects against a bill
+ * that does not exist while stopping work that costs nothing but electricity.
+ *
+ * Conservative in the direction that matters: anything routable on the public
+ * internet is treated as billable, so a ceiling is never lifted from something
+ * that might charge for the next token.
+ */
+export function isSelfHosted(baseUrl: string): boolean {
+  let host = "";
+  try {
+    host = new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
+  // IPv6 loopback, with or without the brackets a URL puts round it.
+  if (host === "::1" || host === "[::1]") return true;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    if (a === 127) return true; // loopback
+    if (a === 10) return true; // 10.0.0.0/8
+    if (a === 192 && b === 168) return true; // 192.168.0.0/16
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+    if (a === 169 && b === 254) return true; // link-local
+    return false;
+  }
+  // A bare name with no dots is a LAN hostname, not a public one.
+  return host.length > 0 && !host.includes(".");
+}
+
 export function providerName(url: string): string {
   const match = Object.keys(PROVIDERS).find((n) => PROVIDERS[n]!.url === url);
   if (match) return match;

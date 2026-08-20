@@ -32,6 +32,7 @@ import {
   resolveProvider,
   windowRows,
   type ModelChoice,
+  isSelfHosted,
 } from "../src/providers.js";
 import { workspace } from "./helpers.js";
 
@@ -681,5 +682,41 @@ describe("the endpoint you are pointed at is a model source", () => {
 
   it("is unchanged when there is no current endpoint", () => {
     assert.deepEqual(modelSources({ xai: "k" }), modelSources({ xai: "k" }, undefined));
+  });
+});
+
+describe("telling your own hardware from someone's meter", () => {
+  it("recognises the addresses that cannot bill you", () => {
+    for (const url of [
+      "http://localhost:11434/v1",
+      "http://127.0.0.1:8080/v1",
+      "http://192.168.0.218:8080/v1",
+      "http://10.1.2.3:8000/v1",
+      "http://172.16.4.5:8000/v1",
+      "http://172.31.255.1:8000/v1",
+      "http://nuc:11434/v1",
+      "http://workstation.local:8080/v1",
+      "http://[::1]:8080/v1",
+    ]) {
+      assert.equal(isSelfHosted(url), true, `${url} should be self-hosted`);
+    }
+  });
+
+  it("treats anything routable as billable, because it might be", () => {
+    // Conservative in the one direction that matters: a ceiling is never
+    // lifted from something that could charge for the next token.
+    for (const url of [
+      "https://api.anthropic.com/v1",
+      "https://api.x.ai/v1",
+      "https://openrouter.ai/api/v1",
+      "https://api.openai.com/v1",
+      // Adjacent to a private range without being in one.
+      "http://172.32.0.1:8000/v1",
+      "http://11.0.0.1:8000/v1",
+      "http://192.169.0.1:8000/v1",
+      "not a url",
+    ]) {
+      assert.equal(isSelfHosted(url), false, `${url} should be treated as billable`);
+    }
   });
 });
