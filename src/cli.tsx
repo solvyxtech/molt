@@ -978,7 +978,6 @@ function cmdVerify(args: Args): number {
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
-  // molt: CLI entry point - handles command parsing and execution
   let args: Args;
   try {
     args = parseArgs(argv, storedEndpoint());
