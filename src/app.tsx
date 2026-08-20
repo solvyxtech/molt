@@ -273,6 +273,13 @@ export function App({
   // Read inside `note`, which must not be rebuilt every time the view opens or
   // closes — a new identity there would re-run every effect that depends on it.
   const verboseRef = useRef(startVerbose);
+  /**
+   * Whether the live detail is also written into the permanent transcript.
+   *
+   * Fixed at startup by `--verbose` and never moved by the shift+V toggle: one
+   * is a request for a record, the other is a look.
+   */
+  const mirrorToTranscript = useRef(startVerbose);
   const [jobs, setJobs] = useState<Job[]>([]);
   // The splash is the one moving thing on screen at startup, and the
   // transcript cannot be printed permanently above something still moving.
@@ -363,7 +370,21 @@ export function App({
         const next = [...prev, { id, text, dim }];
         return next.length > FEED_MEMORY ? next.slice(-FEED_MEMORY) : next;
       });
-      if (verboseRef.current) {
+      // Only when the session was *started* with --verbose, not when someone
+      // has the view open.
+      //
+      // The transcript is permanent: it is printed once and never redrawn, so
+      // anything written into it is in the conversation for good. Mirroring
+      // the feed there while the view was open meant a glance at what molt was
+      // doing permanently interleaved every argument, byte count and line of
+      // every result with what the model had said — and closing the view could
+      // not take any of it back. Reported as the view ruining the chat log and
+      // pushing the model's own words out of sight.
+      //
+      // So looking and recording are separate acts now. shift+V is a live
+      // view that leaves no trace; `--verbose` at launch is the deliberate
+      // choice to have all of it in the scrollback.
+      if (mirrorToTranscript.current) {
         setLines((prev) => [...prev, { id: nextId.current++, tone: "info", text: `  ${text}` }]);
       }
     },
@@ -758,25 +779,13 @@ export function App({
   const toggleVerbose = useCallback(() => {
     setVerbose((v) => {
       verboseRef.current = !v;
-      // Opening the view prints everything it has been recording, so what you
-      // get is the session so far and not just the session from here on.
-      if (!v) {
-        setFeed((current) => {
-          setLines((prev) => [
-            ...prev,
-            { id: nextId.current++, tone: "info", text: "── everything recorded so far ──" },
-            ...current.map((f) => ({ id: nextId.current++, tone: "info" as const, text: `  ${f.text}` })),
-            { id: nextId.current++, tone: "info", text: "── live from here ──" },
-          ]);
-          return current;
-        });
-      }
       // Said in the feed, not the transcript: a keypress that permanently
       // prints a line into the record is a keypress people stop pressing.
       note(
         v
           ? "view closed — shift+V while working, ctrl+V any time"
-          : "view open: every call, argument, and result, as recorded in .molt/log",
+          : "view open: every call, argument, and result — live only, nothing added to the chat. " +
+            "--verbose at launch keeps it all in the scrollback instead.",
       );
       return !v;
     });

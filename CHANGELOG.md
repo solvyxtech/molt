@@ -358,6 +358,18 @@ a number presented with more confidence than it was earned with.
 
 ### Fixed
 
+- **Opening the transparency view wrote itself into the chat.** shift+V dumped
+  everything recorded so far into the transcript and then mirrored every note
+  after it — each argument, byte count and line of every result — interleaved
+  with what the model had said. The transcript is printed once and never
+  redrawn, so closing the view could take none of it back. Reported as the view
+  ruining the chat log and pushing the model's own words out of sight.
+
+  Looking and recording are separate acts now. shift+V is a live view that
+  leaves no trace in the record; `--verbose` at launch is the deliberate
+  request to keep all of it in the scrollback, and still does. The panel shows
+  exactly what it showed before.
+
 - **A pasted block was drawn on top of itself.** A terminal sends carriage
   return for a line ending — pressing Return sends `\r`, and so does every
   newline inside a paste. Nothing downstream expected it: the prompt splits on

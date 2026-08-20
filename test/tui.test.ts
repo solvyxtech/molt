@@ -109,7 +109,11 @@ function slowProvider(ms: number): typeof fetch {
   }) as unknown as typeof fetch;
 }
 
-async function mount(over: Record<string, unknown> = {}, columns?: number) {
+async function mount(
+  over: Record<string, unknown> = {},
+  columns?: number,
+  props: { verbose?: boolean } = {},
+) {
   const ws = workspace();
   const stdin = new FakeStdin();
   const stdout = new FakeStdout();
@@ -132,7 +136,7 @@ async function mount(over: Record<string, unknown> = {}, columns?: number) {
   // that mounts its own way tests something the real program never runs — which
   // is exactly how the ctrl+C bug survived a whole suite.
   const app = renderApp(
-    { engine, version: "vtest" },
+    { engine, version: "vtest", ...props },
     {
       stdin: stdin as unknown as NodeJS.ReadStream,
       stdout: stdout as unknown as NodeJS.WriteStream,
@@ -1362,6 +1366,88 @@ describe("what a terminal actually sends for a newline", () => {
       assert.ok(
         !t.stdout.text.includes("\r"),
         "the pasted block still carries carriage returns into the transcript",
+      );
+    } finally {
+      t.cleanup();
+    }
+  });
+});
+
+describe("looking is not the same as recording", () => {
+  /** Rows of the permanent transcript, which is everything above the panel. */
+  const transcriptRows = (frame: string): number =>
+    frame.split("\n").filter((l) => l.trim() && !/auto (low|medium|high)/.test(l)).length;
+
+  it("adds nothing to the chat when the view is opened and closed", async () => {
+    // Reported from use: shift+V "ruins the chat log — when you close the view
+    // it stays in the chat and pushes what the LLM is saying up". It did.
+    // Opening dumped everything recorded so far into the transcript and then
+    // mirrored every note after it, and the transcript is printed once and
+    // never redrawn, so closing the view could not take any of it back.
+    const t = await mount();
+    try {
+      await submit(t.stdin, "read the seed");
+      await tick(100);
+      const before = transcriptRows(t.stdout.lastFrame);
+
+      t.stdin.press(CTRL_V);
+      await tick(80);
+      t.stdin.press(CTRL_V);
+      await tick(80);
+
+      const after = transcriptRows(t.stdout.lastFrame);
+      assert.ok(
+        after <= before + 1,
+        `opening and closing the view added ${after - before} rows to the chat`,
+      );
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("still shows the detail while the view is open", async () => {
+    // The panel is the point; it just does not write to the record.
+    const t = await mount();
+    try {
+      await submit(t.stdin, "read the seed");
+      t.stdin.press(CTRL_V);
+      await tick(80);
+      assert.match(t.stdout.lastFrame, /args \{"path":"seed\.txt"\}/, "the view revealed nothing");
+      assert.match(t.stdout.lastFrame, /what the model is doing/);
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("keeps the model's own words in view after a look", async () => {
+    const t = await mount();
+    try {
+      await submit(t.stdin, "read the seed");
+      await tick(100);
+      t.stdin.press(CTRL_V);
+      await tick(80);
+      t.stdin.press(CTRL_V);
+      await tick(80);
+      assert.match(
+        t.stdout.lastFrame,
+        /read it/,
+        "the model's answer was pushed out of the frame by the view",
+      );
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("writes it all to the transcript when asked for that at launch", async () => {
+    // --verbose is the deliberate request for a record, and still gets one.
+    const t = await mount({}, undefined, { verbose: true });
+    try {
+      await submit(t.stdin, "read the seed");
+      await tick(120);
+      assert.match(
+        t.stdout.text,
+        /args \{"path":"seed\.txt"\}/,
+        "--verbose stopped putting the detail in the scrollback",
       );
     } finally {
       t.cleanup();
