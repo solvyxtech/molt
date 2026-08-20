@@ -75,7 +75,7 @@ usage
   molt init                 write a starter .molt/done.yml
   molt doctor               check the endpoint and model
 
-  molt receipts             list completion attempts (--grep, --show <file>)
+  molt receipts             list completion attempts (--grep, --show <file>, --repair)
   molt archive              list shed batches (--grep, --show <n>, --explain)
   molt stats                false-claim rate and tokens per verified change
   molt log                  what the model actually did, from the session log
@@ -141,6 +141,7 @@ type Args = {
   skip?: string[];
   grep?: string;
   show?: string;
+  repair?: boolean;
   explain: boolean;
   session?: string;
   raw: boolean;
@@ -282,6 +283,9 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         break;
       case "--show":
         out.show = next();
+        break;
+      case "--repair":
+        out.repair = true;
         break;
       case "--explain":
         out.explain = true;
@@ -713,6 +717,26 @@ async function cmdDoctor(args: Args): Promise<number> {
 function cmdReceipts(args: Args): number {
   const receipts = new Receipts(args.cwd);
 
+  if (args.repair) {
+    const report = receipts.repair();
+    if (args.json) {
+      process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+      return 0;
+    }
+    process.stdout.write(
+      `${report.marked} marked missing (file gone; row kept as evidence)\n` +
+        `${report.kept} left alone (file exists)\n` +
+        `${report.alreadyMissing} already marked missing\n`,
+    );
+    process.stdout.write(
+      report.marked === 0
+        ? "\nNothing changed. Safe to run again.\n"
+        : "\nGhost rows are marked, not deleted — the record of a receipt is itself evidence.\n" +
+            "Run again is a no-op. Repair does not rewrite receipt files or renumber anything.\n",
+    );
+    return 0;
+  }
+
   if (args.show) {
     const file = receipts.list().find((f) => f === args.show || f.startsWith(args.show!));
     if (!file) {
@@ -760,10 +784,12 @@ function cmdReceipts(args: Args): number {
     process.stdout.write("no completion attempts recorded yet\n");
     return 0;
   }
+  const onDisk = new Set(receipts.list());
   for (const r of rows) {
     const failed = r.failed.length ? `  failed: ${r.failed.join(", ")}` : "";
+    const gone = onDisk.has(r.file) ? "" : "  MISSING";
     process.stdout.write(
-      `${r.file}  ${r.verdict.padEnd(9)} attempt ${r.attempt}  ${r.model}  ${r.sessionTokens} tok${failed}\n`,
+      `${r.file}  ${r.verdict.padEnd(9)} attempt ${r.attempt}  ${r.model}  ${r.sessionTokens} tok${failed}${gone}\n`,
     );
   }
   return 0;
@@ -841,13 +867,20 @@ function cmdStats(args: Args): number {
     process.stdout.write("no completion attempts recorded yet\n");
     return 0;
   }
+  const missing = s.attempts - s.present;
+  const rate =
+    s.present === 0
+      ? "—  (no receipts left on disk to check)"
+      : `${(s.falseClaimRate * 100).toFixed(1)}%  ` +
+        `(share of on-disk claims that did not survive the bar` +
+        (missing === 0 ? ")" : `; ${missing} recorded attempt(s) have no file)`);
   process.stdout.write(
-    `completion attempts     ${s.attempts}\n` +
+    `completion attempts     ${s.attempts} recorded\n` +
+      `  still on disk         ${s.present}\n` +
       `  accepted              ${s.accepted}\n` +
       `  refused               ${s.refused}\n` +
       `  exhausted             ${s.exhausted}\n\n` +
-      `false-claim rate        ${(s.falseClaimRate * 100).toFixed(1)}%  ` +
-      `(share of claims that did not survive the bar)\n` +
+      `false-claim rate        ${rate}\n` +
       `tokens per verified change  ${s.tokensPerVerifiedChange ?? "—"}\n` +
       `cost per verified change    ${s.usdPerVerifiedChange === undefined ? "—" : `$${s.usdPerVerifiedChange.toFixed(4)}`}\n\n`,
   );
