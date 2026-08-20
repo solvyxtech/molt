@@ -173,6 +173,17 @@ function fmtBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/**
+ * How many rows the prompt may occupy before it summarises instead.
+ *
+ * The prompt is a live region and a region that changes height is one the
+ * terminal cannot repaint without tearing. Four leaves room for an ordinary
+ * long sentence to wrap — which is wanted, since the text is yours and you are
+ * still editing it — while bounding the pasted block that would otherwise take
+ * twenty.
+ */
+const MAX_PROMPT_ROWS = 4;
+
 /** How many palette rows to show at once. */
 const PALETTE_ROWS = 6;
 
@@ -1879,7 +1890,10 @@ export function App({
                     // on every chunk is what tore the display.
                     <Text color={theme.text} wrap="wrap">
                       {input.includes("\n")
-                        ? `  › ${input.split("\n")[0]}  ⏎ +${input.split("\n").length - 1} more`
+                        ? fit(
+                            `  › [${input.split("\n").length} lines, ${input.length} chars] ` +
+                              input.split("\n")[0],
+                          )
                         : `  › ${input}`}
                     </Text>
                   ) : null}
@@ -1920,15 +1934,41 @@ export function App({
                         // has nothing useful to say about a caret three lines
                         // up anyway.
                         const rows = entry.text.split("\n");
-                        if (rows.length > 1) {
-                          const rest = rows.length - 1;
+                        // Summarised when it has newlines, and also when one
+                        // line alone would fill more of the window than a
+                        // prompt should. A chunked paste arrives before its
+                        // first newline does, so four hundred characters of a
+                        // single line grew the prompt to six rows and then
+                        // collapsed it when the newline landed — the same
+                        // height oscillation, reached without a newline in
+                        // sight. Ordinary typing stays under this and still
+                        // wraps, which is what you want when the text is yours.
+                        const overlong = entry.text.length > room * MAX_PROMPT_ROWS;
+                        if (rows.length > 1 || overlong) {
+                          // The count goes first, deliberately. Showing the
+                          // opening words and trailing "+10 more lines" read as
+                          // truncation — reported as "it only pastes some of
+                          // the text, or I can't see the whole text" — when
+                          // every character was in fact held and sent. Leading
+                          // with what molt has says so before the eye reaches
+                          // anything that looks cut off.
+                          const tag =
+                            rows.length > 1
+                              ? `[${rows.length} lines, ${entry.text.length} chars] `
+                              : `[${entry.text.length} chars] `;
+                          // Trimmed to the window rather than wrapped: the
+                          // whole point is a prompt that does not change height
+                          // while a paste arrives in a dozen reads, and a long
+                          // first line wraps to two rows on its own.
+                          const preview = rows[0]!.slice(0, Math.max(8, room - tag.length - 2));
                           return (
                             <>
-                              {rows[0]}
+                              <Text color={theme.ghost}>{tag}</Text>
+                              {preview}
+                              {preview.length < rows[0]!.length ? (
+                                <Text color={theme.ghost}>…</Text>
+                              ) : null}
                               <Text color={theme.accent}>▌</Text>
-                              <Text color={theme.ghost}>
-                                {`  ⏎ +${rest} more line${rest === 1 ? "" : "s"}, ${entry.text.length} chars`}
-                              </Text>
                             </>
                           );
                         }

@@ -1175,7 +1175,42 @@ describe("the delete keys", () => {
 });
 
 describe("pasting more than one line", () => {
-  it("keeps the prompt one line tall however much is pasted", async () => {
+  /**
+   * How many rows the prompt occupies, which is the thing that tears.
+   *
+   * Measured on the prompt itself rather than on the frame height: the frame
+   * includes the transcript above, which legitimately grows as molt prints
+   * things, and a test that watched the total passed for reasons that had
+   * nothing to do with the prompt.
+   */
+  function promptRows(frame: string, columns: number): number {
+    const lines = frame.split("\n");
+    let start = -1;
+    lines.forEach((l, i) => {
+      if (l.includes("›")) start = i;
+    });
+    if (start === -1) return 0;
+    // Down to the status row, which always sits directly under the prompt.
+    // Counting only the line carrying the caret misses the rows a block spills
+    // onto, which is the entire failure being tested.
+    //
+    // Zero when there is no status row yet: early frames are still drawing the
+    // splash, and running to the end of the frame there measures the banner
+    // rather than the prompt. Callers drop the zeros.
+    let end = -1;
+    for (let i = start + 1; i < lines.length; i++) {
+      if (/auto (low|medium|high)/.test(lines[i]!)) {
+        end = i;
+        break;
+      }
+    }
+    if (end === -1) return 0;
+    const drawn = lines.slice(start, end);
+    // Plus whatever the terminal itself wraps.
+    return drawn.reduce((n, l) => n + Math.max(1, Math.ceil(l.length / columns)), 0);
+  }
+
+  it("keeps the prompt one row tall however much is pasted", async () => {
     // A paste arrives in several reads, and the prompt is a live region: an
     // eight-line block re-rendered it at eight different heights on the way in,
     // and the terminal — which repaints by erasing a line count — interleaved
@@ -1183,38 +1218,62 @@ describe("pasting more than one line", () => {
     // wrong order, and whole lines missing.
     const t = await mount();
     try {
-      const before = t.stdout.lastFrame.split("\n").length;
       const paste = Array.from({ length: 8 }, (_, i) => `line ${i + 1} of the pasted block`).join("\n");
       for (const chunk of paste.match(/[\s\S]{1,30}/g) ?? []) {
         t.stdin.press(chunk);
         await tick(25);
       }
       await tick(60);
-      const heights = t.stdout.frames.slice(-6).map((f) => f.split("\n").length);
-      assert.equal(
-        new Set(heights).size,
-        1,
-        `the prompt changed height while the paste arrived: ${heights.join(" -> ")}`,
-      );
-      assert.ok(
-        t.stdout.lastFrame.split("\n").length <= before + 1,
-        "a pasted block made the live region taller",
+      const rows = t.stdout.frames.slice(-6).map((f) => promptRows(f, 100)).filter((n) => n > 0);
+      assert.ok(rows.length >= 3, `only ${rows.length} frames were measurable`);
+      assert.deepEqual(
+        [...new Set(rows)],
+        [1],
+        `the prompt changed height while the paste arrived: ${rows.join(" -> ")} rows`,
       );
     } finally {
       t.cleanup();
     }
   });
 
-  it("says how much was pasted rather than hiding it", async () => {
+  it("says up front how much it is holding", async () => {
+    // Showing the opening words with a trailing "+2 more lines" read as
+    // truncation — reported as "it only pastes some of the text" — when every
+    // character had in fact been kept. The count goes first now, before the
+    // eye reaches anything that looks cut off.
     const t = await mount();
     try {
       const paste = "first line\nsecond line\nthird line";
       t.stdin.press(paste);
       await tick(80);
       const frame = t.stdout.lastFrame;
-      assert.match(frame, /first line/, "the first line is not shown");
-      assert.match(frame, /\+2 more lines/, "did not say how much more there was");
+      const prompt = frame.split("\n").find((l) => l.includes("›")) ?? "";
+      assert.match(prompt, /\[3 lines, 33 chars\]/, "did not say what it was holding");
+      assert.ok(prompt.indexOf("[3 lines") < prompt.indexOf("first line"), "the count came after the preview");
       assert.ok(!frame.includes("third line"), "still drawing the whole block");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("fits the prompt in the window even when the first line is long", async () => {
+    // A long first line wraps to two rows on its own, which puts the height
+    // back where it started: changing while the paste arrives.
+    const t = await mount({}, 60);
+    try {
+      const paste = `${"x".repeat(400)}\nsecond line\nthird line`;
+      for (const chunk of paste.match(/[\s\S]{1,25}/g) ?? []) {
+        t.stdin.press(chunk);
+        await tick(15);
+      }
+      await tick(60);
+      const rows = t.stdout.frames.slice(-6).map((f) => promptRows(f, 60)).filter((n) => n > 0);
+      assert.ok(rows.length >= 3, `only ${rows.length} frames were measurable`);
+      assert.deepEqual(
+        [...new Set(rows)],
+        [1],
+        `a 400-character first line wrapped the prompt to ${rows.join("/")} rows`,
+      );
     } finally {
       t.cleanup();
     }

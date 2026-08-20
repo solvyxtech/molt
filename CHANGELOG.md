@@ -370,6 +370,22 @@ a number presented with more confidence than it was earned with.
   `cache_control` or `stream_options` — since that says nothing about the new
   one.
 
+- **A pasted block looked like it had been cut off.** The summary showed the
+  opening words with a trailing "+10 more lines", which reads as truncation —
+  reported as *"it only pastes some of the text, or I can't see the whole
+  text"* — when every character had in fact been kept and sent. The count goes
+  first now (`[11 lines, 619 chars] Section 3 of…`), before the eye reaches
+  anything that looks missing.
+
+  The same fix closed a case the first one missed. A chunked paste arrives
+  before its first newline does, so four hundred characters of a single line
+  grew the prompt to six rows and collapsed it again when the newline landed —
+  the same height oscillation, reached without a newline in sight. The prompt
+  now summarises on width as well as on line count, and the tests measure the
+  rows the prompt actually occupies rather than the height of the whole frame,
+  which grows for reasons of its own and made the first version of them pass
+  regardless.
+
 - **Pasting more than one line tore the display.** The prompt is a live region,
   and a paste arrives in several reads, so an eight-line block re-rendered it at
   eight different heights on the way in — 10 rows to 15 in a measured run. A
