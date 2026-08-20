@@ -25,6 +25,11 @@ export type Command = {
   aliases?: string[];
 };
 
+/** Name plus argument hint, the way the palette and `/help` print a command. */
+export function commandLabel(c: Pick<Command, "name" | "args">): string {
+  return c.args ? `${c.name} ${c.args}` : c.name;
+}
+
 export const COMMANDS: Command[] = [
   { name: "/help", summary: "list every command" },
   {
@@ -72,6 +77,16 @@ export const COMMANDS: Command[] = [
   { name: "/clear", summary: "reset the session" },
   { name: "/exit", summary: "quit", aliases: ["quit"] },
 ];
+
+/**
+ * Width of the command column in the palette and `/help`.
+ *
+ * Longest name-plus-args, plus two spaces of gutter, so summaries start on
+ * the same column everywhere. A hardcoded 20 was already too short for
+ * `/price [<in> <out>|refresh|off]` and `/autonomy [low|medium|high]`, so
+ * those two ran into their own descriptions.
+ */
+export const COMMAND_COL = Math.max(...COMMANDS.map((c) => commandLabel(c).length)) + 2;
 
 /** Is `needle` a subsequence of `hay`? Powers /rgw → /regrow. */
 export function isSubsequence(needle: string, hay: string): boolean {

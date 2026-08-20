@@ -377,6 +377,15 @@ export type RunOptions = {
    * exactly the behaviour molt is built to encourage.
    */
   ask?: boolean;
+  /**
+   * Asked when a turn reaches its spending ceiling, before it stops.
+   *
+   * Returning true doubles the ceiling and carries on; anything else stops the
+   * turn as it always did. Supplied only by an interactive session — a headless
+   * run has nobody to ask, and a ceiling that could be waved through
+   * unattended is not a ceiling.
+   */
+  onCeiling?: (spent: string) => Promise<boolean>;
 };
 
 /**
@@ -1662,6 +1671,37 @@ export class Engine {
       }
 
       if (ceiling > 0 && used >= ceiling) {
+        // Ask, when there is someone to ask.
+        //
+        // Stopping dead at the ceiling is the most expensive outcome available:
+        // the money is already spent, and ending there converts it into nothing
+        // at all. A reported run reached $1.02 of a $1.00 ceiling twenty steps
+        // into real work and got no answer for any of it — "it seems like a
+        // bigger waste if you spend the money and never get an output".
+        //
+        // Deliberately not the `confirm` used for tools. `--yes` means "do not
+        // ask me about tool calls", and reading it as "spend without limit"
+        // would let a headless run in CI go through a budget unattended. This
+        // is a separate channel that only an interactive session provides, so
+        // where nobody is watching the ceiling still stops the turn.
+        if (opts.onCeiling) {
+          const more = await opts.onCeiling(ceilingLine);
+          if (more) {
+            // Raised by the same amount again, so continuing is a decision
+            // taken once per ceiling rather than a limit quietly removed.
+            if (priced) this.cfg.maxTurnUsd = usdCeiling * 2;
+            else this.cfg.maxTurnTokens = tokenCeiling * 2;
+            log?.append("note", { text: `ceiling raised at ${ceilingLine} — turn continues` });
+            yield {
+              kind: "info",
+              text: `carrying on past ${ceilingLine}. The ceiling is now ${
+                priced ? fmtUsd(usdCeiling * 2) : `${tokenCeiling * 2} tokens`
+              } for this turn.`,
+            };
+            warned = 0;
+            continue;
+          }
+        }
         log?.append("session_end", {
           reason: "turn ceiling",
           tokens: spentThisTurn,

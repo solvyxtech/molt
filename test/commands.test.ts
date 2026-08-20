@@ -6,6 +6,8 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   COMMANDS,
+  COMMAND_COL,
+  commandLabel,
   completionFor,
   isSubsequence,
   matchCommands,
@@ -106,6 +108,20 @@ describe("the registry itself", () => {
       seen.add(c.name);
       assert.ok(c.summary.length > 0, `${c.name} needs a summary`);
     }
+  });
+
+  it("gives the palette and /help a column that fits every command", () => {
+    // A hardcoded 20 was already too short for /price and /autonomy, so those
+    // two ran into their own descriptions. The column is derived from the
+    // registry so a longer argument hint cannot silently overflow again.
+    for (const c of COMMANDS) {
+      assert.ok(
+        commandLabel(c).length + 2 <= COMMAND_COL,
+        `${commandLabel(c)} does not fit the ${COMMAND_COL}-wide column`,
+      );
+    }
+    assert.equal(commandLabel({ name: "/prove" }), "/prove");
+    assert.equal(commandLabel({ name: "/ask", args: "<question>" }), "/ask <question>");
   });
 });
 

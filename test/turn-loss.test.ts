@@ -342,3 +342,130 @@ describe("a ceiling raised mid-turn", () => {
     }
   });
 });
+
+describe("the ceiling asks before it gives up", () => {
+  /** Keeps calling tools, so the turn runs long enough to reach a limit. */
+  function grinder(steps: number, perStep: number) {
+    let n = 0;
+    const fetchFn = (async () => {
+      n += 1;
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => "application/json" },
+        text: async () => "",
+        json: async () => ({
+          choices: [
+            {
+              message:
+                n > steps
+                  ? { role: "assistant", content: "finished the work" }
+                  : {
+                      role: "assistant",
+                      content: "working",
+                      tool_calls: [
+                        {
+                          id: `c${n}`,
+                          type: "function",
+                          function: { name: "bash", arguments: JSON.stringify({ command: "echo hi" }) },
+                        },
+                      ],
+                    },
+            },
+          ],
+          usage: { prompt_tokens: perStep, completion_tokens: 10 },
+        }),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    return { fetchFn, steps: () => n };
+  }
+
+  const engineFor = (dir: string, g: { fetchFn: typeof fetch }) =>
+    engineWith(dir, {
+      fetchFn: g.fetchFn,
+      stream: false,
+      autonomy: "high",
+      maxTurnTokens: 60_000,
+    });
+
+  it("carries on and finishes when told to", async () => {
+    // The reported waste: $1.02 spent, twenty steps of real work, and no answer
+    // for any of it. The money is gone either way — ending there is what turns
+    // it into nothing.
+    const ws = workspace();
+    try {
+      const g = grinder(10, 20_000);
+      const engine = engineFor(ws.dir, g);
+      const events = [];
+      for await (const ev of engine.run("grind", allowAll, { onCeiling: async () => true })) {
+        events.push(ev);
+      }
+      assert.ok(
+        events.some((e) => e.kind === "assistant_text" && e.text.includes("finished the work")),
+        "said yes to carrying on and still got no answer",
+      );
+      assert.ok(
+        events.some((e) => e.kind === "info" && /carrying on past/.test(e.text)),
+        "carried on without saying that it had",
+      );
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("stops and reports when told to stop", async () => {
+    const ws = workspace();
+    try {
+      const g = grinder(50, 20_000);
+      const engine = engineFor(ws.dir, g);
+      const events = [];
+      for await (const ev of engine.run("grind", allowAll, { onCeiling: async () => false })) {
+        events.push(ev);
+      }
+      const err = events.find((e) => e.kind === "error") as { text: string } | undefined;
+      assert.match(err?.text ?? "", /ceiling for a single turn/);
+      // And still hands back what the turn paid for.
+      assert.ok(events.some((e) => e.kind === "info" || e.kind === "assistant_text"));
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("stops when nobody is there to ask", async () => {
+    // A headless run has no one watching, and a ceiling that can be waved
+    // through unattended is not a ceiling. `--yes` means "do not ask me about
+    // tool calls", not "spend without limit".
+    const ws = workspace();
+    try {
+      const g = grinder(50, 20_000);
+      const engine = engineFor(ws.dir, g);
+      const events = await drain(engine.run("grind", allowAll));
+      const err = events.find((e) => e.kind === "error") as { text: string } | undefined;
+      assert.match(err?.text ?? "", /ceiling for a single turn/, "ran past the ceiling with nobody watching");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("asks again at the new ceiling rather than removing it", async () => {
+    // Carrying on is a decision taken once per ceiling, not a limit quietly
+    // switched off.
+    const ws = workspace();
+    try {
+      const g = grinder(80, 20_000);
+      const engine = engineFor(ws.dir, g);
+      let asked = 0;
+      await drain(
+        engine.run("grind", allowAll, {
+          onCeiling: async () => {
+            asked += 1;
+            return asked < 3;
+          },
+        }),
+      );
+      assert.equal(asked, 3, `asked ${asked} time(s); the ceiling should return at each new limit`);
+    } finally {
+      ws.cleanup();
+    }
+  });
+});
