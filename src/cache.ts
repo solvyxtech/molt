@@ -32,16 +32,60 @@ export const MAX_BREAKPOINTS = 4;
 /**
  * How far a breakpoint looks back for an existing entry, in content blocks.
  *
- * Anthropic walks back at most 20. An agent step can append an assistant
- * message plus one result per tool call, so a single busy step can push the
- * previous request's marker out of range — and the miss is silent: no error,
- * just a full-price request that looks exactly like a cheap one. Markers are
- * spaced to stay inside this window rather than all landing at the tip.
+ * Anthropic walks back at most 20, and the miss is silent: no error, just a
+ * full-price request that looks exactly like a cheap one.
+ *
+ * The thing that has to stay inside this window is **how far the tip marker
+ * moves between one request and the next** — not the gap between the markers
+ * within a single request. Consecutive requests differ by one agent step, so
+ * the tip advances by whatever that step appended, and it needs to find the
+ * entry the previous request wrote. Measured on the native wire: 3 blocks per
+ * step with one tool call, 7 with three, 13 with six, and 21 with ten — so a
+ * step making about ten parallel calls is the point where the tip overshoots
+ * and that one request pays full price before recovering.
+ *
+ * The rolling markers are the hedge against exactly that: they leave earlier
+ * entries scattered behind the tip for it to fall back on.
  */
 export const LOOKBACK_BLOCKS = 20;
 
-/** Spacing between rolling markers, comfortably inside the lookback window. */
-const STRIDE = 12;
+/**
+ * Spacing between rolling markers, counted in wire blocks.
+ *
+ * Blocks, not messages, because those are not the same unit and the lookback
+ * is denominated in blocks. molt holds one message where the wire carries
+ * several — an assistant turn with three tool calls is one message and four
+ * blocks — and `markable` skips those assistant turns entirely, so a stride
+ * counted in messages drifts further from the block count the more parallel
+ * the model gets. Measured with a twelve-message stride: 18 blocks at one tool
+ * call per step, 24 at three. Over the limit, with nothing to say so.
+ *
+ * Sixteen keeps the fallback markers near the window at ordinary levels of
+ * parallelism. It cannot guarantee it at every level, and does not try: a
+ * marker can only sit on a message that carries text, so an assistant turn
+ * making six parallel calls is seven blocks that no marker can land inside,
+ * and one making twenty exceeds the whole window by itself. That is a bound on
+ * placement, not a bug — and it is not the guarantee that matters, which is the
+ * tip advance described above.
+ */
+const STRIDE_BLOCKS = 16;
+
+/**
+ * How many content blocks a message becomes on the wire.
+ *
+ * Mirrors what `toRequest` builds: one block for ordinary text, and for an
+ * assistant turn one per tool call plus one for any text beside them. On the
+ * OpenAI-compatible path every message is a single block, so counting this way
+ * is exact there and conservative here — it never spaces markers further apart
+ * than the real geometry allows.
+ */
+function blockCost(msg: Omit<Msg, "molt">): number {
+  if (msg.role === "assistant") {
+    const text = typeof msg.content === "string" && msg.content ? 1 : 0;
+    return text + (msg.tool_calls?.length ?? 0);
+  }
+  return 1;
+}
 
 export type CacheStyle = "explicit" | "automatic";
 
@@ -119,10 +163,10 @@ export function breakpoints(messages: Omit<Msg, "molt">[]): number[] {
   // request will read from, and it is the one that must exist.
   const room = MAX_BREAKPOINTS - marks.length;
   const rolling: number[] = [];
-  let since = STRIDE;
+  let since = STRIDE_BLOCKS;
   for (let i = messages.length - 1; i > (first === -1 ? -1 : first) && rolling.length < room; i--) {
-    since += 1;
-    if (since < STRIDE || !markable(messages[i]!)) continue;
+    since += blockCost(messages[i]!);
+    if (since < STRIDE_BLOCKS || !markable(messages[i]!)) continue;
     rolling.push(i);
     since = 0;
   }
