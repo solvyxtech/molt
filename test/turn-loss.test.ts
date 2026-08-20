@@ -14,7 +14,13 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { Engine, systemPromptFor, NETWORK_RETRIES, SYSTEM_PROMPT } from "../src/engine.js";
+import {
+  Engine,
+  systemPromptFor,
+  contextOverflow,
+  NETWORK_RETRIES,
+  SYSTEM_PROMPT,
+} from "../src/engine.js";
 import type { Msg } from "../src/types.js";
 import { allowAll, drain, workspace } from "./helpers.js";
 
@@ -638,6 +644,113 @@ describe("no ceiling on hardware you own", () => {
         /budget hit|ceiling for a single turn/.test(err?.text ?? ""),
         `a budget set by hand was ignored on a local endpoint: ${err?.text}`,
       );
+    } finally {
+      ws.cleanup();
+    }
+  });
+});
+
+/**
+ * The refusal that says how to fix itself.
+ *
+ * A local llama.cpp serving qwen3-coder answered step 5 of a real session with
+ *
+ *     request (17222 tokens) exceeds the available context size (16384
+ *     tokens) ... "n_ctx": 16384
+ *
+ * and molt threw the turn away — five steps, four minutes, nothing verified —
+ * having shed nothing at all, because its own shed threshold is 60,000 tokens
+ * and it had no idea the endpoint served a quarter of that. Nobody had told it,
+ * and nothing in the OpenAI-compatible protocol offers to.
+ *
+ * This is the most recoverable failure molt can hit: the request was rejected
+ * rather than billed, the fix is to carry less, and the server has just said
+ * how much less. Ending the turn on it is a choice, and it was the wrong one.
+ */
+describe("an endpoint too small for the conversation", () => {
+  it("reads the window out of the refusal", () => {
+    // llama.cpp, verbatim from the session that prompted this.
+    assert.equal(
+      contextOverflow(
+        `{"error":{"code":400,"message":"request (17222 tokens) exceeds the available context size (16384 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":17222,"n_ctx":16384}}`,
+      ),
+      16384,
+    );
+    // OpenAI's wording for the same thing.
+    assert.equal(
+      contextOverflow(
+        `{"error":{"message":"This model's maximum context length is 8192 tokens, however you requested 9000."}}`,
+      ),
+      8192,
+    );
+    // Refused for context reasons without naming a number: still an overflow.
+    assert.equal(contextOverflow(`{"error":"too many tokens in context"}`), -1);
+    // A 400 that is not about size at all must stay a plain 400 — shedding
+    // would destroy a working conversation to fix something else.
+    assert.equal(contextOverflow(`{"error":"invalid api key"}`), 0);
+    assert.equal(contextOverflow(`{"error":"unsupported tool_choice value"}`), 0);
+  });
+
+  it("sheds and carries on instead of losing the turn", async () => {
+    const ws = workspace();
+    try {
+      const bodies: Body[] = [];
+      const fetchFn = (async (_url: string, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body ?? "{}")) as Body);
+        if (bodies.length === 1) {
+          return {
+            ok: false,
+            status: 400,
+            text: async () =>
+              `{"error":{"message":"request (17222 tokens) exceeds the available context size (16384 tokens)","type":"exceed_context_size_error","n_ctx":16384}}`,
+            json: async () => ({}),
+          } as unknown as Response;
+        }
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => "application/json" },
+          text: async () => "",
+          json: async () => ({
+            choices: [{ message: { role: "assistant", content: "carried on and answered." } }],
+            usage: { prompt_tokens: 500, completion_tokens: 40 },
+          }),
+        } as unknown as Response;
+      }) as unknown as typeof fetch;
+
+      const engine = engineWith(ws.dir, { fetchFn, stream: false });
+      const events = await drain(engine.run("do the work", allowAll));
+
+      assert.equal(bodies.length, 2, "the refusal must be retried, not reported and dropped");
+      // Two requests is also what a salvage looks like, and a salvaged answer
+      // would satisfy every other assertion here while the turn was in fact
+      // over. `tool_choice` is what tells them apart: the salvage sets it to
+      // "none" to ask for a last word, and a real retry leaves the model free
+      // to keep working.
+      assert.notEqual(
+        bodies[1]!.tool_choice,
+        "none",
+        "the second request must be the work resuming, not a eulogy for it",
+      );
+      const said = events.some(
+        (e) => e.kind === "assistant_text" && e.text.includes("carried on"),
+      );
+      assert.ok(said, "the turn must reach an answer rather than dying on a fixable refusal");
+
+      // The window is learned, not just survived: two thirds of 16384, leaving
+      // room for the reply and the next few tool results.
+      assert.equal(
+        (engine as unknown as { cfg: { autoShedAtTokens?: number } }).cfg.autoShedAtTokens,
+        Math.floor(16384 * 0.66),
+        "the endpoint's real window must be adopted for the rest of the session",
+      );
+
+      // And it is said out loud, with the flag that skips the round trip next
+      // time — a silent adaptation is one the user cannot make permanent.
+      const told = events.find(
+        (e) => e.kind === "info" && e.text.includes("16384") && e.text.includes("--auto-shed"),
+      );
+      assert.ok(told, "the user must be told the window and how to set it up front");
     } finally {
       ws.cleanup();
     }

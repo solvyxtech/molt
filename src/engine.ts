@@ -190,6 +190,36 @@ const CEILING_WARNINGS = [0.5, 0.8];
  */
 export const DEFAULT_AUTO_SHED_TOKENS = 60_000;
 
+/**
+ * A context-overflow refusal, and the window it named.
+ *
+ * Some endpoints answer an oversized request with the one number molt most
+ * needs and has no other way to learn: how much context they actually serve.
+ * A local llama.cpp says
+ *
+ *     request (17222 tokens) exceeds the available context size (16384
+ *     tokens) ... "n_ctx": 16384
+ *
+ * molt was treating that as an ordinary 400 and ending the turn, having shed
+ * nothing — its own threshold is 60,000 tokens, nearly four times a window it
+ * had no idea was that small. But this is the most recoverable failure there
+ * is: the fix is to carry less, the request has not been billed, and the
+ * server has just said exactly how much less. Returns the window in tokens, or
+ * 0 when the body says nothing about one.
+ */
+export function contextOverflow(body: string): number {
+  if (!/context|n_ctx|too many tokens|maximum context length/i.test(body)) return 0;
+  // Every field the common servers use for it, most specific first.
+  const named =
+    /"n_ctx"\s*:\s*(\d+)/.exec(body) ??
+    /context size \((\d+)\s*tokens?\)/i.exec(body) ??
+    /maximum context length is (\d+)/i.exec(body);
+  if (named) return Number(named[1]);
+  // It refused for context reasons but did not say how much it has. Treated as
+  // an overflow with an unknown window, which still means "carry less".
+  return -1;
+}
+
 export const TOOL_RESULT_MAX_BYTES = 8192;
 /**
  * How much of a file one `read_file` may return.
@@ -1933,6 +1963,8 @@ export class Engine {
       let failure:
         | { text: string; why: string; retryable: boolean; retryAfterMs?: number }
         | undefined;
+      /** Shed-and-retry is offered once per step, not once per attempt. */
+      let overflowHandled = false;
 
       for (let attempt = 0; ; attempt++) {
         failure = undefined;
@@ -1986,6 +2018,53 @@ export class Engine {
           }
 
           if (!res.ok) {
+            // "Too big" is not a verdict on the work, and it is the one
+            // refusal that says how to fix itself. Shed and send less rather
+            // than ending a turn that has done real work — molt's own
+            // threshold is 60,000 tokens and this endpoint may serve 16,384,
+            // which it has no other way to discover.
+            const window = res.status === 400 ? contextOverflow(body) : 0;
+            if (window !== 0 && !overflowHandled) {
+              overflowHandled = true;
+              // Two thirds of the window, so the reply and the next few tool
+              // results have somewhere to go. Below the floor there is nothing
+              // useful left to carry and shedding cannot help.
+              const target = window > 0 ? Math.max(4_000, Math.floor(window * 0.66)) : Math.max(4_000, Math.floor(this.transcript.historyTokens() / 2));
+              this.cfg.autoShedAtTokens = target;
+              log?.append("note", {
+                text: `context window ${window > 0 ? window : "unknown"} — shedding at ${target} and retrying`,
+              });
+              yield {
+                kind: "info",
+                text:
+                  (window > 0
+                    ? `this endpoint serves ${window} tokens of context, less than molt was carrying. `
+                    : "this endpoint refused the request as too large. ") +
+                  `Shedding to ${target} and trying again — start with --auto-shed ${target} to skip this.`,
+              };
+              const shed = this.shed();
+              if (shed) {
+                log?.append("shed", {
+                  dropped: shed.dropped,
+                  before: shed.before,
+                  after: shed.after,
+                  archive: shed.path,
+                });
+                yield {
+                  kind: "shed",
+                  dropped: shed.dropped,
+                  before: shed.before,
+                  after: shed.after,
+                  path: shed.path,
+                };
+              }
+              failure = {
+                text: `context window too small for what molt was carrying`,
+                why: "The endpoint could not hold the conversation.",
+                retryable: true,
+              };
+              continue;
+            }
             const transient = res.status === 408 || res.status === 429 || res.status >= 500;
             failure = {
               text: `HTTP ${res.status}: ${body.slice(0, 300)}`,
