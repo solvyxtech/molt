@@ -640,3 +640,46 @@ describe("pricing, read from the provider", () => {
     }
   });
 });
+
+describe("the endpoint you are pointed at is a model source", () => {
+  it("lists a self-hosted endpoint that holds no key", () => {
+    // Reported from use: "/model only shows anthropic and xai, not the models
+    // being hosted". modelSources built its list from providers you hold keys
+    // for, so a server you had just connected to was invisible in the one
+    // place you would go to choose one of its models.
+    const sources = modelSources(
+      { anthropic: "k1", xai: "k2" },
+      { url: "http://192.168.0.218:8080/v1" },
+    );
+    assert.equal(sources[0]?.url, "http://192.168.0.218:8080/v1", "the current endpoint is not first");
+    assert.ok(
+      sources.some((s) => s.url.includes("anthropic")),
+      "adding the current endpoint dropped the keyed providers",
+    );
+  });
+
+  it("does not list a preset twice when it is also the current one", () => {
+    const sources = modelSources({}, { url: "http://localhost:11434/v1" });
+    const ollama = sources.filter((s) => s.url.replace(/\/$/, "") === "http://localhost:11434/v1");
+    assert.equal(ollama.length, 1, "pointing at a preset produced two of it");
+  });
+
+  it("ignores a trailing slash when deciding that", () => {
+    const sources = modelSources({}, { url: "http://localhost:11434/v1/" });
+    assert.equal(
+      sources.filter((s) => s.url.startsWith("http://localhost:11434/v1")).length,
+      1,
+      "a trailing slash made the same endpoint look like two",
+    );
+  });
+
+  it("carries the key, so a keyed custom endpoint can still be asked", () => {
+    const sources = modelSources({}, { url: "https://gateway.internal/v1", key: "secret", name: "work" });
+    assert.equal(sources[0]?.key, "secret");
+    assert.equal(sources[0]?.name, "work");
+  });
+
+  it("is unchanged when there is no current endpoint", () => {
+    assert.deepEqual(modelSources({ xai: "k" }), modelSources({ xai: "k" }, undefined));
+  });
+});

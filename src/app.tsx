@@ -1067,7 +1067,15 @@ export function App({
   /** Aggregate models across every provider you hold a key for. */
   const startModelPicker = useCallback(async () => {
     const auth = readAuth();
-    const sources = modelSources(auth);
+    // The endpoint molt is pointed at right now counts as a source, keyed or
+    // not. Otherwise connecting to a server you run and opening /model showed
+    // the providers you hold keys for and nothing from the machine you had
+    // just connected to.
+    const sources = modelSources(auth, {
+      url: engine.baseUrl,
+      key: engine.apiKey,
+      name: engine.provider,
+    });
     if (!sources.length) {
       add("info", "no provider keys yet — /login to add one");
       return;

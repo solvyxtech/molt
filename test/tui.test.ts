@@ -1758,3 +1758,41 @@ describe("connecting to an endpoint says what is true", () => {
     }
   });
 });
+
+describe("/model shows the machine you connected to", () => {
+  function serverWith(ids: string[]): typeof fetch {
+    return (async (url: string) => {
+      if (String(url).endsWith("/models")) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => "application/json" },
+          json: async () => ({ data: ids.map((id) => ({ id })) }),
+          text: async () => "",
+        } as unknown as Response;
+      }
+      return { ok: false, status: 404, headers: { get: () => "" }, text: async () => "", json: async () => ({}) } as unknown as Response;
+    }) as unknown as typeof fetch;
+  }
+
+  it("lists the models on a self-hosted endpoint", async () => {
+    // Reported from use: "/model only shows anthropic and xai, not the models
+    // being hosted".
+    const t = await mount({
+      fetchFn: serverWith(["qwen3-coder-30b-a3b", "llama31-8b-q4km", "gpt-oss-20b-mxfp4"]),
+    });
+    try {
+      await submit(t.stdin, "/endpoint http://192.168.0.218:8080/v1");
+      await tick(250);
+      await submit(t.stdin, "/model");
+      await tick(400);
+      assert.match(
+        t.stdout.lastFrame,
+        /qwen3-coder-30b-a3b/,
+        "the endpoint molt was pointed at contributed no models",
+      );
+    } finally {
+      t.cleanup();
+    }
+  });
+});
