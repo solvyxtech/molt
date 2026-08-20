@@ -10,6 +10,7 @@ import { Box, Static, Text, render, useApp, useInput, useStdout } from "ink";
 import type { RenderOptions } from "ink";
 import { Banner, fmtCost, fmtDuration } from "./banner.js";
 import { COMMANDS, completionFor, matchCommands, windowAround, wrapIndex } from "./commands.js";
+import { RemappedStdin } from "./keys.js";
 import { StatusLine } from "./status-line.js";
 import { loadBar, writeDefaultBar, BarError } from "./bar.js";
 import type { Engine } from "./engine.js";
@@ -205,7 +206,15 @@ export type AppProps = {
  * and exercised handling the real program never reached.
  */
 export function renderApp(props: AppProps, options: RenderOptions = {}) {
-  return render(<App {...props} />, { ...options, exitOnCtrlC: false });
+  const stdin = options.stdin ?? process.stdin;
+  return render(<App {...props} />, {
+    ...options,
+    // Ink labels the Backspace key `delete` and cannot tell it apart from the
+    // real forward-delete. Untangled in the bytes on the way in, so both keys
+    // mean what they say. See src/keys.ts.
+    stdin: new RemappedStdin(stdin as NodeJS.ReadStream) as unknown as NodeJS.ReadStream,
+    exitOnCtrlC: false,
+  });
 }
 
 export function App({
@@ -1419,8 +1428,8 @@ export function App({
       }
       if (key.leftArrow) return edit(key.meta || key.ctrl ? wordLeft : left);
       if (key.rightArrow) return edit(key.meta || key.ctrl ? wordRight : right);
-      if (key.backspace) return edit(backspace);
-      if (key.delete) return edit((l) => (l.at < l.text.length ? deleteForward(l) : backspace(l)));
+      if (key.backspace) return edit(key.meta ? deleteWord : backspace);
+      if (key.delete) return edit(deleteForward);
       if (key.ctrl && char === "w") return edit(deleteWord);
       if (key.ctrl && char === "u") return edit(killToStart);
       if (key.ctrl && char === "k") return edit(killToEnd);
@@ -1588,15 +1597,21 @@ export function App({
       return;
     }
     if (key.backspace) {
-      edit(backspace);
+      // alt+Backspace deletes the word behind the caret, the way every shell
+      // does. It was unreachable before: the terminal sends `ESC 0x7f`, which
+      // Ink called meta+delete, so it fell into the forward-delete guess below
+      // and took a single character off the front instead.
+      edit(key.meta ? deleteWord : backspace);
       setPaletteIndex(0);
       return;
     }
     if (key.delete) {
-      // Ink reports both backspace and the delete key here depending on the
-      // terminal; with a caret the two are different edits, so the one that
-      // deletes forward only does so when there is something ahead of it.
-      edit((l) => (l.at < l.text.length ? deleteForward(l) : backspace(l)));
+      // Only the real forward-delete reaches here now: Backspace is remapped to
+      // 0x08 on the way in, so it arrives above as `key.backspace`. This used to
+      // guess between the two from the caret position, which is why it deleted
+      // the right character at the end of a line and the wrong one everywhere
+      // else.
+      edit(deleteForward);
       setPaletteIndex(0);
       return;
     }
