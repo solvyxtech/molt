@@ -1602,3 +1602,47 @@ describe("the view shows what molt is doing, not the payload", () => {
     }
   });
 });
+
+describe("pointing molt at a model you host", () => {
+  it("takes any OpenAI-compatible URL, including one on another machine", async () => {
+    // `/login` only knows the presets, so a model you run yourself was
+    // unreachable from the TUI — `--url` worked headlessly and nowhere else.
+    const t = await mount();
+    try {
+      await submit(t.stdin, "/endpoint http://192.168.0.72:11434/v1");
+      await tick(150);
+      assert.match(t.stdout.text, /endpoint → http:\/\/192\.168\.0\.72:11434\/v1/);
+      assert.equal(t.engine.baseUrl, "http://192.168.0.72:11434/v1");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("says what is wrong rather than accepting nonsense", async () => {
+    const t = await mount();
+    try {
+      const was = t.engine.baseUrl;
+      await submit(t.stdin, "/endpoint localhost:11434");
+      await tick(120);
+      assert.match(t.stdout.text, /needs the scheme too/, "took a URL with no scheme");
+      assert.equal(t.engine.baseUrl, was, "moved the endpoint anyway");
+      await submit(t.stdin, "/endpoint file:///etc/passwd");
+      await tick(120);
+      assert.match(t.stdout.text, /not a scheme molt can call/);
+      assert.equal(t.engine.baseUrl, was, "moved the endpoint anyway");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("says where it is pointing when asked with no argument", async () => {
+    const t = await mount();
+    try {
+      await submit(t.stdin, "/endpoint");
+      await tick(120);
+      assert.match(t.stdout.text, /now: http:\/\/provider\.test\/v1/);
+    } finally {
+      t.cleanup();
+    }
+  });
+});

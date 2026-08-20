@@ -1190,6 +1190,53 @@ export function App({
         case "/login":
           startLogin(arg || undefined);
           return true;
+        case "/endpoint": {
+          // `/login` only knows the presets, so a model you host yourself was
+          // unreachable from the TUI — you could pass `--url` headlessly and
+          // nowhere else. Anything speaking the OpenAI shape works: Ollama on
+          // this machine, llama.cpp or vLLM on another box on the network.
+          if (!arg) {
+            add("info", "usage: /endpoint http://192.168.0.72:11434/v1 — any OpenAI-compatible server");
+            add("info", `now: ${engine.baseUrl}`);
+            return true;
+          }
+          // `host:port` is the shape people type, and `new URL` does not
+          // reject it — it reads `192.168.0.72:` as the scheme. Checking for
+          // the separator first means the message names the actual mistake
+          // rather than complaining about a scheme the user never wrote.
+          if (!arg.includes("://")) {
+            add("error", `${arg} needs the scheme too, e.g. http://${arg.replace(/^\/+/, "")}`);
+            return true;
+          }
+          let url: URL;
+          try {
+            url = new URL(arg);
+          } catch {
+            add("error", `not a URL: ${arg} — try http://localhost:11434/v1`);
+            return true;
+          }
+          if (url.protocol !== "http:" && url.protocol !== "https:") {
+            add("error", `${url.protocol} is not a scheme molt can call — use http or https`);
+            return true;
+          }
+          // A key is not asked for: the case this exists to serve is a server
+          // you run, which wants none. Use /login for a provider that does.
+          engine.setBaseUrl(arg.replace(/\/$/, ""), undefined, url.hostname);
+          setTokens(0);
+          setCost(undefined);
+          setCostEstimated(false);
+          persistEndpoint();
+          add("ok", `endpoint → ${arg}`);
+          // Reachability said now rather than discovered on the first turn.
+          void engine.doctor().then(
+            (d) => {
+              add(d.ok ? "ok" : "error", `${d.ok ? "reachable" : "unreachable"}: ${d.detail}`);
+              if (d.ok) add("info", "/model to pick one of its models");
+            },
+            (e: unknown) => add("error", `could not reach it: ${String(e)}`),
+          );
+          return true;
+        }
         case "/model":
           if (!arg) void startModelPicker();
           else {
