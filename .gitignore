@@ -1,0 +1,16 @@
+node_modules/
+dist/
+dist-test/
+*.tsbuildinfo
+
+# molt's own session artifacts
+.molt/exuviae/
+.molt/receipts/
+.molt/log/
+
+.DS_Store
+*.log
+
+# Desktop build outputs
+out/
+release/

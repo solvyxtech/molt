@@ -1,0 +1,50 @@
+# Packaging, for the three desktops molt has to run on.
+#
+# The app is deliberately small: `out/` is the whole program, because esbuild
+# has already inlined the engine and its one runtime dependency. Nothing under
+# node_modules ships, which keeps the bundle honest — what you audit in out/ is
+# what runs on the customer's machine.
+appId: xyz.solvyx.molt
+productName: molt
+copyright: © 2026 Solvyx
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - out/**/*
+  - package.json
+
+# No native modules, so nothing needs rebuilding per platform.
+npmRebuild: false
+
+mac:
+  category: public.app-category.developer-tools
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+  # Unsigned for now: signing needs a Developer ID, and shipping an unsigned
+  # build knowingly is better than a signed one nobody can reproduce.
+  identity: null
+  hardenedRuntime: false
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: zip
+      arch: [x64]
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+
+linux:
+  category: Development
+  target:
+    - target: AppImage
+      arch: [x64]
+    - target: tar.gz
+      arch: [x64]
