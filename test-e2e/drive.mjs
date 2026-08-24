@@ -74,6 +74,29 @@ const server = createServer((req, res) => {
   let body = "";
   req.on("data", (d) => (body += d));
   req.on("end", () => {
+    // The criteria drafter is a separate, single-shot call. Recognised by its
+    // system prompt so the scripted turn below is not consumed by it.
+    if (body.includes("You draft acceptance criteria")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: JSON.stringify({
+                  checks: [{ name: "drafted", run: "true" }],
+                  notes: ["it should read plainly"],
+                }),
+              },
+              finish_reason: "stop",
+            },
+          ],
+          usage: { prompt_tokens: 100, completion_tokens: 20 },
+        }),
+      );
+      return;
+    }
     const message = script[Math.min(step++, script.length - 1)];
     res.writeHead(200, { "content-type": "application/json" });
     res.end(

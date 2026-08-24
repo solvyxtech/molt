@@ -272,7 +272,7 @@ function createWindow(): void {
         })()`);
         // Criteria set through the real panel, so the path under test is the
         // one a person uses — not a shortcut into the IPC handler.
-        if (process.env.MOLT_E2E_CRITERION) {
+        if (process.env.MOLT_E2E_CRITERION && process.env.MOLT_E2E_AUTO !== "1") {
           await win!.webContents.executeJavaScript(`(() => {
             document.getElementById("ck-open").click();
             document.getElementById("ck-add").click();
@@ -449,7 +449,7 @@ function createWindow(): void {
       void win!.webContents
         .executeJavaScript(
           `(async () => {
-             const need = ["tabs","panels","stream","wire","checks","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","autonomy","ask","criteria","ck-rows","ck-open","ck-draft"];
+             const need = ["tabs","panels","stream","wire","checks","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","autonomy","ask","criteria","ck-rows","ck-open","ck-draft","ck-auto"];
              const missing = need.filter((id) => !document.getElementById(id));
              const tabs = [...document.querySelectorAll(".tab")].map((t) => t.dataset.tab);
              const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
@@ -462,6 +462,7 @@ function createWindow(): void {
                // A check and a note must never be presented alike: one is
                // evidence and the other is intent, and the receipt's honesty
                // depends on a reader telling them apart at a glance.
+               autoCriteriaDefault: document.getElementById("ck-auto").checked,
                criteriaRows: await (async () => {
                  document.getElementById("ck-open").click();
                  document.getElementById("ck-add").click();
@@ -553,6 +554,7 @@ function createWindow(): void {
             r.autonomyButtons === 3 &&
             String(r.autonomyOn).length > 0 &&
             r.autonomySticks === true &&
+            r.autoCriteriaDefault === true &&
             (r.criteriaRows as { distinct: boolean; converted: boolean }).distinct === true &&
             (r.criteriaRows as { distinct: boolean; converted: boolean }).converted === true &&
             Number(r.paletteRows) >= 15 &&
@@ -571,7 +573,8 @@ function createWindow(): void {
           console.log(`[self-check] palette     ${r.paletteRows} command(s) on "/"`);
           const ck = r.criteriaRows as { distinct: boolean; converted: boolean };
           console.log(
-            `[self-check] criteria    check/note distinct: ${ck.distinct}, convertible: ${ck.converted}`,
+            `[self-check] criteria    check/note distinct: ${ck.distinct}, convertible: ${ck.converted}` +
+              `, automatic: ${r.autoCriteriaDefault}`,
           );
           const csp = r.csp as { script?: boolean; connect?: boolean; dirs?: string } | undefined;
           console.log(
