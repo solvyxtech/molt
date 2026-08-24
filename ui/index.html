@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'"
+    />
+    <title>molt</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!-- The strip is draggable so the frameless window still moves. -->
+    <header class="titlebar" id="titlebar">
+      <div class="brand"><span class="mark">▚</span> molt</div>
+      <div class="crumbs">
+        <span id="crumb-cwd" class="crumb muted">no workspace</span>
+        <span class="sep">·</span>
+        <span id="crumb-model" class="crumb muted">no model</span>
+        <span id="crumb-local" class="pill hidden">local</span>
+      </div>
+      <div class="state">
+        <span id="state-dot" class="dot"></span>
+        <span id="state-text">idle</span>
+      </div>
+    </header>
+
+    <nav class="tabs" id="tabs" role="tablist">
+      <button class="tab active" data-tab="session" role="tab">Session</button>
+      <button class="tab" data-tab="view" role="tab">View</button>
+      <button class="tab" data-tab="checks" role="tab">Checks<span class="badge hidden" id="badge-checks"></span></button>
+      <button class="tab" data-tab="receipts" role="tab">Receipts<span class="badge hidden" id="badge-receipts"></span></button>
+      <button class="tab" data-tab="log" role="tab">Log</button>
+      <button class="tab" data-tab="settings" role="tab">Settings</button>
+    </nav>
+
+    <main id="panels">
+      <section class="panel active" id="panel-session">
+        <div class="stream" id="stream">
+          <div class="empty" id="stream-empty">
+            <p class="empty-mark">▚</p>
+            <p>A coding agent that can't say <em>done</em> without proving it.</p>
+            <p class="muted">
+              Open a workspace in <button class="link" data-goto="settings">Settings</button> to begin.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-view">
+        <div class="panel-head">
+          <h2>Wire view</h2>
+          <p class="muted">
+            Every byte the model received and sent, in order. Kept out of the session
+            so reading the payload never costs you the thread of the work.
+          </p>
+          <div class="controls">
+            <label><input type="checkbox" id="view-follow" checked /> follow</label>
+            <button class="btn ghost" id="view-clear">clear</button>
+          </div>
+        </div>
+        <div class="wire" id="wire"></div>
+      </section>
+
+      <section class="panel" id="panel-checks">
+        <div class="panel-head">
+          <h2>The bar</h2>
+          <p class="muted" id="checks-sub">No workspace open.</p>
+        </div>
+        <div class="checks" id="checks"></div>
+      </section>
+
+      <section class="panel" id="panel-receipts">
+        <div class="split">
+          <aside class="list" id="receipt-list"></aside>
+          <article class="doc" id="receipt-doc">
+            <p class="muted pad">Select a receipt.</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-log">
+        <div class="panel-head">
+          <h2>Journal</h2>
+          <p class="muted">
+            The hash-chained record for this session, as written to disk.
+          </p>
+          <div class="controls">
+            <input type="search" id="log-filter" placeholder="filter by kind or text" />
+            <button class="btn ghost" id="log-refresh">refresh</button>
+          </div>
+        </div>
+        <div class="log" id="log"></div>
+      </section>
+
+      <section class="panel" id="panel-settings">
+        <div class="settings">
+          <fieldset>
+            <legend>Workspace</legend>
+            <div class="row">
+              <input type="text" id="set-cwd" placeholder="/path/to/project" spellcheck="false" />
+              <button class="btn" id="set-pick">Browse…</button>
+            </div>
+            <p class="hint">molt reads <code>.molt/done.yml</code> here for what "done" means.</p>
+          </fieldset>
+
+          <fieldset>
+            <legend>Model</legend>
+            <div class="row">
+              <input type="text" id="set-model" placeholder="claude-sonnet-5" spellcheck="false" />
+            </div>
+            <div class="row">
+              <input type="text" id="set-url" placeholder="https://api.anthropic.com/v1" spellcheck="false" />
+            </div>
+            <div class="row">
+              <input type="password" id="set-key" placeholder="API key — blank keeps the stored one" spellcheck="false" />
+              <select id="set-provider"></select>
+              <button class="btn ghost" id="set-savekey">Store key</button>
+            </div>
+            <p class="hint" id="local-hint"></p>
+          </fieldset>
+
+          <fieldset>
+            <legend>Appearance</legend>
+            <div class="row">
+              <select id="set-theme"></select>
+            </div>
+          </fieldset>
+
+          <div class="row end">
+            <span class="muted" id="set-status"></span>
+            <button class="btn primary" id="set-open">Open workspace</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div class="composer" id="composer">
+      <textarea
+        id="prompt"
+        rows="1"
+        placeholder="Describe the change. molt will prove it or refuse to say it is done."
+        spellcheck="false"
+      ></textarea>
+      <div class="composer-side">
+        <label class="ask"><input type="checkbox" id="ask" /> ask only</label>
+        <button class="btn primary" id="send">Run</button>
+        <button class="btn danger hidden" id="stop">Stop</button>
+      </div>
+    </div>
+
+    <footer class="status" id="status">
+      <span id="st-tokens">—</span>
+      <span class="sep">·</span>
+      <span id="st-cached">—</span>
+      <span class="sep">·</span>
+      <span id="st-cost">—</span>
+      <span class="sep">·</span>
+      <span id="st-bar">no bar</span>
+      <span class="spacer"></span>
+      <span id="st-session" class="muted"></span>
+    </footer>
+
+    <div class="modal hidden" id="confirm">
+      <div class="modal-box">
+        <h3 id="confirm-title">Permission</h3>
+        <pre id="confirm-detail"></pre>
+        <div class="modal-actions">
+          <button class="btn ghost" id="confirm-no">Refuse</button>
+          <button class="btn primary" id="confirm-yes">Allow</button>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

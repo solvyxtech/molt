@@ -1,0 +1,24 @@
+# A worked example. Copy into .molt/done.yml and cut what does not apply.
+version: 1
+
+checks:
+  # Fast checks first — they run on every completion attempt.
+  - name: types
+    run: npm run typecheck
+    timeout: 120
+
+  - name: tests
+    run: npm test
+    timeout: 300
+
+  # A bar can encode project rules, not just tooling.
+  - name: no-debug-leftovers
+    run: "! grep -rn 'console\\.log' src/"
+
+  # molt's own checks, run against the full session record —
+  # including context that has already been shed.
+  - name: work-landed
+    builtin: files-changed
+
+  - name: record-intact
+    builtin: record-intact

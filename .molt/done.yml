@@ -1,0 +1,52 @@
+# What "done" means in this project.
+#
+# molt will not emit a final answer while any check below fails. Checks are
+# ordinary shell commands, so anything CI can run, the agent must pass.
+#
+# molt holds itself to what it asks of everyone else: an agent working on
+# molt must leave the types clean and the suite green before it may say it
+# finished.
+
+version: 1
+
+checks:
+  # --- ordinary commands: anything with an exit code ---
+
+  # What each command reads. molt reuses a result while none of it has moved,
+  # which is what stops four proof attempts from costing four test suites.
+  - name: types
+    run: npm run typecheck
+    timeout: 120
+    watch: ["src/**", "test/**", "tsconfig*.json", "package.json"]
+    tags: [fast]
+
+  - name: tests
+    run: npm test
+    timeout: 300
+    watch: ["src/**", "test/**", "tsconfig*.json", "package.json"]
+    tags: [slow]
+
+  # --- builtins: molt runs these itself, against the session record ---
+  #
+  # These are session-scoped. They read the ledger of writes molt performed
+  # and the archive of context it shed, so they are meaningful only inside a
+  # session — a standalone `molt prove` has no ledger and work-landed will
+  # fail by definition. That is why they carry a `session` tag: it lets you
+  # run the command checks on their own with `--skip session`, without ever
+  # removing them from the bar the agent is judged against.
+  #
+  #   files-changed   at least one file was actually modified, and every
+  #                   write molt performed is still on disk, byte for byte.
+  #                   Also fails a file rewritten with identical contents,
+  #                   which is how "I fixed it" turns into a no-op.
+  #   record-intact   the shed archive holds every batch the session shed
+  #                   and each one is readable, so the evidence behind these
+  #                   results can still be audited after compaction.
+
+  - name: work-landed
+    builtin: files-changed
+    tags: [session]
+
+  - name: record-intact
+    builtin: record-intact
+    tags: [session]
