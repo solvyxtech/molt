@@ -9,6 +9,7 @@
  * Nothing here asks a model anything. A bar result is an exit code.
  */
 import { runCommand } from "./run.js";
+import { parseLcov, coverageFor, unprovenIn, type Unproven } from "./coverage.js";
 import { proposeBar, type Detected } from "./detect.js";
 import { fingerprint } from "./files.js";
 import { createHash } from "node:crypto";
@@ -30,7 +31,12 @@ export const BAR_FILENAME = "done.yml";
 export const DEFAULT_TIMEOUT_MS = 120_000;
 const OUTPUT_MAX = 2000;
 
-export const BUILTINS: BuiltinCheck[] = ["files-changed", "record-intact", "claims-grounded"];
+export const BUILTINS: BuiltinCheck[] = [
+  "files-changed",
+  "record-intact",
+  "claims-grounded",
+  "diff-covered",
+];
 
 /**
  * Conventional tags. Not enforced — a bar may use any label — but these are
@@ -191,7 +197,21 @@ export function parseBar(source: string): Bar {
         }
       }
       const commentOnly = c["comment-only"] === "allow" ? { commentOnly: "allow" as const } : {};
-      return { name, kind: "builtin", builtin, tags, ...advisory, ...commentOnly };
+
+      // diff-covered cannot work without being told where the report is, and
+      // a check that cannot work must say so at parse time rather than fail
+      // mysteriously on the first turn that changes a file.
+      if (builtin === "diff-covered" && typeof c.lcov !== "string") {
+        throw new BarError(
+          `done.yml: check "${name}" uses the diff-covered builtin and needs an \`lcov\` ` +
+            "path — the file your test command writes coverage to.",
+        );
+      }
+      if (c.lcov !== undefined && typeof c.lcov !== "string") {
+        throw new BarError(`done.yml: check "${name}" has a non-string \`lcov\`.`);
+      }
+      const lcov = typeof c.lcov === "string" ? { lcov: c.lcov.trim() } : {};
+      return { name, kind: "builtin", builtin, tags, ...advisory, ...commentOnly, ...lcov };
     }
 
     const timeout = c.timeout === undefined ? undefined : Number(c.timeout);
@@ -418,11 +438,92 @@ export function claimedWrites(record: Msg[]): string[] {
   return paths;
 }
 
+/**
+ * Every line this turn added, executed by the tests that just ran.
+ *
+ * The failure this closes, from a real session: a turn added a constant
+ * referenced nowhere and a guard whose branch no test ever trips, and passed
+ * six checks — types, tests, two app checks, record-intact and work-landed. It
+ * was caught by a person reading the diff. That does not scale, and reading
+ * diffs by hand is the job molt exists to replace.
+ *
+ * A missing report fails rather than passes. A check that quietly verifies
+ * nothing when its input is absent is worse than no check, because it is
+ * counted as one.
+ */
+function diffCovered(ctx: BarContext, lcovPath?: string): { ok: boolean; output: string } {
+  const judged = ctx.ledger.filter((e) => e.changedLines && e.changedLines.length > 0);
+  if (judged.length === 0) {
+    // Nothing was written that could be executed. files-changed is the check
+    // that has an opinion about that; this one has nothing to measure.
+    return { ok: true, output: "No changed lines to cover." };
+  }
+  if (!lcovPath) {
+    return { ok: false, output: "diff-covered needs an `lcov` path in done.yml." };
+  }
+  const abs = resolve(ctx.cwd, lcovPath);
+  let text: string;
+  try {
+    text = readFileSync(abs, "utf8");
+  } catch {
+    return {
+      ok: false,
+      output:
+        `No coverage report at ${lcovPath}. This check cannot establish anything without ` +
+        `one, and passing it would be a claim molt has not earned. Make the test command ` +
+        `write lcov there, or drop this check.`,
+    };
+  }
+
+  const cov = parseLcov(text);
+  const problems: Unproven[] = [];
+  let unmatched = 0;
+  for (const entry of judged) {
+    const found = coverageFor(cov, entry.path);
+    if (!found) {
+      unmatched++;
+      continue;
+    }
+    const bad = unprovenIn(cov, entry.path, entry.changedLines!);
+    if (bad) problems.push(bad);
+  }
+
+  if (problems.length === 0) {
+    const covered = judged.length - unmatched;
+    return {
+      ok: true,
+      output:
+        `${covered} changed file(s) executed by the tests` +
+        (unmatched > 0
+          ? ` · ${unmatched} not in the coverage report (not instrumented — nothing is claimed about them)`
+          : ""),
+    };
+  }
+
+  const lines = problems.map((p) => {
+    const bits: string[] = [];
+    if (p.deadLines.length) bits.push(`never executed: ${p.deadLines.join(", ")}`);
+    if (p.deadBranches.length) bits.push(`branch never taken: ${p.deadBranches.join(", ")}`);
+    return `  ${p.path} — ${bits.join(" · ")}`;
+  });
+  return {
+    ok: false,
+    output:
+      "Lines this turn added that nothing executes:\n" +
+      lines.join("\n") +
+      "\n\nCode no test reaches has not been shown to do anything. Either exercise it or " +
+      "do not add it — a constant nothing references and a branch nothing trips are how a " +
+      "diff gets made without work being done.",
+  };
+}
+
 function runBuiltin(
   builtin: BuiltinCheck,
   ctx: BarContext,
   allowCommentOnly = false,
+  lcovPath?: string,
 ): { ok: boolean; output: string } {
+  if (builtin === "diff-covered") return diffCovered(ctx, lcovPath);
   if (builtin === "files-changed") {
     const attempted = claimedWrites(ctx.record);
     if (ctx.ledger.length === 0) {
@@ -622,7 +723,12 @@ function runBuiltin(
 export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResult> {
   const t0 = Date.now();
   if (check.kind === "builtin") {
-    const { ok, output } = runBuiltin(check.builtin, ctx, check.commentOnly === "allow");
+    const { ok, output } = runBuiltin(
+      check.builtin,
+      ctx,
+      check.commentOnly === "allow",
+      check.lcov,
+    );
     return {
       name: check.name,
       ...(check.advisory ? { advisory: true } : {}),

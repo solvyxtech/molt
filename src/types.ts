@@ -132,10 +132,35 @@ export type Check = Advisory &
          * green, which is how receipt 0025 was issued for no work at all.
          */
         commentOnly?: "allow";
+        /**
+         * Where to read lcov from, for `diff-covered`.
+         *
+         * Required, and deliberately not defaulted: a missing file makes the
+         * check fail rather than pass, so guessing the path would turn a
+         * misconfiguration into a permanent red.
+         */
+        lcov?: string;
       }
   );
 
-export type BuiltinCheck = "files-changed" | "record-intact" | "claims-grounded";
+export type BuiltinCheck =
+  | "files-changed"
+  | "record-intact"
+  | "claims-grounded"
+  /**
+   * Every line this turn added is executed by the tests, and every branch on
+   * those lines is taken.
+   *
+   * The gap the other builtins leave. `files-changed` proves a file moved and
+   * `substance` proves the movement was not only comments; neither can tell
+   * whether the new code does anything. A constant referenced nowhere and a
+   * guard no test trips pass all of them.
+   *
+   * Reads lcov the project's own tests produced — it does not run coverage
+   * itself, because the command differs per project and a check that guesses
+   * would be wrong more often than useful.
+   */
+  | "diff-covered";
 
 export type Bar = {
   version: 1;
@@ -192,6 +217,15 @@ export type LedgerEntry = {
    * the field, and an absent count is treated as unknown rather than as zero.
    */
   substance?: number;
+  /**
+   * Which lines this write added or changed, 1-indexed into the file as it now
+   * stands. Blank and comment lines excluded.
+   *
+   * Recorded so a check can ask whether the tests execute them. "A file
+   * changed" and "the change is exercised by anything" are different claims,
+   * and only the second is evidence that the work does something.
+   */
+  changedLines?: number[];
   /**
    * The tool call that performed this write. Used to decide whether the
    * entry travels with a shed batch.

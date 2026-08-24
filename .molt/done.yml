@@ -79,3 +79,16 @@ checks:
   - name: record-intact
     builtin: record-intact
     tags: [session]
+
+  # A file changed, and the change was not only comments — neither of those can
+  # say whether the new code does anything. A turn once added a constant
+  # referenced nowhere and a guard whose branch no test trips, and passed six
+  # checks; it was caught by a person reading the diff, which does not scale.
+  #
+  # Reads the lcov the `tests` check writes. A missing report fails rather than
+  # passes: a check that verifies nothing when its input is absent is worse
+  # than no check, because it is counted as one.
+  - name: work-proven
+    builtin: diff-covered
+    lcov: coverage/lcov.info
+    tags: [session]
