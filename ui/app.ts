@@ -553,6 +553,25 @@ molt.onEvent((ev) => {
       endMessage();
       break;
 
+    case "tool_pending":
+      // The model has begun emitting a call, several hundred milliseconds
+      // before the row for it can exist. Saying so here is the difference
+      // between "it is talking" and "it is about to act", at exactly the
+      // moment someone is deciding whether to press Stop.
+      setPhase(`calling ${ev.name}`);
+      bumpActivity();
+      break;
+
+    case "stream_reset": {
+      // The attempt that produced this text is being abandoned and replayed.
+      // Leaving it on screen would show the same sentence twice.
+      if (openSaid) openSaid.remove();
+      openSaid = null;
+      setPhase(`retrying — ${ev.why}`.slice(0, 80));
+      bumpActivity();
+      break;
+    }
+
     case "assistant_text":
       // `streamed` means the deltas already carried this text. Rendering it
       // again is how the CLI printed every final answer twice.

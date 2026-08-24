@@ -241,6 +241,35 @@ export type EngineEvent =
    * that changed are named rather than covered by a claim of "unchanged".
    */
   | { kind: "cancelled"; filesWritten?: string[] }
+  /**
+   * The model has begun emitting a call to `name`, mid-stream.
+   *
+   * Earlier than `tool_start`, which fires once the message is complete and the
+   * call is about to run. This is the moment the intent becomes knowable — the
+   * name arrives in the stream several hundred milliseconds before the
+   * arguments finish — and it exists because the silence between narration
+   * ending and a tool row appearing is where a person concludes the model has
+   * stalled. Three runs in one session were cancelled in that gap, one of them
+   * three seconds before its first `list_files` would have fired.
+   *
+   * Advisory: a surface may ignore it. `tool_start` and `tool` still tell the
+   * whole story, and a call announced here is always followed by one of them.
+   */
+  | { kind: "tool_pending"; name: string }
+  /**
+   * Discard whatever text this step has streamed so far.
+   *
+   * A stream that dies partway is retried, and the retry produces the message
+   * again from the beginning. Text already on screen cannot be un-shown, which
+   * is why streaming was buffered until the attempt had stuck — at the cost of
+   * showing nothing at all during a step that takes half a minute.
+   *
+   * This is the other way to keep that promise: show the text as it arrives,
+   * and if the attempt is abandoned, say so and take it back. A surface that
+   * ignores this will duplicate the abandoned text, so it is not optional for
+   * anything that renders `delta`.
+   */
+  | { kind: "stream_reset"; why: string }
   // Emitted before the tool runs, so a UI can say what is happening while it
   // happens. `tool` still follows on completion and carries the outcome.
   | { kind: "tool_start"; name: string; detail: string }

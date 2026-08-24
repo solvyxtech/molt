@@ -250,7 +250,17 @@ export class NativeAccumulator {
   private text = "";
   private blocks = new Map<number, { type: string; id?: string; name?: string; json: string }>();
   private usage: Record<string, unknown> = {};
+  /** Tool names seen and not yet drained. See drainPending. */
+  private pending: string[] = [];
   finishReason?: string;
+
+  /** Tool names seen since the last call. Drained, so each is reported once. */
+  drainPending(): string[] {
+    if (this.pending.length === 0) return [];
+    const out = [...this.pending];
+    this.pending.length = 0;
+    return out;
+  }
 
   /** Returns the text added by this event, for incremental rendering. */
   push(ev: Record<string, unknown>): string {
@@ -265,6 +275,11 @@ export class NativeAccumulator {
       const i = ev.index as number;
       const b = ev.content_block as { type: string; id?: string; name?: string };
       this.blocks.set(i, { type: b.type, id: b.id, name: b.name, json: "" });
+      // The native wire names the tool in the block header, before a byte of
+      // its arguments — earlier than the OpenAI path can manage. Announced for
+      // the same reason: the gap between narration ending and a tool row
+      // appearing is where people decide the model has stalled.
+      if (b.type === "tool_use" && b.name) this.pending.push(b.name);
       return "";
     }
     if (type === "content_block_delta") {
