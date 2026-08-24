@@ -139,6 +139,13 @@
       </section>
     </main>
 
+    <div class="palette hidden" id="palette">
+      <div class="palette-rows" id="palette-rows"></div>
+      <div class="palette-foot">
+        <span>↑↓ choose</span><span>tab complete</span><span>enter run</span><span>esc close</span>
+      </div>
+    </div>
+
     <div class="composer" id="composer">
       <textarea
         id="prompt"
@@ -149,7 +156,10 @@
       <div class="composer-side">
         <div class="side-stack">
           <label class="ask"><input type="checkbox" id="ask" /> ask only</label>
-          <div class="autonomy" id="autonomy" role="group" aria-label="autonomy"></div>
+          <div class="au-wrap">
+            <span class="au-label">autonomy <b id="au-name">medium</b></span>
+            <div class="autonomy" id="autonomy" role="group" aria-label="autonomy level"></div>
+          </div>
         </div>
         <button class="btn primary" id="send">Run</button>
         <button class="btn danger hidden" id="stop">Stop</button>
