@@ -55,7 +55,8 @@ import { breakpoints, withCaching, refusedCaching, type CacheStyle, cacheStyle }
 import { Journal } from "./journal.js";
 import { authHeaders, isSelfHosted } from "./providers.js";
 import { Receipts } from "./receipts.js";
-import { readStream, type Usage } from "./stream.js";
+import { readStream, type StreamAccumulator, type Usage } from "./stream.js";
+import { Fragments, SafeStream } from "./live.js";
 import { Transcript, toolDetail } from "./transcript.js";
 import {
   estTokens,
@@ -2330,7 +2331,6 @@ export class Engine {
       let finishReason: string | undefined;
       /** Whether this step's text already went out as deltas. */
       let streamedContent = false;
-      let streamedText = "";
       let failure:
         | { text: string; why: string; retryable: boolean; retryAfterMs?: number }
         | undefined;
@@ -2344,11 +2344,19 @@ export class Engine {
        * turn ended there with everything it had done thrown away.
        */
       let overflowRounds = 0;
+      /**
+       * Whether this attempt has put text on screen.
+       *
+       * A retry replays the message from the beginning, so anything already
+       * shown belongs to an abandoned attempt and has to be taken back first —
+       * otherwise the reader sees the same sentence twice with no way to tell
+       * which one the model actually finished.
+       */
+      let shownThisAttempt = false;
 
       for (let attempt = 0; ; attempt++) {
         failure = undefined;
         msg = undefined;
-        streamedText = "";
         let res: Response | undefined;
         try {
           res = await send(askForUsage);
@@ -2462,6 +2470,10 @@ export class Engine {
                   why: "The endpoint could not hold the conversation.",
                   retryable: true,
                 };
+                if (shownThisAttempt) {
+                  shownThisAttempt = false;
+                  yield { kind: "stream_reset", why: "shed and retried" };
+                }
                 continue;
               }
 
@@ -2546,17 +2558,54 @@ export class Engine {
                 cache_read_input_tokens: result.cachedTokens,
                 cache_creation_input_tokens: result.cacheWriteTokens,
               };
-              streamedText = redact(fragments.join(""), this.secrets());
             } else if (isSse) {
-              // Fragments are buffered and re-yielded after the read completes.
-              // An async generator cannot yield from inside a callback, and
-              // restructuring the whole loop into a push model to gain a few
-              // hundred milliseconds of earlier paint is not worth the
-              // complexity that would add to the proof gate below.
-              const fragments: string[] = [];
-              const result = await readStream(res.body!, (fragment) => {
-                fragments.push(fragment);
-              });
+              // Yielded as they arrive. This was buffered until the read
+              // completed, on the reasoning that a few hundred milliseconds of
+              // earlier paint was not worth the complexity — but on a local
+              // endpoint a step is tens of seconds, and buffering meant the
+              // window showed nothing at all for the whole of it. Three runs in
+              // one session were cancelled during that silence.
+              const frag = new Fragments();
+              const safe = new SafeStream((t: string) => redact(t, this.secrets()));
+              let streamAcc: StreamAccumulator | undefined;
+              let live = "";
+              shownThisAttempt = false;
+              const reading = readStream(
+                res.body!,
+                (fragment) => frag.push(fragment),
+                (a) => (streamAcc = a),
+              )
+                .then((r) => {
+                  frag.finish();
+                  return r;
+                })
+                .catch((e: unknown) => {
+                  frag.finish();
+                  throw e;
+                });
+              for await (const fragment of frag.drain()) {
+                live += fragment;
+                const showable = safe.take(fragment);
+                if (showable) {
+                  streamedContent = true;
+                  shownThisAttempt = true;
+                  yield { kind: "delta", text: showable };
+                }
+                // The model names a tool several hundred milliseconds before
+                // its arguments finish. Said as soon as it is known, because
+                // the gap between narration ending and a tool row appearing is
+                // where a person decides the model has stalled.
+                for (const name of streamAcc?.drainPending() ?? []) {
+                  yield { kind: "tool_pending", name };
+                }
+              }
+              const tail = safe.flush();
+              if (tail) {
+                streamedContent = true;
+                shownThisAttempt = true;
+                yield { kind: "delta", text: tail };
+              }
+              const result = await reading;
               msg = result.message;
               finishReason = result.finishReason;
               usage = {
@@ -2570,16 +2619,6 @@ export class Engine {
                   : { completion_tokens_details: { reasoning_tokens: result.reasoningTokens } }),
                 ...(result.costUsd === undefined ? {} : { cost: result.costUsd }),
               };
-              // Redacted whole rather than fragment by fragment: a key split
-              // across two chunks matches neither half, and these are already
-              // buffered, so there is nothing to lose by masking the joined
-              // text. The screen is a distribution channel too — the same rule
-              // the tool preview below has always followed.
-              //
-              // Held rather than yielded here: a stream that dies after some
-              // text arrived is retried, and text already on screen cannot be
-              // taken back. It goes out below, once the attempt has stuck.
-              streamedText = redact(fragments.join(""), this.secrets());
             } else {
               type Payload = {
                 choices?: { message?: Msg; finish_reason?: string | null }[];
@@ -2642,6 +2681,14 @@ export class Engine {
 
         if (!failure) break;
         if (!failure.retryable || attempt >= NETWORK_RETRIES) break;
+        // About to replay this message from the beginning. Anything already on
+        // screen belongs to an attempt that is being abandoned, and leaving it
+        // there would show the reader the same sentence twice with no way to
+        // tell which one the model actually finished.
+        if (shownThisAttempt) {
+          shownThisAttempt = false;
+          yield { kind: "stream_reset", why: failure.text };
+        }
         const backoff = this.cfg.retryBackoffMs ?? NETWORK_BACKOFF_MS;
         const wait = failure.retryAfterMs ?? backoff[attempt] ?? backoff.at(-1) ?? 4_000;
         log?.append("note", { text: `${failure.text} — retrying in ${wait}ms` });
@@ -2693,7 +2740,10 @@ export class Engine {
       // away and only the tool calls showed. Sent as a delta, which is the
       // event that means "the model is talking", so both kinds of provider
       // reach the screen the same way.
-      const said = streamedText || redact(msg.content ?? "", this.secrets());
+      // Only for a provider that did not stream. The SSE path now yields its
+      // fragments as they arrive, and repeating the joined text here is how the
+      // whole message came out twice.
+      const said = streamedContent ? "" : redact(msg.content ?? "", this.secrets());
       if (said) {
         streamedContent = true;
         yield { kind: "delta", text: said };

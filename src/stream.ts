@@ -78,6 +78,10 @@ export type StreamResult = {
  */
 export class StreamAccumulator {
   private content = "";
+  /** Names announced already, so a call is never reported twice. */
+  private announced = new Set<number>();
+  /** Names seen and not yet drained. */
+  private pending: string[] = [];
   private calls = new Map<number, { id: string; name: string; args: string }>();
   promptTokens?: number;
   completionTokens?: number;
@@ -130,7 +134,22 @@ export class StreamAccumulator {
       const index = typeof tc.index === "number" ? tc.index : 0;
       const slot = this.calls.get(index) ?? { id: "", name: "", args: "" };
       if (tc.id) slot.id = tc.id;
-      if (tc.function?.name) slot.name += tc.function.name;
+      if (tc.function?.name) {
+        slot.name += tc.function.name;
+        // The first moment anyone can know a tool is coming.
+        //
+        // A step streams its narration, then its tool calls, and until now the
+        // window showed the prose and then nothing until the call completed.
+        // That gap is where a person decides whether the model is working or
+        // waffling — and three runs in one session were cancelled inside it,
+        // one of them three seconds before `list_files` would have fired. The
+        // name is known here, several hundred milliseconds before the call is
+        // complete, so it is announced here.
+        if (!this.announced.has(index)) {
+          this.announced.add(index);
+          this.pending.push(slot.name);
+        }
+      }
       if (typeof tc.function?.arguments === "string") slot.args += tc.function.arguments;
       this.calls.set(index, slot);
     }
@@ -141,6 +160,20 @@ export class StreamAccumulator {
   /** Text accumulated so far. */
   get text(): string {
     return this.content;
+  }
+
+  /**
+   * Tool names seen since the last time this was asked, and cleared by asking.
+   *
+   * Drained rather than read so a caller polling between chunks reports each
+   * name once. The alternative — a flag the caller inspects — announces the
+   * same call on every subsequent chunk of its arguments.
+   */
+  drainPending(): string[] {
+    if (this.pending.length === 0) return [];
+    const out = [...this.pending];
+    this.pending.length = 0;
+    return out;
   }
 
   finish(): StreamResult {
@@ -224,8 +257,18 @@ export class SseParser {
 export async function readStream(
   body: ReadableStream<Uint8Array>,
   onText: (fragment: string, accumulated: string) => void,
+  /**
+   * Called once with the accumulator, before the first byte is read.
+   *
+   * The caller needs it to drain pending tool names mid-stream: the model
+   * names a tool several hundred milliseconds before its arguments finish, and
+   * that is the earliest anyone can say the model is about to act rather than
+   * merely talk.
+   */
+  onStart?: (acc: StreamAccumulator) => void,
 ): Promise<StreamResult> {
   const acc = new StreamAccumulator();
+  onStart?.(acc);
   const parser = new SseParser();
   const decoder = new TextDecoder();
   const reader = body.getReader();
