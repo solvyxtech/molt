@@ -143,6 +143,16 @@ export class Receipts {
     costEstimated?: boolean;
     /** Every file the turn changed, with the hashes that prove it. */
     changed?: { path: string; before: string | null; after: string }[];
+    /**
+     * This task's own criteria, and the seal taken before work began.
+     *
+     * Separated into checked and recorded because conflating them is the one
+     * dishonesty a receipt cannot afford. A command that ran and exited zero is
+     * evidence. A sentence someone wrote down is intent. Both belong on the
+     * document; only one of them is proof, and the reader must never have to
+     * work out which is which.
+     */
+    task?: { seal: string; checks: string[]; notes: string[] };
     /** What the model ran and read, in order, as one line each. */
     did?: string[];
   }): Receipt {
@@ -163,7 +173,36 @@ export class Receipts {
           : "molt reported failure: the attempt limit was reached with checks still failing.";
 
     const changed = args.changed ?? [];
-    const work: string[] = ["## What the model changed", ""];
+    // The task's own criteria go above what changed, because they are what the
+    // change was supposed to achieve — a reader who sees the diff first has
+    // already started judging it against nothing in particular.
+    const task = args.task;
+    const asked: string[] = [];
+    if (task && (task.checks.length || task.notes.length)) {
+      asked.push("## What this task had to satisfy", "");
+      asked.push(
+        `Set before the work began and sealed as \`${task.seal}\`. The seal is written to`,
+        "the session journal before the first request, so these can be shown to predate",
+        "the work rather than to claim they did.",
+        "",
+      );
+      if (task.checks.length) {
+        asked.push("**Machine-checked.** These ran with the bar and could refuse the claim:", "");
+        for (const c of task.checks) asked.push(`- \`${c}\``);
+        asked.push("");
+      }
+      if (task.notes.length) {
+        asked.push(
+          "**Recorded, not verified.** No machine checked these. They are stated here",
+          "because they were asked for, and molt will not report them as met:",
+          "",
+        );
+        for (const n of task.notes) asked.push(`- ${n}`);
+        asked.push("");
+      }
+    }
+
+    const work: string[] = [...asked, "## What the model changed", ""];
     if (changed.length === 0) {
       work.push("Nothing. No file was modified during this turn.", "");
     } else {
