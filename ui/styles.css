@@ -80,7 +80,28 @@ body {
   letter-spacing: 0.08em;
   color: var(--accent);
 }
-.brand .mark { opacity: 0.75; margin-right: 2px; }
+/*
+ * The mark, drawn rather than typed.
+ *
+ * It was ▚ (U+259A) — which renders as a solid pair of quadrants on macOS, as
+ * a different weight on Windows, and as a tofu box wherever the font lacks it.
+ * A logo that depends on the user's font stack is not a logo. This is the same
+ * diagonal split as the app icon, in CSS, identical on all three platforms.
+ */
+.mark {
+  display: inline-block;
+  width: 13px; height: 13px;
+  vertical-align: -2px;
+  margin-right: 5px;
+  border-radius: 3px;
+  background: linear-gradient(135deg, var(--accent) 0 46%, var(--dim) 46% 54%, var(--ghost) 54% 100%);
+}
+.empty-mark {
+  display: block;
+  width: 56px; height: 56px;
+  border-radius: 13px;
+  background: linear-gradient(135deg, var(--ghost) 0 46%, var(--line) 46% 54%, var(--bg-sunken) 54% 100%);
+}
 
 .crumbs { display: flex; align-items: center; gap: 0; min-width: 0; }
 .crumb {
@@ -181,7 +202,7 @@ main { position: relative; overflow: hidden; }
   align-items: center; justify-content: center;
   gap: 10px; text-align: center;
 }
-.empty-mark { font-size: 34px; color: var(--ghost); letter-spacing: 0.2em; }
+
 .empty em { color: var(--accent); font-style: normal; }
 
 .turn { margin-bottom: 20px; }
@@ -374,7 +395,7 @@ main { position: relative; overflow: hidden; }
 
 /* ── settings ──────────────────────────────────────────────────────────── */
 
-.settings { padding: 22px; max-width: 760px; display: flex; flex-direction: column; gap: 18px; }
+.settings { padding: 30px 22px; max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 18px; }
 fieldset { border: 1px solid var(--line); border-radius: var(--r); padding: 14px; }
 legend {
   padding: 0 7px;
@@ -445,7 +466,7 @@ select { flex: 0 0 auto; min-width: 150px; cursor: pointer; }
 /* ── status bar ────────────────────────────────────────────────────────── */
 
 .status {
-  display: flex; align-items: center;
+  display: flex; align-items: center; gap: 14px;
   height: 26px;
   padding: 0 var(--pad);
   background: var(--bg-sunken);
