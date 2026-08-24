@@ -17,13 +17,42 @@ checks:
   - name: types
     run: npm run typecheck
     timeout: 120
-    watch: ["src/**", "test/**", "tsconfig*.json", "package.json"]
+    watch:
+      ["src/**", "test/**", "electron/**", "ui/**", "tsconfig*.json", "package.json"]
     tags: [fast]
 
   - name: tests
     run: npm test
     timeout: 300
     watch: ["src/**", "test/**", "tsconfig*.json", "package.json"]
+    tags: [slow]
+
+  # --- the window ---
+  #
+  # These exist because the suite above cannot see the desktop surfaces at all.
+  # `npm test` runs the engine's tests, and the engine is shared with the CLI —
+  # a change to electron/ or ui/ can break the app while leaving every one of
+  # those 805 tests green. Worse, before these were added the `types` check
+  # watched only src/** and test/**, so editing the renderer left every watched
+  # glob untouched and molt reused a cached pass. The bar agreed the work was
+  # fine because it had not looked at it.
+  #
+  #   app-boots   launches the real window and asks the page whether it wired
+  #               itself up: bridge present, elements present, six tabs.
+  #   app-drives  runs a real turn against a stub provider and reads the DOM
+  #               back. This is the only check that crosses the IPC boundary,
+  #               which is where a desktop port actually breaks.
+
+  - name: app-boots
+    run: npm run self-check
+    timeout: 60
+    watch: ["electron/**", "ui/**", "build.mjs", "package.json"]
+    tags: [fast]
+
+  - name: app-drives
+    run: npm run e2e
+    timeout: 120
+    watch: ["electron/**", "ui/**", "src/**", "build.mjs", "package.json"]
     tags: [slow]
 
   # --- builtins: molt runs these itself, against the session record ---
