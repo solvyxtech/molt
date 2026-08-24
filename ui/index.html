@@ -146,6 +146,24 @@
       </div>
     </div>
 
+    <div class="criteria hidden" id="criteria">
+      <div class="criteria-head">
+        <span class="ck-title">Acceptance criteria for this task</span>
+        <span class="muted" id="ck-state"></span>
+        <span class="spacer"></span>
+        <button class="btn ghost sm" id="ck-add">+ check</button>
+        <button class="btn ghost sm" id="ck-add-note">+ note</button>
+        <button class="btn ghost sm" id="ck-draft">Draft from task</button>
+        <button class="btn ghost sm" id="ck-hide">✕</button>
+      </div>
+      <div class="ck-rows" id="ck-rows"></div>
+      <p class="hint" id="ck-hint">
+        Checks are commands — they run with the bar and can refuse the claim.
+        Notes are recorded on the receipt as stated intent and are never
+        reported as verified. Both are sealed when you press Run.
+      </p>
+    </div>
+
     <div class="composer" id="composer">
       <textarea
         id="prompt"
@@ -156,6 +174,7 @@
       <div class="composer-side">
         <div class="side-stack">
           <label class="ask"><input type="checkbox" id="ask" /> ask only</label>
+          <button class="btn ghost sm" id="ck-open">criteria</button>
           <div class="au-wrap">
             <span class="au-label">autonomy <b id="au-name">medium</b></span>
             <div class="autonomy" id="autonomy" role="group" aria-label="autonomy level"></div>
