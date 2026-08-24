@@ -23,6 +23,8 @@ import {
   resultBudgetBytes,
   tokenScale,
   historyBudget,
+  keepForRound,
+  keepRecentForRound,
   NETWORK_RETRIES,
   SYSTEM_PROMPT,
 } from "../src/engine.js";
@@ -813,6 +815,31 @@ describe("an endpoint too small for the conversation", () => {
       );
     } finally {
       ws.cleanup();
+    }
+  });
+
+  it("loosens its grip with each round, and stops loosening", () => {
+    // Found by mutating this project's own code: keepForRound could be
+    // replaced with a constant and the whole suite stayed green. It is used in
+    // one place and reached only by a session with several user turns, so the
+    // overflow tests below — which have one — never exercised it.
+    //
+    // The progression is the property, not the numbers. Each round must keep
+    // less than the last, or a second shed finds nothing new to drop and the
+    // extra rounds are theatre. And it must stop at one: the exchange being
+    // shed for is the one the turn is in the middle of, and dropping that
+    // leaves nothing to answer.
+    const exchanges = [1, 2, 3, 4].map(keepForRound);
+    assert.deepEqual(exchanges, [2, 1, 1, 1]);
+    const recent = [1, 2, 3, 4].map(keepRecentForRound);
+    assert.deepEqual(recent, [6, 4, 2, 2]);
+
+    for (const f of [keepForRound, keepRecentForRound]) {
+      for (let r = 1; r < 6; r++) {
+        assert.ok(f(r + 1) <= f(r), `${f.name} must not keep more on a later round`);
+      }
+      assert.ok(f(1) > f(3), `${f.name} must actually loosen, not hold constant`);
+      assert.ok(f(99) >= 1, `${f.name} must never reach zero`);
     }
   });
 

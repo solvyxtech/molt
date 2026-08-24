@@ -94,6 +94,83 @@ Fails read-only tasks by design. If a task legitimately changes nothing, leave
 this check out of that project's bar — or use `molt ask`, which drops the write
 checks for the turn.
 
+
+#### `diff-covered`
+
+Passes when every line this turn added is executed by the tests, and every
+branch on those lines goes both ways.
+
+This is the gap the checks above leave. `files-changed` proves a file moved.
+The substance rule proves the movement was not only comments. Neither can say
+whether the new code *does* anything.
+
+A real turn added exactly this and passed six checks:
+
+```js
+export const MAX_COMMAND_LENGTH = 16384;           // referenced nowhere
+if (path.length > MAX_PATH_LENGTH) return false;   // branch never taken
+```
+
+Branch counts are what catch the second line. Line coverage calls it covered —
+the `if` executed. Only the branch count shows the `return false` was never
+reached.
+
+```yaml
+  - name: work-proven
+    builtin: diff-covered
+    lcov: coverage/lcov.info
+    tags: [session]
+```
+
+It does **not** run coverage. The command differs per project and a check that
+guessed would be wrong more often than useful, so it reads the lcov your own
+test command wrote. Node's test runner emits it with
+`--test-reporter=lcov`; so do c8, nyc and pytest-cov.
+
+A missing report **fails**. A check that verifies nothing when its input is
+absent is worse than no check, because it is counted as one.
+
+A changed line absent from the report is not held against anyone — lcov lists
+only what the tool considers executable, so a type or an import simply is not
+there. Silence means "not instrumented", not "not run".
+
+Known limit: it catches the dead branch and not the dead constant. A
+module-level `export const` executes at import, so coverage cannot see that
+nothing references it.
+
+#### `mutation`
+
+Passes when breaking each new line makes the tests fail.
+
+The rung above `diff-covered`. Coverage proves a line runs; it cannot prove
+anything *checks* what the line does. A test that executes code while asserting
+nothing satisfies coverage completely, and leaves the line exactly as unproven
+as one never run — but with a green tick beside it.
+
+```yaml
+  - name: work-tested
+    builtin: mutation
+    run: npm test
+    sample: 4
+    timeout: 600
+    tags: [session, slow]
+```
+
+`run` is the command that should fail when code is broken. `sample` is how many
+changed lines to break — **each one costs a full run of that command**, so keep
+it small and expect this on a slow tag rather than the inner loop. The report
+says how many changed lines went unexamined; a bound nobody is told about reads
+as completeness.
+
+It runs the command once **unmutated** first and refuses to proceed unless that
+passes. Without it, a suite that is already failing makes every mutation look
+killed — the command failed, after all — and the check reports success having
+tested nothing.
+
+Every file is hashed before it is touched and verified after. A failed restore
+is reported as this check failing, whatever the mutations found: a verification
+tool that leaves your source altered has done something worse than miss a bug.
+
 #### `record-intact`
 
 Passes when everything this project shed is still recoverable.
