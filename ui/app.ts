@@ -29,6 +29,9 @@ type MoltBridge = {
   saveEndpoint(baseUrl: string, model: string): Promise<boolean>;
   storedEndpoint(): Promise<{ baseUrl?: string; model?: string }>;
   listModels(current?: { url: string; key?: string }): Promise<ModelSource[]>;
+  endpoints(): Promise<{ url: string; lastModel?: string; seen: string }[]>;
+  addEndpoint(url: string, model?: string): Promise<unknown>;
+  forgetEndpoint(url: string): Promise<unknown>;
   setModel(o: {
     model: string;
     baseUrl?: string;
@@ -83,6 +86,8 @@ type ModelSource = {
   ids: string[];
   error?: string;
   needsKey?: boolean;
+  local?: boolean;
+  remembered?: boolean;
 };
 
 type ReceiptRow = { file: string; n: number; verdict: string; mtime: number };
@@ -1251,11 +1256,24 @@ async function drawPicker(list: ModelSource[]): Promise<void> {
     grp.appendChild(el("span", "host", src.url));
     // A refusal is a thing to show, with its reason — not a provider that
     // silently vanished from the list.
-    if (!src.ok) grp.appendChild(el("span", "err", src.needsKey ? "no key stored" : (src.error ?? "unreachable")));
+    if (src.local) grp.appendChild(el("span", "tag-local", "local"));
+    if (!src.ok && src.ids.length) grp.appendChild(el("span", "err", reasonFor(src)));
+    if (src.remembered) {
+      // Only a server this window remembered can be forgotten; a preset is
+      // not the user's to remove.
+      const x = el("button", "forget", "forget") as HTMLButtonElement;
+      x.title = `stop asking ${src.url} for models`;
+      x.addEventListener("click", async (ev) => {
+        ev.stopPropagation();
+        await molt.forgetEndpoint(src.url);
+        await drawPicker(await sources(true));
+      });
+      grp.appendChild(x);
+    }
     box.appendChild(grp);
 
     if (!src.ids.length) {
-      box.appendChild(el("div", "empty-grp", src.ok ? "no models listed" : "—"));
+      box.appendChild(el("div", "empty-grp", reasonFor(src)));
       continue;
     }
     for (const id of src.ids) {
@@ -1293,6 +1311,40 @@ async function chooseModel(id: string, url: string): Promise<void> {
 
 $("crumb-model").addEventListener("click", () => void openPicker());
 $("picker-close").addEventListener("click", () => $("picker").classList.add("hidden"));
+$("picker-add").addEventListener("click", () => void addEndpoint());
+$("picker-url").addEventListener("keydown", (e) => {
+  if ((e as KeyboardEvent).key === "Enter") void addEndpoint();
+});
+
+/**
+ * Register a server and ask it what it serves.
+ *
+ * Deliberately usable with no workspace open: a new box on the network is
+ * exactly the thing you want to point at before you have chosen a project, and
+ * requiring a session first is how its models stayed invisible.
+ */
+async function addEndpoint(): Promise<void> {
+  const box = $("picker-url") as HTMLInputElement;
+  const url = box.value.trim();
+  if (!url) return;
+  if (!/^https?:\/\//i.test(url)) {
+    $("picker-sub").textContent = "An endpoint needs a scheme — http:// or https://";
+    return;
+  }
+  $("picker-sub").textContent = `Asking ${url}…`;
+  await molt.addEndpoint(url);
+  box.value = "";
+  const list = await sources(true);
+  await drawPicker(list);
+  const added = list.find((s) => s.url.replace(/\/+$/, "") === url.replace(/\/+$/, ""));
+  if (added && !added.ok) {
+    // Kept in the list even so: a server that is merely switched off should
+    // not have to be typed in again when it comes back.
+    $("picker-sub").textContent = `${url} — ${reasonFor(added)}. Kept in the list.`;
+  }
+  void fillModelSelect(false);
+}
+
 $("picker-refresh").addEventListener("click", async () => {
   $("picker-sub").textContent = "Asking…";
   await drawPicker(await sources(true));
@@ -1305,10 +1357,19 @@ async function fillModelSelect(force = false): Promise<void> {
   sel.textContent = "";
   const list = await sources(force);
   for (const src of list) {
-    if (!src.ids.length) continue;
     const g = document.createElement("optgroup");
     g.label = `${src.name} — ${src.url}`;
-    for (const id of src.ids) g.appendChild(new Option(id, `${id}\u0000${src.url}`));
+    if (src.ids.length) {
+      for (const id of src.ids) g.appendChild(new Option(id, `${id}\u0000${src.url}`));
+    } else {
+      // Shown, not skipped. Dropping an endpoint that answered nothing left
+      // "other" as the only group in the list, which reads as "there are no
+      // models" when it means "this server did not answer" — and hides the one
+      // fact you need, which is why.
+      const why = new Option(`  ${reasonFor(src)}`, "\u0000custom");
+      why.disabled = true;
+      g.appendChild(why);
+    }
     sel.appendChild(g);
   }
   const custom = document.createElement("optgroup");
@@ -1316,6 +1377,14 @@ async function fillModelSelect(force = false): Promise<void> {
   custom.appendChild(new Option("custom — type an id below", "\u0000custom"));
   sel.appendChild(custom);
   syncModelPick(chosen);
+}
+
+/** Why a source listed nothing, in the terms that apply to that kind of host. */
+function reasonFor(src: ModelSource): string {
+  if (src.ok) return "no models listed";
+  if (src.needsKey) return "no key stored — add one in Settings";
+  if (src.local) return "not answering — is the server running?";
+  return src.error ?? "unreachable";
 }
 
 /** Point the dropdown at `id` if it is in the list; otherwise show custom. */

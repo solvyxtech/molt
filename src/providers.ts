@@ -69,6 +69,15 @@ export function authHeaders(baseUrl: string, apiKey?: string): Record<string, st
 }
 
 export function defaultConfigDir(): string {
+  // `MOLT_CONFIG_DIR` relocates the whole of molt's config: keys, endpoint,
+  // prices. It exists because without it the test suite writes to the real
+  // one — a TUI test that mounts the app triggers a pricing refresh, and
+  // `savePricing` had nowhere else to go, so running `npm test` rewrote the
+  // developer's stored endpoint and left `priceModel: "test-model"` behind.
+  // A test that edits the machine it runs on is not a test you can trust
+  // twice, and this was doing it on every run.
+  const override = process.env.MOLT_CONFIG_DIR?.trim();
+  if (override) return override;
   return join(homedir(), ".config", "molt");
 }
 
