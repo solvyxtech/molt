@@ -16,7 +16,7 @@ import { describe, it } from "node:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runCheck, type BarContext } from "../src/bar.js";
+import { runCheck, mutationVerdict, type BarContext } from "../src/bar.js";
 import { mutateLine, planMutations, applyMutation } from "../src/mutate.js";
 
 describe("mutating one line", () => {
@@ -233,5 +233,67 @@ describe("the mutation check", () => {
         rmSync(dir, { recursive: true, force: true });
       }
     }
+  });
+});
+
+/**
+ * The verdict, apart from the running.
+ *
+ * These four outcomes are the whole contract of the check, and three of them
+ * were only ever exercised incidentally by the end-to-end tests above. The
+ * "none applied" case could not be exercised at all: it guards an invariant
+ * `mutationCheck` currently upholds, which is precisely the shape of line the
+ * mutation check refuses to let anyone else ship — reached by no test and
+ * defended only by an argument.
+ */
+describe("the mutation verdict", () => {
+  const base = { killed: [], survived: [], planned: 0, total: 0, sample: 4 };
+
+  it("claims nothing when nothing was applied", () => {
+    // The dangerous fall-through. Without this the same counts render as
+    // "0 mutation(s) broke a test, as they should" — a pass asserting the
+    // suite killed everything, after breaking the code exactly zero times.
+    const r = mutationVerdict({ ...base, planned: 3, total: 3 });
+    assert.equal(r.ok, true);
+    assert.match(r.output, /3 mutation\(s\) planned, none applied/);
+    assert.match(r.output, /nothing is claimed/);
+    assert.doesNotMatch(r.output, /as they should/);
+  });
+
+  it("passes when every applied mutation was killed", () => {
+    const r = mutationVerdict({ ...base, killed: ["a.ts:1 (> to >=)"], planned: 1, total: 1 });
+    assert.equal(r.ok, true);
+    assert.match(r.output, /1 mutation\(s\) broke a test, as they should/);
+  });
+
+  it("fails when a mutation survived, and names it", () => {
+    const r = mutationVerdict({
+      ...base,
+      killed: ["a.ts:1 (> to >=)"],
+      survived: ["b.ts:7 (&& to ||) — if (a && b) return 1;"],
+      planned: 2,
+      total: 2,
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.output, /1 of 2 mutation\(s\) changed the code and nothing failed/);
+    assert.match(r.output, /b\.ts:7/);
+  });
+
+  it("says how much it did not look at, and stays quiet when it looked at all of it", () => {
+    // A bound nobody is told about reads as completeness. The pass case is
+    // the one that matters: "2 broke a test" on a 9-line diff means something
+    // very different from the same sentence on a 2-line diff.
+    const bounded = mutationVerdict({
+      ...base,
+      killed: ["a.ts:1 (> to >=)", "a.ts:2 (< to <=)"],
+      planned: 2,
+      total: 9,
+      sample: 2,
+    });
+    assert.equal(bounded.ok, true);
+    assert.match(bounded.output, /7 changed line\(s\) not mutated \(sample is 2/);
+
+    const complete = mutationVerdict({ ...base, killed: ["a.ts:1 (> to >=)"], planned: 1, total: 1 });
+    assert.doesNotMatch(complete.output, /not mutated/);
   });
 });
