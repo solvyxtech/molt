@@ -14,6 +14,9 @@ import { receiptBasename, resolveReceipt } from "../electron/receipts-path.js";
 import { desktopSurfaces } from "../electron/theme-surfaces.js";
 import { getTheme } from "../src/theme.js";
 import { sessionOpenReject } from "../electron/session-open.js";
+import { JOURNAL_IPC_CAP, barInitText, tailLines } from "../electron/limits.js";
+import { JOURNAL_RENDER_CAP, STREAM_CAP, newest, trimOldest } from "../ui/bounds.js";
+import { renderMarkdown } from "../ui/markdown.js";
 
 /** The nearest ancestor holding a package.json. */
 function repoRoot(): string {
@@ -153,5 +156,166 @@ describe("title bar padding", () => {
     assert.match(css, /\[data-platform=["']darwin["']\][^{]*\.titlebar/);
     const unguarded = /^\s*padding:\s*0\s+var\(--pad\)\s+0\s+86px/m.test(css);
     assert.equal(unguarded, false, "86px must not be the default padding");
+  });
+});
+
+describe("/init reports whether it wrote", () => {
+  it("does not claim a write when the bar already existed", () => {
+    // writeDefaultBar returns `{ existed }`. That object is always truthy, so
+    // `wrote ? "wrote…" : "already exists"` always took the first branch —
+    // /init on a project that already had a bar said it had just created one.
+    assert.match(barInitText(true, "done.yml", 4), /already exists/);
+    assert.match(barInitText(false, "done.yml", 4), /wrote done\.yml — 4 check/);
+    assert.doesNotMatch(barInitText(true, "done.yml", 4), /wrote /);
+  });
+});
+
+describe("long-session caps", () => {
+  it("keeps only the newest journal lines on the wire", () => {
+    const text = Array.from({ length: JOURNAL_IPC_CAP + 50 }, (_, i) => `{"seq":${i}}`).join("\n");
+    const kept = tailLines(text, JOURNAL_IPC_CAP);
+    assert.equal(kept.length, JOURNAL_IPC_CAP);
+    assert.equal(kept[0], `{"seq":50}`);
+    assert.equal(kept[kept.length - 1], `{"seq":${JOURNAL_IPC_CAP + 49}}`);
+  });
+
+  it("drops the oldest stream rows past the cap", () => {
+    const kids: { id: number }[] = [];
+    const parent = {
+      get childElementCount() {
+        return kids.length;
+      },
+      get firstChild() {
+        return kids[0] ?? null;
+      },
+      removeChild(n: { id: number }) {
+        const i = kids.indexOf(n);
+        if (i >= 0) kids.splice(i, 1);
+      },
+    };
+    for (let i = 0; i < STREAM_CAP + 25; i++) kids.push({ id: i });
+    trimOldest(parent, STREAM_CAP);
+    assert.equal(kids.length, STREAM_CAP);
+    assert.equal(kids[0]!.id, 25, "the oldest 25 must be the ones that left");
+  });
+
+  it("renders the newest journal rows, not the first ones", () => {
+    const rows = Array.from({ length: JOURNAL_RENDER_CAP + 10 }, (_, i) => i);
+    const shown = newest(rows, JOURNAL_RENDER_CAP);
+    assert.equal(shown.length, JOURNAL_RENDER_CAP);
+    assert.equal(shown[0], 10);
+    assert.equal(shown[shown.length - 1], JOURNAL_RENDER_CAP + 9);
+  });
+});
+
+describe("the confirm dialog dies with the turn", () => {
+  it("hides on idle, not only when a button is clicked", () => {
+    const src = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    // The buttons hide it. session:idle used not to, so Stop left a modal
+    // that answered nothing.
+    assert.match(src, /molt\.onIdle/);
+    const idle = src.slice(src.indexOf("molt.onIdle"));
+    assert.match(idle.slice(0, 500), /\$\("confirm"\)\.classList\.add\("hidden"\)/);
+  });
+});
+
+describe("receipt markdown is text, never HTML", () => {
+  function stub(): HTMLElement {
+    const kids: HTMLElement[] = [];
+    const node = {
+      childNodes: kids,
+      children: kids,
+      style: {} as CSSStyleDeclaration,
+      className: "",
+      _text: "",
+      get textContent() {
+        return this._text || kids.map((c) => c.textContent).join("");
+      },
+      set textContent(v: string) {
+        this._text = v;
+        kids.length = 0;
+      },
+      appendChild(c: HTMLElement) {
+        kids.push(c);
+        return c;
+      },
+    };
+    return node as unknown as HTMLElement;
+  }
+
+  const orig = globalThis.document;
+  const created: { tag: string; node: HTMLElement }[] = [];
+
+  function install(): void {
+    created.length = 0;
+    (globalThis as unknown as { document: unknown }).document = {
+      createElement(tag: string) {
+        const n = stub();
+        (n as unknown as { tagName: string }).tagName = tag.toUpperCase();
+        created.push({ tag, node: n });
+        return n;
+      },
+      createTextNode(text: string) {
+        const n = stub();
+        n.textContent = text;
+        return n;
+      },
+    };
+  }
+
+  function restore(): void {
+    (globalThis as unknown as { document: unknown }).document = orig;
+  }
+
+  it("does not create a script element for a script tag in the claim", () => {
+    install();
+    try {
+      const into = stub();
+      renderMarkdown('claim: <script>alert(1)</script>\n\n> <script src="x"></script>', into);
+      assert.equal(
+        created.some((c) => c.tag.toLowerCase() === "script"),
+        false,
+        "a receipt must never become a script node",
+      );
+      assert.match(into.textContent ?? "", /<script>alert\(1\)<\/script>/);
+    } finally {
+      restore();
+    }
+  });
+
+  it("keeps a script tag literal inside a table cell and a blockquote", () => {
+    install();
+    try {
+      const into = stub();
+      renderMarkdown(
+        [
+          "| a | b |",
+          "|---|---|",
+          "| <script>x</script> | ok |",
+          "",
+          "> **bold** and <script>y</script>",
+        ].join("\n"),
+        into,
+      );
+      assert.equal(created.some((c) => c.tag.toLowerCase() === "script"), false);
+      assert.match(into.textContent ?? "", /<script>x<\/script>/);
+      assert.match(into.textContent ?? "", /<script>y<\/script>/);
+      assert.equal(created.some((c) => c.tag === "table"), true);
+      assert.equal(created.some((c) => c.tag === "blockquote"), true);
+    } finally {
+      restore();
+    }
+  });
+
+  it("closes an unterminated fence at the end of the document", () => {
+    install();
+    try {
+      const into = stub();
+      renderMarkdown("```\nnot closed", into);
+      assert.equal(created.some((c) => c.tag === "pre"), true);
+      assert.match(into.textContent ?? "", /not closed/);
+    } finally {
+      restore();
+    }
   });
 });

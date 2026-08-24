@@ -20,6 +20,7 @@ import { join } from "node:path";
 import { resolveReceipt } from "./receipts-path.js";
 import { sessionOpenReject } from "./session-open.js";
 import { desktopSurfaces } from "./theme-surfaces.js";
+import { barInitText } from "./limits.js";
 import { Engine } from "../src/engine.js";
 import { Archive } from "../src/archive.js";
 import { Receipts } from "../src/receipts.js";
@@ -471,6 +472,27 @@ function createWindow(): void {
                  const p = o.value.split(String.fromCharCode(0));
                  return p.length === 2 && p[0] === "a/b" && p[1] === "http://h:1/v1";
                })(),
+               // A meta tag that is present but not enforced is how this used
+               // to pass: we read the header and assumed it meant something.
+               // securitypolicyviolation fires only when the policy actually
+               // refused the action — a network error is a different event.
+               csp: await (async () => {
+                 const seen = [];
+                 const on = (e) => seen.push(e.violatedDirective);
+                 document.addEventListener("securitypolicyviolation", on);
+                 const s = document.createElement("script");
+                 s.textContent = "void 0";
+                 document.head.appendChild(s);
+                 try { await fetch("https://example.com/"); } catch {}
+                 await new Promise((r) => setTimeout(r, 80));
+                 document.removeEventListener("securitypolicyviolation", on);
+                 const dirs = seen.join(" ");
+                 return {
+                   script: /script-src/.test(dirs),
+                   connect: /connect-src|default-src/.test(dirs),
+                   dirs,
+                 };
+               })(),
              };
            })()`,
         )
@@ -485,7 +507,9 @@ function createWindow(): void {
             r.autonomyButtons === 3 &&
             String(r.autonomyOn).length > 0 &&
             r.autonomySticks === true &&
-            Number(r.paletteRows) >= 15;
+            Number(r.paletteRows) >= 15 &&
+            (r.csp as { script?: boolean; connect?: boolean } | undefined)?.script === true &&
+            (r.csp as { script?: boolean; connect?: boolean } | undefined)?.connect === true;
           console.log(`[self-check] bridge      ${r.bridge ? "ok" : "MISSING"}`);
           console.log(`[self-check] elements    ${(r.missing as string[]).length === 0 ? "ok" : "missing " + (r.missing as string[]).join(", ")}`);
           console.log(`[self-check] tabs        ${(r.tabs as string[]).join(", ")}`);
@@ -497,6 +521,11 @@ function createWindow(): void {
               `, click sticks: ${r.autonomySticks}`,
           );
           console.log(`[self-check] palette     ${r.paletteRows} command(s) on "/"`);
+          const csp = r.csp as { script?: boolean; connect?: boolean; dirs?: string } | undefined;
+          console.log(
+            `[self-check] csp         inline ${csp?.script ? "refused" : "RAN"} · fetch ${csp?.connect ? "refused" : "ALLOWED"}` +
+              (csp?.dirs ? ` (${csp.dirs})` : ""),
+          );
           console.log(ok ? "[self-check] PASS" : "[self-check] FAIL");
           // A screenshot on demand, because "PASS" says the page assembled and
           // says nothing about whether it is legible. Support asks for one of
@@ -759,9 +788,9 @@ ipcMain.handle("bar:init", () => {
     session.engine.setBar(session.bar);
     return {
       kind: "info" as const,
-      text: wrote
-        ? `wrote ${BAR_FILENAME} — ${session.bar?.checks.length ?? 0} check(s). Edit it to match this project.`
-        : `${BAR_FILENAME} already exists — left alone`,
+      // wrote is `{ existed }`, not a boolean. Truthy either way, so the
+      // old test always claimed it had just written the file.
+      text: barInitText(wrote.existed, BAR_FILENAME, session.bar?.checks.length ?? 0),
       state: stateOf(session),
     };
   } catch (e) {
