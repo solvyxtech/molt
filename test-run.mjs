@@ -9,7 +9,7 @@
  * existed.
  */
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, readdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,9 +18,25 @@ const files = readdirSync("dist-test/test")
   .filter((f) => f.endsWith(".test.js"))
   .map((f) => join("dist-test/test", f));
 
-const r = spawnSync("node", ["--test", ...files], {
-  stdio: "inherit",
-  env: { ...process.env, MOLT_CONFIG_DIR: dir },
-});
+// Coverage on every run, so `diff-covered` always has something to read. It
+// costs a little wall clock and it is the difference between "a file changed"
+// and "the change is executed by anything".
+mkdirSync("coverage", { recursive: true });
+const r = spawnSync(
+  "node",
+  [
+    "--test",
+    "--experimental-test-coverage",
+    "--test-reporter=lcov",
+    "--test-reporter-destination=coverage/lcov.info",
+    "--test-reporter=spec",
+    "--test-reporter-destination=stdout",
+    ...files,
+  ],
+  {
+    stdio: "inherit",
+    env: { ...process.env, MOLT_CONFIG_DIR: dir },
+  },
+);
 rmSync(dir, { recursive: true, force: true });
 process.exit(r.status ?? 1);

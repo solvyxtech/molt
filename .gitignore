@@ -17,3 +17,6 @@ release/
 
 # molt's scratch space during a run
 tmp/
+
+# coverage output
+coverage/

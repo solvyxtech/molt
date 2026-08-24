@@ -570,6 +570,36 @@ export function applyEdit(
  *    scores zero. Reordering functions is real work that this cannot see, and
  *    `comment-only` in done.yml is the way to say so.
  */
+/**
+ * Which lines of `after` are new or changed, 1-indexed.
+ *
+ * The companion to `substanceOf`, which answers how many and is used to refuse
+ * a diff of pure comments. This answers *which*, so a check can ask whether the
+ * tests actually execute them.
+ *
+ * Same multiset comparison: a line that survives in the same quantity did not
+ * change, wherever it moved to. Blank and comment lines are excluded, because
+ * requiring a test to execute a comment is nonsense and would make the check
+ * impossible to satisfy rather than merely strict.
+ */
+export function changedLinesOf(before: string, after: string): number[] {
+  if (before === after) return [];
+  const counts = new Map<string, number>();
+  for (const line of before.split("\n")) counts.set(line, (counts.get(line) ?? 0) + 1);
+  const changed: number[] = [];
+  const lines = after.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const n = counts.get(line) ?? 0;
+    if (n > 0) {
+      counts.set(line, n - 1);
+      continue;
+    }
+    if (isSubstantive(line)) changed.push(i + 1);
+  }
+  return changed;
+}
+
 export function substanceOf(before: string, after: string): number {
   if (before === after) return 0;
   // Multiset difference: a line that survives in the same quantity did not

@@ -39,6 +39,7 @@ import {
   formatListing,
   formatMatches,
   grepFiles,
+  changedLinesOf,
   substanceOf,
   walkAsync,
 } from "./files.js";
@@ -1537,6 +1538,7 @@ export class Engine {
             after,
             callId,
             substance: substanceOf(priorText, content),
+            changedLines: changedLinesOf(priorText, content),
           });
         }
         return (
@@ -1602,6 +1604,7 @@ export class Engine {
             after: createHash("sha256").update(edit.text, "utf8").digest("hex"),
             callId,
             substance: substanceOf(current, edit.text),
+            changedLines: changedLinesOf(current, edit.text),
           });
         }
         const delta = Buffer.byteLength(edit.text, "utf8") - Buffer.byteLength(current, "utf8");
