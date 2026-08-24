@@ -14,7 +14,7 @@
  * same proof because they came from the same code.
  */
 import { app, BrowserWindow, ipcMain, dialog, shell } from "electron";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { Engine } from "../src/engine.js";
@@ -227,7 +227,9 @@ function createWindow(): void {
       setTimeout(() => {
         void win!.webContents
           .executeJavaScript(
-            `({
+            `(document.querySelector('.tab[data-tab="session"]').click(), {
+               activeTab: (document.querySelector(".tab.active")||{}).dataset?.tab,
+               activePanel: (document.querySelector(".panel.active")||{}).id,
                rows: document.querySelectorAll("#stream .said").length,
                tools: document.querySelectorAll("#stream .tool").length,
                proofs: document.querySelectorAll("#stream .proof").length,
@@ -241,10 +243,26 @@ function createWindow(): void {
             console.log(`[self-drive] tool rows  ${r.tools}`);
             console.log(`[self-drive] proofs     ${r.proofs}`);
             console.log(`[self-drive] wire rows  ${r.wire}`);
+            console.log(`[self-drive] active     ${r.activeTab} / ${r.activePanel}`);
             const text = String(r.text);
             const ok = Number(r.rows) > 0 && text.includes(process.env.MOLT_E2E_EXPECT ?? "");
             console.log(ok ? "[self-drive] PASS" : "[self-drive] FAIL");
             if (!ok) console.log(`[self-drive] screen was: ${text.slice(0, 400)}`);
+            const shot = process.env.MOLT_SHOT;
+            if (shot) {
+              // capturePage reads the compositor, not the DOM. A tab switched
+              // one statement ago has not been painted yet, and the capture
+              // returns the previous frame — which is how a screenshot can
+              // disagree with the assertions taken beside it.
+              setTimeout(() => {
+                void win!.webContents.capturePage().then((img) => {
+                  writeFileSync(shot, img.toPNG());
+                  console.log(`[self-drive] shot        ${shot}`);
+                  app.exit(ok ? 0 : 1);
+                });
+              }, 250);
+              return;
+            }
             app.exit(ok ? 0 : 1);
           })
           .catch((e: unknown) => {
@@ -286,6 +304,18 @@ function createWindow(): void {
           console.log(`[self-check] panels      ${r.panels}`);
           console.log(`[self-check] accent      ${r.accent}`);
           console.log(ok ? "[self-check] PASS" : "[self-check] FAIL");
+          // A screenshot on demand, because "PASS" says the page assembled and
+          // says nothing about whether it is legible. Support asks for one of
+          // these on the first call every time.
+          const shot = process.env.MOLT_SHOT;
+          if (shot) {
+            void win!.webContents.capturePage().then((img) => {
+              writeFileSync(shot, img.toPNG());
+              console.log(`[self-check] shot        ${shot}`);
+              app.exit(ok ? 0 : 1);
+            });
+            return;
+          }
           app.exit(ok ? 0 : 1);
         })
         .catch((e: unknown) => {

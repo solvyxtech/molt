@@ -12,7 +12,7 @@
   <body>
     <!-- The strip is draggable so the frameless window still moves. -->
     <header class="titlebar" id="titlebar">
-      <div class="brand"><span class="mark">▚</span> molt</div>
+      <div class="brand"><i class="mark" aria-hidden="true"></i> molt</div>
       <div class="crumbs">
         <span id="crumb-cwd" class="crumb muted">no workspace</span>
         <span class="sep">·</span>
@@ -38,7 +38,7 @@
       <section class="panel active" id="panel-session">
         <div class="stream" id="stream">
           <div class="empty" id="stream-empty">
-            <p class="empty-mark">▚</p>
+            <i class="empty-mark" aria-hidden="true"></i>
             <p>A coding agent that can't say <em>done</em> without proving it.</p>
             <p class="muted">
               Open a workspace in <button class="link" data-goto="settings">Settings</button> to begin.
@@ -150,12 +150,7 @@
     </div>
 
     <footer class="status" id="status">
-      <span id="st-tokens">—</span>
-      <span class="sep">·</span>
-      <span id="st-cached">—</span>
-      <span class="sep">·</span>
-      <span id="st-cost">—</span>
-      <span class="sep">·</span>
+      <span id="st-usage"></span>
       <span id="st-bar">no bar</span>
       <span class="spacer"></span>
       <span id="st-session" class="muted"></span>

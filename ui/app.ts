@@ -107,6 +107,8 @@ let openSaid: HTMLElement | null = null;
 /** Tool rows awaiting completion, keyed by name+detail. */
 const runningTools = new Map<string, HTMLElement>();
 let activeReceipt: string | null = null;
+/** The receipt for the proof still being rendered. See the `receipt` case. */
+let pendingReceipt: string | null = null;
 
 // ── tabs ─────────────────────────────────────────────────────────────────────
 
@@ -206,6 +208,17 @@ function toolRow(ev: Ev, running: boolean): HTMLElement {
   if (ev.note) body.push(ev.note);
   if (body.length) d.appendChild(el("pre", undefined, body.join("\n\n")));
   return d;
+}
+
+function receiptLink(path: string): HTMLElement {
+  const file = path.split("/").pop()!;
+  const b = el("button", "receipt-link", `receipt · ${file}`);
+  b.addEventListener("click", () => {
+    activeReceipt = file;
+    showTab("receipts");
+    void openReceipt(file);
+  });
+  return b;
 }
 
 function proofBlock(ev: Ev): HTMLElement {
@@ -565,6 +578,10 @@ molt.onEvent((ev) => {
     case "proof_exhausted": {
       endMessage();
       append(proofBlock(ev));
+      if (pendingReceipt) {
+        append(receiptLink(pendingReceipt));
+        pendingReceipt = null;
+      }
       renderChecks(ev);
       const ok = ev.result?.ok === true;
       badge("checks", ok ? "pass" : "fail", ok ? "ok" : "fail");
@@ -573,14 +590,7 @@ molt.onEvent((ev) => {
     }
 
     case "receipt": {
-      const b = el("button", "receipt-link", `receipt · ${ev.path.split("/").pop()}`);
-      b.addEventListener("click", () => {
-        const file = String(ev.path).split("/").pop()!;
-        activeReceipt = file;
-        showTab("receipts");
-        void openReceipt(file);
-      });
-      append(b);
+      pendingReceipt = String(ev.path);
       badge("receipts", "new");
       break;
     }
@@ -769,9 +779,13 @@ function applyState(): void {
 async function refreshStats(): Promise<void> {
   const s = await molt.stats();
   if (!s) return;
-  $("st-tokens").textContent = `${fmtInt(s.tokens)} tokens`;
-  $("st-cached").textContent = `${fmtInt(s.cached)} cached`;
-  $("st-cost").textContent = s.costUsd === null ? "no price" : `$${s.costUsd.toFixed(4)}`;
+  // One string rather than three fields with separators between them: an
+  // empty session showed "— · — · —", which reads as broken rather than idle.
+  const parts = [`${fmtInt(s.tokens)} tokens`];
+  if (s.cached > 0) parts.push(`${fmtInt(s.cached)} cached`);
+  if (s.costUsd !== null) parts.push(`$${s.costUsd.toFixed(4)}`);
+  if (s.shedBatches > 0) parts.push(`${s.shedBatches} shed`);
+  $("st-usage").textContent = s.tokens > 0 ? parts.join("  ·  ") : "";
 }
 
 async function boot(): Promise<void> {
