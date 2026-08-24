@@ -11,15 +11,6 @@
 import { runCommand } from "./run.js";
 import { parseLcov, coverageFor, unprovenIn, type Unproven } from "./coverage.js";
 import { planMutations, applyMutation, type Mutation } from "./mutate.js";
-
-/** sha256 of a file, or "" if it cannot be read. Used to verify a restore. */
-function sha256Of(abs: string): string {
-  try {
-    return createHash("sha256").update(readFileSync(abs)).digest("hex");
-  } catch {
-    return "";
-  }
-}
 import { proposeBar, type Detected } from "./detect.js";
 import { fingerprint } from "./files.js";
 import { createHash } from "node:crypto";
@@ -154,7 +145,14 @@ export function parseBar(source: string): Bar {
 
     const hasRun = runStr.length > 0;
     const hasBuiltin = typeof c.builtin === "string";
-    if (hasRun === hasBuiltin) {
+    // Every builtin but one runs against the session record alone, so a `run`
+    // beside it is a mistake worth refusing. The mutation builtin is the
+    // exception and needs both: molt chooses the lines and breaks them, but
+    // only the project knows which command is supposed to go red. Without this
+    // exemption the mutation builtin cannot be configured at all — both shapes
+    // throw, and the validator below that asks for a `run` is unreachable.
+    const builtinTakesRun = c.builtin === "mutation";
+    if (hasRun === hasBuiltin && !builtinTakesRun) {
       throw new BarError(`done.yml: check "${name}" needs exactly one of \`run\` or \`builtin\`.`);
     }
 
@@ -221,7 +219,11 @@ export function parseBar(source: string): Bar {
       if (c.lcov !== undefined && typeof c.lcov !== "string") {
         throw new BarError(`done.yml: check "${name}" has a non-string \`lcov\`.`);
       }
-      if (builtin === "mutation" && typeof c.run !== "string") {
+      // `hasRun`/`runStr` rather than `typeof c.run`, so a mutation check reads
+      // a `run` the same way every other check does — YAML coerces bare scalars,
+      // and a command this parser accepts everywhere else must not be reported
+      // as missing here.
+      if (builtin === "mutation" && !hasRun) {
         throw new BarError(
           `done.yml: check "${name}" uses the mutation builtin and needs a \`run\` — the ` +
             "command that should fail when the code is broken.",
@@ -230,7 +232,7 @@ export function parseBar(source: string): Bar {
       const mut =
         builtin === "mutation"
           ? {
-              run: String(c.run).trim(),
+              run: runStr,
               sample: Number.isFinite(Number(c.sample)) ? Math.max(1, Number(c.sample)) : 4,
               timeoutMs: Number.isFinite(Number(c.timeout)) ? Number(c.timeout) * 1000 : 600_000,
             }
@@ -342,6 +344,15 @@ function truncate(s: string, n = OUTPUT_MAX): string {
   const bytes = Buffer.byteLength(s, "utf8");
   if (bytes <= n) return s;
   return Buffer.from(s, "utf8").subarray(0, n).toString("utf8") + `\n[molt: truncated ${bytes - n} bytes]`;
+}
+
+/** sha256 of a file, or "" if it cannot be read. Used to verify a restore. */
+function sha256Of(abs: string): string {
+  try {
+    return createHash("sha256").update(readFileSync(abs)).digest("hex");
+  } catch {
+    return "";
+  }
 }
 
 function sha256File(p: string): string | null {
@@ -579,13 +590,49 @@ async function mutationCheck(
     };
   }
 
-  const examined = killed.length + survived.length;
   const total = files.reduce((n, f) => n + f.changedLines.length, 0);
+  return mutationVerdict({ killed, survived, planned: plan.length, total, sample });
+}
+
+/**
+ * What the counts mean, separated from the running that produced them.
+ *
+ * Extracted so every outcome can be proven. The `examined === 0` case below is
+ * unreachable through `mutationCheck` today — the planner only emits swaps
+ * against the same in-memory text `applyMutation` re-checks, so an applied
+ * count of zero cannot happen — and a branch no test can reach is exactly what
+ * the mutation check exists to refuse. Being a pure function makes it reachable
+ * by a test rather than by an argument that it cannot go wrong.
+ */
+export function mutationVerdict(r: {
+  killed: string[];
+  survived: string[];
+  planned: number;
+  total: number;
+  sample: number;
+}): { ok: boolean; output: string } {
+  const { killed, survived, planned, total, sample } = r;
+  const examined = killed.length + survived.length;
   const unexamined = total - examined;
   const note =
     unexamined > 0
       ? ` · ${unexamined} changed line(s) not mutated (sample is ${sample}; raise it or accept the bound)`
       : "";
+
+  // Nothing was applied, so nothing was tested. The loop above already refuses
+  // to trust that a planned mutation applied, and this must refuse it too.
+  // Falling through would report "0 mutation(s) broke a test, as they should"
+  // after a single baseline run: a green pass claiming a suite killed
+  // everything when the code was never once broken. Same phrasing as the
+  // empty-plan case, because it is the same claim — that none is being made.
+  if (examined === 0) {
+    return {
+      ok: true,
+      output:
+        `${planned} mutation(s) planned, none applied (every line had moved, or the swap ` +
+        "left the file unchanged). Nothing was mutated, so nothing is claimed.",
+    };
+  }
 
   if (survived.length === 0) {
     return {

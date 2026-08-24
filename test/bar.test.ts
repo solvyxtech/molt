@@ -174,6 +174,75 @@ checks:
     });
   }
 
+  /**
+   * The mutation builtin needs a `run` beside it, which every other builtin is
+   * refused for having. Nothing here went through parseBar until this test:
+   * the check's own tests build the Check object as a literal, so a parser that
+   * rejected every possible mutation config still had a green suite. The
+   * feature shipped unconfigurable.
+   */
+  describe("builtin: mutation", () => {
+    it("accepts a builtin and a run together", () => {
+      const bar = parseBar(
+        "version: 1\nchecks:\n  - name: mut\n    builtin: mutation\n    run: npm test\n",
+      );
+      const c = bar.checks[0];
+      assert.ok(c.kind === "builtin" && c.builtin === "mutation");
+      assert.equal(c.run, "npm test");
+    });
+
+    it("defaults the sample and the per-run timeout", () => {
+      const bar = parseBar(
+        "version: 1\nchecks:\n  - name: mut\n    builtin: mutation\n    run: npm test\n",
+      );
+      const c = bar.checks[0];
+      assert.ok(c.kind === "builtin");
+      assert.equal(c.sample, 4);
+      assert.equal(c.timeoutMs, 600_000);
+    });
+
+    it("carries a stated sample and timeout through", () => {
+      const bar = parseBar(
+        "version: 1\nchecks:\n  - name: mut\n    builtin: mutation\n    run: npm test\n" +
+          "    sample: 9\n    timeout: 30\n",
+      );
+      const c = bar.checks[0];
+      assert.ok(c.kind === "builtin");
+      assert.equal(c.sample, 9);
+      assert.equal(c.timeoutMs, 30_000);
+    });
+
+    it("reads a bare scalar run the way every other check does", () => {
+      // `run: true` is /usr/bin/true, and the parser accepts it everywhere
+      // else. Reporting it as a missing run here would be a lie about the file.
+      const bar = parseBar(
+        "version: 1\nchecks:\n  - name: mut\n    builtin: mutation\n    run: true\n",
+      );
+      const c = bar.checks[0];
+      assert.ok(c.kind === "builtin");
+      assert.equal(c.run, "true");
+    });
+
+    it("rejects a mutation check with no run", () => {
+      assert.throws(
+        () => parseBar("version: 1\nchecks:\n  - name: mut\n    builtin: mutation\n"),
+        (e: unknown) => e instanceof BarError && /needs a `run`/.test((e as Error).message),
+      );
+    });
+
+    it("still refuses a run beside any other builtin", () => {
+      // The exemption is for mutation alone. A `run` on a session-scoped
+      // builtin is a mistake, and widening the hole would hide it.
+      assert.throws(
+        () =>
+          parseBar(
+            "version: 1\nchecks:\n  - name: a\n    builtin: record-intact\n    run: npm test\n",
+          ),
+        (e: unknown) => e instanceof BarError && /exactly one of/.test((e as Error).message),
+      );
+    });
+  });
+
   it("ships a default bar that is itself valid", () => {
     const bar = parseBar(FALLBACK_BAR);
     assert.ok(bar.checks.length >= 2);
