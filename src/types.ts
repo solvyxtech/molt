@@ -140,6 +140,12 @@ export type Check = Advisory &
          * misconfiguration into a permanent red.
          */
         lcov?: string;
+        /** For `mutation`: the command that should fail when code is broken. */
+        run?: string;
+        /** For `mutation`: how many changed lines to break. Each costs a run. */
+        sample?: number;
+        /** For `mutation`: per-run timeout in ms. */
+        timeoutMs?: number;
       }
   );
 
@@ -160,7 +166,16 @@ export type BuiltinCheck =
    * itself, because the command differs per project and a check that guesses
    * would be wrong more often than useful.
    */
-  | "diff-covered";
+  | "diff-covered"
+  /**
+   * Break each new line and confirm a test notices.
+   *
+   * The rung above diff-covered. Coverage proves a line runs; it cannot prove
+   * anything checks what the line does, and a test that executes code while
+   * asserting nothing satisfies it completely. Expensive — one run of the
+   * command per mutation — so it belongs on a slow tag, not the inner loop.
+   */
+  | "mutation";
 
 export type Bar = {
   version: 1;
