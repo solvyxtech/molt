@@ -208,17 +208,119 @@ export const DEFAULT_AUTO_SHED_TOKENS = 60_000;
  * server has just said exactly how much less. Returns the window in tokens, or
  * 0 when the body says nothing about one.
  */
-export function contextOverflow(body: string): number {
-  if (!/context|n_ctx|too many tokens|maximum context length/i.test(body)) return 0;
-  // Every field the common servers use for it, most specific first.
-  const named =
+export type Overflow = {
+  /** The window the server serves, or 0 when it did not say. */
+  window: number;
+  /**
+   * How many tokens the server counted in the request molt just sent.
+   *
+   * The single most valuable number in the body, and it was being thrown away.
+   * molt estimates tokens as characters/4, which is roughly right for prose and
+   * badly wrong for code: one session shed its history to an estimated 11.6k
+   * and the server counted the result at 24,307. Every decision about what to
+   * drop was being made in a unit twice the size of the real one.
+   *
+   * Comparing this against molt's own estimate of the same request gives the
+   * ratio between them, which is the only way to shed to a size that fits.
+   */
+  sent: number;
+};
+
+export function contextOverflow(body: string): Overflow | null {
+  if (!/context|n_ctx|too many tokens|maximum context length/i.test(body)) return null;
+  // Every field the common servers use, most specific first.
+  const win =
     /"n_ctx"\s*:\s*(\d+)/.exec(body) ??
     /context size \((\d+)\s*tokens?\)/i.exec(body) ??
     /maximum context length is (\d+)/i.exec(body);
-  if (named) return Number(named[1]);
-  // It refused for context reasons but did not say how much it has. Treated as
-  // an overflow with an unknown window, which still means "carry less".
-  return -1;
+  const sent =
+    /"n_prompt_tokens"\s*:\s*(\d+)/.exec(body) ??
+    /request \((\d+)\s*tokens?\)/i.exec(body) ??
+    /you requested (\d+)/i.exec(body);
+  return { window: win ? Number(win[1]) : 0, sent: sent ? Number(sent[1]) : 0 };
+}
+
+/**
+ * How many real tokens one of molt's estimated tokens is worth.
+ *
+ * `estTokens` counts characters/4. Real tokenizers disagree, and they disagree
+ * most on exactly the content an agent carries: indented code, punctuation
+ * runs, long identifiers, JSON. Measured against a local qwen3-coder, molt's
+ * estimate was about half the truth.
+ *
+ * Clamped because this multiplies a size limit. Below 1 it would let molt
+ * carry more than it measured; far above it, one strange response would shed
+ * a whole session to nothing.
+ */
+export function tokenScale(reported: number, estimated: number): number {
+  if (!(reported > 0) || !(estimated > 0)) return 1;
+  return Math.min(8, Math.max(1, reported / estimated));
+}
+
+/**
+ * The history budget, in molt's own estimate units, that fits a real window.
+ *
+ * Everything here has to cross between two units. The window is in the
+ * server's tokens; `historyTokens()` and the auto-shed threshold are in molt's.
+ * `scale` is the bridge.
+ *
+ * `fixedEst` is the system prompt plus the tool schemas — the part of a request
+ * that shedding cannot touch. Subtracting it is the difference between a target
+ * that fits and one that cannot: two thirds of a 16,384 window is 10,813, and
+ * a session whose tools alone cost more than that will refuse forever, shedding
+ * every message it has and still overflowing.
+ *
+ * Returns 0 when the fixed overhead cannot fit the window at all, which is not
+ * a smaller number to try — it means this server cannot run molt at this size.
+ */
+export const REPLY_RESERVE = 0.35;
+
+/**
+ * How many shed-and-retry rounds one step may spend.
+ *
+ * Each round costs a refused request, which is not billed and not slow, and
+ * teaches molt the real ratio between its estimate and the server's count. Three
+ * is enough to converge from a 2x error; more would be a loop rather than a
+ * correction.
+ */
+export const OVERFLOW_ROUNDS = 3;
+
+/**
+ * How many recent exchanges a shed keeps, on the nth overflow round.
+ *
+ * `shed()` drops everything older than the last `keepExchanges` and ignores
+ * the token threshold entirely — so calling it twice with the same argument
+ * finds nothing to drop the second time, and a lower threshold changes
+ * nothing. That is why a second round appeared to do nothing: the threshold
+ * was the only thing being lowered.
+ *
+ * Loosening the grip instead: two exchanges, then one. It stops at one rather
+ * than zero because the exchange being shed for is the one the turn is in the
+ * middle of, and dropping that leaves nothing to answer.
+ */
+export function keepForRound(round: number): number {
+  return Math.max(1, 3 - round);
+}
+
+/**
+ * How many recent messages a shed keeps, on the nth overflow round.
+ *
+ * The companion to `keepForRound`, and the one that actually bites. A turn
+ * with one ask and forty tool calls has no user turn to cut on, so `planShed`
+ * falls back to keeping a fixed number of recent messages — and a fixed number
+ * drops the same messages every round. Six, then four, then two.
+ */
+export function keepRecentForRound(round: number): number {
+  return Math.max(2, 8 - round * 2);
+}
+
+export function historyBudget(window: number, fixedEst: number, scale: number): number {
+  if (!(window > 0)) return 0;
+  // Room for the reply and the tool results the next step will add.
+  const usableReal = window * (1 - REPLY_RESERVE);
+  const usableEst = Math.floor(usableReal / Math.max(scale, 1));
+  const target = usableEst - fixedEst;
+  return target > 500 ? target : 0;
 }
 
 export const TOOL_RESULT_MAX_BYTES = 8192;
@@ -737,6 +839,15 @@ export class Engine {
   cfg: EngineConfig;
   private transcript: Transcript;
   private ledger: LedgerEntry[] = [];
+  /**
+   * Real tokens per estimated token, learned from this endpoint.
+   *
+   * Starts at 1 — molt's estimate taken at face value — and only ever rises,
+   * because the failure it guards against is carrying too much. Persisted for
+   * the session so later steps size their sheds correctly without having to be
+   * refused first.
+   */
+  private tokenScale = 1;
   private sessionPrompt = 0;
   private sessionCompletion = 0;
   private sessionCached = 0;
@@ -1167,8 +1278,11 @@ export class Engine {
    * Shed context. Two-phase: the archive write happens between planning and
    * committing, so a throwing archive leaves the transcript untouched.
    */
-  shed(keepExchanges = 2): { before: number; after: number; dropped: number; path: string } | null {
-    const plan = this.transcript.planShed(keepExchanges);
+  shed(
+    keepExchanges = 2,
+    keepRecent?: number,
+  ): { before: number; after: number; dropped: number; path: string } | null {
+    const plan = this.transcript.planShed(keepExchanges, keepRecent);
     if (!plan) return null;
 
     // Writes performed during the messages being shed travel with them. After
@@ -2024,8 +2138,16 @@ export class Engine {
       let failure:
         | { text: string; why: string; retryable: boolean; retryAfterMs?: number }
         | undefined;
-      /** Shed-and-retry is offered once per step, not once per attempt. */
-      let overflowHandled = false;
+      /**
+       * Shed-and-retry rounds used on this step.
+       *
+       * More than one, because a single shed is a guess: the first is sized
+       * with whatever ratio molt has learned so far, and the server's answer to
+       * it is what makes the next one right. One round was enough to fail —
+       * "shedding to 10813" was followed by a refusal at 24,307 tokens, and the
+       * turn ended there with everything it had done thrown away.
+       */
+      let overflowRounds = 0;
 
       for (let attempt = 0; ; attempt++) {
         failure = undefined;
@@ -2084,26 +2206,44 @@ export class Engine {
             // than ending a turn that has done real work — molt's own
             // threshold is 60,000 tokens and this endpoint may serve 16,384,
             // which it has no other way to discover.
-            const window = res.status === 400 ? contextOverflow(body) : 0;
-            if (window !== 0 && !overflowHandled) {
-              overflowHandled = true;
-              // Two thirds of the window, so the reply and the next few tool
-              // results have somewhere to go. Below the floor there is nothing
-              // useful left to carry and shedding cannot help.
-              const target = window > 0 ? Math.max(4_000, Math.floor(window * 0.66)) : Math.max(4_000, Math.floor(this.transcript.historyTokens() / 2));
-              this.cfg.autoShedAtTokens = target;
+            const over = res.status === 400 ? contextOverflow(body) : null;
+            if (over && overflowRounds < OVERFLOW_ROUNDS) {
+              overflowRounds++;
+              const bom = this.bom();
+              // What molt believed it was sending, against what the server
+              // counted. molt estimates characters/4; a real tokenizer on code
+              // disagrees, and one session shed to an estimated 11.6k only to
+              // be refused at 24,307. Every decision about what to drop was
+              // being made in a unit twice the size of the real one.
+              const scale = tokenScale(over.sent, bom.requestTotalEst);
+              if (scale > this.tokenScale) this.tokenScale = scale;
+              const fixedEst = bom.systemTokens + bom.toolSchemaTokens;
+              const target = historyBudget(over.window, fixedEst, this.tokenScale);
+              if (target > 0) this.cfg.autoShedAtTokens = target;
+
               log?.append("note", {
-                text: `context window ${window > 0 ? window : "unknown"} — shedding at ${target} and retrying`,
+                text:
+                  `context window ${over.window || "unknown"}; server counted ${over.sent} where ` +
+                  `molt estimated ${bom.requestTotalEst} (x${this.tokenScale.toFixed(2)}) — ` +
+                  `round ${overflowRounds}, history target ${target || "unknown"}`,
               });
               yield {
                 kind: "info",
-                text:
-                  (window > 0
-                    ? `this endpoint serves ${window} tokens of context, less than molt was carrying. `
-                    : "this endpoint refused the request as too large. ") +
-                  `Shedding to ${target} and trying again — start with --auto-shed ${target} to skip this.`,
+                text: over.window
+                  ? `this endpoint serves ${over.window} tokens and counted ${over.sent} in that ` +
+                    `request — about ${this.tokenScale.toFixed(1)}x molt's estimate. Carrying less ` +
+                    `and trying again` +
+                    (target > 0 && overflowRounds === 1
+                      ? ` — start with --auto-shed ${target} to skip this.`
+                      : ".")
+                  : "this endpoint refused the request as too large. Carrying less and trying again.",
               };
-              const shed = this.shed();
+
+              // Each round keeps fewer exchanges. The threshold alone changes
+              // nothing: shed() drops everything older than `keepExchanges` and
+              // does not consult it, so a second call with the same argument
+              // finds nothing and a lower target is ignored.
+              const shed = this.shed(keepForRound(overflowRounds), keepRecentForRound(overflowRounds));
               if (shed) {
                 log?.append("shed", {
                   dropped: shed.dropped,
@@ -2118,13 +2258,32 @@ export class Engine {
                   after: shed.after,
                   path: shed.path,
                 };
+                failure = {
+                  text: "context window too small for what molt was carrying",
+                  why: "The endpoint could not hold the conversation.",
+                  retryable: true,
+                };
+                continue;
               }
+
+              // Nothing left to drop. That, and only that, makes this endpoint
+              // unusable rather than merely overloaded — a verdict worth
+              // drawing from an empty transcript rather than from a ratio,
+              // which is noisy enough to condemn a server that would have
+              // fitted after one more shed.
+              const fixedReal = Math.round(fixedEst * this.tokenScale);
+              const need = Math.max(32_768, 2 ** Math.ceil(Math.log2(Math.max(fixedReal, 1) * 3)));
               failure = {
-                text: `context window too small for what molt was carrying`,
-                why: "The endpoint could not hold the conversation.",
-                retryable: true,
+                text: over.window
+                  ? `this endpoint serves ${over.window} tokens of context and there is nothing ` +
+                    `left to shed — molt's system prompt and tool definitions alone are about ` +
+                    `${fixedReal} as it counts them. Restart the server with a larger context ` +
+                    `(-c ${need} or more), or use an endpoint that serves one.`
+                  : "the endpoint refused the request as too large and there is nothing left to shed.",
+                why: "Shedding cannot make this request fit.",
+                retryable: false,
               };
-              continue;
+              break;
             }
             const transient = res.status === 408 || res.status === 429 || res.status >= 500;
             failure = {
@@ -2323,6 +2482,16 @@ export class Engine {
       this.sessionCompletion += cTok;
       this.sessionCached += cachedTok;
       if (!reportedUsage) this.estimatedSteps += 1;
+
+      // Every successful step is a free measurement of how wrong molt's
+      // character-count estimate is on this endpoint's tokenizer. Learning it
+      // here means auto-shed is sized correctly before an overflow rather than
+      // after one — the refused request is the expensive way to find out, and
+      // on a small window it arrives mid-turn with work already done.
+      if (reportedUsage && typeof usage?.prompt_tokens === "number") {
+        const learned = tokenScale(usage.prompt_tokens, requestEst);
+        if (learned > this.tokenScale) this.tokenScale = learned;
+      }
       if (typeof billedUsd === "number") this.sessionBilled += billedUsd;
       else this.unbilledSteps += 1;
 

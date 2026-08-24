@@ -68,10 +68,16 @@ body {
   align-items: center;
   gap: 18px;
   height: 42px;
-  padding: 0 var(--pad) 0 86px; /* room for the macOS traffic lights */
+  /* The frame is the OS's on Windows and Linux; only macOS hides its traffic
+     lights over the page and needs room made for them. The inset was
+     unconditional, which left a 86px hole at the top left of every non-Mac
+     window. */
+  padding: 0 var(--pad);
   background: var(--bg-raised);
   border-bottom: 1px solid var(--line);
 }
+
+[data-platform="darwin"] .titlebar { padding-left: 86px; }
 
 .titlebar button, .titlebar input { -webkit-app-region: no-drag; }
 

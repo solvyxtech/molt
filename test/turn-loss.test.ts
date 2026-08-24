@@ -13,11 +13,15 @@
  * with work in hand.
  */
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
   Engine,
   systemPromptFor,
   contextOverflow,
+  tokenScale,
+  historyBudget,
   NETWORK_RETRIES,
   SYSTEM_PROMPT,
 } from "../src/engine.js";
@@ -668,89 +672,253 @@ describe("no ceiling on hardware you own", () => {
  * how much less. Ending the turn on it is a choice, and it was the wrong one.
  */
 describe("an endpoint too small for the conversation", () => {
-  it("reads the window out of the refusal", () => {
+  it("reads both numbers out of the refusal", () => {
     // llama.cpp, verbatim from the session that prompted this.
-    assert.equal(
+    assert.deepEqual(
       contextOverflow(
         `{"error":{"code":400,"message":"request (17222 tokens) exceeds the available context size (16384 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":17222,"n_ctx":16384}}`,
       ),
-      16384,
+      { window: 16384, sent: 17222 },
     );
-    // OpenAI's wording for the same thing.
-    assert.equal(
+    // `sent` is the number that was being thrown away, and the one that makes
+    // a correctly-sized shed possible.
+    assert.deepEqual(
       contextOverflow(
         `{"error":{"message":"This model's maximum context length is 8192 tokens, however you requested 9000."}}`,
       ),
-      8192,
+      { window: 8192, sent: 9000 },
     );
-    // Refused for context reasons without naming a number: still an overflow.
-    assert.equal(contextOverflow(`{"error":"too many tokens in context"}`), -1);
+    // Refused for context reasons without naming numbers: still an overflow.
+    assert.deepEqual(contextOverflow(`{"error":"too many tokens in context"}`), {
+      window: 0,
+      sent: 0,
+    });
     // A 400 that is not about size at all must stay a plain 400 — shedding
     // would destroy a working conversation to fix something else.
-    assert.equal(contextOverflow(`{"error":"invalid api key"}`), 0);
-    assert.equal(contextOverflow(`{"error":"unsupported tool_choice value"}`), 0);
+    assert.equal(contextOverflow(`{"error":"invalid api key"}`), null);
+    assert.equal(contextOverflow(`{"error":"unsupported tool_choice value"}`), null);
   });
 
-  it("sheds and carries on instead of losing the turn", async () => {
+  it("measures how wrong its own token estimate is", () => {
+    // The session that prompted this shed to an estimated 11.6k and was
+    // refused at 24,307. Roughly two real tokens per estimated one.
+    assert.equal(tokenScale(24307, 11600).toFixed(2), "2.10");
+    // Never below 1: trusting an estimate that reads high would let molt carry
+    // more than it measured.
+    assert.equal(tokenScale(5000, 10000), 1);
+    // Never absurd: this multiplies a size limit, and one strange response
+    // must not shed a whole session to nothing.
+    assert.equal(tokenScale(1_000_000, 10), 8);
+    // Nothing to learn from nothing.
+    assert.equal(tokenScale(0, 100), 1);
+    assert.equal(tokenScale(100, 0), 1);
+  });
+
+  it("sizes the history budget from the real window, not a fraction of it", () => {
+    // 16384 window, 2.1x denser than molt counts, 1,500 estimated tokens of
+    // system prompt and tool schemas that shedding can never touch.
+    const target = historyBudget(16384, 1500, 2.1);
+    // The old rule was window * 0.66 = 10,813 — a number in molt's units that
+    // ignored both the tokenizer and the fixed overhead, and was refused again
+    // at more than twice the window.
+    assert.ok(target < 10813, `must be well under the old naive target, got ${target}`);
+    // And it has to actually fit: the whole request, in the server's tokens.
+    const realRequest = (target + 1500) * 2.1;
+    assert.ok(realRequest < 16384, `budget still overflows the window: ${realRequest}`);
+
+    // A window that cannot hold the fixed overhead is not a smaller number to
+    // try. 8,000 estimated tokens of tools at 2.1x is 16,800 before a single
+    // message of history.
+    assert.equal(historyBudget(16384, 8000, 2.1), 0);
+    assert.equal(historyBudget(0, 100, 1), 0);
+  });
+
+  it("sheds again when the first shed was not enough", async () => {
+    // This is the reported failure, exactly. A session shed 13 messages —
+    // 22.7k down to 11.6k by molt's count — and the very next request was
+    // refused at 24,307 tokens against a 16,384 window. One shed had been the
+    // whole allowance, so the turn ended there and everything it had done was
+    // thrown away. The first shed is a guess; the server's answer to it is
+    // what makes the second one right.
+    const ws = workspace();
+    try {
+      writeFileSync(join(ws.dir, "big.txt"), "x".repeat(60_000), "utf8");
+      const bodies: Body[] = [];
+      let refusals = 0;
+      const ok = (content: unknown, usage: Record<string, number>) =>
+        ({
+          ok: true,
+          status: 200,
+          headers: { get: () => "application/json" },
+          text: async () => "",
+          json: async () => ({ choices: [content], usage }),
+        }) as unknown as Response;
+
+      const fetchFn = (async (_url: string, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body ?? "{}")) as Body);
+        if (bodies.length <= 5) {
+          return ok(
+            {
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: `c${bodies.length}`,
+                    type: "function",
+                    function: {
+                      name: "read_file",
+                      arguments: JSON.stringify({ path: "big.txt" }),
+                    },
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+            { prompt_tokens: 900, completion_tokens: 20 },
+          );
+        }
+        // Refuse twice. The second refusal is smaller than the first, the way
+        // a real server answers a request that shrank but not enough.
+        if (refusals < 2) {
+          refusals++;
+          const sent = refusals === 1 ? 40_000 : 24_307;
+          return {
+            ok: false,
+            status: 400,
+            text: async () =>
+              `{"error":{"message":"request (${sent} tokens) exceeds the available context size (16384 tokens)","n_prompt_tokens":${sent},"n_ctx":16384}}`,
+            json: async () => ({}),
+          } as unknown as Response;
+        }
+        return ok({ message: { role: "assistant", content: "fitted on the third try." } }, {
+          prompt_tokens: 400,
+          completion_tokens: 30,
+        });
+      }) as unknown as typeof fetch;
+
+      const engine = engineWith(ws.dir, { fetchFn, stream: false });
+      const events = await drain(engine.run("read it a few times then answer", allowAll));
+
+      assert.equal(refusals, 2, "both refusals must be met with a shed, not just the first");
+      assert.ok(
+        events.filter((e) => e.kind === "shed").length >= 2,
+        "a second refusal must produce a second shed",
+      );
+      assert.ok(
+        events.some((e) => e.kind === "assistant_text" && e.text.includes("fitted on the third")),
+        "and the turn must survive to answer",
+      );
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("says so plainly when there is nothing left to shed", async () => {
+    // A first request that does not fit has no history to drop: the system
+    // prompt and the tool schemas are the whole of it. Retrying an identical
+    // request spends the turn's attempts learning nothing, so molt stops and
+    // names the number to change.
     const ws = workspace();
     try {
       const bodies: Body[] = [];
       const fetchFn = (async (_url: string, init?: RequestInit) => {
         bodies.push(JSON.parse(String(init?.body ?? "{}")) as Body);
-        if (bodies.length === 1) {
-          return {
-            ok: false,
-            status: 400,
-            text: async () =>
-              `{"error":{"message":"request (17222 tokens) exceeds the available context size (16384 tokens)","type":"exceed_context_size_error","n_ctx":16384}}`,
-            json: async () => ({}),
-          } as unknown as Response;
-        }
         return {
-          ok: true,
-          status: 200,
-          headers: { get: () => "application/json" },
-          text: async () => "",
-          json: async () => ({
-            choices: [{ message: { role: "assistant", content: "carried on and answered." } }],
-            usage: { prompt_tokens: 500, completion_tokens: 40 },
-          }),
+          ok: false,
+          status: 400,
+          text: async () =>
+            `{"error":{"message":"request (24307 tokens) exceeds the available context size (16384 tokens)","type":"exceed_context_size_error","n_prompt_tokens":24307,"n_ctx":16384}}`,
+          json: async () => ({}),
         } as unknown as Response;
       }) as unknown as typeof fetch;
 
       const engine = engineWith(ws.dir, { fetchFn, stream: false });
       const events = await drain(engine.run("do the work", allowAll));
 
-      assert.equal(bodies.length, 2, "the refusal must be retried, not reported and dropped");
-      // Two requests is also what a salvage looks like, and a salvaged answer
-      // would satisfy every other assertion here while the turn was in fact
-      // over. `tool_choice` is what tells them apart: the salvage sets it to
-      // "none" to ask for a last word, and a real retry leaves the model free
-      // to keep working.
+      assert.equal(bodies.length, 1, "an identical request may not be sent again");
+      const err = events.find((e) => e.kind === "error");
+      assert.ok(err, "the turn must report why it stopped");
+      const text = err.kind === "error" ? err.text : "";
+      assert.match(text, /16384/, "it must name the window the server serves");
+      assert.match(text, /larger context|-c /i, "and what to change about it");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("sheds and carries on when there is history to shed", async () => {
+    const ws = workspace();
+    try {
+      writeFileSync(join(ws.dir, "big.txt"), "x".repeat(40_000), "utf8");
+      const bodies: Body[] = [];
+      let overflowed = false;
+      const answer = (content: unknown, usage: Record<string, number>) =>
+        ({
+          ok: true,
+          status: 200,
+          headers: { get: () => "application/json" },
+          text: async () => "",
+          json: async () => ({ choices: [content], usage }),
+        }) as unknown as Response;
+
+      const fetchFn = (async (_url: string, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body ?? "{}")) as Body);
+        // Several reads first. One exchange is not sheddable — the shed keeps
+        // recent context, which is the right policy and means a fixture with a
+        // single message can only ever prove the "nothing to shed" path.
+        if (bodies.length <= 4) {
+          return answer(
+            {
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "c1",
+                    type: "function",
+                    function: { name: "read_file", arguments: JSON.stringify({ path: "big.txt" }) },
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+            { prompt_tokens: 900, completion_tokens: 20 },
+          );
+        }
+        // Then refuse the next request as too large, exactly once.
+        if (!overflowed) {
+          overflowed = true;
+          return {
+            ok: false,
+            status: 400,
+            text: async () =>
+              `{"error":{"message":"request (24307 tokens) exceeds the available context size (16384 tokens)","type":"exceed_context_size_error","n_prompt_tokens":24307,"n_ctx":16384}}`,
+            json: async () => ({}),
+          } as unknown as Response;
+        }
+        return answer({ message: { role: "assistant", content: "carried on and answered." } }, {
+          prompt_tokens: 500,
+          completion_tokens: 40,
+        });
+      }) as unknown as typeof fetch;
+
+      const engine = engineWith(ws.dir, { fetchFn, stream: false });
+      const events = await drain(engine.run("read big.txt then answer", allowAll));
+
+      assert.ok(
+        events.some((e) => e.kind === "shed"),
+        "an oversized request with history behind it must produce a shed",
+      );
+      assert.ok(
+        events.some((e) => e.kind === "assistant_text" && e.text.includes("carried on")),
+        "and the turn must reach an answer rather than dying on a fixable refusal",
+      );
       assert.notEqual(
-        bodies[1]!.tool_choice,
+        bodies.at(-1)!.tool_choice,
         "none",
-        "the second request must be the work resuming, not a eulogy for it",
+        "the last request must be the work resuming, not a eulogy for it",
       );
-      const said = events.some(
-        (e) => e.kind === "assistant_text" && e.text.includes("carried on"),
-      );
-      assert.ok(said, "the turn must reach an answer rather than dying on a fixable refusal");
-
-      // The window is learned, not just survived: two thirds of 16384, leaving
-      // room for the reply and the next few tool results.
-      assert.equal(
-        (engine as unknown as { cfg: { autoShedAtTokens?: number } }).cfg.autoShedAtTokens,
-        Math.floor(16384 * 0.66),
-        "the endpoint's real window must be adopted for the rest of the session",
-      );
-
-      // And it is said out loud, with the flag that skips the round trip next
-      // time — a silent adaptation is one the user cannot make permanent.
-      const told = events.find(
-        (e) => e.kind === "info" && e.text.includes("16384") && e.text.includes("--auto-shed"),
-      );
-      assert.ok(told, "the user must be told the window and how to set it up front");
     } finally {
       ws.cleanup();
     }
