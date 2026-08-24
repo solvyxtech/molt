@@ -30,7 +30,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node -e \"require('fs').chmodSync('dist/cli.js', 0o755)\"",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.app.json --noEmit",
-    "test": "npm run build && node --test dist-test/test/*.test.js",
+    "test": "npm run build && node test-run.mjs",
     "test:build": "tsc -p tsconfig.test.json",
     "pretest": "npm run test:build",
     "check": "npm run typecheck && npm test && npm run e2e && npm run self-check",

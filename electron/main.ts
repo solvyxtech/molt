@@ -38,6 +38,13 @@ import {
 import type { EngineEvent } from "../src/types.js";
 import { COMMANDS } from "../src/commands.js";
 import { runEngineCommand } from "./commands.js";
+import {
+  readEndpoints,
+  rememberEndpoint,
+  forgetEndpoint,
+  normalizeUrl,
+  configDir,
+} from "./endpoints.js";
 
 /**
  * Where this bundle sits on disk.
@@ -143,7 +150,7 @@ function openSession(cwd: string, model: string, baseUrl: string, apiKey?: strin
 
 /** What the renderer needs to draw its chrome. */
 function stateOf(s: Session | null) {
-  const auth = readAuth();
+  const auth = readAuth(configDir());
   return {
     open: s !== null,
     cwd: s?.cwd ?? null,
@@ -317,6 +324,7 @@ function createWindow(): void {
                checkNames: [...document.querySelectorAll("#checks .check-card .nm")].map((n) => n.textContent),
                proofHead: (document.querySelector("#stream .proof h4")||{}).textContent||"",
                pickerRows: document.querySelectorAll("#picker-list button").length,
+               pickerText: (document.getElementById("picker-list")||{}).textContent||"",
                pickerGroups: document.querySelectorAll("#picker-list .grp").length,
                activeTab: (document.querySelector(".tab.active")||{}).dataset?.tab,
                activePanel: (document.querySelector(".panel.active")||{}).id,
@@ -335,6 +343,13 @@ function createWindow(): void {
             console.log(`[self-drive] wire rows  ${r.wire}`);
             console.log(`[self-drive] active     ${r.activeTab} / ${r.activePanel}`);
             console.log(`[self-drive] picker     ${r.pickerRows} model(s) in ${r.pickerGroups} group(s)`);
+            console.log(
+              `[self-drive] remembered ${
+                String(r.pickerText).includes(process.env.MOLT_E2E_EXPECT_MODEL ?? "\u0000")
+                  ? "second server listed"
+                  : "MISSING"
+              }`,
+            );
             console.log(`[self-drive] activity   shown=${r.sawActivity} leftover=${r.activityLeft}`);
             console.log(`[self-drive] proof      ${r.proofHead}`);
             console.log(`[self-drive] checks     ${(r.checkNames as string[]).join(", ") || "(none)"}`);
@@ -343,6 +358,10 @@ function createWindow(): void {
               Number(r.rows) > 0 &&
               text.includes(process.env.MOLT_E2E_EXPECT ?? "") &&
               Number(r.pickerRows) >= 2 &&
+              // A server the app was never pointed at, only remembered, must
+              // still be asked — that is the whole of the reported bug.
+              (!process.env.MOLT_E2E_EXPECT_MODEL ||
+                String(r.pickerText).includes(process.env.MOLT_E2E_EXPECT_MODEL)) &&
               // The window must say it is working while it works, and must
               // stop saying it afterwards. Both halves, or the indicator is
               // either invisible or permanent.
@@ -480,6 +499,11 @@ function createWindow(): void {
           // these on the first call every time.
           const shot = process.env.MOLT_SHOT;
           if (shot) {
+            if (process.env.MOLT_SHOT_PICKER === "1") {
+              void win!.webContents.executeJavaScript(
+                `(document.getElementById("crumb-model").click(), 0)`,
+              );
+            }
             if (process.env.MOLT_SHOT_PALETTE === "1") {
               void win!.webContents.executeJavaScript(
                 `(() => { document.querySelector('.tab[data-tab="session"]').click();
@@ -487,11 +511,16 @@ function createWindow(): void {
                           b.value = "/"; b.dispatchEvent(new Event("input")); return 0; })()`,
               );
             }
-            void win!.webContents.capturePage().then((img) => {
-              writeFileSync(shot, img.toPNG());
-              console.log(`[self-check] shot        ${shot}`);
-              app.exit(ok ? 0 : 1);
-            });
+            setTimeout(
+              () => {
+                void win!.webContents.capturePage().then((img) => {
+                  writeFileSync(shot, img.toPNG());
+                  console.log(`[self-check] shot        ${shot}`);
+                  app.exit(ok ? 0 : 1);
+                });
+              },
+              process.env.MOLT_SHOT_PICKER === "1" ? 1200 : 120,
+            );
             return;
           }
           app.exit(ok ? 0 : 1);
@@ -543,6 +572,7 @@ ipcMain.handle(
     if (!existsSync(opts.cwd)) return { ok: false, error: `no such directory: ${opts.cwd}` };
     try {
       session = openSession(opts.cwd, opts.model, opts.baseUrl, opts.apiKey);
+      rememberEndpoint(opts.baseUrl, opts.model);
       return { ok: true, state: stateOf(session) };
     } catch (e) {
       return { ok: false, error: String(e) };
@@ -576,21 +606,58 @@ function prober(baseUrl: string, apiKey?: string): Engine {
  * reason, not a provider that silently vanished.
  */
 ipcMain.handle("models:list", async (_e, current?: { url: string; key?: string }) => {
-  const auth = readAuth();
-  const stored = storedEndpoint();
-  const here = current?.url ? current : session ? { url: session.baseUrl } : { url: stored.baseUrl ?? "" };
-  const sources = modelSources(auth, here.url ? { url: here.url, key: current?.key } : undefined);
+  const auth = readAuth(configDir());
+  const stored = storedEndpoint(configDir());
+  const hereUrl = normalizeUrl(
+    current?.url || session?.baseUrl || stored.baseUrl || "",
+  );
+  const sources = modelSources(auth, hereUrl ? { url: hereUrl, key: current?.key } : undefined);
+
+  // Every server this window has been pointed at, not just the one it is
+  // pointed at now. The CLI's config holds a single endpoint, which is right
+  // for a terminal and wrong for a list: a second machine on the network was
+  // simply never asked, so its models could not appear.
+  const known = readEndpoints().map((e) => e.url);
+  const seen = new Set(sources.map((s) => normalizeUrl(s.url)));
+  const extra = known
+    .filter((u) => !seen.has(u))
+    .map((u) => ({ name: providerName(u), url: u, key: undefined as string | undefined }));
 
   return Promise.all(
-    sources.map(async (src) => {
-      const key = src.key ?? (src.url === here.url ? current?.key : undefined);
+    [...sources, ...extra].map(async (src) => {
+      const key = src.key ?? (normalizeUrl(src.url) === hereUrl ? current?.key : undefined);
       const r = await prober(src.url, key).listModels(src.url, key);
+      const local = isSelfHosted(src.url);
       return r.ok
-        ? { name: src.name, url: src.url, ok: true as const, ids: r.ids, needsKey: !key }
-        : { name: src.name, url: src.url, ok: false as const, ids: [], error: r.error, needsKey: !key };
+        ? {
+            name: src.name,
+            url: src.url,
+            ok: true as const,
+            ids: r.ids,
+            needsKey: false,
+            local,
+            remembered: !seen.has(normalizeUrl(src.url)),
+          }
+        : {
+            name: src.name,
+            url: src.url,
+            ok: false as const,
+            ids: [],
+            // A local server that needs no key is not "no key stored"; it is
+            // off, or listening somewhere else. Saying the wrong reason sends
+            // you looking for a key you never needed.
+            error: r.error,
+            needsKey: !key && !local,
+            local,
+            remembered: !seen.has(normalizeUrl(src.url)),
+          };
     }),
   );
 });
+
+ipcMain.handle("endpoints:list", () => readEndpoints());
+ipcMain.handle("endpoints:add", (_e, url: string, model?: string) => rememberEndpoint(url, model));
+ipcMain.handle("endpoints:forget", (_e, url: string) => forgetEndpoint(url));
 
 /**
  * Change model mid-session, without closing the workspace.
@@ -614,7 +681,8 @@ ipcMain.handle(
     }
     session.model = opts.model;
     session.engine.setModel(opts.model);
-    saveEndpoint(session.baseUrl, opts.model);
+    saveEndpoint(session.baseUrl, opts.model, configDir());
+    rememberEndpoint(session.baseUrl, opts.model);
     // `note`, not a new JournalKind: src/ is the CLI's engine unmodified, and
     // adding a kind here would fork the two copies over a line of bookkeeping.
     // Worth recording at all because a receipt names the model that produced
@@ -690,11 +758,13 @@ ipcMain.handle("bar:init", () => {
   }
 });
 
-ipcMain.handle("auth:save", (_e, provider: string, key: string) => saveKey(provider, key));
-ipcMain.handle("auth:endpoint", (_e, baseUrl: string, model: string) =>
-  saveEndpoint(baseUrl, model),
+ipcMain.handle("auth:save", (_e, provider: string, key: string) =>
+  saveKey(provider, key, configDir()),
 );
-ipcMain.handle("auth:stored", () => storedEndpoint());
+ipcMain.handle("auth:endpoint", (_e, baseUrl: string, model: string) =>
+  saveEndpoint(baseUrl, model, configDir()),
+);
+ipcMain.handle("auth:stored", () => storedEndpoint(configDir()));
 
 /** The renderer answering a tool confirmation. */
 ipcMain.on("confirm:reply", (_e, id: string, ok: boolean) => {

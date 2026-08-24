@@ -18,6 +18,7 @@ import {
   firstSelectable,
   needsPriceLookup,
   openrouterPricing,
+  defaultConfigDir,
   savePricing,
   xaiPricing,
   keyedProviders,
@@ -759,5 +760,58 @@ describe("naming an endpoint you can point at", () => {
 
   it("says so when the URL is not one", () => {
     assert.equal(providerName("not a url"), "custom");
+  });
+});
+
+/**
+ * Where molt keeps its config, and why that has to be movable.
+ *
+ * `npm test` used to rewrite the developer's real ~/.config/molt on every run.
+ * A TUI test mounts the app, the app refreshes pricing for whatever model the
+ * fixture used, and `savePricing` had nowhere to go but the real file — so it
+ * replaced the stored endpoint and left `priceModel: "test-model"` behind. It
+ * had been doing that since before the desktop existed, quietly, and it means
+ * every run before this one started from whatever the previous run left.
+ */
+describe("the config directory is movable", () => {
+  it("honours MOLT_CONFIG_DIR", () => {
+    const was = process.env.MOLT_CONFIG_DIR;
+    try {
+      process.env.MOLT_CONFIG_DIR = "/tmp/molt-config-probe";
+      assert.equal(defaultConfigDir(), "/tmp/molt-config-probe");
+    } finally {
+      if (was === undefined) delete process.env.MOLT_CONFIG_DIR;
+      else process.env.MOLT_CONFIG_DIR = was;
+    }
+  });
+
+  it("falls back to the home directory when it is unset or blank", () => {
+    const was = process.env.MOLT_CONFIG_DIR;
+    try {
+      delete process.env.MOLT_CONFIG_DIR;
+      assert.match(defaultConfigDir(), /\.config[/\\]molt$/);
+      // Blank is not a directory. Treating "" as an override would send every
+      // read and write to the process's working directory.
+      process.env.MOLT_CONFIG_DIR = "   ";
+      assert.match(defaultConfigDir(), /\.config[/\\]molt$/);
+    } finally {
+      if (was === undefined) delete process.env.MOLT_CONFIG_DIR;
+      else process.env.MOLT_CONFIG_DIR = was;
+    }
+  });
+
+  it("routes what molt stores through it", () => {
+    const was = process.env.MOLT_CONFIG_DIR;
+    const ws = workspace();
+    try {
+      process.env.MOLT_CONFIG_DIR = ws.dir;
+      saveEndpoint("http://probe.test/v1", "probe-model");
+      assert.equal(storedEndpoint().baseUrl, "http://probe.test/v1");
+      assert.ok(statSync(join(ws.dir, "config.json")).isFile(), "written where it was told");
+    } finally {
+      if (was === undefined) delete process.env.MOLT_CONFIG_DIR;
+      else process.env.MOLT_CONFIG_DIR = was;
+      ws.cleanup();
+    }
   });
 });

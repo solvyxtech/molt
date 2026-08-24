@@ -31,6 +31,9 @@ contextBridge.exposeInMainWorld("molt", {
   storedEndpoint: () => ipcRenderer.invoke("auth:stored"),
   listModels: (current?: { url: string; key?: string }) =>
     ipcRenderer.invoke("models:list", current),
+  endpoints: () => ipcRenderer.invoke("endpoints:list"),
+  addEndpoint: (url: string, model?: string) => ipcRenderer.invoke("endpoints:add", url, model),
+  forgetEndpoint: (url: string) => ipcRenderer.invoke("endpoints:forget", url),
   setModel: (opts: { model: string; baseUrl?: string; apiKey?: string }) =>
     ipcRenderer.invoke("session:model", opts),
   setAutonomy: (level: string) => ipcRenderer.invoke("session:autonomy", level),

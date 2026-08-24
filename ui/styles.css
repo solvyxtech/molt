@@ -652,3 +652,21 @@ select { flex: 0 0 auto; min-width: 150px; cursor: pointer; }
   color: var(--line);
   font-size: 11px;
 }
+
+/* Adding a server you run, from the picker rather than from Settings. */
+.add-endpoint { display: flex; gap: 9px; margin-bottom: 12px; }
+.picker-list .tag-local {
+  color: var(--accent);
+  border: 1px solid var(--dim);
+  border-radius: 999px;
+  padding: 0 6px;
+  font-size: 10px;
+  text-transform: uppercase;
+}
+.picker-list .forget {
+  margin-left: auto;
+  background: none; border: 0; color: var(--line);
+  font: inherit; font-size: 11px; text-transform: none; letter-spacing: 0;
+  cursor: pointer;
+}
+.picker-list .forget:hover { color: var(--fail); }
