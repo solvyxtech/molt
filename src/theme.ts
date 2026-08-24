@@ -10,6 +10,21 @@ export type Theme = {
   ok: string;
   fail: string;
   text: string;
+  /**
+   * The larger surfaces a window needs and a terminal does not.
+   *
+   * Optional, because the TUI paints on whatever background the terminal
+   * already has and has never needed them. The desktop does: without these it
+   * wrote tidepool's backgrounds as literals in the stylesheet, so choosing
+   * another theme recoloured the text and left the window blue underneath.
+   * A theme that omits them has them derived from `ghost`.
+   */
+  surfaces?: {
+    bg: string;
+    bgRaised: string;
+    bgSunken: string;
+    lineSoft: string;
+  };
 };
 
 export const THEMES: Record<string, Theme> = {
@@ -21,6 +36,12 @@ export const THEMES: Record<string, Theme> = {
     ok: "#5FD3A0",
     fail: "#E06C68",
     text: "#BDD6DD",
+    surfaces: {
+      bg: "#05171D",
+      bgRaised: "#08222B",
+      bgSunken: "#041219",
+      lineSoft: "#0A2A35",
+    },
   },
   brackish: {
     accent: "#7FD4A8",

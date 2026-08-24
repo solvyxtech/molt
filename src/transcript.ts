@@ -152,7 +152,7 @@ export class Transcript {
     this.task = content;
   }
 
-  planShed(keepExchanges = 2): ShedPlan | null {
+  planShed(keepExchanges = 2, keepRecent = KEEP_RECENT_MESSAGES): ShedPlan | null {
     const isDigest = (m: Msg) => m.molt?.digest === true;
 
     // Digest messages are bookkeeping, not exchanges: they never count
@@ -168,7 +168,13 @@ export class Transcript {
       // A single request can produce dozens of tool calls with no user turn
       // to cut on — which is exactly when context runs out. Fall back to
       // keeping the most recent messages instead.
-      const fallback = this.findSafeCut(this.working.length - KEEP_RECENT_MESSAGES);
+      // `keepRecent` is what a caller tightens when one shed was not enough.
+      // A turn that has made forty tool calls against a single ask has no user
+      // turn to cut on, so this branch is the one that runs in practice — and
+      // with a fixed constant it drops the same messages every time, which is
+      // why a second shed reported nothing to do while the request was still
+      // twice the window.
+      const fallback = this.findSafeCut(this.working.length - Math.max(2, keepRecent));
       if (fallback === null) return null;
       cutAt = fallback;
     }

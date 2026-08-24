@@ -70,6 +70,7 @@ type AppState = {
   providers: string[];
   keyed: string[];
   themes: string[];
+  platform: string;
   commands: { name: string; args?: string; summary: string; aliases?: string[] }[];
 };
 
@@ -1207,7 +1208,12 @@ $("set-open").addEventListener("click", async () => {
 $("set-theme").addEventListener("change", async () => {
   const name = ($("set-theme") as HTMLSelectElement).value;
   const t = await molt.theme(name);
-  for (const [k, v] of Object.entries(t)) document.documentElement.style.setProperty(`--${k}`, v);
+  for (const [k, v] of Object.entries(t)) {
+    // bgRaised -> --bg-raised, so the surfaces land on the properties the
+    // stylesheet actually reads rather than on ones nothing consults.
+    const prop = k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
+    document.documentElement.style.setProperty(`--${prop}`, v);
+  }
   localStorage.setItem("molt.theme", name);
 });
 
@@ -1473,6 +1479,10 @@ async function boot(): Promise<void> {
     const r = await molt.setAutonomy(savedAutonomy);
     if (r.ok && r.state) state = r.state;
   }
+
+  // The frame differs by platform, and the padding that compensates for
+  // macOS's traffic lights is a hole anywhere else.
+  document.documentElement.dataset.platform = state.platform;
 
   applyState();
   // Discovery is a network call per endpoint; it must not hold the window

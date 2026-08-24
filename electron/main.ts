@@ -15,8 +15,11 @@
  */
 import { app, BrowserWindow, ipcMain, dialog, shell } from "electron";
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 
+import { resolveReceipt } from "./receipts-path.js";
+import { sessionOpenReject } from "./session-open.js";
+import { desktopSurfaces } from "./theme-surfaces.js";
 import { Engine } from "../src/engine.js";
 import { Archive } from "../src/archive.js";
 import { Receipts } from "../src/receipts.js";
@@ -171,6 +174,7 @@ function stateOf(s: Session | null) {
     providers: Object.keys(PROVIDERS),
     keyed: Object.keys(auth),
     themes: Object.keys(THEMES),
+    platform: process.platform,
     commands: COMMANDS,
   };
 }
@@ -555,7 +559,13 @@ app.on("window-all-closed", () => {
 
 ipcMain.handle("app:state", () => stateOf(session));
 
-ipcMain.handle("app:theme", (_e, name: string) => getTheme(name));
+ipcMain.handle("app:theme", (_e, name: string) => {
+  const t = getTheme(name);
+  // The seven palette colours plus the five surfaces the window paints on.
+  // Sent together so a theme can never be half-applied — which is what left
+  // mono and slate wearing tidepool's backgrounds.
+  return { ...t, ...desktopSurfaces(t) };
+});
 
 ipcMain.handle("workspace:pick", async () => {
   const r = await dialog.showOpenDialog({
@@ -569,7 +579,8 @@ ipcMain.handle("workspace:pick", async () => {
 ipcMain.handle(
   "session:open",
   (_e, opts: { cwd: string; model: string; baseUrl: string; apiKey?: string }) => {
-    if (!existsSync(opts.cwd)) return { ok: false, error: `no such directory: ${opts.cwd}` };
+    const refuse = sessionOpenReject(opts, running !== null);
+    if (refuse) return { ok: false, error: refuse };
     try {
       session = openSession(opts.cwd, opts.model, opts.baseUrl, opts.apiKey);
       rememberEndpoint(opts.baseUrl, opts.model);
@@ -846,9 +857,8 @@ ipcMain.handle("receipts:list", () => {
 ipcMain.handle("receipts:read", (_e, file: string) => {
   if (!session) return null;
   // Never leaves the receipts directory, whatever the renderer asks for.
-  const dir = resolve(join(session.cwd, ".molt", "receipts"));
-  const p = resolve(join(dir, file));
-  if (!p.startsWith(dir + "/") || !existsSync(p)) return null;
+  const p = resolveReceipt(join(session.cwd, ".molt", "receipts"), file);
+  if (p === null || !existsSync(p)) return null;
   return readFileSync(p, "utf8");
 });
 
