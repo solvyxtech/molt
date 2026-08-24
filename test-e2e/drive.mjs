@@ -145,6 +145,9 @@ const child = spawn(electron, ["out/main.cjs", "--self-drive"], {
     MOLT_E2E_ASK: process.env.MOLT_E2E_ASK ?? "",
     MOLT_E2E_WANT_PROOF: process.env.MOLT_E2E_WANT_PROOF ?? "",
     MOLT_E2E_NO_WRITE: process.env.MOLT_E2E_NO_WRITE ?? "",
+    // Every run exercises the criteria path. A feature covered only by a
+    // variant nobody remembers to pass is a feature covered by nothing.
+    MOLT_E2E_CRITERION: process.env.MOLT_E2E_CRITERION ?? "true",
     MOLT_E2E_EXPECT_MODEL: "second-box-model",
     MOLT_CONFIG_DIR: cfg,
   },

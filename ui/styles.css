@@ -676,3 +676,47 @@ select { flex: 0 0 auto; min-width: 150px; cursor: pointer; }
   cursor: pointer;
 }
 .picker-list .forget:hover { color: var(--fail); }
+
+/* ── acceptance criteria ───────────────────────────────────────────────── */
+
+.criteria {
+  background: var(--bg-sunken);
+  border-top: 1px solid var(--line);
+  padding: 10px var(--pad) 12px;
+  max-height: 40vh;
+  overflow: auto;
+}
+.criteria-head { display: flex; align-items: center; gap: 9px; margin-bottom: 8px; }
+.ck-title {
+  font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--accent);
+}
+.btn.sm { padding: 3px 9px; font-size: 11px; }
+
+.ck-rows { display: flex; flex-direction: column; gap: 6px; }
+.ck-row { display: flex; align-items: center; gap: 9px; }
+.ck-kind {
+  flex: 0 0 auto;
+  font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
+  border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px;
+  cursor: pointer;
+}
+/* The distinction the whole feature rests on: one of these is evidence and
+   the other is intent, and they must never look alike. */
+.ck-row.check .ck-kind { color: var(--ok); border-color: var(--ok); }
+.ck-row.note  .ck-kind { color: var(--warn); border-color: var(--warn); }
+.ck-name { flex: 0 0 150px; }
+.ck-row input { padding: 4px 8px; font-size: 12px; }
+.ck-del {
+  background: none; border: 0; color: var(--line); font: inherit; cursor: pointer; padding: 0 4px;
+}
+.ck-del:hover { color: var(--fail); }
+.ck-empty { color: var(--line); font-size: 12px; padding: 3px 0; }
+
+/* The sealed summary, once a turn has started. */
+.sealed { margin: 6px 0 6px 90px; }
+.sealed .s-head {
+  font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--dim);
+}
+.sealed ul { margin: 4px 0 0 16px; }
+.sealed .c { color: var(--ok); }
+.sealed .n { color: var(--warn); }

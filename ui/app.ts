@@ -46,7 +46,17 @@ type MoltBridge = {
   command(name: string, arg: string): Promise<CommandOutcome>;
   reset(): Promise<{ ok: boolean; error?: string; state?: AppState }>;
   initBar(): Promise<CommandOutcome & { state?: AppState }>;
-  run(text: string, ask?: boolean): Promise<{ ok: boolean; error?: string }>;
+  run(
+    text: string,
+    ask?: boolean,
+    criteria?: { checks: { name: string; run: string }[]; notes: string[] },
+  ): Promise<{ ok: boolean; error?: string }>;
+  draftCriteria(
+    task: string,
+  ): Promise<
+    { ok: true; draft: { checks: { name: string; run: string }[]; notes: string[] } }
+    | { ok: false; error: string }
+  >;
   cancel(): void;
   answerConfirm(id: string, ok: boolean): void;
   receipts(): Promise<ReceiptRow[]>;
@@ -306,6 +316,29 @@ function toolRow(ev: Ev, running: boolean): HTMLElement {
   if (ev.note) body.push(ev.note);
   if (body.length) d.appendChild(el("pre", undefined, body.join("\n\n")));
   return d;
+}
+
+/** What was sealed, shown in the stream where the work will appear. */
+function sealedBlock(c: { checks: { name: string; run: string }[]; notes: string[] }): HTMLElement {
+  const box = el("div", "sealed");
+  box.appendChild(
+    el("div", "s-head", `sealed for this task — ${c.checks.length} check(s), ${c.notes.length} note(s)`),
+  );
+  const ul = el("ul");
+  for (const k of c.checks) {
+    const li = el("li");
+    li.appendChild(el("span", "c", "check "));
+    li.appendChild(document.createTextNode(`${k.name}: ${k.run}`));
+    ul.appendChild(li);
+  }
+  for (const n of c.notes) {
+    const li = el("li");
+    li.appendChild(el("span", "n", "note "));
+    li.appendChild(document.createTextNode(`${n} (recorded, not verified)`));
+    ul.appendChild(li);
+  }
+  box.appendChild(ul);
+  return box;
 }
 
 function receiptLink(path: string): HTMLElement {
@@ -774,8 +807,18 @@ async function send(): Promise<void> {
   // so, or the gap between Run and the first token reads as a dead click.
   startActivity(ask0() ? "asking" : "thinking");
   const ask = ($("ask") as HTMLInputElement).checked;
-  const r = await molt.run(text, ask);
+  const criteria = criteriaPayload();
+  if (criteria.checks.length || criteria.notes.length) {
+    append(sealedBlock(criteria));
+    bumpActivity();
+  }
+  const r = await molt.run(text, ask, criteria);
   if (!r.ok && r.error) say("error", r.error, "error");
+  // One task, one set. Carrying them into the next turn would quietly apply
+  // yesterday's criteria to today's work.
+  rows = [];
+  drawCriteria();
+  $("criteria").classList.add("hidden");
 }
 
 $("send").addEventListener("click", () => void send());
@@ -838,6 +881,133 @@ async function chooseAutonomy(level: string, means: string): Promise<void> {
   if (state.open) say("", `autonomy: ${level} — ${means}`, "info");
   localStorage.setItem("molt.autonomy", level);
 }
+
+// ── acceptance criteria ──────────────────────────────────────────────────────
+
+/**
+ * What "done" means for this task, on top of what it means for the project.
+ *
+ * Kept out of the way until asked for. The value of per-task verification is
+ * real and the friction is what kills it, so there is one button to open the
+ * panel, one to have the model draft from what you typed, and nothing to fill
+ * in before you can press Run.
+ *
+ * A row is either a check or a note and the two never look alike. A check is a
+ * command that runs with the bar and can refuse the claim; a note is a sentence
+ * that lands on the receipt as stated intent and is never reported as verified.
+ * Conflating them would make the receipt lie in the one direction it cannot
+ * afford, so they are different colours, differently labelled, and the label is
+ * a button — clicking it converts the row, because most people discover which
+ * one they meant while typing it.
+ */
+type Row = { kind: "check" | "note"; name: string; text: string };
+let rows: Row[] = [];
+
+function drawCriteria(): void {
+  const box = $("ck-rows");
+  box.textContent = "";
+  if (rows.length === 0) {
+    box.appendChild(
+      el("div", "ck-empty", "None. The project's bar still applies — this adds to it."),
+    );
+  }
+  for (const [i, r] of rows.entries()) {
+    const row = el("div", `ck-row ${r.kind}`);
+
+    const kind = el("button", "ck-kind", r.kind === "check" ? "check" : "note") as HTMLButtonElement;
+    kind.type = "button";
+    kind.title =
+      r.kind === "check"
+        ? "Runs with the bar and can refuse the claim. Click to make it a note."
+        : "Recorded on the receipt, never reported as verified. Click to make it a check.";
+    kind.addEventListener("click", () => {
+      r.kind = r.kind === "check" ? "note" : "check";
+      drawCriteria();
+    });
+    row.appendChild(kind);
+
+    if (r.kind === "check") {
+      const name = el("input", "ck-name") as HTMLInputElement;
+      name.value = r.name;
+      name.placeholder = "name";
+      name.spellcheck = false;
+      name.addEventListener("input", () => (r.name = name.value));
+      row.appendChild(name);
+    }
+
+    const text = el("input") as HTMLInputElement;
+    text.value = r.text;
+    text.placeholder = r.kind === "check" ? "shell command that must exit 0" : "what should be true";
+    text.spellcheck = false;
+    text.addEventListener("input", () => (r.text = text.value));
+    row.appendChild(text);
+
+    const del = el("button", "ck-del", "✕") as HTMLButtonElement;
+    del.type = "button";
+    del.title = "remove";
+    del.addEventListener("click", () => {
+      rows.splice(i, 1);
+      drawCriteria();
+    });
+    row.appendChild(del);
+    box.appendChild(row);
+  }
+  updateCriteriaState();
+}
+
+function updateCriteriaState(): void {
+  const c = rows.filter((r) => r.kind === "check" && r.text.trim()).length;
+  const n = rows.filter((r) => r.kind === "note" && r.text.trim()).length;
+  $("ck-state").textContent = c || n ? `${c} check(s), ${n} note(s)` : "";
+  // The button by the prompt carries the count, so the panel can stay shut
+  // without the criteria being out of sight and out of mind.
+  $("ck-open").textContent = c || n ? `criteria · ${c + n}` : "criteria";
+}
+
+/** What gets sent, cleaned of half-typed rows. */
+function criteriaPayload(): { checks: { name: string; run: string }[]; notes: string[] } {
+  const checks = rows
+    .filter((r) => r.kind === "check" && r.text.trim())
+    .map((r, i) => ({ name: r.name.trim() || `check-${i + 1}`, run: r.text.trim() }));
+  const notes = rows.filter((r) => r.kind === "note" && r.text.trim()).map((r) => r.text.trim());
+  return { checks, notes };
+}
+
+$("ck-open").addEventListener("click", () => {
+  $("criteria").classList.toggle("hidden");
+  if (!$("criteria").classList.contains("hidden")) drawCriteria();
+});
+$("ck-hide").addEventListener("click", () => $("criteria").classList.add("hidden"));
+$("ck-add").addEventListener("click", () => {
+  rows.push({ kind: "check", name: "", text: "" });
+  drawCriteria();
+});
+$("ck-add-note").addEventListener("click", () => {
+  rows.push({ kind: "note", name: "", text: "" });
+  drawCriteria();
+});
+
+$("ck-draft").addEventListener("click", async () => {
+  const task = promptBox.value.trim();
+  if (!task) {
+    $("ck-state").textContent = "type the task first — the draft is made from it";
+    return;
+  }
+  $("ck-state").textContent = "asking the model what would prove this…";
+  const r = await molt.draftCriteria(task);
+  if (!r.ok) {
+    $("ck-state").textContent = r.error;
+    return;
+  }
+  // Appended, not replacing: anything already typed was written by a person
+  // and outranks a suggestion.
+  for (const c of r.draft.checks) rows.push({ kind: "check", name: c.name, text: c.run });
+  for (const n of r.draft.notes) rows.push({ kind: "note", name: "", text: n });
+  drawCriteria();
+  if (!r.draft.checks.length && !r.draft.notes.length) {
+    $("ck-state").textContent = "the model had nothing to add beyond the project's bar";
+  }
+});
 
 // ── slash commands ───────────────────────────────────────────────────────────
 

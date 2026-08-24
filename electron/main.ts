@@ -19,6 +19,7 @@ import { join } from "node:path";
 
 import { resolveReceipt } from "./receipts-path.js";
 import { sessionOpenReject } from "./session-open.js";
+import { draftCriteria, type Draft } from "./criteria.js";
 import { desktopSurfaces } from "./theme-surfaces.js";
 import { barInitText } from "./limits.js";
 import { Engine } from "../src/engine.js";
@@ -269,6 +270,21 @@ function createWindow(): void {
           obs.observe(document.getElementById("stream"), { childList: true, subtree: true });
           return 0;
         })()`);
+        // Criteria set through the real panel, so the path under test is the
+        // one a person uses — not a shortcut into the IPC handler.
+        if (process.env.MOLT_E2E_CRITERION) {
+          await win!.webContents.executeJavaScript(`(() => {
+            document.getElementById("ck-open").click();
+            document.getElementById("ck-add").click();
+            const row = document.querySelector("#ck-rows .ck-row.check");
+            const ins = row.querySelectorAll("input");
+            ins[0].value = "task-gate";
+            ins[0].dispatchEvent(new Event("input"));
+            ins[1].value = ${JSON.stringify(process.env.MOLT_E2E_CRITERION)};
+            ins[1].dispatchEvent(new Event("input"));
+            return 0;
+          })()`);
+        }
         await win!.webContents.executeJavaScript(`(() => {
           document.getElementById("ask").checked = ${process.env.MOLT_E2E_ASK === "1"};
           document.getElementById("prompt").value = ${JSON.stringify(
@@ -325,6 +341,8 @@ function createWindow(): void {
             `(document.querySelector('.tab[data-tab="session"]').click(), {
                sawActivity: window.__sawActivity === true,
                activityLeft: document.querySelectorAll("#stream .activity").length,
+               sealedShown: document.querySelectorAll("#stream .sealed").length,
+               checkNamesRun: [...document.querySelectorAll("#checks .check-card .nm")].map((n) => n.textContent),
                checksRun: [...document.querySelectorAll("#stream .proof .check .est")].length,
                checkNames: [...document.querySelectorAll("#checks .check-card .nm")].map((n) => n.textContent),
                proofHead: (document.querySelector("#stream .proof h4")||{}).textContent||"",
@@ -357,6 +375,7 @@ function createWindow(): void {
             );
             console.log(`[self-drive] activity   shown=${r.sawActivity} leftover=${r.activityLeft}`);
             console.log(`[self-drive] proof      ${r.proofHead}`);
+            console.log(`[self-drive] sealed     ${r.sealedShown} block(s) · ran: ${(r.checkNamesRun as string[]).join(", ")}`);
             console.log(`[self-drive] checks     ${(r.checkNames as string[]).join(", ") || "(none)"}`);
             const text = String(r.text);
             const ok =
@@ -372,6 +391,11 @@ function createWindow(): void {
               // either invisible or permanent.
               (process.env.MOLT_E2E_VIA_UI !== "1" || r.sawActivity === true) &&
               Number(r.activityLeft) === 0 &&
+              // The seal has to be visible where the work is, and the check has
+              // to have actually run under its namespaced name.
+              (!process.env.MOLT_E2E_CRITERION ||
+                (Number(r.sealedShown) === 1 &&
+                  (r.checkNamesRun as string[]).some((n) => n.startsWith("task:")))) &&
               (!process.env.MOLT_E2E_WANT_PROOF ||
                 String(r.proofHead).includes(process.env.MOLT_E2E_WANT_PROOF));
             console.log(ok ? "[self-drive] PASS" : "[self-drive] FAIL");
@@ -425,7 +449,7 @@ function createWindow(): void {
       void win!.webContents
         .executeJavaScript(
           `(async () => {
-             const need = ["tabs","panels","stream","wire","checks","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","autonomy","ask"];
+             const need = ["tabs","panels","stream","wire","checks","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","autonomy","ask","criteria","ck-rows","ck-open","ck-draft"];
              const missing = need.filter((id) => !document.getElementById(id));
              const tabs = [...document.querySelectorAll(".tab")].map((t) => t.dataset.tab);
              const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
@@ -435,6 +459,28 @@ function createWindow(): void {
                tabs,
                accent,
                panels: [...document.querySelectorAll(".panel")].length,
+               // A check and a note must never be presented alike: one is
+               // evidence and the other is intent, and the receipt's honesty
+               // depends on a reader telling them apart at a glance.
+               criteriaRows: await (async () => {
+                 document.getElementById("ck-open").click();
+                 document.getElementById("ck-add").click();
+                 document.getElementById("ck-add-note").click();
+                 await new Promise((r) => setTimeout(r, 60));
+                 const check = document.querySelector("#ck-rows .ck-row.check .ck-kind");
+                 const note = document.querySelector("#ck-rows .ck-row.note .ck-kind");
+                 const distinct =
+                   !!check && !!note &&
+                   getComputedStyle(check).color !== getComputedStyle(note).color &&
+                   check.textContent !== note.textContent;
+                 // Clicking the label converts the row.
+                 check.click();
+                 await new Promise((r) => setTimeout(r, 40));
+                 const converted = document.querySelectorAll("#ck-rows .ck-row.note").length === 2;
+                 document.querySelectorAll("#ck-rows .ck-del").forEach((b) => b.click());
+                 document.getElementById("ck-hide").click();
+                 return { distinct, converted };
+               })(),
                autonomyButtons: document.querySelectorAll("#autonomy .au").length,
                autonomyOn: (document.getElementById("au-name")||{}).textContent||"",
                // Clicking a level must change the level. It did not: stateOf()
@@ -507,6 +553,8 @@ function createWindow(): void {
             r.autonomyButtons === 3 &&
             String(r.autonomyOn).length > 0 &&
             r.autonomySticks === true &&
+            (r.criteriaRows as { distinct: boolean; converted: boolean }).distinct === true &&
+            (r.criteriaRows as { distinct: boolean; converted: boolean }).converted === true &&
             Number(r.paletteRows) >= 15 &&
             (r.csp as { script?: boolean; connect?: boolean } | undefined)?.script === true &&
             (r.csp as { script?: boolean; connect?: boolean } | undefined)?.connect === true;
@@ -521,6 +569,10 @@ function createWindow(): void {
               `, click sticks: ${r.autonomySticks}`,
           );
           console.log(`[self-check] palette     ${r.paletteRows} command(s) on "/"`);
+          const ck = r.criteriaRows as { distinct: boolean; converted: boolean };
+          console.log(
+            `[self-check] criteria    check/note distinct: ${ck.distinct}, convertible: ${ck.converted}`,
+          );
           const csp = r.csp as { script?: boolean; connect?: boolean; dirs?: string } | undefined;
           console.log(
             `[self-check] csp         inline ${csp?.script ? "refused" : "RAN"} · fetch ${csp?.connect ? "refused" : "ALLOWED"}` +
@@ -798,6 +850,35 @@ ipcMain.handle("bar:init", () => {
   }
 });
 
+/**
+ * Ask the model what would prove this task was done.
+ *
+ * A proposal, never a decision. What comes back is editable and has to be
+ * approved before it means anything — the engine seals what the person
+ * approved, not what the model suggested.
+ */
+ipcMain.handle("criteria:draft", async (_e, task: string) => {
+  if (!session) return { ok: false, error: "no workspace is open" };
+  if (!task.trim()) return { ok: false, error: "nothing to draft from" };
+  let scripts: string[] = [];
+  try {
+    const pkg = JSON.parse(readFileSync(join(session.cwd, "package.json"), "utf8")) as {
+      scripts?: Record<string, string>;
+    };
+    scripts = Object.keys(pkg.scripts ?? {});
+  } catch {
+    /* not a node project, or no package.json — the drafter is told "(none found)" */
+  }
+  return draftCriteria({
+    task,
+    scripts,
+    barChecks: session.bar?.checks.map((c: Check) => c.name) ?? [],
+    baseUrl: session.baseUrl,
+    apiKey: session.engine.apiKey,
+    model: session.model,
+  });
+});
+
 ipcMain.handle("auth:save", (_e, provider: string, key: string) =>
   saveKey(provider, key, configDir()),
 );
@@ -822,7 +903,7 @@ ipcMain.on("session:cancel", () => {
   running?.abort();
 });
 
-ipcMain.handle("session:run", async (_e, text: string, ask: boolean) => {
+ipcMain.handle("session:run", async (_e, text: string, ask: boolean, criteria?: Draft) => {
   if (!session) return { ok: false, error: "no workspace is open" };
   if (running) return { ok: false, error: "a turn is already running" };
 
@@ -846,7 +927,21 @@ ipcMain.handle("session:run", async (_e, text: string, ask: boolean) => {
     });
 
   try {
-    for await (const ev of session.engine.run(text, confirm, { ask })) {
+    // Turned into real checks here, at the boundary, so the shape the engine
+    // seals is one this process built rather than one the renderer sent.
+    const taskChecks = (criteria?.checks ?? []).map((c) => ({
+      name: c.name,
+      kind: "command" as const,
+      run: c.run,
+      timeoutMs: 120_000,
+      expectExit: 0,
+      tags: ["task"],
+    }));
+    for await (const ev of session.engine.run(text, confirm, {
+      ask,
+      taskChecks,
+      taskNotes: criteria?.notes ?? [],
+    })) {
       send("engine:event", ev satisfies EngineEvent);
     }
     return { ok: true };

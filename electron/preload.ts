@@ -41,7 +41,9 @@ contextBridge.exposeInMainWorld("molt", {
   reset: () => ipcRenderer.invoke("session:reset"),
   initBar: () => ipcRenderer.invoke("bar:init"),
 
-  run: (text: string, ask = false) => ipcRenderer.invoke("session:run", text, ask),
+  run: (text: string, ask = false, criteria?: unknown) =>
+    ipcRenderer.invoke("session:run", text, ask, criteria),
+  draftCriteria: (task: string) => ipcRenderer.invoke("criteria:draft", task),
   cancel: () => ipcRenderer.send("session:cancel"),
   answerConfirm: (id: string, ok: boolean) => ipcRenderer.send("confirm:reply", id, ok),
 
