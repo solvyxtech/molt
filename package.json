@@ -43,7 +43,7 @@
     "dist:mac": "npm run bundle && electron-builder --mac",
     "dist:win": "npm run bundle && electron-builder --win",
     "dist:linux": "npm run bundle && electron-builder --linux",
-    "e2e": "npm run bundle && MOLT_E2E_VIA_UI=1 node test-e2e/drive.mjs",
+    "e2e": "npm run bundle && MOLT_E2E_VIA_UI=1 MOLT_E2E_AUTO=1 node test-e2e/drive.mjs",
     "self-check": "npm run bundle && electron out/main.cjs --self-check",
     "app:install": "npm run bundle && electron-builder --dir && node install.mjs",
     "app:push": "npm run bundle && node install.mjs --push",

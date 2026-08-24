@@ -826,6 +826,16 @@ async function send(): Promise<void> {
   // so, or the gap between Run and the first token reads as a dead click.
   startActivity(ask0() ? "asking" : "thinking");
   const ask = ($("ask") as HTMLInputElement).checked;
+
+  // Drafted from what you just typed, unless you already wrote some yourself.
+  // Announced rather than silent: criteria decide whether the turn can be
+  // called done, and finding out afterwards that something was added on your
+  // behalf is the wrong way to learn it.
+  if (($("ck-auto") as HTMLInputElement).checked && rows.length === 0 && !ask) {
+    setPhase("drafting criteria");
+    await draftInto(text, true);
+  }
+
   const criteria = criteriaPayload();
   if (criteria.checks.length || criteria.notes.length) {
     append(sealedBlock(criteria));
@@ -1006,15 +1016,26 @@ $("ck-add-note").addEventListener("click", () => {
   drawCriteria();
 });
 
-$("ck-draft").addEventListener("click", async () => {
-  const task = promptBox.value.trim();
+/**
+ * Draft criteria from the task text.
+ *
+ * Safe to run without asking, which is why it is automatic by default. Task
+ * checks are appended to the project's bar and a name collision resolves toward
+ * the project, so a drafted criterion can only make the gate stricter — the
+ * worst a bad draft can do is leave you where you started. The project bar is
+ * the one that must never come from a prompt, because that one can be
+ * weakened, and a model that sets its own passing conditions always passes.
+ */
+async function draftInto(task: string, quiet = false): Promise<void> {
   if (!task) {
-    $("ck-state").textContent = "type the task first — the draft is made from it";
+    if (!quiet) $("ck-state").textContent = "type the task first — the draft is made from it";
     return;
   }
   $("ck-state").textContent = "asking the model what would prove this…";
   const r = await molt.draftCriteria(task);
   if (!r.ok) {
+    // Never blocks the turn. A drafting failure means no extra criteria, not
+    // no work — the project's bar still applies.
     $("ck-state").textContent = r.error;
     return;
   }
@@ -1026,7 +1047,9 @@ $("ck-draft").addEventListener("click", async () => {
   if (!r.draft.checks.length && !r.draft.notes.length) {
     $("ck-state").textContent = "the model had nothing to add beyond the project's bar";
   }
-});
+}
+
+$("ck-draft").addEventListener("click", () => void draftInto(promptBox.value.trim()));
 
 // ── slash commands ───────────────────────────────────────────────────────────
 

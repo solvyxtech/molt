@@ -720,3 +720,6 @@ select { flex: 0 0 auto; min-width: 150px; cursor: pointer; }
 .sealed ul { margin: 4px 0 0 16px; }
 .sealed .c { color: var(--ok); }
 .sealed .n { color: var(--warn); }
+
+.ck-auto { color: var(--dim); font-size: 11px; white-space: nowrap; cursor: pointer; }
+.ck-auto input { accent-color: var(--dim); }
