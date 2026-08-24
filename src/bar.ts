@@ -10,6 +10,16 @@
  */
 import { runCommand } from "./run.js";
 import { parseLcov, coverageFor, unprovenIn, type Unproven } from "./coverage.js";
+import { planMutations, applyMutation, type Mutation } from "./mutate.js";
+
+/** sha256 of a file, or "" if it cannot be read. Used to verify a restore. */
+function sha256Of(abs: string): string {
+  try {
+    return createHash("sha256").update(readFileSync(abs)).digest("hex");
+  } catch {
+    return "";
+  }
+}
 import { proposeBar, type Detected } from "./detect.js";
 import { fingerprint } from "./files.js";
 import { createHash } from "node:crypto";
@@ -36,6 +46,7 @@ export const BUILTINS: BuiltinCheck[] = [
   "record-intact",
   "claims-grounded",
   "diff-covered",
+  "mutation",
 ];
 
 /**
@@ -210,8 +221,31 @@ export function parseBar(source: string): Bar {
       if (c.lcov !== undefined && typeof c.lcov !== "string") {
         throw new BarError(`done.yml: check "${name}" has a non-string \`lcov\`.`);
       }
+      if (builtin === "mutation" && typeof c.run !== "string") {
+        throw new BarError(
+          `done.yml: check "${name}" uses the mutation builtin and needs a \`run\` — the ` +
+            "command that should fail when the code is broken.",
+        );
+      }
+      const mut =
+        builtin === "mutation"
+          ? {
+              run: String(c.run).trim(),
+              sample: Number.isFinite(Number(c.sample)) ? Math.max(1, Number(c.sample)) : 4,
+              timeoutMs: Number.isFinite(Number(c.timeout)) ? Number(c.timeout) * 1000 : 600_000,
+            }
+          : {};
       const lcov = typeof c.lcov === "string" ? { lcov: c.lcov.trim() } : {};
-      return { name, kind: "builtin", builtin, tags, ...advisory, ...commentOnly, ...lcov };
+      return {
+        name,
+        kind: "builtin",
+        builtin,
+        tags,
+        ...advisory,
+        ...commentOnly,
+        ...lcov,
+        ...mut,
+      };
     }
 
     const timeout = c.timeout === undefined ? undefined : Number(c.timeout);
@@ -436,6 +470,137 @@ export function claimedWrites(record: Msg[]): string[] {
     }
   }
   return paths;
+}
+
+/**
+ * Break each new line and confirm something notices.
+ *
+ * `diff-covered` proves a line runs. It cannot prove anything *checks* what
+ * the line does: a test that executes code while asserting nothing satisfies
+ * coverage completely, and reports the line as fine. Breaking the line is the
+ * only mechanical way to tell those apart.
+ *
+ * Expensive, and honest about it — one full run of the command per mutation,
+ * so the sample is small and the report says what was left unexamined. A bound
+ * nobody is told about reads as completeness.
+ *
+ * The dangerous part is not the mutating, it is the restoring. Every file is
+ * hashed before it is touched and verified after; a failed restore is reported
+ * as a failure of this check no matter what the mutations found, because a
+ * verification tool that leaves your source altered has done something far
+ * worse than miss a bug.
+ */
+async function mutationCheck(
+  ctx: BarContext,
+  run: string,
+  sample: number,
+  timeoutMs: number,
+): Promise<{ ok: boolean; output: string }> {
+  const files = ctx.ledger
+    .filter((e) => e.changedLines && e.changedLines.length > 0)
+    .map((e) => {
+      const abs = resolve(ctx.cwd, e.path);
+      let text = "";
+      try {
+        text = readFileSync(abs, "utf8");
+      } catch {
+        return null;
+      }
+      return { path: e.path, abs, text, sha: sha256Of(abs), changedLines: e.changedLines! };
+    })
+    .filter((f): f is NonNullable<typeof f> => f !== null);
+
+  if (files.length === 0) return { ok: true, output: "No changed lines to mutate." };
+
+  const plan = planMutations(files, sample) as (Mutation & { path: string })[];
+  if (plan.length === 0) {
+    return {
+      ok: true,
+      output:
+        `${files.length} changed file(s), no line with an operator to flip. ` +
+        "Nothing was mutated, so nothing is claimed.",
+    };
+  }
+
+  // The command has to pass on the unmutated code before any of this means
+  // anything. A suite that is already red counts every mutation as "killed" —
+  // the command failed, after all — and the check reports "N mutations broke a
+  // test, as they should" having tested precisely nothing. That is the exact
+  // shape of false confidence this tool exists to refuse, and it passed a
+  // hand-written probe before being caught.
+  const baseline = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal });
+  if (baseline.code !== 0) {
+    return {
+      ok: false,
+      output:
+        `\`${run}\` fails on the unmutated code (exit ${baseline.code}), so breaking a line ` +
+        `proves nothing — every mutation would look killed by a failure that was already ` +
+        `there. Fix the suite first.\n\n` +
+        (baseline.stdout || baseline.stderr || "").slice(0, 600),
+    };
+  }
+
+  const survived: string[] = [];
+  const killed: string[] = [];
+  const restoreFailures: string[] = [];
+
+  for (const m of plan) {
+    const file = files.find((f) => f.path === m.path)!;
+    const mutated = applyMutation(file.text, m);
+    if (mutated === null || mutated === file.text) {
+      // The line moved or the swap was a no-op. Reporting a green run here
+      // would be reporting a mutation that never happened, which is exactly
+      // how this discipline has been fooled by hand.
+      continue;
+    }
+    try {
+      writeFileSync(file.abs, mutated, "utf8");
+      const r = await runCommand(run, {
+        cwd: ctx.cwd,
+        timeoutMs,
+        signal: ctx.signal,
+      });
+      // A mutation the command still passes is a line nothing checks.
+      if (r.code === 0) survived.push(`${m.path}:${m.line} (${m.operator}) — ${m.before.trim()}`);
+      else killed.push(`${m.path}:${m.line} (${m.operator})`);
+    } finally {
+      writeFileSync(file.abs, file.text, "utf8");
+      if (sha256Of(file.abs) !== file.sha) restoreFailures.push(file.path);
+    }
+  }
+
+  if (restoreFailures.length) {
+    return {
+      ok: false,
+      output:
+        `RESTORE FAILED for ${restoreFailures.join(", ")}. The file on disk is not what it ` +
+        `was before this check ran. Fix that before anything else — nothing this check ` +
+        `found matters next to it.`,
+    };
+  }
+
+  const examined = killed.length + survived.length;
+  const total = files.reduce((n, f) => n + f.changedLines.length, 0);
+  const unexamined = total - examined;
+  const note =
+    unexamined > 0
+      ? ` · ${unexamined} changed line(s) not mutated (sample is ${sample}; raise it or accept the bound)`
+      : "";
+
+  if (survived.length === 0) {
+    return {
+      ok: true,
+      output: `${killed.length} mutation(s) broke a test, as they should${note}`,
+    };
+  }
+  return {
+    ok: false,
+    output:
+      `${survived.length} of ${examined} mutation(s) changed the code and nothing failed:\n` +
+      survived.map((s) => `  ${s}`).join("\n") +
+      `\n\nThose lines run but nothing checks what they do. A test that executes code ` +
+      `without asserting on it leaves the code exactly as unproven as no test at all.${note}`,
+  };
 }
 
 /**
@@ -723,12 +888,11 @@ function runBuiltin(
 export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResult> {
   const t0 = Date.now();
   if (check.kind === "builtin") {
-    const { ok, output } = runBuiltin(
-      check.builtin,
-      ctx,
-      check.commentOnly === "allow",
-      check.lcov,
-    );
+    // The only builtin that runs a command, so the only one that can await.
+    const { ok, output } =
+      check.builtin === "mutation"
+        ? await mutationCheck(ctx, check.run ?? "", check.sample ?? 4, check.timeoutMs ?? 600_000)
+        : runBuiltin(check.builtin, ctx, check.commentOnly === "allow", check.lcov);
     return {
       name: check.name,
       ...(check.advisory ? { advisory: true } : {}),
