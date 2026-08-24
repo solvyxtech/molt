@@ -18,7 +18,7 @@ import {
   runBar,
   writeDefaultBar,
 } from "../src/bar.js";
-import { Engine } from "../src/engine.js";
+import { Engine, asQuestion } from "../src/engine.js";
 import { Receipts } from "../src/receipts.js";
 import type { BarContext } from "../src/bar.js";
 import { createHash } from "node:crypto";
@@ -601,5 +601,97 @@ describe("replaying receipt 0025 through the engine", () => {
   it("accepts the same edit carrying one line of code", async () => {
     const out = await runWithEdit("export async function main() {\n  setup();");
     assert.equal(out.refused, false, "one real line of code is work and must land");
+  });
+});
+
+/**
+ * What a question may be refused for.
+ *
+ * Reported from the desktop app: "I had ask only clicked and still got bar not
+ * met." They had. `ask` dropped `files-changed` and left every command check
+ * in place, so a turn that wrote nothing was refused because `tests` was red.
+ *
+ * The turn could not have caused that. A question touches no file, so if the
+ * suite is failing it was failing before the question was asked — and the bar
+ * exists to stop a model claiming work it did not do, which a question never
+ * claims. Refusing one is a category error, not a strict gate.
+ *
+ * The checks still run, because knowing the suite is red is worth having. They
+ * run advisory: they report, and they do not refuse.
+ */
+describe("a question is not refused for the state of the repository", () => {
+  const BAR = `version: 1
+checks:
+  - name: types
+    run: "true"
+  - name: tests
+    run: "false"
+  - name: work-landed
+    builtin: files-changed
+`;
+
+  it("drops the write check and keeps the rest", () => {
+    const q = asQuestion(parseBar(BAR), true)!;
+    assert.deepEqual(
+      q.checks.map((c) => c.name),
+      ["types", "tests"],
+      "files-changed cannot be satisfied by a turn that writes nothing",
+    );
+  });
+
+  it("leaves nothing that can refuse the answer", () => {
+    const q = asQuestion(parseBar(BAR), true)!;
+    assert.ok(
+      q.checks.every((c) => c.advisory === true),
+      "every surviving check must report rather than block",
+    );
+  });
+
+  it("still reports the failure rather than hiding it", async () => {
+    const ws = workspace();
+    try {
+      const q = asQuestion(parseBar(BAR), true)!;
+      const result = await runBar(q, {
+        cwd: ws.dir,
+        record: [],
+        ledger: [],
+        archivedBatches: 0,
+      });
+      assert.equal(result.ok, true, "a question may not be refused");
+      const warned = (result.warnings ?? []).map((w) => w.name);
+      assert.ok(warned.includes("tests"), "the red suite must still be surfaced, as a warning");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("does not soften the bar for a turn that does change files", () => {
+    // The whole gate depends on this staying strict for ordinary work.
+    const normal = parseBar(BAR);
+    assert.ok(
+      normal.checks.every((c) => c.advisory !== true),
+      "a normal turn's checks must still be able to refuse",
+    );
+  });
+
+  it("has nothing to do when there is no bar", () => {
+    assert.equal(asQuestion(null, true), null);
+    assert.equal(asQuestion(undefined, true), null);
+  });
+
+  it("is not a way out of the bar for a turn that wrote something", () => {
+    // Ticking "ask" drops the write check, not the ability to write. A turn
+    // that edited a file can have broken the suite it is about to be judged
+    // by, so the softening does not apply to it — whichever box was ticked.
+    const q = asQuestion(parseBar(BAR), false)!;
+    assert.ok(
+      q.checks.every((c) => c.advisory !== true),
+      "a turn that changed files must still be refusable",
+    );
+    assert.deepEqual(
+      q.checks.map((c) => c.name),
+      ["types", "tests"],
+      "the write check is still dropped — ask mode does not require a change",
+    );
   });
 });

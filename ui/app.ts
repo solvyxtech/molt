@@ -28,6 +28,15 @@ type MoltBridge = {
   saveKey(provider: string, key: string): Promise<boolean>;
   saveEndpoint(baseUrl: string, model: string): Promise<boolean>;
   storedEndpoint(): Promise<{ baseUrl?: string; model?: string }>;
+  listModels(current?: { url: string; key?: string }): Promise<ModelSource[]>;
+  setModel(o: {
+    model: string;
+    baseUrl?: string;
+    apiKey?: string;
+  }): Promise<{ ok: boolean; error?: string; state?: AppState }>;
+  setAutonomy(
+    level: string,
+  ): Promise<{ ok: boolean; error?: string; state?: AppState; means?: string }>;
   run(text: string, ask?: boolean): Promise<{ ok: boolean; error?: string }>;
   cancel(): void;
   answerConfirm(id: string, ok: boolean): void;
@@ -47,12 +56,23 @@ type AppState = {
   baseUrl: string | null;
   provider: string | null;
   selfHosted: boolean;
+  autonomy: string;
+  autonomyLevels: { level: string; means: string }[];
   checks: { name: string; kind: string; tags: string[] }[];
   barError: string | null;
   sessionId: string | null;
   providers: string[];
   keyed: string[];
   themes: string[];
+};
+
+type ModelSource = {
+  name: string;
+  url: string;
+  ok: boolean;
+  ids: string[];
+  error?: string;
+  needsKey?: boolean;
 };
 
 type ReceiptRow = { file: string; n: number; verdict: string; mtime: number };
@@ -163,11 +183,65 @@ function append(node: HTMLElement): void {
   follow(was);
 }
 
+/**
+ * The row that says molt is alive.
+ *
+ * Reported as "nothing happens when you put in a prompt". Something did — the
+ * dot in the corner pulsed and the Stop button appeared — but the stream, which
+ * is where you are looking, showed your message and then held still. Against a
+ * hosted model that gap is a second. Against a 30B on your own hardware it was
+ * over three minutes of a screen that looked broken.
+ *
+ * So the wait gets a line of its own, with a phase and a clock, and the clock
+ * is the point: a number that changes is the difference between "working" and
+ * "hung", and no amount of animation says it as plainly.
+ */
+let activity: { row: HTMLElement; phase: HTMLElement; clock: HTMLElement; started: number } | null =
+  null;
+let activityTimer: ReturnType<typeof setInterval> | null = null;
+
+function startActivity(phase: string): void {
+  if (activity) {
+    setPhase(phase);
+    return;
+  }
+  const row = el("div", "activity");
+  row.appendChild(el("span", "spin", "▪"));
+  const p = el("span", "phase", phase);
+  const c = el("span", "clock", "0s");
+  row.appendChild(p);
+  row.appendChild(c);
+  activity = { row, phase: p, clock: c, started: Date.now() };
+  append(row);
+  activityTimer = setInterval(() => {
+    if (!activity) return;
+    activity.clock.textContent = fmtMs(Date.now() - activity.started);
+  }, 1000);
+}
+
+function setPhase(phase: string): void {
+  if (activity) activity.phase.textContent = phase;
+  else startActivity(phase);
+}
+
+function stopActivity(): void {
+  if (activityTimer) clearInterval(activityTimer);
+  activityTimer = null;
+  activity?.row.remove();
+  activity = null;
+}
+
+/** Keep the waiting row at the bottom, below whatever just arrived. */
+function bumpActivity(): void {
+  if (activity) stream().appendChild(activity.row);
+}
+
 function say(who: string, text: string, cls = ""): HTMLElement {
   const row = el("div", `said ${cls}`.trim());
   row.appendChild(el("div", "who", who));
   row.appendChild(el("div", "what", text));
   append(row);
+  bumpActivity();
   return row;
 }
 
@@ -224,23 +298,38 @@ function receiptLink(path: string): HTMLElement {
 function proofBlock(ev: Ev): HTMLElement {
   const r = ev.result ?? {};
   const ok = r.ok === true;
-  const box = el("div", `proof ${ok ? "pass" : "fail"}`);
-  const n = (r.results ?? []).length;
-  const passed = (r.results ?? []).filter((c: any) => c.ok).length;
-  box.appendChild(
-    el(
-      "h4",
-      undefined,
-      ok
-        ? `bar met — ${passed} of ${n} checks · ${fmtMs(r.durationMs ?? 0)}`
-        : `bar not met — ${passed} of ${n} checks${ev.attempt ? ` · attempt ${ev.attempt}` : ""}`,
-    ),
-  );
-  for (const c of r.results ?? []) {
+  const rows: any[] = [...(r.results ?? []), ...(r.warnings ?? [])];
+  // A question runs its checks advisory, so a failure among them is a note
+  // about the repository rather than a verdict on the turn. Rendering that as
+  // "bar met — 0 of 1 checks" was true and unreadable: it claimed a pass while
+  // showing a failure, which is the shape of the dishonesty this tool exists
+  // to refuse — just pointing the other way.
+  const advisoryOnly = rows.length > 0 && rows.every((c) => c.advisory === true);
+  const failed = rows.filter((c) => !c.ok).length;
+  const passed = rows.filter((c) => c.ok).length;
+
+  const box = el("div", `proof ${ok ? (advisoryOnly && failed ? "note" : "pass") : "fail"}`);
+  let head: string;
+  if (advisoryOnly) {
+    head =
+      failed === 0
+        ? `answered — ${passed} check(s) reported, all clear · ${fmtMs(r.durationMs ?? 0)}`
+        : `answered — ${failed} of ${rows.length} check(s) already failing, before this question`;
+  } else if (ok) {
+    head = `bar met — ${passed} of ${rows.length} checks · ${fmtMs(r.durationMs ?? 0)}`;
+  } else {
+    head = `bar not met — ${passed} of ${rows.length} checks${
+      ev.attempt ? ` · attempt ${ev.attempt}` : ""
+    }`;
+  }
+  box.appendChild(el("h4", undefined, head));
+
+  for (const c of rows) {
     const row = el("div", "check");
-    row.appendChild(el("div", `verdict ${c.ok ? "pass" : "fail"}`, c.ok ? "pass" : "FAIL"));
-    const est = el("div", "est", c.output || c.detail || "");
-    row.appendChild(est);
+    const label = c.ok ? "pass" : c.advisory ? "note" : "FAIL";
+    const cls = c.ok ? "pass" : c.advisory ? "note" : "fail";
+    row.appendChild(el("div", `verdict ${cls}`, label));
+    row.appendChild(el("div", "est", c.output || c.detail || ""));
     row.appendChild(el("div", "ms muted", c.durationMs ? fmtMs(c.durationMs) : ""));
     box.appendChild(row);
   }
@@ -509,6 +598,9 @@ function setState(kind: "idle" | "busy" | "proving" | "ok" | "fail", text: strin
 molt.onEvent((ev) => {
   switch (ev.kind) {
     case "delta":
+      // The first token is the answer to "is it alive?", so the waiting row
+      // goes as soon as one arrives.
+      stopActivity();
       delta(ev.text);
       break;
 
@@ -532,6 +624,9 @@ molt.onEvent((ev) => {
       runningTools.set(`${ev.name}:${ev.detail}`, row);
       append(row);
       setState("busy", ev.name);
+      // A long bash or a wide grep is exactly when the screen looks stuck.
+      setPhase(`${ev.name} ${ev.detail}`.trim());
+      bumpActivity();
       break;
     }
 
@@ -550,11 +645,14 @@ molt.onEvent((ev) => {
         "in",
         [ev.args ? `args ${ev.args}` : "", ev.preview ?? ""].filter(Boolean).join("\n"),
       );
+      setPhase("thinking");
+      bumpActivity();
       break;
     }
 
     case "job_start":
       setState("busy", "thinking");
+      startActivity("thinking");
       wire("request", "out", `step ${ev.step ?? ""} · ${ev.messages ?? "?"} messages`);
       break;
 
@@ -569,6 +667,10 @@ molt.onEvent((ev) => {
 
     case "proof_start":
       setState("proving", `proving · ${ev.checks} checks`);
+      // The longest silence in a turn: the suite runs, and until now nothing
+      // said which check was taking the time.
+      setPhase(`proving · ${ev.checks} check(s)`);
+      bumpActivity();
       badge("checks", "…");
       showTabHint();
       break;
@@ -577,6 +679,7 @@ molt.onEvent((ev) => {
     case "proof_refused":
     case "proof_exhausted": {
       endMessage();
+      stopActivity();
       append(proofBlock(ev));
       if (pendingReceipt) {
         append(receiptLink(pendingReceipt));
@@ -610,12 +713,14 @@ molt.onEvent((ev) => {
 
     case "error":
       endMessage();
+      stopActivity();
       say("error", ev.text, "error");
       setState("fail", "error");
       break;
 
     case "cancelled":
       endMessage();
+      stopActivity();
       say(
         "",
         ev.filesWritten?.length
@@ -651,6 +756,7 @@ molt.onConfirm((req) => {
 });
 
 molt.onIdle(() => {
+  stopActivity();
   busy = false;
   $("send").classList.remove("hidden");
   $("stop").classList.add("hidden");
@@ -679,6 +785,8 @@ promptBox.addEventListener("keydown", (e) => {
   }
 });
 
+const ask0 = (): boolean => ($("ask") as HTMLInputElement).checked;
+
 async function send(): Promise<void> {
   const text = promptBox.value.trim();
   if (!text || busy) return;
@@ -694,6 +802,9 @@ async function send(): Promise<void> {
   $("send").classList.add("hidden");
   $("stop").classList.remove("hidden");
   setState("busy", "thinking");
+  // Before the first event: the request is in flight and the window must say
+  // so, or the gap between Run and the first token reads as a dead click.
+  startActivity(ask0() ? "asking" : "thinking");
   const ask = ($("ask") as HTMLInputElement).checked;
   const r = await molt.run(text, ask);
   if (!r.ok && r.error) say("error", r.error, "error");
@@ -704,6 +815,48 @@ $("stop").addEventListener("click", () => {
   molt.cancel();
   setState("idle", "cancelling");
 });
+
+// ── autonomy ─────────────────────────────────────────────────────────────────
+
+/**
+ * How much molt may do without asking, next to the thing it modifies.
+ *
+ * A segmented control rather than a dropdown, because all three options and
+ * the distance between them should be visible at once — this is the setting
+ * that decides whether a command runs on your machine unattended, and a
+ * closed dropdown hides which way it is currently pointing.
+ *
+ * It sits under "ask only" in the composer for the same reason: it is a
+ * property of the turn you are about to send, not a preference filed away in
+ * Settings where you would never look at it again.
+ */
+function renderAutonomy(): void {
+  const box = $("autonomy");
+  box.textContent = "";
+  if (!state) return;
+  for (const { level, means } of state.autonomyLevels) {
+    const b = el("button", `au${level === state.autonomy ? " on" : ""}`, level) as HTMLButtonElement;
+    // The summary is the engine's own words for what the level permits.
+    b.title = means;
+    b.addEventListener("click", () => void chooseAutonomy(level, means));
+    box.appendChild(b);
+  }
+}
+
+async function chooseAutonomy(level: string, means: string): Promise<void> {
+  const r = await molt.setAutonomy(level);
+  if (!r.ok) {
+    say("error", r.error ?? "could not change autonomy", "error");
+    return;
+  }
+  state = r.state!;
+  renderAutonomy();
+  // Said out loud in the stream, because it changes what the next turn may do
+  // to this machine without asking, and a silent change to that is the kind
+  // nobody remembers making.
+  if (state.open) say("", `autonomy: ${level} — ${means}`, "info");
+  localStorage.setItem("molt.autonomy", level);
+}
 
 // ── settings ─────────────────────────────────────────────────────────────────
 
@@ -754,6 +907,146 @@ $("set-theme").addEventListener("change", async () => {
   localStorage.setItem("molt.theme", name);
 });
 
+// ── model picker ─────────────────────────────────────────────────────────────
+
+/**
+ * Every model you could pick, from every endpoint you hold a key for.
+ *
+ * This is `/model`. The desktop shipped without it — Settings had a free-text
+ * field seeded from the last endpoint, so the only reachable model was the one
+ * used last and changing it meant knowing an id by heart. Opened from the
+ * model name in the title bar, which is where you are already looking when you
+ * want to change it.
+ *
+ * Cached for the session: asking four endpoints costs four round trips, and
+ * the list does not change between two glances at it.
+ */
+let sourceCache: ModelSource[] | null = null;
+
+async function sources(force = false): Promise<ModelSource[]> {
+  if (sourceCache && !force) return sourceCache;
+  const url = ($("set-url") as HTMLInputElement).value.trim() || state?.baseUrl || "";
+  const key = ($("set-key") as HTMLInputElement).value.trim() || undefined;
+  sourceCache = await molt.listModels(url ? { url, key } : undefined);
+  return sourceCache;
+}
+
+async function openPicker(): Promise<void> {
+  $("picker").classList.remove("hidden");
+  $("picker-sub").textContent = "Asking every endpoint you hold a key for…";
+  $("picker-list").textContent = "";
+  await drawPicker(await sources());
+}
+
+async function drawPicker(list: ModelSource[]): Promise<void> {
+  const box = $("picker-list");
+  box.textContent = "";
+  const total = list.reduce((n, s) => n + s.ids.length, 0);
+  $("picker-sub").textContent = total
+    ? `${total} model(s) across ${list.length} endpoint(s). Switching keeps the conversation.`
+    : "No endpoint answered. Store a key in Settings, or point at a server you run.";
+
+  for (const src of list) {
+    const grp = el("div", "grp");
+    grp.appendChild(el("span", undefined, src.name));
+    grp.appendChild(el("span", "host", src.url));
+    // A refusal is a thing to show, with its reason — not a provider that
+    // silently vanished from the list.
+    if (!src.ok) grp.appendChild(el("span", "err", src.needsKey ? "no key stored" : (src.error ?? "unreachable")));
+    box.appendChild(grp);
+
+    if (!src.ids.length) {
+      box.appendChild(el("div", "empty-grp", src.ok ? "no models listed" : "—"));
+      continue;
+    }
+    for (const id of src.ids) {
+      const b = el("button", undefined, id) as HTMLButtonElement;
+      if (id === state?.model && src.url === state?.baseUrl) b.classList.add("current");
+      b.addEventListener("click", () => void chooseModel(id, src.url));
+      box.appendChild(b);
+    }
+  }
+}
+
+async function chooseModel(id: string, url: string): Promise<void> {
+  // Before a workspace is open there is no engine to tell; the choice is
+  // staged in Settings and applied when it opens.
+  if (!state?.open) {
+    ($("set-model") as HTMLInputElement).value = id;
+    ($("set-url") as HTMLInputElement).value = url;
+    syncModelPick(id);
+    $("picker").classList.add("hidden");
+    $("set-status").textContent = `${id} selected — open a workspace to use it.`;
+    showTab("settings");
+    return;
+  }
+  const key = ($("set-key") as HTMLInputElement).value.trim() || undefined;
+  const r = await molt.setModel({ model: id, baseUrl: url, apiKey: key });
+  if (!r.ok) {
+    $("picker-sub").textContent = r.error ?? "Could not switch model.";
+    return;
+  }
+  state = r.state!;
+  applyState();
+  $("picker").classList.add("hidden");
+  say("", `model is now ${id}`, "info");
+}
+
+$("crumb-model").addEventListener("click", () => void openPicker());
+$("picker-close").addEventListener("click", () => $("picker").classList.add("hidden"));
+$("picker-refresh").addEventListener("click", async () => {
+  $("picker-sub").textContent = "Asking…";
+  await drawPicker(await sources(true));
+});
+
+/** Settings' own dropdown, which shares the discovery with the picker. */
+async function fillModelSelect(force = false): Promise<void> {
+  const sel = $("set-model-pick") as HTMLSelectElement;
+  const chosen = ($("set-model") as HTMLInputElement).value.trim();
+  sel.textContent = "";
+  const list = await sources(force);
+  for (const src of list) {
+    if (!src.ids.length) continue;
+    const g = document.createElement("optgroup");
+    g.label = `${src.name} — ${src.url}`;
+    for (const id of src.ids) g.appendChild(new Option(id, `${id}\u0000${src.url}`));
+    sel.appendChild(g);
+  }
+  const custom = document.createElement("optgroup");
+  custom.label = "other";
+  custom.appendChild(new Option("custom — type an id below", "\u0000custom"));
+  sel.appendChild(custom);
+  syncModelPick(chosen);
+}
+
+/** Point the dropdown at `id` if it is in the list; otherwise show custom. */
+function syncModelPick(id: string): void {
+  const sel = $("set-model-pick") as HTMLSelectElement;
+  const url = ($("set-url") as HTMLInputElement).value.trim();
+  const exact = [...sel.options].find((o) => o.value === `${id}\u0000${url}`);
+  const byId = [...sel.options].find((o) => o.value.split("\u0000")[0] === id);
+  sel.value = (exact ?? byId)?.value ?? "\u0000custom";
+  $("row-custom-model").classList.toggle("hidden", sel.value !== "\u0000custom");
+}
+
+$("set-model-pick").addEventListener("change", () => {
+  const sel = $("set-model-pick") as HTMLSelectElement;
+  const [id, url] = sel.value.split("\u0000");
+  if (url === "custom") {
+    $("row-custom-model").classList.remove("hidden");
+    ($("set-model") as HTMLInputElement).focus();
+    return;
+  }
+  $("row-custom-model").classList.add("hidden");
+  ($("set-model") as HTMLInputElement).value = id!;
+  if (url) ($("set-url") as HTMLInputElement).value = url;
+});
+
+$("set-refresh").addEventListener("click", () => {
+  $("set-status").textContent = "Asking endpoints…";
+  void fillModelSelect(true).then(() => ($("set-status").textContent = "Models refreshed."));
+});
+
 // ── chrome ───────────────────────────────────────────────────────────────────
 
 function applyState(): void {
@@ -761,12 +1054,15 @@ function applyState(): void {
   $("crumb-cwd").textContent = state.cwd ?? "no workspace";
   $("crumb-cwd").className = state.cwd ? "crumb" : "crumb muted";
   $("crumb-model").textContent = state.model ?? "no model";
-  $("crumb-model").className = state.model ? "crumb" : "crumb muted";
+  // Keep link-quiet: the crumb is the way into the model picker, and assigning
+  // className wholesale here would quietly strip the affordance that says so.
+  $("crumb-model").classList.toggle("muted", !state.model);
   $("crumb-local").classList.toggle("hidden", !state.selfHosted);
   $("st-bar").textContent = state.checks.length
     ? `bar: ${state.checks.length} check(s)`
     : "no bar — unverified";
   $("st-session").textContent = state.sessionId ? `session ${state.sessionId}` : "";
+  renderAutonomy();
   $("local-hint").textContent = state.selfHosted
     ? "Self-hosted: no spending ceiling applies, and molt will not warn about caching it cannot see."
     : "";
@@ -804,7 +1100,18 @@ async function boot(): Promise<void> {
   if (stored.baseUrl) ($("set-url") as HTMLInputElement).value = stored.baseUrl;
   if (stored.model) ($("set-model") as HTMLInputElement).value = stored.model;
 
+  const savedAutonomy = localStorage.getItem("molt.autonomy");
+  if (savedAutonomy && savedAutonomy !== state.autonomy) {
+    const r = await molt.setAutonomy(savedAutonomy);
+    if (r.ok && r.state) state = r.state;
+  }
+
   applyState();
+  // Discovery is a network call per endpoint; it must not hold the window
+  // shut, so it fills in behind the first paint.
+  void fillModelSelect().catch(() => {
+    $("set-status").textContent = "Could not reach any endpoint to list models.";
+  });
   showTab(state.open ? "session" : "settings");
   if (!state.open) $("composer").classList.add("hidden");
 }

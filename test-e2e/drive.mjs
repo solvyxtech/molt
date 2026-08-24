@@ -21,14 +21,27 @@ const electron = require("electron");
 const ws = mkdtempSync(join(tmpdir(), "molt-e2e-"));
 mkdirSync(join(ws, ".molt"), { recursive: true });
 writeFileSync(join(ws, "note.txt"), "before\n", "utf8");
+// MOLT_E2E_RED_CHECK adds a check that always fails. It is how the ask case
+// gets something to be wrongly refused by: a question that wrote nothing must
+// not be blocked by a suite that was already red.
 writeFileSync(
   join(ws, ".molt", "done.yml"),
-  "version: 1\nchecks:\n  - name: work-landed\n    builtin: files-changed\n",
+  "version: 1\nchecks:\n  - name: work-landed\n    builtin: files-changed\n" +
+    (process.env.MOLT_E2E_RED_CHECK === "1" ? '  - name: tests\n    run: "false"\n' : ""),
   "utf8",
 );
 
-/** Two steps: write the file, then claim it is done. */
-const script = [
+/**
+ * Two steps: write the file, then claim it is done.
+ *
+ * MOLT_E2E_NO_WRITE gives the other shape — an answer and nothing else. It is
+ * the only way to exercise the question path, because "ask" softens the bar
+ * only for a turn whose ledger is empty, and a stub that always writes can
+ * never produce one.
+ */
+const script = process.env.MOLT_E2E_NO_WRITE === "1"
+  ? [{ role: "assistant", content: "It reads note.txt and returns its contents." }]
+  : [
   {
     role: "assistant",
     content: null,
@@ -48,6 +61,13 @@ const script = [
 let step = 0;
 
 const server = createServer((req, res) => {
+  // The picker asks every endpoint what it serves. A stub that only answers
+  // chat/completions would let a broken /models path pass unnoticed.
+  if (req.url && req.url.endsWith("/models")) {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ data: [{ id: "stub-model" }, { id: "stub/other-model" }] }));
+    return;
+  }
   let body = "";
   req.on("data", (d) => (body += d));
   req.on("end", () => {
@@ -73,7 +93,11 @@ const child = spawn(electron, ["out/main.cjs", "--self-drive"], {
     MOLT_E2E_URL: url,
     MOLT_E2E_MODEL: "stub-model",
     MOLT_E2E_TASK: "change note.txt",
-    MOLT_E2E_EXPECT: "I changed note.txt",
+    MOLT_E2E_EXPECT: process.env.MOLT_E2E_EXPECT ?? "I changed note.txt",
+    MOLT_E2E_VIA_UI: process.env.MOLT_E2E_VIA_UI ?? "",
+    MOLT_E2E_ASK: process.env.MOLT_E2E_ASK ?? "",
+    MOLT_E2E_WANT_PROOF: process.env.MOLT_E2E_WANT_PROOF ?? "",
+    MOLT_E2E_NO_WRITE: process.env.MOLT_E2E_NO_WRITE ?? "",
   },
 });
 
