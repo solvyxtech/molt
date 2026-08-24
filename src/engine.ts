@@ -60,6 +60,7 @@ import { Transcript, toolDetail } from "./transcript.js";
 import {
   estTokens,
   type Bar,
+  type Check,
   type CheckResult,
   type BarResult,
   type Bom,
@@ -553,6 +554,32 @@ export type RunOptions = {
    * unattended is not a ceiling.
    */
   onCeiling?: (spent: string) => Promise<boolean>;
+  /**
+   * What "done" means for THIS task, on top of what it means for the project.
+   *
+   * `.molt/done.yml` is deliberately per-project and deliberately not read
+   * from the prompt: a bar the model can define is not a bar. But that makes it
+   * blind in one direction — it verifies that the project is healthy, not that
+   * the task was done. A comment added to a file passes `work-landed` and a
+   * green suite, and neither knows what you asked for.
+   *
+   * These close that gap without handing over the pen. They are supplied by
+   * the caller before the turn starts, frozen when it does, and never written
+   * to done.yml. A model may *draft* them — it is good at "what would prove
+   * this?" — but what it drafts is a proposal a person approves, and the
+   * approval happens before any work exists to be judged.
+   */
+  taskChecks?: Check[];
+  /**
+   * Criteria stated in words rather than as commands.
+   *
+   * Recorded on the receipt and shown to the model, never treated as passed.
+   * A sentence no machine checked is a statement of intent, and reporting one
+   * as verified would be the exact failure this tool exists to refuse — so
+   * these are carried through to the receipt labelled as unverified, and they
+   * cannot make a turn succeed or fail.
+   */
+  taskNotes?: string[];
 };
 
 /**
@@ -593,6 +620,44 @@ export function withoutWriteChecks(bar?: Bar | null): Bar | null {
  * applies only to a turn whose ledger is empty. Change anything at all and the
  * bar is the bar, whichever box was ticked.
  */
+/**
+ * The project's bar plus this turn's criteria.
+ *
+ * Task checks go last so the cheap project checks fail first, and are prefixed
+ * so a receipt never leaves you wondering whether `builds` was the project's
+ * rule or this task's. A name collision resolves toward the project: its bar
+ * is the one that outlives the turn.
+ */
+/**
+ * A short, stable fingerprint of this turn's criteria.
+ *
+ * Written to the journal before the first request and to the receipt after the
+ * last, so the two can be compared. If they differ, the criteria moved during
+ * the turn — which they cannot, but a claim that rests on "cannot" is worth
+ * less than one a reader can check.
+ */
+export function sealOf(checks: Check[], notes: string[]): string {
+  const canon = JSON.stringify({
+    checks: checks.map((c) => ({
+      name: c.name,
+      kind: c.kind,
+      run: c.kind === "command" ? c.run : c.builtin,
+    })),
+    notes,
+  });
+  return createHash("sha256").update(canon, "utf8").digest("hex").slice(0, 16);
+}
+
+export function withTaskChecks(bar: Bar | null | undefined, task: Check[]): Bar | null {
+  if (!task.length) return bar ?? null;
+  const base = bar ?? { version: 1 as const, checks: [] };
+  const taken = new Set(base.checks.map((c) => c.name));
+  const added = task
+    .map((c) => ({ ...c, name: c.name.startsWith("task:") ? c.name : `task:${c.name}` }))
+    .filter((c) => !taken.has(c.name));
+  return { ...base, checks: [...base.checks, ...added] };
+}
+
 export function asQuestion(bar: Bar | null | undefined, wroteNothing: boolean): Bar | null {
   const dropped = withoutWriteChecks(bar);
   if (!dropped || !wroteNothing) return dropped;
@@ -1803,10 +1868,31 @@ export class Engine {
    * turn, and reported when the turn ends. Nothing about the session totals
    * changes; a job is a view of them, never a reset.
    */
-  async *run(
+  /**
+   * Start a turn.
+   *
+   * Deliberately not a generator. A generator body does not execute until the
+   * first `next()`, so the criteria would be captured whenever the caller got
+   * round to iterating — and "sealed before the work" would rest on a nuance of
+   * when iteration happens rather than on when the seal is taken. Copying here,
+   * eagerly, means the criteria are fixed the instant the turn is asked for.
+   *
+   * Nothing else moves: the returned value is the same async generator it
+   * always was.
+   */
+  run(userText: string, confirm: Confirm, opts: RunOptions = {}): AsyncGenerator<EngineEvent> {
+    const sealed: RunOptions = {
+      ...opts,
+      taskChecks: Object.freeze((opts.taskChecks ?? []).map((c) => Object.freeze({ ...c }))) as Check[],
+      taskNotes: Object.freeze([...(opts.taskNotes ?? [])]) as string[],
+    };
+    return this.runSealed(userText, confirm, sealed);
+  }
+
+  private async *runSealed(
     userText: string,
     confirm: Confirm,
-    opts: RunOptions = {},
+    opts: RunOptions,
   ): AsyncGenerator<EngineEvent> {
     const job = ++this.jobCount;
     const startedAt = Date.now();
@@ -1879,7 +1965,61 @@ export class Engine {
     // Remember where this turn began so a cancellation can leave no trace.
     const turnStart = this.transcript.length;
     const log = this.cfg.journal;
+    /**
+     * This turn's criteria, copied and sealed before anything runs.
+     *
+     * The copy is the whole point. `opts` belongs to the caller, and a caller
+     * that could keep editing it — or a model that could reach it — would be
+     * choosing the passing conditions after seeing what it had done. Frozen
+     * here, at the top of the turn, before the first request goes out, so
+     * "these were set before the work existed" is a fact about the code rather
+     * than a promise about behaviour.
+     */
+    const taskChecks: Check[] = (opts.taskChecks ?? []).map((c) => Object.freeze({ ...c }));
+    const taskNotes: string[] = [...(opts.taskNotes ?? [])];
+    Object.freeze(taskChecks);
+    Object.freeze(taskNotes);
+    const taskSeal = taskChecks.length || taskNotes.length ? sealOf(taskChecks, taskNotes) : "";
+    if (taskSeal) {
+      // Journalled before the first request, so the record shows the criteria
+      // predating the work rather than merely claiming to.
+      log?.append("note", {
+        text: `task criteria sealed: ${taskChecks.length} check(s), ${taskNotes.length} note(s)`,
+        seal: taskSeal,
+        checks: taskChecks.map((c) => c.name),
+        notes: taskNotes,
+      });
+      yield {
+        kind: "info",
+        text:
+          `${taskChecks.length} task check(s) and ${taskNotes.length} note(s) sealed for this ` +
+          `turn (${taskSeal.slice(0, 12)}). They cannot change while it runs.`,
+      };
+    }
+
     this.transcript.push({ role: "user", content: userText });
+    if (taskChecks.length || taskNotes.length) {
+      // Stated to the model, because a gate it does not know about is a trap
+      // rather than a specification — and the point is for the work to satisfy
+      // these, not to be caught out by them. Pushed as a separate message so it
+      // survives shedding independently of the ask, and so a reader of the
+      // transcript can see exactly what was set and when.
+      const lines = [
+        "Acceptance criteria for this task, fixed before you began and unchangeable:",
+        ...taskChecks.map((c) =>
+          c.kind === "command"
+            ? `  [checked] ${c.name}: ${c.run}`
+            : `  [checked] ${c.name}: builtin ${c.builtin}`,
+        ),
+        ...taskNotes.map((n) => `  [recorded, not machine-checked] ${n}`),
+        "",
+        "The [checked] ones run when you claim to be finished and can refuse the",
+        "claim. The [recorded] ones appear on the receipt as stated intent and are",
+        "never reported as verified — do not describe one as passing. You cannot",
+        "edit these; attempting to is itself a failure.",
+      ];
+      this.transcript.push({ role: "user", content: lines.join("\n") });
+    }
     log?.append("user_message", {
       chars: userText.length,
       preview: userText.replace(/\s+/g, " ").slice(0, 120),
@@ -1923,11 +2063,13 @@ export class Engine {
     // Narrowed here for the announcement below and for proof_start's names;
     // re-derived at each proof attempt, because whether this turn wrote
     // anything is not known until it has had the chance to.
-    const bar = opts.ask ? withoutWriteChecks(this.cfg.bar) : this.cfg.bar;
+    const bar = opts.ask
+      ? withoutWriteChecks(withTaskChecks(this.cfg.bar, taskChecks))
+      : withTaskChecks(this.cfg.bar, taskChecks);
     const barNow = (): Bar | null =>
       opts.ask
-        ? asQuestion(this.cfg.bar, this.mergedLedger().length === 0)
-        : (this.cfg.bar ?? null);
+        ? asQuestion(withTaskChecks(this.cfg.bar, taskChecks), this.mergedLedger().length === 0)
+        : withTaskChecks(this.cfg.bar, taskChecks);
     if (opts.ask) {
       const dropped = (this.cfg.bar?.checks.length ?? 0) - (bar?.checks.length ?? 0);
       log?.append("note", { text: `ask turn — ${dropped} write-dependent check(s) not run` });
@@ -3039,6 +3181,18 @@ export class Engine {
           shedBatches: this.transcript.shedCount,
           changed: this.mergedLedger().map((e) => ({ path: e.path, before: e.before, after: e.after })),
           did: [...this.did],
+          task: taskSeal
+            ? {
+                // Recomputed from the frozen arrays, not carried along, so a
+                // receipt that disagrees with the journal is a real signal
+                // rather than the same string copied twice.
+                seal: sealOf(taskChecks, taskNotes),
+                checks: taskChecks.map((c) =>
+                  c.kind === "command" ? `${c.name}: ${c.run}` : `${c.name}: builtin ${c.builtin}`,
+                ),
+                notes: [...taskNotes],
+              }
+            : undefined,
         });
         log?.append("receipt", { verdict, file: receipt.path, attempt: proofAttempts });
         yield { kind: "receipt", path: receipt.path };
