@@ -6,6 +6,21 @@
  * working, and nothing said what it was working on, what came back, or what
  * the step cost. A capability with no surface is not a feature — so these
  * mount the actual component, press the actual keys, and read the frames.
+ *
+ * Most describes here run `{ concurrency: true }`. These tests spend their
+ * time waiting — for a render to settle, for a slow provider, for a spinner
+ * frame — rather than computing, and serially that idling was 36s, which was
+ * the entire suite's wall clock. Overlapping it costs nothing and is worth
+ * real money now that the mutation builtin reruns the suite once per broken
+ * line.
+ *
+ * Five describes are deliberately left serial: everything under `/login`,
+ * `/endpoint`, `/model` and the ceiling. Those drive flows that read and
+ * write molt's config, and the whole suite shares one MOLT_CONFIG_DIR, so
+ * their siblings would race on a single config.json. Each holds two or three
+ * tests, so serialising them costs about four seconds — cheap next to a test
+ * that fails once in twenty for a reason nobody can reproduce. Adding a test
+ * that touches config means adding it to a serial describe, not a fast one.
  */
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
@@ -164,7 +179,7 @@ async function submit(stdin: FakeStdin, text: string): Promise<void> {
   await tick(300);
 }
 
-describe("the transparency view", () => {
+describe("the transparency view", { concurrency: true }, () => {
   it("offers the key while it is working, where the answer is needed", async () => {
     const t = await mount({ fetchFn: slowProvider(150) });
     try {
@@ -659,7 +674,7 @@ describe("the transparency view", () => {
   });
 });
 
-describe("narration across steps", () => {
+describe("narration across steps", { concurrency: true }, () => {
   /**
    * A model that talks before each tool call, the way every real one does:
    * a sentence of narration, then the call. The content never ends in a
@@ -762,7 +777,7 @@ describe("narration across steps", () => {
   });
 });
 
-describe("ctrl+C", () => {
+describe("ctrl+C", { concurrency: true }, () => {
   /**
    * Ink exits on ctrl+C by itself unless told not to, beside whatever the app
    * does with the key. These mount with the flag left at its default — the
@@ -880,7 +895,7 @@ describe("ctrl+C", () => {
   });
 });
 
-describe("what the transcript keeps", () => {
+describe("what the transcript keeps", { concurrency: true }, () => {
   /** Streams `text`, then optionally a tool call, then stops. */
   function sayingProvider(turns: { text: string; call?: string }[], stream = true): typeof fetch {
     let n = 0;
@@ -1010,7 +1025,7 @@ describe("what the transcript keeps", () => {
   });
 });
 
-describe("getting out", () => {
+describe("getting out", { concurrency: true }, () => {
   it("escapes a salvage that will not finish", async () => {
     // The reported bug: hitting the budget runs a salvage, the salvage's
     // request was the one request molt never made cancellable, and ctrl+C
@@ -1138,7 +1153,7 @@ describe("getting out", () => {
   });
 });
 
-describe("the delete keys", () => {
+describe("the delete keys", { concurrency: true }, () => {
   /** What a terminal really sends for each of them. */
   const BACKSPACE = "\x7f";
   const FORWARD_DELETE = "\x1b[3~";
@@ -1195,7 +1210,7 @@ describe("the delete keys", () => {
   });
 });
 
-describe("pasting more than one line", () => {
+describe("pasting more than one line", { concurrency: true }, () => {
   /**
    * How many rows the prompt occupies, which is the thing that tears.
    *
@@ -1319,7 +1334,7 @@ describe("pasting more than one line", () => {
   });
 });
 
-describe("what a terminal actually sends for a newline", () => {
+describe("what a terminal actually sends for a newline", { concurrency: true }, () => {
   it("treats carriage returns inside a paste as line breaks", async () => {
     // A terminal sends CR for a line ending — Return sends `\r`, and so does
     // every newline inside a pasted block. The prompt splits on `\n`, so a
@@ -1390,7 +1405,7 @@ describe("what a terminal actually sends for a newline", () => {
   });
 });
 
-describe("looking is not the same as recording", () => {
+describe("looking is not the same as recording", { concurrency: true }, () => {
   /** Rows of the permanent transcript, which is everything above the panel. */
   const transcriptRows = (frame: string): number =>
     frame.split("\n").filter((l) => l.trim() && !/auto (low|medium|high)/.test(l)).length;
@@ -1517,7 +1532,7 @@ describe("raising the ceiling before it stops you", () => {
   });
 });
 
-describe("the view shows what molt is doing, not the payload", () => {
+describe("the view shows what molt is doing, not the payload", { concurrency: true }, () => {
   /** A provider that reads a file with a great many lines in it. */
   function bigReadProvider(dir: string, lines: number): typeof fetch {
     writeFileSync(join(dir, "big.txt"), Array.from({ length: lines }, (_, i) => `content line ${i}`).join("\n"));

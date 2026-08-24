@@ -17,6 +17,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCheck, mutationVerdict, type BarContext } from "../src/bar.js";
+import type { Check, CheckResult } from "../src/types.js";
 import { mutateLine, planMutations, applyMutation } from "../src/mutate.js";
 
 describe("mutating one line", () => {
@@ -295,5 +296,182 @@ describe("the mutation verdict", () => {
 
     const complete = mutationVerdict({ ...base, killed: ["a.ts:1 (> to >=)"], planned: 1, total: 1 });
     assert.doesNotMatch(complete.output, /not mutated/);
+  });
+});
+
+/**
+ * Paying once for the baseline instead of twice.
+ *
+ * The mutation check must know the command passes on unmutated code before a
+ * red run means anything. On this project that command is the suite — the most
+ * expensive thing molt runs — and the `tests` check ran it moments earlier
+ * against the same untouched tree. Reusing that answer saves a full suite run
+ * on every bar attempt; reusing the *wrong* answer would silently remove the
+ * one guard that makes every other result in this check meaningful. So what
+ * counts as reusable is tested here in more detail than the saving is.
+ */
+describe("the mutation baseline", () => {
+  // Each invocation leaves a mark, so the tests below count runs rather than
+  // trusting a report about them.
+  const COUNTED = "echo . >> runs.log && node t/check.js";
+
+  function project(testBody: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "mutbase-"));
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ type: "module" }));
+    writeFileSync(
+      join(dir, "code.js"),
+      "export function over(a, b) {\n  if (a > b) return 1;\n  return 0;\n}\n",
+    );
+    mkdirSync(join(dir, "t"), { recursive: true });
+    writeFileSync(join(dir, "t", "check.js"), testBody);
+    return dir;
+  }
+
+  const STRONG = [
+    'import assert from "node:assert";',
+    'import { over } from "../code.js";',
+    "assert.equal(over(2, 1), 1);",
+    "assert.equal(over(1, 1), 0);",
+    "",
+  ].join("\n");
+
+  const check = (run: string) => ({
+    name: "m",
+    kind: "builtin" as const,
+    builtin: "mutation" as const,
+    tags: [] as string[],
+    run,
+    sample: 1,
+    timeoutMs: 30_000,
+  });
+
+  /** A plain check that already ran `run` in this bar attempt. */
+  function ran(run: string, ok: boolean, over: Partial<Check & CheckResult> = {}) {
+    return {
+      check: {
+        name: "tests",
+        kind: "command" as const,
+        run,
+        timeoutMs: 30_000,
+        expectExit: 0,
+        tags: [],
+        ...over,
+      } as Check,
+      result: {
+        name: "tests",
+        kind: "command" as const,
+        detail: run,
+        ok,
+        output: "",
+        durationMs: 1,
+        ...over,
+      } as CheckResult,
+    };
+  }
+
+  const ctx = (dir: string, over: Partial<BarContext> = {}): BarContext => ({
+    cwd: dir,
+    record: [],
+    archivedBatches: 0,
+    ledger: [{ path: "code.js", before: "x", after: "y", callId: "c1", changedLines: [2] }],
+    ...over,
+  });
+
+  const runs = (dir: string): number => {
+    try {
+      return readFileSync(join(dir, "runs.log"), "utf8").trim().split("\n").filter(Boolean).length;
+    } catch {
+      return 0;
+    }
+  };
+
+  it("runs the command itself when nothing ran it first", async () => {
+    const dir = project(STRONG);
+    try {
+      const r = await runCheck(check(COUNTED), ctx(dir));
+      assert.equal(r.ok, true, r.output);
+      // One baseline, one mutation.
+      assert.equal(runs(dir), 2, "expected a baseline run and one mutated run");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("skips the baseline when an earlier check just ran the same command", async () => {
+    const dir = project(STRONG);
+    try {
+      const r = await runCheck(
+        check(COUNTED),
+        ctx(dir, { earlier: [ran(COUNTED, true)] }),
+      );
+      assert.equal(r.ok, true, r.output);
+      assert.equal(runs(dir), 1, "ran the baseline again despite an earlier identical run");
+      // The saving must not cost the finding: the mutation still happened.
+      assert.match(r.output, /broke a test, as they should/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not run at all when that earlier check failed", async () => {
+    const dir = project(STRONG);
+    try {
+      const r = await runCheck(
+        check(COUNTED),
+        ctx(dir, { earlier: [ran(COUNTED, false)] }),
+      );
+      assert.equal(r.ok, false);
+      assert.match(r.output, /already failed this bar run as check "tests"/);
+      assert.match(r.output, /did not run/);
+      assert.equal(runs(dir), 0, "spent a suite run to rediscover a known failure");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  for (const [why, earlier] of [
+    ["a different command", () => ran("node t/other.js", true)],
+    ["a check that passes by failing", () => ran(COUNTED, true, { expectExit: 1 })],
+    ["a result that was reused rather than run", () => ran(COUNTED, true, { cached: true })],
+  ] as const) {
+    it(`still runs its own baseline after ${why}`, async () => {
+      // Each of these is a "pass" that does not mean what the baseline needs
+      // it to mean. Accepting one would drop the guard without saying so.
+      const dir = project(STRONG);
+      try {
+        const r = await runCheck(check(COUNTED), ctx(dir, { earlier: [earlier()] }));
+        assert.equal(r.ok, true, r.output);
+        assert.equal(runs(dir), 2, "reused a result that was not a green run of this command");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("puts back a report another check reads", async () => {
+    // The failure this closes: the command writes coverage/lcov.info, this
+    // check reruns it from broken source, and `diff-covered` — never cached —
+    // judges the turn on coverage produced by code that was deliberately
+    // wrong. A mutated run whose suite fails writes a materially shorter
+    // report, so a good turn fails a check for a reason not on disk any more.
+    const dir = project(STRONG);
+    try {
+      mkdirSync(join(dir, "coverage"), { recursive: true });
+      const lcov = join(dir, "coverage", "lcov.info");
+      writeFileSync(lcov, "REAL COVERAGE FROM THE REAL CODE\n");
+      const clobber = "echo CLOBBERED > coverage/lcov.info && node t/check.js";
+      const r = await runCheck(
+        check(clobber),
+        ctx(dir, { protect: ["coverage/lcov.info"] }),
+      );
+      assert.equal(r.ok, true, r.output);
+      assert.equal(
+        readFileSync(lcov, "utf8"),
+        "REAL COVERAGE FROM THE REAL CODE\n",
+        "left a later check reading coverage generated from mutated source",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

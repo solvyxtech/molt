@@ -92,3 +92,32 @@ checks:
     builtin: diff-covered
     lcov: coverage/lcov.info
     tags: [session]
+
+  # The last rung, and the only builtin that runs a command.
+  #
+  # `work-proven` proves a changed line is executed. It cannot prove anything
+  # *checks* what the line does: a test that calls a function and asserts
+  # nothing satisfies coverage completely, and a line covered that way is
+  # exactly as unproven as one never run — the difference is that coverage
+  # says it is fine. The only mechanical answer is to break the line and see
+  # whether the suite goes red. `run` is the command that is supposed to go
+  # red; molt chooses the lines.
+  #
+  # It runs LAST on purpose. It reruns `npm test` from deliberately broken
+  # source, which rewrites `coverage/lcov.info` — the report `work-proven`
+  # reads. Ordering it after that check means the coverage judged is the
+  # coverage the real code produced. (The check also puts the file back, so
+  # neither safeguard is load-bearing alone.)
+  #
+  # Cost, measured rather than guessed: `npm test` is ~17s here, and the
+  # baseline run is skipped because the `tests` check above already ran the
+  # identical command on the identical unmutated tree. So this is `sample`
+  # suite runs, not `sample` + 1 — about 50s at 3, and it says plainly how
+  # many changed lines it did not get to. Raise `sample` to buy more coverage
+  # of the diff at ~17s each.
+  - name: work-checked
+    builtin: mutation
+    run: npm test
+    sample: 3
+    timeout: 90
+    tags: [session, slow]

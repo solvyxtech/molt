@@ -84,6 +84,22 @@ export type BarContext = {
   expectedArchiveFiles?: string[];
   /** The completion claim being judged, when there is one. */
   claim?: string;
+  /**
+   * Checks already run in this bar attempt, in order.
+   *
+   * Only the mutation builtin reads this, and only to avoid paying twice for
+   * the same command: its baseline run asks exactly the question the `tests`
+   * check answered moments earlier on the same unmutated tree. A check that
+   * consults this must be able to state why an earlier result is as good as
+   * running it again — "it is slow" is not that reason.
+   */
+  earlier?: { check: Check; result: CheckResult }[];
+  /**
+   * Files one check writes and another reads — the bar's declared `lcov`
+   * reports. A check that reruns a build has to put these back, or it corrupts
+   * the evidence a later check is judged on.
+   */
+  protect?: string[];
 };
 
 export function barPath(cwd: string): string {
@@ -501,6 +517,32 @@ export function claimedWrites(record: Msg[]): string[] {
  * verification tool that leaves your source altered has done something far
  * worse than miss a bug.
  */
+/**
+ * A plain check earlier in this same bar attempt that ran exactly this command.
+ *
+ * Deliberately strict, because the answer is used in place of running the
+ * command again:
+ *
+ *  - identical command text, so a different suite cannot stand in for this one;
+ *  - `expectExit === 0`, since a check built to expect a failure passes by
+ *    failing, and "passed" there is not the green baseline this needs;
+ *  - not a cached result. A cache hit says the watched files have not moved,
+ *    which is a claim about the filesystem rather than a run that happened.
+ *    The baseline is the one thing here that must have actually executed.
+ */
+function priorRunOf(
+  ctx: BarContext,
+  run: string,
+): { check: Check; result: CheckResult } | null {
+  for (const e of ctx.earlier ?? []) {
+    if (e.check.kind !== "command") continue;
+    if (e.check.run !== run || e.check.expectExit !== 0) continue;
+    if (e.result.cached) continue;
+    return e;
+  }
+  return null;
+}
+
 async function mutationCheck(
   ctx: BarContext,
   run: string,
@@ -533,22 +575,59 @@ async function mutationCheck(
     };
   }
 
+  // Snapshot before anything runs, the baseline included — it runs the same
+  // command and writes the same side effects. Taking this after it would
+  // preserve output the check itself produced rather than the turn's.
+  //
+  // Whatever the command writes as a side effect, it is about to write it
+  // again from deliberately broken source. `coverage/lcov.info` is the case
+  // that bites: `diff-covered` reads it, builtins are never cached, so the
+  // next bar attempt would judge this turn's coverage using a report generated
+  // from mutated code — and a mutated run that fails its suite writes a
+  // materially shorter report. A green turn would fail a check for a reason
+  // that no longer exists on disk. Anything another check declares it reads is
+  // put back exactly as it was found.
+  const artifacts = (ctx.protect ?? [])
+    .map((rel) => ({ rel, abs: resolve(ctx.cwd, rel) }))
+    .filter((a) => existsSync(a.abs))
+    .map((a) => ({ ...a, body: readFileSync(a.abs) }));
+
   // The command has to pass on the unmutated code before any of this means
   // anything. A suite that is already red counts every mutation as "killed" —
   // the command failed, after all — and the check reports "N mutations broke a
   // test, as they should" having tested precisely nothing. That is the exact
   // shape of false confidence this tool exists to refuse, and it passed a
   // hand-written probe before being caught.
-  const baseline = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal });
-  if (baseline.code !== 0) {
+  //
+  // It does not have to be *this* check that runs it. A plain check earlier in
+  // the same bar attempt, running the identical command against the identical
+  // unmutated tree, has already answered the question — and on this project
+  // that command is the suite, which is the single most expensive thing molt
+  // runs. Reusing it is worth one full run of every bar attempt.
+  const prior = priorRunOf(ctx, run);
+  if (prior && !prior.result.ok) {
+    // Already known red, and knowing it cost nothing. Running it again to
+    // rediscover that would be the most expensive way to learn nothing.
     return {
       ok: false,
       output:
-        `\`${run}\` fails on the unmutated code (exit ${baseline.code}), so breaking a line ` +
-        `proves nothing — every mutation would look killed by a failure that was already ` +
-        `there. Fix the suite first.\n\n` +
-        (baseline.stdout || baseline.stderr || "").slice(0, 600),
+        `\`${run}\` already failed this bar run as check "${prior.check.name}", so breaking a ` +
+        `line proves nothing — every mutation would look killed by a failure that was ` +
+        `already there. Fix that check first; this one did not run.`,
     };
+  }
+  if (!prior) {
+    const baseline = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal });
+    if (baseline.code !== 0) {
+      return {
+        ok: false,
+        output:
+          `\`${run}\` fails on the unmutated code (exit ${baseline.code}), so breaking a line ` +
+          `proves nothing — every mutation would look killed by a failure that was already ` +
+          `there. Fix the suite first.\n\n` +
+          (baseline.stdout || baseline.stderr || "").slice(0, 600),
+      };
+    }
   }
 
   const survived: string[] = [];
@@ -577,6 +656,17 @@ async function mutationCheck(
     } finally {
       writeFileSync(file.abs, file.text, "utf8");
       if (sha256Of(file.abs) !== file.sha) restoreFailures.push(file.path);
+    }
+  }
+
+  // Put back what the runs above overwrote, before any result is reported. A
+  // later check reading a stale artifact is a failure this check caused, and
+  // it would be attributed to the turn's work rather than to the tool.
+  for (const a of artifacts) {
+    try {
+      writeFileSync(a.abs, a.body);
+    } catch {
+      restoreFailures.push(a.rel);
     }
   }
 
@@ -1004,9 +1094,15 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
  *  1. **Memory only.** Never written to disk, never shared between processes.
  *     A cache that outlives the session outlives the environment it was true
  *     in — a dependency install, a toolchain change, a different branch.
- *  2. **Commands only.** Builtins read the session record rather than the
- *     filesystem, and they are cheap. Nothing to save and everything to get
- *     wrong.
+ *  2. **Commands only.** Builtins are keyed on the session record, not the
+ *     filesystem, so a fingerprint over watched files cannot say whether one
+ *     is still true — the ledger moves under them while every watched file
+ *     stands still. That is the reason, and it is not cost: the mutation
+ *     builtin is the most expensive check molt runs. It buys its time back by
+ *     reusing an earlier check's run of the same command (`priorRunOf`), which
+ *     is sound for the opposite reason a cache would not be — it reuses a run
+ *     that happened during this attempt rather than a claim that nothing moved
+ *     since the last one.
  *  3. **The check itself is part of the key.** Editing a command invalidates
  *     it, so a bar that changed cannot reuse a result from the bar before it.
  *  4. **Said out loud.** A reused result is marked in the transcript, in the
@@ -1046,15 +1142,23 @@ export async function runBar(bar: Bar, ctx: BarContext): Promise<BarResult> {
   // each other's output, and a bar that fails depending on scheduling is worse
   // than a slow one.
   const results: CheckResult[] = [];
+  const earlier: { check: Check; result: CheckResult }[] = [];
+  // Declared once, from the bar itself, so a project that adds a coverage
+  // check gets it protected without having to know it needed protecting.
+  const protect = bar.checks
+    .map((c) => (c.kind === "builtin" ? c.lcov : undefined))
+    .filter((p): p is string => typeof p === "string" && p.length > 0);
   for (const c of bar.checks) {
     const reused = ctx.cache?.get(c, ctx.cwd) ?? null;
     if (reused) {
       results.push(reused);
+      earlier.push({ check: c, result: reused });
       continue;
     }
-    const fresh = await runCheck(c, ctx);
+    const fresh = await runCheck(c, { ...ctx, earlier, protect });
     ctx.cache?.put(c, ctx.cwd, fresh);
     results.push(fresh);
+    earlier.push({ check: c, result: fresh });
   }
   const warnings = results.filter((r) => !r.ok && r.advisory);
   return {
