@@ -568,19 +568,87 @@ select { flex: 0 0 auto; min-width: 150px; cursor: pointer; }
 
 .side-stack { display: flex; flex-direction: column; gap: 7px; align-items: flex-end; }
 
-.autonomy { display: flex; border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; }
+/*
+ * Three bars rather than three words.
+ *
+ * The words cost a whole row of the composer and said less: "low / medium /
+ * high" as buttons reads as three separate things you might do, when it is one
+ * scale with a position on it. Bars rising left to right are the same shape as
+ * every signal meter, so the level is legible without reading anything — and
+ * the word is still there, above, for when precision matters.
+ */
+.au-wrap { display: flex; align-items: center; gap: 9px; }
+.au-label {
+  color: var(--dim);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.au-label b { color: var(--accent); font-weight: 500; }
+
+.autonomy {
+  display: flex; align-items: flex-end; gap: 2px;
+  height: 16px;
+  padding: 0 2px;
+}
 .autonomy .au {
   appearance: none;
-  background: none;
+  background: var(--line);
   border: 0;
-  border-left: 1px solid var(--line);
-  color: var(--dim);
-  font: inherit;
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  padding: 3px 10px;
+  border-radius: 1px;
+  width: 6px;
+  padding: 0;
   cursor: pointer;
+  transition: background 0.12s;
+  /* The label is the accessible name; the glyph carries no text. */
+  font-size: 0;
+  color: transparent;
 }
-.autonomy .au:first-child { border-left: 0; }
-.autonomy .au:hover { color: var(--text); background: var(--bg-sunken); }
-.autonomy .au.on { background: var(--ghost); color: var(--accent); }
+.autonomy .au[data-i="0"] { height: 6px; }
+.autonomy .au[data-i="1"] { height: 11px; }
+.autonomy .au[data-i="2"] { height: 16px; }
+.autonomy .au:hover { background: var(--dim); }
+/* Filled up to the current level, the way a meter fills. */
+.autonomy .au.lit { background: var(--accent); }
+.autonomy:hover .au { background: var(--line); }
+.autonomy:hover .au.hot { background: var(--dim); }
+
+/* ── command palette ───────────────────────────────────────────────────── */
+
+.palette {
+  position: absolute;
+  left: var(--pad);
+  /* Wide enough for the longest name plus its summary, and no wider — a list
+     that spans a 2560px display puts the description a foot from the name. */
+  width: min(760px, calc(100vw - var(--pad) * 2));
+  bottom: 74px;
+  z-index: 30;
+  background: var(--bg-raised);
+  border: 1px solid var(--dim);
+  border-radius: var(--r);
+  overflow: hidden;
+  /* Ten rows or so. 46vh was 770px on this display: the palette covered the
+     panel behind it and read as a screen rather than a suggestion. */
+  max-height: 340px;
+  display: flex; flex-direction: column;
+  box-shadow: 0 -8px 24px rgba(2, 10, 14, 0.5);
+}
+.palette-rows { overflow: auto; }
+.palette-rows button {
+  display: flex; align-items: baseline; gap: 12px;
+  width: 100%; text-align: left;
+  background: none; border: 0; color: var(--text);
+  font: inherit; padding: 5px 12px; cursor: pointer;
+}
+.palette-rows button .cmd { color: var(--accent); white-space: nowrap; }
+.palette-rows button .sum { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.palette-rows button.on { background: var(--ghost); }
+.palette-rows button.on .sum { color: var(--text); }
+.palette-foot {
+  display: flex; gap: 16px;
+  padding: 5px 12px;
+  border-top: 1px solid var(--line-soft);
+  background: var(--bg-sunken);
+  color: var(--line);
+  font-size: 11px;
+}

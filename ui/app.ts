@@ -37,6 +37,9 @@ type MoltBridge = {
   setAutonomy(
     level: string,
   ): Promise<{ ok: boolean; error?: string; state?: AppState; means?: string }>;
+  command(name: string, arg: string): Promise<CommandOutcome>;
+  reset(): Promise<{ ok: boolean; error?: string; state?: AppState }>;
+  initBar(): Promise<CommandOutcome & { state?: AppState }>;
   run(text: string, ask?: boolean): Promise<{ ok: boolean; error?: string }>;
   cancel(): void;
   answerConfirm(id: string, ok: boolean): void;
@@ -64,7 +67,14 @@ type AppState = {
   providers: string[];
   keyed: string[];
   themes: string[];
+  commands: { name: string; args?: string; summary: string; aliases?: string[] }[];
 };
+
+type CommandOutcome =
+  | { kind: "info"; text: string }
+  | { kind: "error"; text: string }
+  | { kind: "bar"; result: any }
+  | { kind: "unhandled" };
 
 type ModelSource = {
   name: string;
@@ -140,6 +150,7 @@ function showTab(name: string): void {
   // The composer belongs to the session; showing it elsewhere invites you to
   // type a task into a screen that will not run one.
   $("composer").classList.toggle("hidden", name !== "session");
+  if (name !== "session") closePalette();
   if (name === "receipts") void loadReceipts();
   if (name === "log") void loadJournal();
   if (name === "checks") clearBadge("checks");
@@ -773,9 +784,41 @@ function autogrow(): void {
   promptBox.style.height = "auto";
   promptBox.style.height = `${Math.min(promptBox.scrollHeight, 200)}px`;
 }
-promptBox.addEventListener("input", autogrow);
+promptBox.addEventListener("input", () => {
+  autogrow();
+  refreshPalette();
+});
 
 promptBox.addEventListener("keydown", (e) => {
+  // While the palette is open the arrow keys belong to it, not to the caret.
+  if (paletteMatches.length > 0) {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const d = e.key === "ArrowDown" ? 1 : -1;
+      paletteIndex = (paletteIndex + d + paletteMatches.length) % paletteMatches.length;
+      drawPalette();
+      return;
+    }
+    if (e.key === "Tab") {
+      e.preventDefault();
+      const c = paletteMatches[paletteIndex];
+      if (c) {
+        promptBox.value = c.args ? `${c.name} ` : c.name;
+        refreshPalette();
+      }
+      return;
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closePalette();
+      return;
+    }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      void runPaletteChoice();
+      return;
+    }
+  }
   // Enter sends; shift+Enter is a newline. The opposite of a chat box would be
   // wrong here — a task is usually one line and sending it should not need a
   // second gesture.
@@ -790,6 +833,25 @@ const ask0 = (): boolean => ($("ask") as HTMLInputElement).checked;
 async function send(): Promise<void> {
   const text = promptBox.value.trim();
   if (!text || busy) return;
+  // A line beginning with / is a command. Sending it to the model instead is
+  // how "/budget 40000" becomes a request to write a budgeting feature.
+  if (text.startsWith("/")) {
+    closePalette();
+    promptBox.value = "";
+    autogrow();
+    const sp = text.indexOf(" ");
+    const name = sp === -1 ? text : text.slice(0, sp);
+    const arg = sp === -1 ? "" : text.slice(sp + 1).trim();
+    say("you", text, "user");
+    await runCommand(name, arg);
+    return;
+  }
+  // "? question" is the terminal's shorthand for ask-only.
+  if (text.startsWith("?")) {
+    ($("ask") as HTMLInputElement).checked = true;
+    promptBox.value = text.slice(1).trim();
+    return void send();
+  }
   if (!state?.open) {
     showTab("settings");
     $("set-status").textContent = "Open a workspace first.";
@@ -834,13 +896,26 @@ function renderAutonomy(): void {
   const box = $("autonomy");
   box.textContent = "";
   if (!state) return;
-  for (const { level, means } of state.autonomyLevels) {
-    const b = el("button", `au${level === state.autonomy ? " on" : ""}`, level) as HTMLButtonElement;
-    // The summary is the engine's own words for what the level permits.
-    b.title = means;
+  const at = state.autonomyLevels.findIndex((l) => l.level === state!.autonomy);
+  for (const [i, { level, means }] of state.autonomyLevels.entries()) {
+    const b = el("button", `au${i <= at ? " lit" : ""}`) as HTMLButtonElement;
+    b.dataset.i = String(i);
+    b.type = "button";
+    // The engine's own words for what this level permits — the tooltip is the
+    // only place the full sentence fits now that the buttons are 6px wide.
+    b.title = `${level} — ${means}`;
+    b.setAttribute("aria-label", `${level}: ${means}`);
+    b.textContent = level;
+    // Hovering previews the level you would set, filling to that bar.
+    b.addEventListener("mouseenter", () => {
+      for (const [j, other] of [...box.children].entries())
+        other.classList.toggle("hot", j <= i);
+    });
     b.addEventListener("click", () => void chooseAutonomy(level, means));
     box.appendChild(b);
   }
+  $("au-name").textContent = state.autonomy;
+  $("au-name").title = state.autonomyLevels[at]?.means ?? "";
 }
 
 async function chooseAutonomy(level: string, means: string): Promise<void> {
@@ -856,6 +931,230 @@ async function chooseAutonomy(level: string, means: string): Promise<void> {
   // nobody remembers making.
   if (state.open) say("", `autonomy: ${level} — ${means}`, "info");
   localStorage.setItem("molt.autonomy", level);
+}
+
+// ── slash commands ───────────────────────────────────────────────────────────
+
+/**
+ * The palette, as the terminal has it.
+ *
+ * The matching rules are `src/commands.ts`, imported rather than reimplemented
+ * — exact name, then prefix, then subsequence, then a word in the summary, ties
+ * breaking toward the shorter name. That file exists because a palette that
+ * surfaces the wrong command teaches people to stop reading it, and having two
+ * implementations of those rules is the surest way to get two behaviours.
+ *
+ * Bundled into the renderer, where it is pure logic over a list of names. The
+ * commands that need an engine are executed in the main process; the ones that
+ * are only about this window are handled here.
+ */
+let paletteMatches: AppState["commands"] = [];
+let paletteIndex = 0;
+
+function isSubsequence(needle: string, hay: string): boolean {
+  if (needle.length === 0) return true;
+  let i = 0;
+  for (const ch of hay) {
+    if (ch === needle[i]) i++;
+    if (i === needle.length) return true;
+  }
+  return false;
+}
+
+/** Mirrors matchCommands in src/commands.ts, including the tie-breaks. */
+function matchCommands(input: string): AppState["commands"] {
+  const all = state?.commands ?? [];
+  const trimmed = input.trim();
+  if (!trimmed.startsWith("/")) return [];
+  // Once there is an argument the command is settled — stop suggesting.
+  if (/\s/.test(trimmed)) return [];
+  const q = trimmed.slice(1).toLowerCase();
+  if (q === "") return all;
+
+  const scored: { c: AppState["commands"][number]; rank: number }[] = [];
+  for (const c of all) {
+    const name = c.name.slice(1).toLowerCase();
+    const terms = [name, ...(c.aliases ?? [])].map((t) => t.toLowerCase());
+    let rank = -1;
+    if (name === q) rank = 0;
+    else if (terms.some((t) => t.startsWith(q))) rank = 1;
+    else if (isSubsequence(q, name)) rank = 2;
+    else if (c.summary.toLowerCase().split(/\W+/).some((w) => w.startsWith(q))) rank = 3;
+    if (rank >= 0) scored.push({ c, rank });
+  }
+  scored.sort(
+    (a, b) => a.rank - b.rank || a.c.name.length - b.c.name.length || a.c.name.localeCompare(b.c.name),
+  );
+  return scored.map((s) => s.c);
+}
+
+function drawPalette(): void {
+  const box = $("palette-rows");
+  box.textContent = "";
+  for (const [i, c] of paletteMatches.entries()) {
+    const b = el("button", i === paletteIndex ? "on" : "") as HTMLButtonElement;
+    b.appendChild(el("span", "cmd", c.args ? `${c.name} ${c.args}` : c.name));
+    b.appendChild(el("span", "sum", c.summary));
+    b.addEventListener("click", () => {
+      paletteIndex = i;
+      void runPaletteChoice();
+    });
+    box.appendChild(b);
+  }
+  $("palette").classList.toggle("hidden", paletteMatches.length === 0);
+  box.querySelector("button.on")?.scrollIntoView({ block: "nearest" });
+}
+
+function refreshPalette(): void {
+  // The palette belongs to the prompt. On another tab there is no prompt to
+  // run a command from, so offering one is a menu that cannot be used.
+  if ($("composer").classList.contains("hidden")) {
+    closePalette();
+    return;
+  }
+  paletteMatches = matchCommands(promptBox.value);
+  if (paletteIndex >= paletteMatches.length) paletteIndex = 0;
+  drawPalette();
+}
+
+function closePalette(): void {
+  paletteMatches = [];
+  paletteIndex = 0;
+  $("palette").classList.add("hidden");
+}
+
+/** Enter on a highlighted row: complete it if it takes an argument, else run. */
+async function runPaletteChoice(): Promise<void> {
+  const c = paletteMatches[paletteIndex];
+  if (!c) return;
+  closePalette();
+  if (c.args) {
+    // Needs an argument, so complete rather than run — firing /regrow with no
+    // pattern just to print its usage line wastes the keystroke.
+    promptBox.value = `${c.name} `;
+    promptBox.focus();
+    return;
+  }
+  promptBox.value = "";
+  await runCommand(c.name, "");
+}
+
+/**
+ * Run one command, wherever it belongs.
+ *
+ * Window commands are handled here. Everything else goes to the main process,
+ * which answers `unhandled` for a name it does not know — so an unknown command
+ * is reported once, by the side that knows it is unknown, rather than silently
+ * doing nothing.
+ */
+async function runCommand(name: string, arg: string): Promise<void> {
+  switch (name) {
+    case "/help":
+      for (const c of state?.commands ?? [])
+        say("", `  ${(c.args ? `${c.name} ${c.args}` : c.name).padEnd(30)}${c.summary}`, "info");
+      return;
+    case "/exit":
+    case "/quit":
+      window.close();
+      return;
+    case "/molt": {
+      const names = state?.themes ?? [];
+      const sel = $("set-theme") as HTMLSelectElement;
+      const next = names[(names.indexOf(sel.value) + 1) % names.length]!;
+      sel.value = next;
+      sel.dispatchEvent(new Event("change"));
+      say("", `theme: ${next}`, "info");
+      return;
+    }
+    case "/model":
+      if (arg) {
+        await chooseModel(arg, state?.baseUrl ?? "");
+        return;
+      }
+      await openPicker();
+      return;
+    case "/autonomy":
+    case "/auto": {
+      const lv = state?.autonomyLevels.find((l) => l.level === arg);
+      if (!arg || !lv) {
+        say("", `autonomy: ${state?.autonomy} — click low/medium/high beside the prompt`, "info");
+        return;
+      }
+      await chooseAutonomy(lv.level, lv.means);
+      return;
+    }
+    case "/ask":
+    case "/q":
+      ($("ask") as HTMLInputElement).checked = true;
+      if (arg) {
+        promptBox.value = arg;
+        await send();
+      } else {
+        say("", "ask only is on — the next turn is a question", "info");
+      }
+      return;
+    case "/verbose":
+    case "/detail":
+      showTab("view");
+      return;
+    case "/receipts":
+      showTab("receipts");
+      return;
+    case "/login":
+      showTab("settings");
+      ($("set-key") as HTMLInputElement).focus();
+      if (arg) ($("set-provider") as HTMLSelectElement).value = arg;
+      return;
+    case "/endpoint":
+      showTab("settings");
+      if (arg) ($("set-url") as HTMLInputElement).value = arg;
+      ($("set-url") as HTMLInputElement).focus();
+      return;
+    case "/clear": {
+      const r = await molt.reset();
+      if (!r.ok) {
+        say("error", r.error ?? "could not reset", "error");
+        return;
+      }
+      stream().textContent = "";
+      state = r.state ?? state;
+      applyState();
+      say("", "session reset — context cleared, the record on disk is untouched", "info");
+      return;
+    }
+    case "/init": {
+      const r = await molt.initBar();
+      if (r.kind === "error") say("error", r.text, "error");
+      else if (r.kind === "info") {
+        say("", r.text, "info");
+        if (r.state) {
+          state = r.state;
+          applyState();
+        }
+      }
+      return;
+    }
+  }
+
+  const out = await molt.command(name, arg);
+  switch (out.kind) {
+    case "info":
+      say("", out.text, "info");
+      // /bar and /wire are about a surface that has its own tab; land there.
+      if (name === "/bar") showTab("checks");
+      if (name === "/wire") showTab("view");
+      return;
+    case "error":
+      say("error", out.text, "error");
+      return;
+    case "bar":
+      append(proofBlock({ kind: "proof_result", result: out.result }));
+      renderChecks({ kind: "proof_result", result: out.result });
+      return;
+    case "unhandled":
+      say("error", `unknown command: ${name} — /help lists them`, "error");
+      return;
+  }
 }
 
 // ── settings ─────────────────────────────────────────────────────────────────

@@ -34,6 +34,9 @@ contextBridge.exposeInMainWorld("molt", {
   setModel: (opts: { model: string; baseUrl?: string; apiKey?: string }) =>
     ipcRenderer.invoke("session:model", opts),
   setAutonomy: (level: string) => ipcRenderer.invoke("session:autonomy", level),
+  command: (name: string, arg: string) => ipcRenderer.invoke("command:run", name, arg),
+  reset: () => ipcRenderer.invoke("session:reset"),
+  initBar: () => ipcRenderer.invoke("bar:init"),
 
   run: (text: string, ask = false) => ipcRenderer.invoke("session:run", text, ask),
   cancel: () => ipcRenderer.send("session:cancel"),

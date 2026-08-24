@@ -21,7 +21,7 @@ import { Engine } from "../src/engine.js";
 import { Archive } from "../src/archive.js";
 import { Receipts } from "../src/receipts.js";
 import { Journal } from "../src/journal.js";
-import { loadBar, BarError } from "../src/bar.js";
+import { loadBar, BarError, writeDefaultBar, BAR_FILENAME } from "../src/bar.js";
 import type { Bar, Check } from "../src/types.js";
 import { AUTONOMY_LEVELS, AUTONOMY_SUMMARY, isAutonomy, type Autonomy } from "../src/autonomy.js";
 import { getTheme, THEMES, DEFAULT_THEME } from "../src/theme.js";
@@ -36,6 +36,8 @@ import {
   PROVIDERS,
 } from "../src/providers.js";
 import type { EngineEvent } from "../src/types.js";
+import { COMMANDS } from "../src/commands.js";
+import { runEngineCommand } from "./commands.js";
 
 /**
  * Where this bundle sits on disk.
@@ -149,7 +151,11 @@ function stateOf(s: Session | null) {
     baseUrl: s?.baseUrl ?? null,
     provider: s?.provider ?? null,
     selfHosted: s ? isSelfHosted(s.baseUrl) : false,
-    autonomy: s?.engine.autonomy ?? "medium",
+    // The module-level level, not a literal. `stateOf(null)` used to answer
+    // "medium" whatever you had just chosen, so with no workspace open every
+    // click was accepted, echoed back as medium, and re-rendered as medium —
+    // reported as "low, medium and high aren't actually selectable".
+    autonomy: s?.engine.autonomy ?? autonomy,
     autonomyLevels: AUTONOMY_LEVELS.map((l) => ({ level: l, means: AUTONOMY_SUMMARY[l] })),
     checks:
       s?.bar?.checks.map((c: Check) => ({ name: c.name, kind: c.kind, tags: c.tags })) ?? [],
@@ -158,6 +164,7 @@ function stateOf(s: Session | null) {
     providers: Object.keys(PROVIDERS),
     keyed: Object.keys(auth),
     themes: Object.keys(THEMES),
+    commands: COMMANDS,
   };
 }
 
@@ -371,10 +378,29 @@ function createWindow(): void {
   }
 
   if (process.argv.includes("--self-check")) {
-    win.webContents.once("did-finish-load", () => {
+    win.webContents.once("did-finish-load", async () => {
+      // `did-finish-load` means the page parsed, not that the app booted.
+      // boot() awaits several IPC round trips before it draws anything it
+      // renders itself, so a check that reads the DOM here sees the static
+      // HTML and none of the app — which looked exactly like "the autonomy
+      // control renders zero bars". Wait for something JS-built to exist.
+      let ready = false;
+      for (let i = 0; i < 100; i++) {
+        ready = await win!.webContents.executeJavaScript(
+          `document.querySelectorAll("#autonomy .au").length > 0`,
+        );
+        if (ready) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      if (!ready) {
+        console.error("[self-check] the app never finished booting (5s)");
+        console.log("[self-check] FAIL");
+        app.exit(1);
+        return;
+      }
       void win!.webContents
         .executeJavaScript(
-          `(() => {
+          `(async () => {
              const need = ["tabs","panels","stream","wire","checks","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","autonomy","ask"];
              const missing = need.filter((id) => !document.getElementById(id));
              const tabs = [...document.querySelectorAll(".tab")].map((t) => t.dataset.tab);
@@ -386,7 +412,37 @@ function createWindow(): void {
                accent,
                panels: [...document.querySelectorAll(".panel")].length,
                autonomyButtons: document.querySelectorAll("#autonomy .au").length,
-               autonomyOn: (document.querySelector("#autonomy .au.on")||{}).textContent||"",
+               autonomyOn: (document.getElementById("au-name")||{}).textContent||"",
+               // Clicking a level must change the level. It did not: stateOf()
+               // answered a hardcoded "medium" with no session open, so every
+               // click was echoed back as medium and re-rendered as medium.
+               autonomySticks: await (async () => {
+                 const bars = document.querySelectorAll("#autonomy .au");
+                 if (bars.length !== 3) return false;
+                 bars[2].click();
+                 await new Promise((r) => setTimeout(r, 150));
+                 const name = (document.getElementById("au-name")||{}).textContent;
+                 const lit = document.querySelectorAll("#autonomy .au.lit").length;
+                 bars[1].click();
+                 await new Promise((r) => setTimeout(r, 150));
+                 return name === "high" && lit === 3;
+               })(),
+               paletteRows: await (async () => {
+                 document.querySelector('.tab[data-tab="session"]').click();
+                 const box = document.getElementById("prompt");
+                 box.value = "/";
+                 box.dispatchEvent(new Event("input"));
+                 await new Promise((r) => setTimeout(r, 60));
+                 const n = document.querySelectorAll("#palette-rows button").length;
+                 // And it must close when the prompt is no longer showing one.
+                 document.querySelector('.tab[data-tab="settings"]').click();
+                 const leaked = document.getElementById("palette").classList.contains("hidden")
+                   ? 0
+                   : 1000;
+                 box.value = "";
+                 box.dispatchEvent(new Event("input"));
+                 return n - leaked;
+               })(),
                nulRoundTrip: (() => {
                  const o = new Option("x", "a/b" + String.fromCharCode(0) + "http://h:1/v1");
                  const p = o.value.split(String.fromCharCode(0));
@@ -404,20 +460,33 @@ function createWindow(): void {
             r.tabs.length === 6 &&
             r.nulRoundTrip === true &&
             r.autonomyButtons === 3 &&
-            String(r.autonomyOn).length > 0;
+            String(r.autonomyOn).length > 0 &&
+            r.autonomySticks === true &&
+            Number(r.paletteRows) >= 15;
           console.log(`[self-check] bridge      ${r.bridge ? "ok" : "MISSING"}`);
           console.log(`[self-check] elements    ${(r.missing as string[]).length === 0 ? "ok" : "missing " + (r.missing as string[]).join(", ")}`);
           console.log(`[self-check] tabs        ${(r.tabs as string[]).join(", ")}`);
           console.log(`[self-check] panels      ${r.panels}`);
           console.log(`[self-check] accent      ${r.accent}`);
           console.log(`[self-check] option key  ${r.nulRoundTrip ? "ok" : "NUL LOST"}`);
-          console.log(`[self-check] autonomy    ${r.autonomyButtons} levels, on: ${r.autonomyOn || "NONE"}`);
+          console.log(
+            `[self-check] autonomy    ${r.autonomyButtons} bars, at: ${r.autonomyOn || "NONE"}` +
+              `, click sticks: ${r.autonomySticks}`,
+          );
+          console.log(`[self-check] palette     ${r.paletteRows} command(s) on "/"`);
           console.log(ok ? "[self-check] PASS" : "[self-check] FAIL");
           // A screenshot on demand, because "PASS" says the page assembled and
           // says nothing about whether it is legible. Support asks for one of
           // these on the first call every time.
           const shot = process.env.MOLT_SHOT;
           if (shot) {
+            if (process.env.MOLT_SHOT_PALETTE === "1") {
+              void win!.webContents.executeJavaScript(
+                `(() => { document.querySelector('.tab[data-tab="session"]').click();
+                          const b = document.getElementById("prompt");
+                          b.value = "/"; b.dispatchEvent(new Event("input")); return 0; })()`,
+              );
+            }
             void win!.webContents.capturePage().then((img) => {
               writeFileSync(shot, img.toPNG());
               console.log(`[self-check] shot        ${shot}`);
@@ -573,6 +642,52 @@ ipcMain.handle("session:autonomy", (_e, level: string) => {
   autonomy = level;
   session?.engine.setAutonomy(level);
   return { ok: true, state: stateOf(session), means: AUTONOMY_SUMMARY[level] };
+});
+
+/**
+ * A slash command that needs the engine.
+ *
+ * The window handles the ones that are only about itself — tabs, theme, the
+ * model picker — and sends the rest here. `unhandled` comes back for anything
+ * this side does not know, which is how the renderer tells a command it should
+ * have handled from one it mistyped.
+ */
+ipcMain.handle("command:run", async (_e, name: string, arg: string) => {
+  if (!session) return { kind: "error", text: "no workspace is open" };
+  if (running && (name === "/shed" || name === "/regrow" || name === "/prove")) {
+    return { kind: "error", text: `${name} changes session state — stop the turn first` };
+  }
+  try {
+    return await runEngineCommand(session.engine, name, arg);
+  } catch (e) {
+    return { kind: "error", text: String(e) };
+  }
+});
+
+ipcMain.handle("session:reset", () => {
+  if (!session) return { ok: false, error: "no workspace is open" };
+  if (running) return { ok: false, error: "a turn is running — stop it first" };
+  session.engine.reset();
+  return { ok: true, state: stateOf(session) };
+});
+
+ipcMain.handle("bar:init", () => {
+  if (!session) return { kind: "error" as const, text: "no workspace is open" };
+  try {
+    const wrote = writeDefaultBar(session.cwd);
+    // Re-read it, or the session goes on believing it has no bar.
+    session.bar = loadBar(session.cwd);
+    session.engine.setBar(session.bar);
+    return {
+      kind: "info" as const,
+      text: wrote
+        ? `wrote ${BAR_FILENAME} — ${session.bar?.checks.length ?? 0} check(s). Edit it to match this project.`
+        : `${BAR_FILENAME} already exists — left alone`,
+      state: stateOf(session),
+    };
+  } catch (e) {
+    return { kind: "error" as const, text: String(e) };
+  }
 });
 
 ipcMain.handle("auth:save", (_e, provider: string, key: string) => saveKey(provider, key));
