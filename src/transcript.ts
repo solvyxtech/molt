@@ -287,6 +287,47 @@ export class Transcript {
    * replacement says plainly what happened. Nothing is invented and the
    * full original stays in the record.
    */
+  /**
+   * Shrink individual tool results that are too large to carry.
+   *
+   * Shedding drops whole messages from the *front* and keeps recent ones by
+   * design. That is right until the thing that will not fit is one of the
+   * messages it is keeping: a session shed three messages and freed 400 tokens
+   * out of 18,300, because a single file read held almost all of it. Nothing
+   * older was the problem, so nothing shedding could do would help.
+   *
+   * This cuts oversized results down to a head and a tail with a marker
+   * between them, newest last so the most recent context survives longest. The
+   * file is still on disk and the marker says how to read the rest, so this
+   * costs a re-read rather than the evidence — unlike dropping the message,
+   * which would leave the model with no idea it had ever looked.
+   */
+  trimOversized(maxTokens: number): { trimmed: number; tokensSaved: number } {
+    let trimmed = 0;
+    let tokensSaved = 0;
+    // Oldest first: a recent result is likelier to be the one being worked on.
+    for (let i = 0; i < this.working.length; i++) {
+      const m = this.working[i];
+      if (m.role !== "tool" || typeof m.content !== "string") continue;
+      const before = estTokens(m.content);
+      if (before <= maxTokens) continue;
+
+      const keepChars = Math.max(400, maxTokens * 4);
+      const head = m.content.slice(0, Math.floor(keepChars * 0.7));
+      const tail = m.content.slice(-Math.floor(keepChars * 0.2));
+      const marker =
+        `\n[molt: ${before - maxTokens} tokens of this result removed to fit the ` +
+        `endpoint's context. It is not lost — re-read the file with an offset to ` +
+        `see the middle, and prefer a narrower read next time.]\n`;
+      const next = head + marker + tail;
+      if (estTokens(next) >= before) continue;
+      m.content = next;
+      tokensSaved += before - estTokens(next);
+      trimmed++;
+    }
+    return { trimmed, tokensSaved };
+  }
+
   elideSupersededReads(): { elided: number; tokensSaved: number } {
     const supersededBy = new Map<number, string>();
     /**
@@ -458,4 +499,5 @@ export function toolDetail(name: string, args: Record<string, unknown>): string 
   // cost to pay for the honesty. Whitespace is still collapsed, because a
   // heredoc spread over twelve lines is a transcript nobody can scan.
   return raw.replace(/\s+/g, " ").trim();
+
 }

@@ -20,11 +20,13 @@ import {
   Engine,
   systemPromptFor,
   contextOverflow,
+  resultBudgetBytes,
   tokenScale,
   historyBudget,
   NETWORK_RETRIES,
   SYSTEM_PROMPT,
 } from "../src/engine.js";
+import { Transcript } from "../src/transcript.js";
 import type { Msg } from "../src/types.js";
 import { allowAll, drain, workspace } from "./helpers.js";
 
@@ -922,5 +924,101 @@ describe("an endpoint too small for the conversation", () => {
     } finally {
       ws.cleanup();
     }
+  });
+});
+
+/**
+ * When the thing that will not fit is a message the shed is keeping.
+ *
+ * Reported from a real run against a 16,384-token server:
+ *
+ *     shed  archived 3 message(s) · 18.3k → 17.9k tokens
+ *     error ... nothing left to shed ... system prompt and tool definitions
+ *           alone are about 1230 ...
+ *
+ * Both halves of that were wrong. The shed freed 400 tokens out of 18,300, so
+ * it was not that there was nothing to drop — it was that dropping the wrong
+ * thing achieved nothing. And the fixed overhead named in the error is 1,230
+ * tokens against a 16,384 window, which is not the reason anything failed.
+ *
+ * The bulk was one file read. `READ_MAX_BYTES` is 32KB — about 8,000 tokens by
+ * molt's count, more by a real one — which is nothing against a 128k window and
+ * most of the request against this one. Shedding keeps recent messages by
+ * design, so the single largest thing in the context was the one thing it would
+ * never touch.
+ */
+describe("a result too large for the window it has to fit in", () => {
+  it("sizes a read to the endpoint, not to a constant", () => {
+    // A large window changes nothing: the old cap still applies.
+    assert.equal(resultBudgetBytes(200_000, 1, 32_768), 32_768);
+    assert.equal(resultBudgetBytes(0, 1, 32_768), 32_768, "unknown window must not narrow it");
+
+    // 16,384 tokens at 1.3x: a fifth of the window is ~3,277 real tokens,
+    // ~2,521 of molt's, ~10KB. A third of the old cap, and the difference
+    // between one read fitting and one read being the whole request.
+    const small = resultBudgetBytes(16_384, 1.3, 32_768);
+    assert.ok(small < 12_000 && small > 8_000, `expected ~10KB, got ${small}`);
+
+    // Never so small that a result cannot carry a useful excerpt.
+    assert.equal(resultBudgetBytes(1_000, 8, 32_768), 2_048);
+  });
+
+  it("trims an oversized result instead of declaring the endpoint unusable", () => {
+    const t = new Transcript("sys");
+    t.push({ role: "user", content: "read it" });
+    t.push({
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        { id: "c1", type: "function", function: { name: "read_file", arguments: "{}" } },
+      ],
+    });
+    t.push({ role: "tool", tool_call_id: "c1", content: "L".repeat(60_000) });
+
+    const before = t.historyTokens();
+    const r = t.trimOversized(1_000);
+    assert.equal(r.trimmed, 1, "the oversized result must be the one that shrinks");
+    assert.ok(r.tokensSaved > 10_000, `freed only ${r.tokensSaved}`);
+    assert.ok(t.historyTokens() < before / 2, "and the history must actually get smaller");
+
+    // Not silently: the model has to know something was cut, and how to get it.
+    const kept = t.record().find((m) => m.role === "tool")!;
+    assert.match(String(kept.content), /removed to fit/);
+    assert.match(String(kept.content), /re-read the file/);
+  });
+
+  it("leaves results that already fit completely alone", () => {
+    const t = new Transcript("sys");
+    t.push({ role: "user", content: "read it" });
+    t.push({
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        { id: "c1", type: "function", function: { name: "read_file", arguments: "{}" } },
+      ],
+    });
+    t.push({ role: "tool", tool_call_id: "c1", content: "small" });
+    const r = t.trimOversized(1_000);
+    assert.equal(r.trimmed, 0);
+    assert.equal(t.record().find((m) => m.role === "tool")!.content, "small");
+  });
+
+  it("does not grow a result it cannot usefully shrink", () => {
+    // The marker explaining the absence costs tokens too. Eliding something
+    // barely over the limit would drop content and enlarge the context, which
+    // is how a sibling of this code once reported negative savings.
+    const t = new Transcript("sys");
+    t.push({ role: "user", content: "read it" });
+    t.push({
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        { id: "c1", type: "function", function: { name: "read_file", arguments: "{}" } },
+      ],
+    });
+    t.push({ role: "tool", tool_call_id: "c1", content: "x".repeat(1_100) });
+    const before = t.historyTokens();
+    t.trimOversized(250);
+    assert.ok(t.historyTokens() <= before, "trimming must never enlarge the context");
   });
 });

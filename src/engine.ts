@@ -341,6 +341,39 @@ export const TOOL_RESULT_MAX_BYTES = 8192;
  * been riding on.
  */
 export const READ_MAX_BYTES = 32_768;
+
+/**
+ * The largest share of a context window one tool result may occupy.
+ *
+ * A 32KB read is about 8,000 tokens by molt's count and more by a real
+ * tokenizer's. Against a 128k window that is nothing. Against the 16,384 a
+ * local llama.cpp serves by default it is most of the room in the request, and
+ * two of them make the next step impossible — which is exactly what happened:
+ * a shed freed 400 tokens out of 18,300 because the bulk was not in old
+ * messages at all, it was in one result that shedding keeps by design.
+ *
+ * Shedding cannot repair that; nothing older is the problem. So the size of a
+ * result is bounded by the window it has to fit inside, and the model is told
+ * to page rather than handed something that cannot be carried.
+ */
+export const RESULT_WINDOW_SHARE = 0.2;
+
+/**
+ * How many bytes one tool result may return, given what the endpoint serves.
+ *
+ * `window` is in the server's tokens and `scale` converts molt's estimate into
+ * them, so the arithmetic crosses back into bytes at four per estimated token.
+ * An unknown window leaves the old cap alone — this narrows for small servers
+ * and changes nothing for large ones.
+ */
+export function resultBudgetBytes(window: number, scale: number, cap = READ_MAX_BYTES): number {
+  if (!(window > 0)) return cap;
+  const realTokens = window * RESULT_WINDOW_SHARE;
+  const estTokensAllowed = realTokens / Math.max(scale, 1);
+  // A floor, because a result too small to contain a useful excerpt is a
+  // different way of failing.
+  return Math.max(2_048, Math.min(cap, Math.floor(estTokensAllowed * 4)));
+}
 export const MAX_STEPS = 32;
 export const MAX_PROOF_ATTEMPTS = 4;
 export const DEFAULT_BASH_TIMEOUT_MS = 60_000;
@@ -735,7 +768,13 @@ function num(v: unknown, fallback: number): number {
  * Paging turns the dead end into a path: every truncated result says how many
  * lines are left and the offset that continues it.
  */
-function readPart(abs: string, shown: string, offset: number, limit: number): string {
+function readPart(
+  abs: string,
+  shown: string,
+  offset: number,
+  limit: number,
+  cap = READ_MAX_BYTES,
+): string {
   const raw = readFileSync(abs, "utf8").split("\n");
   // A trailing newline is a terminator, not an empty last line. Counting it
   // reports 401 lines for a 400-line file, and every offset the model is told
@@ -753,7 +792,7 @@ function readPart(abs: string, shown: string, offset: number, limit: number): st
   const label = `[molt: ${shown} lines ${from + 1}-${lines.length} of ${lines.length}]`;
   const notice = `[molt: ${lines.length} more line(s). Continue with read_file offset=${lines.length}.]`;
   const reserve = Buffer.byteLength(label + "\n" + notice + "\n", "utf8");
-  const budget = Math.max(256, READ_MAX_BYTES - reserve);
+  const budget = Math.max(256, cap - reserve);
 
   const out: string[] = [];
   let bytes = 0;
@@ -825,13 +864,13 @@ function actualReadEnd(result: string, from: number, path: string): number {
   return from + (result.match(/\n/g)?.length ?? 0) + 1;
 }
 
-function truncateResult(s: string): { text: string; note?: string } {
+function truncateResult(s: string, cap = TOOL_RESULT_MAX_BYTES): { text: string; note?: string } {
   const bytes = Buffer.byteLength(s, "utf8");
-  if (bytes <= TOOL_RESULT_MAX_BYTES) return { text: s };
-  const cut = Buffer.from(s, "utf8").subarray(0, TOOL_RESULT_MAX_BYTES).toString("utf8");
+  if (bytes <= cap) return { text: s };
+  const cut = Buffer.from(s, "utf8").subarray(0, cap).toString("utf8");
   return {
-    text: cut + `\n[molt: truncated ${bytes - TOOL_RESULT_MAX_BYTES} bytes]`,
-    note: `capped at ${TOOL_RESULT_MAX_BYTES}B (was ${bytes}B)`,
+    text: cut + `\n[molt: truncated ${bytes - cap} bytes]`,
+    note: `capped at ${cap}B (was ${bytes}B)`,
   };
 }
 
@@ -848,6 +887,20 @@ export class Engine {
    * refused first.
    */
   private tokenScale = 1;
+  /**
+   * The context window this endpoint serves, once it has said so.
+   *
+   * Zero until an overflow names it. Used to bound tool results: a 32KB read is
+   * nothing against 128k of context and most of the request against 16,384,
+   * and no amount of shedding repairs the second case because the bulk sits in
+   * a message the shed is keeping on purpose.
+   */
+  private contextWindow = 0;
+
+  /** Bytes one tool result may return, given what this endpoint can hold. */
+  private resultBudget(): number {
+    return resultBudgetBytes(this.contextWindow, this.tokenScale);
+  }
   private sessionPrompt = 0;
   private sessionCompletion = 0;
   private sessionCached = 0;
@@ -1389,6 +1442,7 @@ export class Engine {
           String(args.path ?? ""),
           num(args.offset, 0),
           num(args.limit, Number.MAX_SAFE_INTEGER),
+          this.resultBudget(),
         );
 
       case "write_file": {
@@ -2217,6 +2271,9 @@ export class Engine {
               // being made in a unit twice the size of the real one.
               const scale = tokenScale(over.sent, bom.requestTotalEst);
               if (scale > this.tokenScale) this.tokenScale = scale;
+              // Remembered for the rest of the session, so every later read is
+              // sized to fit rather than discovered to be too large.
+              if (over.window > 0) this.contextWindow = over.window;
               const fixedEst = bom.systemTokens + bom.toolSchemaTokens;
               const target = historyBudget(over.window, fixedEst, this.tokenScale);
               if (target > 0) this.cfg.autoShedAtTokens = target;
@@ -2266,11 +2323,42 @@ export class Engine {
                 continue;
               }
 
-              // Nothing left to drop. That, and only that, makes this endpoint
-              // unusable rather than merely overloaded — a verdict worth
-              // drawing from an empty transcript rather than from a ratio,
-              // which is noisy enough to condemn a server that would have
-              // fitted after one more shed.
+              // Nothing older to drop. Before concluding anything, check
+              // whether the problem is even age: a shed that freed 400 tokens
+              // out of 18,300 was not failing, it was working on the wrong
+              // thing. The bulk was a single file read the shed keeps by
+              // design, and shrinking that is the only move left.
+              if (over.window > 0) {
+                const per = Math.max(
+                  256,
+                  Math.floor((over.window * RESULT_WINDOW_SHARE) / Math.max(this.tokenScale, 1)),
+                );
+                const trim = this.transcript.trimOversized(per);
+                if (trim.trimmed > 0) {
+                  log?.append("elide", {
+                    trimmed: trim.trimmed,
+                    tokensSaved: trim.tokensSaved,
+                    reason: `oversized for a ${over.window}-token window`,
+                  });
+                  yield {
+                    kind: "info",
+                    text:
+                      `nothing older left to shed, so ${trim.trimmed} oversized result(s) were ` +
+                      `trimmed to fit — ${trim.tokensSaved} tokens freed. The files are still ` +
+                      `on disk; re-read a narrower range to see what was cut.`,
+                  };
+                  failure = {
+                    text: "context window too small for what molt was carrying",
+                    why: "The endpoint could not hold the conversation.",
+                    retryable: true,
+                  };
+                  continue;
+                }
+              }
+
+              // Now it is genuinely the window. That verdict is drawn from an
+              // empty transcript rather than from a ratio, which is noisy
+              // enough to condemn a server that would have fitted.
               const fixedReal = Math.round(fixedEst * this.tokenScale);
               const need = Math.max(32_768, 2 ** Math.ceil(Math.log2(Math.max(fixedReal, 1) * 3)));
               failure = {
@@ -2683,7 +2771,9 @@ export class Engine {
               // cut that notice off and left the model with no way forward.
               const raw = await this.runTool(name, args, call.id);
               const t =
-                name === "read_file" ? { text: raw, note: undefined } : truncateResult(raw);
+                name === "read_file"
+                  ? { text: raw, note: undefined }
+                  : truncateResult(raw, Math.min(TOOL_RESULT_MAX_BYTES, this.resultBudget()));
               result = t.text;
               note = t.note;
             } catch (e) {
