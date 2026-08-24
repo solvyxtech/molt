@@ -44,7 +44,9 @@
     "dist:win": "npm run bundle && electron-builder --win",
     "dist:linux": "npm run bundle && electron-builder --linux",
     "e2e": "npm run bundle && node test-e2e/drive.mjs",
-    "self-check": "npm run bundle && electron out/main.cjs --self-check"
+    "self-check": "npm run bundle && electron out/main.cjs --self-check",
+    "app:install": "npm run bundle && electron-builder --dir && node install.mjs",
+    "app:push": "npm run bundle && node install.mjs --push"
   },
   "dependencies": {
     "ink": "^5.0.1",

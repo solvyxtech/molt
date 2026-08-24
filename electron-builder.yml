@@ -19,6 +19,13 @@ files:
 # No native modules, so nothing needs rebuilding per platform.
 npmRebuild: false
 
+# Unpacked, so an installed app can be refreshed by copying `out/` into it
+# rather than rebuilding a 115MB bundle. The app is three files and a
+# stylesheet; asar's benefit here is a rounding error, and being able to see
+# exactly what shipped is worth more than that on a tool whose whole argument
+# is that you should not have to take its word for anything.
+asar: false
+
 mac:
   category: public.app-category.developer-tools
   target:

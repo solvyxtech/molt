@@ -12,6 +12,9 @@
  * reading.
  */
 
+import { renderMarkdown } from "./markdown.js";
+import { JOURNAL_RENDER_CAP, STREAM_CAP, newest, trimOldest } from "./bounds.js";
+
 // ── the bridge ───────────────────────────────────────────────────────────────
 
 type ConfirmReq = { id: string; name: string; detail: string };
@@ -197,6 +200,10 @@ function append(node: HTMLElement): void {
   const was = atBottom();
   $("stream-empty")?.remove();
   stream().appendChild(node);
+  // The wire view already drops frames past 600. The session stream did
+  // not, so a long day of work paid for every earlier turn on every
+  // scroll. Oldest rows go first; the record is still on disk.
+  trimOldest(stream(), STREAM_CAP);
   follow(was);
 }
 
@@ -302,7 +309,10 @@ function toolRow(ev: Ev, running: boolean): HTMLElement {
 }
 
 function receiptLink(path: string): HTMLElement {
-  const file = path.split("/").pop()!;
+  // Engine paths use the host separator. A split on "/" left the whole
+  // Windows path as the filename, so the link asked for a file that
+  // receipts:read would refuse.
+  const file = path.split(/[\\/]/).pop()!;
   const b = el("button", "receipt-link", `receipt · ${file}`);
   b.addEventListener("click", () => {
     activeReceipt = file;
@@ -468,7 +478,17 @@ function drawJournal(): void {
     box.appendChild(el("p", "muted", journalRows.length ? "Nothing matches." : "No entries yet."));
     return;
   }
-  for (const r of rows) {
+  const shown = newest(rows, JOURNAL_RENDER_CAP);
+  if (shown.length < rows.length) {
+    box.appendChild(
+      el(
+        "p",
+        "muted",
+        `showing the newest ${shown.length} of ${rows.length} matching entries — the rest is still on disk`,
+      ),
+    );
+  }
+  for (const r of shown) {
     const { kind, at, ...rest } = r as any;
     const row = el("div", "entry");
     row.appendChild(el("div", "kind", String(kind ?? "?")));
@@ -479,131 +499,6 @@ function drawJournal(): void {
 
 $("log-filter").addEventListener("input", drawJournal);
 $("log-refresh").addEventListener("click", () => void loadJournal());
-
-// ── markdown, enough of it for a receipt ─────────────────────────────────────
-
-/**
- * A deliberately small renderer.
- *
- * Receipts are the document you hand to someone who does not trust you, so
- * they get rendered by code that can be read in one sitting rather than by a
- * dependency. It builds DOM nodes and sets text, never HTML — a receipt quotes
- * the model verbatim, and the model is not a trusted author.
- */
-function renderMarkdown(md: string, into: HTMLElement): void {
-  const lines = md.split("\n");
-  let i = 0;
-  const inline = (parent: HTMLElement, text: string): void => {
-    // `code`, **bold**, and nothing else. Anything unmatched stays literal.
-    const re = /(`[^`]+`|\*\*[^*]+\*\*)/g;
-    let last = 0;
-    for (const m of text.matchAll(re)) {
-      const at = m.index!;
-      if (at > last) parent.appendChild(document.createTextNode(text.slice(last, at)));
-      const tok = m[0];
-      if (tok.startsWith("`")) parent.appendChild(el("code", undefined, tok.slice(1, -1)));
-      else parent.appendChild(el("strong", undefined, tok.slice(2, -2)));
-      last = at + tok.length;
-    }
-    if (last < text.length) parent.appendChild(document.createTextNode(text.slice(last)));
-  };
-
-  while (i < lines.length) {
-    const line = lines[i]!;
-
-    if (line.startsWith("```")) {
-      const pre = el("pre");
-      const code = el("code");
-      i++;
-      const buf: string[] = [];
-      while (i < lines.length && !lines[i]!.startsWith("```")) buf.push(lines[i++]!);
-      i++;
-      code.textContent = buf.join("\n");
-      pre.appendChild(code);
-      into.appendChild(pre);
-      continue;
-    }
-
-    const h = /^(#{1,4})\s+(.*)$/.exec(line);
-    if (h) {
-      const node = el(`h${h[1]!.length}`);
-      inline(node, h[2]!);
-      into.appendChild(node);
-      i++;
-      continue;
-    }
-
-    if (/^\s*\|.*\|\s*$/.test(line) && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1] ?? "")) {
-      const cells = (r: string): string[] =>
-        r.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
-      const table = el("table");
-      const thead = el("thead");
-      const hr = el("tr");
-      for (const c of cells(line)) {
-        const th = el("th");
-        inline(th, c);
-        hr.appendChild(th);
-      }
-      thead.appendChild(hr);
-      table.appendChild(thead);
-      i += 2;
-      const tbody = el("tbody");
-      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]!)) {
-        const tr = el("tr");
-        for (const c of cells(lines[i]!)) {
-          const td = el("td");
-          inline(td, c);
-          tr.appendChild(td);
-        }
-        tbody.appendChild(tr);
-        i++;
-      }
-      table.appendChild(tbody);
-      into.appendChild(table);
-      continue;
-    }
-
-    if (line.startsWith(">")) {
-      const q = el("blockquote");
-      const buf: string[] = [];
-      while (i < lines.length && lines[i]!.startsWith(">")) buf.push(lines[i++]!.replace(/^>\s?/, ""));
-      inline(q, buf.join("\n"));
-      q.style.whiteSpace = "pre-wrap";
-      into.appendChild(q);
-      continue;
-    }
-
-    if (/^[-*]\s+/.test(line)) {
-      const ul = el("ul");
-      while (i < lines.length && /^[-*]\s+/.test(lines[i]!)) {
-        const li = el("li");
-        inline(li, lines[i]!.replace(/^[-*]\s+/, ""));
-        ul.appendChild(li);
-        i++;
-      }
-      into.appendChild(ul);
-      continue;
-    }
-
-    if (/^---+$/.test(line.trim())) {
-      into.appendChild(el("hr"));
-      i++;
-      continue;
-    }
-
-    if (line.trim() === "") {
-      i++;
-      continue;
-    }
-
-    const p = el("p");
-    const buf: string[] = [];
-    while (i < lines.length && lines[i]!.trim() !== "" && !/^(#|>|```|[-*]\s|\|)/.test(lines[i]!))
-      buf.push(lines[i++]!);
-    inline(p, buf.join(" "));
-    into.appendChild(p);
-  }
-}
 
 // ── engine events ────────────────────────────────────────────────────────────
 
@@ -777,6 +672,11 @@ molt.onIdle(() => {
   busy = false;
   $("send").classList.remove("hidden");
   $("stop").classList.add("hidden");
+  // Stop (and the turn ending any other way) resolves a pending confirm to
+  // false on the main side. The dialog is only hidden by its own buttons,
+  // so without this a cancelled permission prompt stays on screen and
+  // answers nothing.
+  $("confirm").classList.add("hidden");
   if (!$("state-dot").classList.contains("ok") && !$("state-dot").classList.contains("fail"))
     setState("idle", "idle");
   void refreshStats();
