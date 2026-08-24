@@ -433,6 +433,40 @@ export function withoutWriteChecks(bar?: Bar | null): Bar | null {
   };
 }
 
+/**
+ * The bar as it applies to a question.
+ *
+ * Dropping `files-changed` was not enough, and the gap showed up the first
+ * time someone asked a question in a real project: "ask only was ticked and I
+ * still got bar not met". They had. The write check was gone, and `tests` had
+ * run anyway and failed — on a turn that wrote nothing.
+ *
+ * That is a category error rather than a strict gate. The bar exists to stop a
+ * model claiming work it did not do; a question claims no work, so there is
+ * nothing to refuse. And the failure is not attributable: a turn that touched
+ * no file cannot have broken a suite, so if the suite is red it was red before
+ * the question was asked. Refusing the answer punishes the reader for the
+ * state of the repository.
+ *
+ * So the remaining checks still run — knowing the suite is red is worth
+ * having — but they run advisory. They report, and they do not refuse.
+ *
+ * `wroteNothing` is what keeps this from being a way out of the bar, which is
+ * the reason it was not built this way to begin with. Ticking "ask" drops the
+ * write *check*, not the ability to write: a turn in ask mode can still edit a
+ * file and break the suite it is about to be judged by. So the softening
+ * applies only to a turn whose ledger is empty. Change anything at all and the
+ * bar is the bar, whichever box was ticked.
+ */
+export function asQuestion(bar: Bar | null | undefined, wroteNothing: boolean): Bar | null {
+  const dropped = withoutWriteChecks(bar);
+  if (!dropped || !wroteNothing) return dropped;
+  return {
+    ...dropped,
+    checks: dropped.checks.map((c) => ({ ...c, advisory: true as const })),
+  };
+}
+
 export type EngineConfig = {
   baseUrl: string;
   apiKey?: string;
@@ -1718,7 +1752,14 @@ export class Engine {
     // ever fail it. `ask` drops exactly those checks for this turn and runs
     // the rest — the bar is narrowed in the open, never quietly lowered, and
     // the receipt records which checks actually ran.
+    // Narrowed here for the announcement below and for proof_start's names;
+    // re-derived at each proof attempt, because whether this turn wrote
+    // anything is not known until it has had the chance to.
     const bar = opts.ask ? withoutWriteChecks(this.cfg.bar) : this.cfg.bar;
+    const barNow = (): Bar | null =>
+      opts.ask
+        ? asQuestion(this.cfg.bar, this.mergedLedger().length === 0)
+        : (this.cfg.bar ?? null);
     if (opts.ask) {
       const dropped = (this.cfg.bar?.checks.length ?? 0) - (bar?.checks.length ?? 0);
       log?.append("note", { text: `ask turn — ${dropped} write-dependent check(s) not run` });
@@ -2689,7 +2730,7 @@ export class Engine {
         checks: bar.checks.length,
         names: bar.checks.map((c) => c.name),
       };
-      const result = await this.runBarGuarded(claim, bar);
+      const result = await this.runBarGuarded(claim, barNow());
       this.actsSinceBar = 0;
       lastResult = result;
       log?.append("bar_run", {

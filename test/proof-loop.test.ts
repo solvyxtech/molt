@@ -189,9 +189,19 @@ describe("the proof loop", () => {
     );
   });
 
-  it("still refuses a question that fails a check it could have passed", async () => {
-    // /ask drops the write check and nothing else. A failing suite still
-    // refuses the claim — asking is not a way out of the bar.
+  it("does not refuse a question for a suite that was already red", async () => {
+    // This used to assert the opposite, on the reasoning that "asking is not a
+    // way out of the bar". The reasoning was right; the rule drawn from it was
+    // too wide, and it surfaced the first time someone asked a question in a
+    // real project: "I had ask only clicked and still got bar not met."
+    //
+    // They had. The write check was gone and `tests` ran anyway and failed —
+    // on a turn that wrote nothing. That failure is not attributable to the
+    // turn: a question touches no file, so a red suite was red before it was
+    // asked. And the bar exists to stop a model claiming work it did not do,
+    // which a question never claims. There is nothing to refuse.
+    //
+    // The check still runs and still reports. It just cannot block the answer.
     const dir = ws();
     writeFileSync(join(dir, "check.sh"), 'echo "suite is broken"\nexit 1\n');
     const { engine } = engineIn(dir, [{ text: "It is 64°F and sunny." }], {
@@ -200,8 +210,38 @@ describe("the proof loop", () => {
     });
 
     const events = await drain(engine.run("what is the weather", allowAll, { ask: true }));
-    assert.ok(kinds(events).includes("proof_refused"));
-    assert.ok(!kinds(events).includes("assistant_text"));
+    assert.ok(!kinds(events).includes("proof_refused"), "a question may not be refused for this");
+    assert.ok(kinds(events).includes("assistant_text"), "the answer must reach the user");
+
+    // Reported, not hidden: the red suite is still on the record.
+    const proof = events.find((e) => e.kind === "proof_result");
+    assert.ok(proof && proof.kind === "proof_result");
+    const warned = (proof.result.warnings ?? []).map((w) => w.name);
+    assert.ok(warned.includes("suite"), "the failing check must still be surfaced");
+  });
+
+  it("still refuses an ask turn that changed a file", async () => {
+    // The other half, and the reason the original rule existed. Ticking "ask"
+    // drops the write check, not the ability to write. A turn that edited
+    // something can have broken the suite it is about to be judged by, so it
+    // is judged — whichever box was ticked. Without this, "ask" really would
+    // be a way out of the bar.
+    const dir = ws();
+    writeFileSync(join(dir, "check.sh"), 'echo "suite is broken"\nexit 1\n');
+    const { engine } = engineIn(
+      dir,
+      [
+        { calls: [{ name: "write_file", args: { path: "a.txt", content: "x\n" } }] },
+        { text: "Changed it." },
+      ],
+      { bar: BAR_WITH_TESTS, maxProofAttempts: 2 },
+    );
+
+    const events = await drain(engine.run("change a.txt", allowAll, { ask: true }));
+    assert.ok(
+      kinds(events).includes("proof_refused") || kinds(events).includes("proof_exhausted"),
+      "a turn that wrote something must still answer to the bar",
+    );
   });
 
   it("feeds the exact failing output back to the model", async () => {

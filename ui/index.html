@@ -16,7 +16,7 @@
       <div class="crumbs">
         <span id="crumb-cwd" class="crumb muted">no workspace</span>
         <span class="sep">·</span>
-        <span id="crumb-model" class="crumb muted">no model</span>
+        <button id="crumb-model" class="crumb link-quiet" title="Change model">no model</button>
         <span id="crumb-local" class="pill hidden">local</span>
       </div>
       <div class="state">
@@ -107,7 +107,11 @@
           <fieldset>
             <legend>Model</legend>
             <div class="row">
-              <input type="text" id="set-model" placeholder="claude-sonnet-5" spellcheck="false" />
+              <select id="set-model-pick"></select>
+              <button class="btn ghost" id="set-refresh">Refresh</button>
+            </div>
+            <div class="row" id="row-custom-model">
+              <input type="text" id="set-model" placeholder="model id" spellcheck="false" />
             </div>
             <div class="row">
               <input type="text" id="set-url" placeholder="https://api.anthropic.com/v1" spellcheck="false" />
@@ -143,7 +147,10 @@
         spellcheck="false"
       ></textarea>
       <div class="composer-side">
-        <label class="ask"><input type="checkbox" id="ask" /> ask only</label>
+        <div class="side-stack">
+          <label class="ask"><input type="checkbox" id="ask" /> ask only</label>
+          <div class="autonomy" id="autonomy" role="group" aria-label="autonomy"></div>
+        </div>
         <button class="btn primary" id="send">Run</button>
         <button class="btn danger hidden" id="stop">Stop</button>
       </div>
@@ -155,6 +162,18 @@
       <span class="spacer"></span>
       <span id="st-session" class="muted"></span>
     </footer>
+
+    <div class="modal hidden" id="picker">
+      <div class="modal-box">
+        <h3>Model</h3>
+        <p class="muted" id="picker-sub">Asking every endpoint you hold a key for…</p>
+        <div class="picker-list" id="picker-list"></div>
+        <div class="modal-actions">
+          <button class="btn ghost" id="picker-refresh">Refresh</button>
+          <button class="btn ghost" id="picker-close">Close</button>
+        </div>
+      </div>
+    </div>
 
     <div class="modal hidden" id="confirm">
       <div class="modal-box">

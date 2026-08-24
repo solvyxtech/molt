@@ -23,6 +23,7 @@ import { Receipts } from "../src/receipts.js";
 import { Journal } from "../src/journal.js";
 import { loadBar, BarError } from "../src/bar.js";
 import type { Bar, Check } from "../src/types.js";
+import { AUTONOMY_LEVELS, AUTONOMY_SUMMARY, isAutonomy, type Autonomy } from "../src/autonomy.js";
 import { getTheme, THEMES, DEFAULT_THEME } from "../src/theme.js";
 import {
   readAuth,
@@ -31,6 +32,7 @@ import {
   storedEndpoint,
   providerName,
   isSelfHosted,
+  modelSources,
   PROVIDERS,
 } from "../src/providers.js";
 import type { EngineEvent } from "../src/types.js";
@@ -71,6 +73,14 @@ type Session = {
 };
 
 let session: Session | null = null;
+/**
+ * Autonomy outlives a session.
+ *
+ * It is a decision about this machine, not about this workspace, and reopening
+ * a project should not quietly hand the model more or less rope than you last
+ * granted it.
+ */
+let autonomy: Autonomy = "medium";
 /** Cancels the turn in flight. */
 let running: AbortController | null = null;
 
@@ -121,6 +131,7 @@ function openSession(cwd: string, model: string, baseUrl: string, apiKey?: strin
     provider,
     cwd,
     bar,
+    autonomy,
     archive: new Archive(cwd),
     receipts,
   });
@@ -138,6 +149,8 @@ function stateOf(s: Session | null) {
     baseUrl: s?.baseUrl ?? null,
     provider: s?.provider ?? null,
     selfHosted: s ? isSelfHosted(s.baseUrl) : false,
+    autonomy: s?.engine.autonomy ?? "medium",
+    autonomyLevels: AUTONOMY_LEVELS.map((l) => ({ level: l, means: AUTONOMY_SUMMARY[l] })),
     checks:
       s?.bar?.checks.map((c: Check) => ({ name: c.name, kind: c.kind, tags: c.tags })) ?? [],
     barError: s?.barError ?? null,
@@ -204,30 +217,100 @@ function createWindow(): void {
       const cwd = process.env.MOLT_E2E_CWD ?? "";
       const model = process.env.MOLT_E2E_MODEL ?? "stub";
       const baseUrl = process.env.MOLT_E2E_URL ?? "";
-      const opened = openSession(cwd, model, baseUrl, "stub-key");
-      session = opened;
       const seen: string[] = [];
-      try {
-        for await (const ev of opened.engine.run(
-          process.env.MOLT_E2E_TASK ?? "say hello",
-          async () => true,
-          {},
-        )) {
-          seen.push(ev.kind);
-          win!.webContents.send("engine:event", ev);
+
+      if (process.env.MOLT_E2E_VIA_UI === "1") {
+        // Drive the window the way a person does: fill Settings, open the
+        // workspace, tick the box, type, click Run. Calling engine.run()
+        // directly skips the preload bridge and both IPC hops — which is
+        // exactly where "ask only ran the write checks anyway" would live, so
+        // a test that skips them cannot see it.
+        await win!.webContents.executeJavaScript(`(() => {
+          document.getElementById("set-cwd").value = ${JSON.stringify(cwd)};
+          document.getElementById("set-model").value = ${JSON.stringify(model)};
+          document.getElementById("set-url").value = ${JSON.stringify(baseUrl)};
+          document.getElementById("set-open").click();
+          return 0;
+        })()`);
+        await new Promise((r) => setTimeout(r, 500));
+        await win!.webContents.executeJavaScript(`(() => {
+          // Record whether the window ever said it was working. Sampled from
+          // inside the page because the turn can finish faster than a poll.
+          window.__sawActivity = false;
+          window.__turnDone = false;
+          const obs = new MutationObserver(() => {
+            if (document.querySelector("#stream .activity")) window.__sawActivity = true;
+            // The end of a turn is a proof block or an error, not a button
+            // changing class. Waiting on the button raced the render: the
+            // stream had not painted its verdict yet, and the assertions read
+            // an empty screen roughly one run in three.
+            if (document.querySelector("#stream .proof, #stream .said.error"))
+              window.__turnDone = true;
+          });
+          obs.observe(document.getElementById("stream"), { childList: true, subtree: true });
+          return 0;
+        })()`);
+        await win!.webContents.executeJavaScript(`(() => {
+          document.getElementById("ask").checked = ${process.env.MOLT_E2E_ASK === "1"};
+          document.getElementById("prompt").value = ${JSON.stringify(
+            process.env.MOLT_E2E_TASK ?? "say hello",
+          )};
+          document.getElementById("send").click();
+          return 0;
+        })()`);
+        // Wait for the turn to finish, seen from the page rather than guessed.
+        let done = false;
+        for (let i = 0; i < 300; i++) {
+          done = await win!.webContents.executeJavaScript(
+            `window.__turnDone === true && document.getElementById("send").classList.contains("hidden") === false`,
+          );
+          if (done) break;
+          await new Promise((r) => setTimeout(r, 100));
         }
-      } catch (e) {
-        console.error(`[self-drive] engine threw: ${String(e)}`);
-        app.exit(1);
-        return;
+        if (!done) {
+          console.error("[self-drive] turn never produced a verdict within 30s");
+          app.exit(1);
+          return;
+        }
+      } else {
+        const opened = openSession(cwd, model, baseUrl, "stub-key");
+        session = opened;
+        try {
+          for await (const ev of opened.engine.run(
+            process.env.MOLT_E2E_TASK ?? "say hello",
+            async () => true,
+            {},
+          )) {
+            seen.push(ev.kind);
+            win!.webContents.send("engine:event", ev);
+          }
+        } catch (e) {
+          console.error(`[self-drive] engine threw: ${String(e)}`);
+          app.exit(1);
+          return;
+        }
       }
       // Give the renderer a tick to paint what it was sent, then ask it what
       // it actually put on screen. Counting events proves delivery; reading the
       // DOM proves rendering, and they fail independently.
+      // Open the model picker before reading the DOM, so the assertions below
+      // see what it listed. `/model` had no desktop equivalent at all until
+      // this existed; an untested picker is how it stays that way.
+      await win!.webContents.executeJavaScript(
+        `(document.getElementById("crumb-model").click(), 0)`,
+      );
+      await new Promise((r) => setTimeout(r, 400));
       setTimeout(() => {
         void win!.webContents
           .executeJavaScript(
             `(document.querySelector('.tab[data-tab="session"]').click(), {
+               sawActivity: window.__sawActivity === true,
+               activityLeft: document.querySelectorAll("#stream .activity").length,
+               checksRun: [...document.querySelectorAll("#stream .proof .check .est")].length,
+               checkNames: [...document.querySelectorAll("#checks .check-card .nm")].map((n) => n.textContent),
+               proofHead: (document.querySelector("#stream .proof h4")||{}).textContent||"",
+               pickerRows: document.querySelectorAll("#picker-list button").length,
+               pickerGroups: document.querySelectorAll("#picker-list .grp").length,
                activeTab: (document.querySelector(".tab.active")||{}).dataset?.tab,
                activePanel: (document.querySelector(".panel.active")||{}).id,
                rows: document.querySelectorAll("#stream .said").length,
@@ -244,8 +327,22 @@ function createWindow(): void {
             console.log(`[self-drive] proofs     ${r.proofs}`);
             console.log(`[self-drive] wire rows  ${r.wire}`);
             console.log(`[self-drive] active     ${r.activeTab} / ${r.activePanel}`);
+            console.log(`[self-drive] picker     ${r.pickerRows} model(s) in ${r.pickerGroups} group(s)`);
+            console.log(`[self-drive] activity   shown=${r.sawActivity} leftover=${r.activityLeft}`);
+            console.log(`[self-drive] proof      ${r.proofHead}`);
+            console.log(`[self-drive] checks     ${(r.checkNames as string[]).join(", ") || "(none)"}`);
             const text = String(r.text);
-            const ok = Number(r.rows) > 0 && text.includes(process.env.MOLT_E2E_EXPECT ?? "");
+            const ok =
+              Number(r.rows) > 0 &&
+              text.includes(process.env.MOLT_E2E_EXPECT ?? "") &&
+              Number(r.pickerRows) >= 2 &&
+              // The window must say it is working while it works, and must
+              // stop saying it afterwards. Both halves, or the indicator is
+              // either invisible or permanent.
+              (process.env.MOLT_E2E_VIA_UI !== "1" || r.sawActivity === true) &&
+              Number(r.activityLeft) === 0 &&
+              (!process.env.MOLT_E2E_WANT_PROOF ||
+                String(r.proofHead).includes(process.env.MOLT_E2E_WANT_PROOF));
             console.log(ok ? "[self-drive] PASS" : "[self-drive] FAIL");
             if (!ok) console.log(`[self-drive] screen was: ${text.slice(0, 400)}`);
             const shot = process.env.MOLT_SHOT;
@@ -278,7 +375,7 @@ function createWindow(): void {
       void win!.webContents
         .executeJavaScript(
           `(() => {
-             const need = ["tabs","panels","stream","wire","checks","receipt-list","log","composer","prompt","send","status"];
+             const need = ["tabs","panels","stream","wire","checks","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","autonomy","ask"];
              const missing = need.filter((id) => !document.getElementById(id));
              const tabs = [...document.querySelectorAll(".tab")].map((t) => t.dataset.tab);
              const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
@@ -288,6 +385,13 @@ function createWindow(): void {
                tabs,
                accent,
                panels: [...document.querySelectorAll(".panel")].length,
+               autonomyButtons: document.querySelectorAll("#autonomy .au").length,
+               autonomyOn: (document.querySelector("#autonomy .au.on")||{}).textContent||"",
+               nulRoundTrip: (() => {
+                 const o = new Option("x", "a/b" + String.fromCharCode(0) + "http://h:1/v1");
+                 const p = o.value.split(String.fromCharCode(0));
+                 return p.length === 2 && p[0] === "a/b" && p[1] === "http://h:1/v1";
+               })(),
              };
            })()`,
         )
@@ -297,12 +401,17 @@ function createWindow(): void {
             Array.isArray(r.missing) &&
             r.missing.length === 0 &&
             Array.isArray(r.tabs) &&
-            r.tabs.length === 6;
+            r.tabs.length === 6 &&
+            r.nulRoundTrip === true &&
+            r.autonomyButtons === 3 &&
+            String(r.autonomyOn).length > 0;
           console.log(`[self-check] bridge      ${r.bridge ? "ok" : "MISSING"}`);
           console.log(`[self-check] elements    ${(r.missing as string[]).length === 0 ? "ok" : "missing " + (r.missing as string[]).join(", ")}`);
           console.log(`[self-check] tabs        ${(r.tabs as string[]).join(", ")}`);
           console.log(`[self-check] panels      ${r.panels}`);
           console.log(`[self-check] accent      ${r.accent}`);
+          console.log(`[self-check] option key  ${r.nulRoundTrip ? "ok" : "NUL LOST"}`);
+          console.log(`[self-check] autonomy    ${r.autonomyButtons} levels, on: ${r.autonomyOn || "NONE"}`);
           console.log(ok ? "[self-check] PASS" : "[self-check] FAIL");
           // A screenshot on demand, because "PASS" says the page assembled and
           // says nothing about whether it is legible. Support asks for one of
@@ -371,6 +480,100 @@ ipcMain.handle(
     }
   },
 );
+
+/**
+ * An engine to ask an endpoint what it serves.
+ *
+ * The live session's engine when there is one, so a probe uses the same
+ * transport the work will; a throwaway otherwise, because the model picker has
+ * to work *before* a workspace is open — that is when you need it most.
+ */
+function prober(baseUrl: string, apiKey?: string): Engine {
+  if (session && session.baseUrl === baseUrl) return session.engine;
+  return new Engine({ baseUrl, apiKey, model: "probe", bar: null });
+}
+
+/**
+ * Every model you could pick, from every endpoint you hold a key for.
+ *
+ * This is `/model` from the terminal. The desktop shipped without it: Settings
+ * had a free-text model field seeded from the last endpoint, so the only model
+ * you could reach was the one you used last, and the only way to change it was
+ * to know an id by heart and type it. Reported as "no model select and no
+ * models loaded".
+ *
+ * Endpoints are asked in parallel and failures are kept rather than dropped —
+ * an endpoint that refuses is a thing you want to see in the list, with its
+ * reason, not a provider that silently vanished.
+ */
+ipcMain.handle("models:list", async (_e, current?: { url: string; key?: string }) => {
+  const auth = readAuth();
+  const stored = storedEndpoint();
+  const here = current?.url ? current : session ? { url: session.baseUrl } : { url: stored.baseUrl ?? "" };
+  const sources = modelSources(auth, here.url ? { url: here.url, key: current?.key } : undefined);
+
+  return Promise.all(
+    sources.map(async (src) => {
+      const key = src.key ?? (src.url === here.url ? current?.key : undefined);
+      const r = await prober(src.url, key).listModels(src.url, key);
+      return r.ok
+        ? { name: src.name, url: src.url, ok: true as const, ids: r.ids, needsKey: !key }
+        : { name: src.name, url: src.url, ok: false as const, ids: [], error: r.error, needsKey: !key };
+    }),
+  );
+});
+
+/**
+ * Change model mid-session, without closing the workspace.
+ *
+ * The terminal can do this with `/model` and keep the conversation; the
+ * desktop could only do it by reopening, which throws the session away. The
+ * engine already supports both halves — setModel and setBaseUrl — so this is
+ * wiring, not new behaviour.
+ */
+ipcMain.handle(
+  "session:model",
+  (_e, opts: { model: string; baseUrl?: string; apiKey?: string }) => {
+    if (!session) return { ok: false, error: "no workspace is open" };
+    if (running) return { ok: false, error: "a turn is running — stop it before switching model" };
+    if (opts.baseUrl && opts.baseUrl !== session.baseUrl) {
+      session.baseUrl = opts.baseUrl;
+      session.provider = providerName(opts.baseUrl);
+      session.engine.setBaseUrl(opts.baseUrl, opts.apiKey, session.provider);
+    } else if (opts.apiKey) {
+      session.engine.setApiKey(opts.apiKey);
+    }
+    session.model = opts.model;
+    session.engine.setModel(opts.model);
+    saveEndpoint(session.baseUrl, opts.model);
+    // `note`, not a new JournalKind: src/ is the CLI's engine unmodified, and
+    // adding a kind here would fork the two copies over a line of bookkeeping.
+    // Worth recording at all because a receipt names the model that produced
+    // the work, and a session can now change it halfway through.
+    session.journal.append("note", {
+      text: `model changed to ${opts.model}`,
+      model: opts.model,
+      endpoint: session.baseUrl,
+      provider: session.provider,
+    });
+    return { ok: true, state: stateOf(session) };
+  },
+);
+
+/**
+ * How much molt may do without asking.
+ *
+ * The terminal has had this since before the window did; the desktop shipped
+ * with no control at all, so every session ran at the default and the only way
+ * to change it was not to. Journalled by the engine, because it is the one
+ * setting that changes what molt is allowed to do to a machine.
+ */
+ipcMain.handle("session:autonomy", (_e, level: string) => {
+  if (!isAutonomy(level)) return { ok: false, error: `unknown autonomy level: ${level}` };
+  autonomy = level;
+  session?.engine.setAutonomy(level);
+  return { ok: true, state: stateOf(session), means: AUTONOMY_SUMMARY[level] };
+});
 
 ipcMain.handle("auth:save", (_e, provider: string, key: string) => saveKey(provider, key));
 ipcMain.handle("auth:endpoint", (_e, baseUrl: string, model: string) =>
