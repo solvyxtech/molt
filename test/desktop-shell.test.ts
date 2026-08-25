@@ -25,7 +25,7 @@ import {
   PATH_BEGIN,
   PATH_END,
 } from "../electron/login-path.js";
-import { holdAfterAutoDraft } from "../ui/criteria-hold.js";
+import { holdAfterAutoDraft, taskForRun } from "../ui/criteria-hold.js";
 import { JOURNAL_RENDER_CAP, STREAM_CAP, newest, trimOldest } from "../ui/bounds.js";
 import { renderMarkdown } from "../ui/markdown.js";
 import { buildFrame } from "../src/banner-frames.js";
@@ -808,5 +808,53 @@ describe("resolving a price that failed at open", () => {
       announcedNoPriceFor: "qwen3-coder",
     });
     assert.equal(r.announce, true, "stayed silent about a different model's missing rate");
+  });
+});
+
+/**
+ * A held turn must not look like a refused one.
+ *
+ * The first Run of every turn drafts criteria and holds — auto is on by
+ * default and `rows` resets each turn, so this is the common path, not an
+ * edge. The clear happened after the early return, so the composer still held
+ * what you typed and the send read as having done nothing.
+ */
+describe("the task a Run acts on", () => {
+  it("uses what was typed", () => {
+    assert.deepEqual(taskForRun("fix the parser", null), {
+      text: "fix the parser",
+      resuming: false,
+    });
+  });
+
+  it("resumes the held task when the composer was cleared", () => {
+    // The whole point: the box is empty because the hold emptied it, and the
+    // second Run must still know what it is starting.
+    assert.deepEqual(taskForRun("", "fix the parser"), {
+      text: "fix the parser",
+      resuming: true,
+    });
+  });
+
+  it("lets anything typed since replace the held task", () => {
+    // Someone who edits the composer during the review has changed their
+    // mind. Running the older text would run words they are not looking at.
+    assert.deepEqual(taskForRun("actually, fix the lexer", "fix the parser"), {
+      text: "actually, fix the lexer",
+      resuming: false,
+    });
+  });
+
+  it("treats whitespace as empty on both sides", () => {
+    assert.deepEqual(taskForRun("   ", "fix the parser"), {
+      text: "fix the parser",
+      resuming: true,
+    });
+    assert.deepEqual(taskForRun("   ", "   "), { text: "", resuming: false });
+    assert.deepEqual(taskForRun("  padded  ", null), { text: "padded", resuming: false });
+  });
+
+  it("does nothing when there is nothing to run", () => {
+    assert.deepEqual(taskForRun("", null), { text: "", resuming: false });
   });
 });

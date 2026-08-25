@@ -347,6 +347,27 @@ function createWindow(): void {
             app.exit(1);
             return;
           }
+          // A held turn must not look like a refused one. The composer is
+          // emptied and the message echoed, so the screen shows something
+          // received and waiting rather than a Run that did nothing — and the
+          // second click below therefore starts a turn from an empty box,
+          // which is the path that used to need the text retyped.
+          const task = process.env.MOLT_E2E_TASK ?? "say hello";
+          const composer = await win!.webContents.executeJavaScript(
+            `({ box: document.getElementById("prompt").value,
+                echoed: document.getElementById("stream").textContent.includes(${JSON.stringify(
+                  task,
+                )}) })`,
+          );
+          const c = composer as { box: string; echoed: boolean };
+          if (c.box.trim() !== "" || !c.echoed) {
+            console.error(
+              `[self-drive] hold left the composer as ${JSON.stringify(c.box)} (echoed=${c.echoed})`,
+            );
+            app.exit(1);
+            return;
+          }
+          console.log("[self-drive] hold       composer cleared, task echoed");
           await win!.webContents.executeJavaScript(`document.getElementById("send").click()`);
         }
         // Wait for the turn to finish, seen from the page rather than guessed.
