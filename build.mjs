@@ -54,4 +54,9 @@ await build({
 
 cpSync("ui/index.html", "out/ui/index.html");
 cpSync("ui/styles.css", "out/ui/styles.css");
+// The mark the page draws, and the same art for the window and dock. Both are
+// copied rather than inlined: a 120KB base64 blob in the stylesheet would hide
+// the one file in this app anyone can check by opening it.
+cpSync("ui/logo.png", "out/ui/logo.png");
+cpSync("build/icon.png", "out/icon.png");
 console.log("built → out/");

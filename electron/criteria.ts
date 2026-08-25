@@ -26,6 +26,78 @@ import { authHeaders } from "../src/providers.js";
 export type DraftedCheck = { name: string; run: string };
 export type Draft = { checks: DraftedCheck[]; notes: string[] };
 
+/** Same bounds the drafter uses — applied again at `session:run`. */
+export const CRITERIA_MAX_CHECKS = 4;
+export const CRITERIA_MAX_NOTES = 3;
+export const CRITERIA_MAX_NAME = 40;
+export const CRITERIA_MAX_RUN = 300;
+export const CRITERIA_MAX_NOTE = 200;
+
+/**
+ * Shape a renderer-supplied payload into checks the engine may run.
+ *
+ * The page is untrusted. `session:run` used to copy `name`/`run` off whatever
+ * arrived, so a non-array `checks`, a 10kB shell string, or a number where a
+ * command should be became `shell: true` in the workspace. The drafter already
+ * capped this; the run handler did not.
+ */
+export function sanitizeCriteria(raw: unknown): Draft {
+  if (!raw || typeof raw !== "object") return { checks: [], notes: [] };
+  const o = raw as { checks?: unknown; notes?: unknown };
+  const checks: DraftedCheck[] = Array.isArray(o.checks)
+    ? o.checks
+        .filter(
+          (c): c is DraftedCheck =>
+            !!c &&
+            typeof (c as DraftedCheck).name === "string" &&
+            typeof (c as DraftedCheck).run === "string" &&
+            (c as DraftedCheck).run.trim().length > 0,
+        )
+        .slice(0, CRITERIA_MAX_CHECKS)
+        .map((c) => ({
+          name: c.name.trim().slice(0, CRITERIA_MAX_NAME),
+          run: c.run.trim().slice(0, CRITERIA_MAX_RUN),
+        }))
+        .filter((c) => c.run.length > 0)
+    : [];
+  const notes: string[] = Array.isArray(o.notes)
+    ? o.notes
+        .filter((n): n is string => typeof n === "string" && n.trim().length > 0)
+        .slice(0, CRITERIA_MAX_NOTES)
+        .map((n) => n.trim().slice(0, CRITERIA_MAX_NOTE))
+    : [];
+  return { checks, notes };
+}
+
+/**
+ * The shape `session:run` seals. Built here so a test of garbage input is a
+ * test of the boundary, not of a mapper the handler forgot to call.
+ */
+export function taskChecksFrom(raw: unknown): {
+  taskChecks: {
+    name: string;
+    kind: "command";
+    run: string;
+    timeoutMs: number;
+    expectExit: number;
+    tags: string[];
+  }[];
+  taskNotes: string[];
+} {
+  const drafted = sanitizeCriteria(raw);
+  return {
+    taskChecks: drafted.checks.map((c) => ({
+      name: c.name,
+      kind: "command" as const,
+      run: c.run,
+      timeoutMs: 120_000,
+      expectExit: 0,
+      tags: ["task"],
+    })),
+    taskNotes: drafted.notes,
+  };
+}
+
 const SYSTEM = [
   "You draft acceptance criteria for one coding task. You are not doing the task",
   "and you will not judge whether it was done — a person approves what you write",
@@ -59,25 +131,7 @@ function parseDraft(text: string): Draft {
   } catch {
     return { checks: [], notes: [] };
   }
-  const o = raw as { checks?: unknown; notes?: unknown };
-  const checks: DraftedCheck[] = Array.isArray(o.checks)
-    ? o.checks
-        .filter(
-          (c): c is DraftedCheck =>
-            !!c &&
-            typeof (c as DraftedCheck).name === "string" &&
-            typeof (c as DraftedCheck).run === "string" &&
-            (c as DraftedCheck).run.trim().length > 0,
-        )
-        .slice(0, 4)
-        .map((c) => ({ name: c.name.trim().slice(0, 40), run: c.run.trim().slice(0, 300) }))
-    : [];
-  const notes: string[] = Array.isArray(o.notes)
-    ? o.notes.filter((n): n is string => typeof n === "string" && n.trim().length > 0)
-        .slice(0, 3)
-        .map((n) => n.trim().slice(0, 200))
-    : [];
-  return { checks, notes };
+  return sanitizeCriteria(raw);
 }
 
 export async function draftCriteria(opts: {

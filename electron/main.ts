@@ -13,16 +13,20 @@
  * and a proof the terminal produced and a proof the window produced are the
  * same proof because they came from the same code.
  */
-import { app, BrowserWindow, ipcMain, dialog, shell } from "electron";
+import { app, BrowserWindow, ipcMain, dialog, shell, nativeImage } from "electron";
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
 import { resolveReceipt } from "./receipts-path.js";
 import { sessionOpenReject } from "./session-open.js";
+import { keyFor } from "./endpoint-key.js";
 import { draftCriteria, type Draft } from "./criteria.js";
+import { runOptions, shouldRefreshPrice } from "./run-options.js";
 import { desktopSurfaces } from "./theme-surfaces.js";
-import { barInitText } from "./limits.js";
-import { Engine } from "../src/engine.js";
+import { barInitText, parseJournal, mutatesSession } from "./limits.js";
+import { resolvePath, PATH_PROBE, type PathFixReport } from "./login-path.js";
+import { Engine, MAX_STEPS } from "../src/engine.js";
 import { Archive } from "../src/archive.js";
 import { Receipts } from "../src/receipts.js";
 import { Journal } from "../src/journal.js";
@@ -38,6 +42,8 @@ import {
   providerName,
   isSelfHosted,
   modelSources,
+  fetchPricing,
+  savePricing,
   PROVIDERS,
 } from "../src/providers.js";
 import type { EngineEvent } from "../src/types.js";
@@ -137,10 +143,21 @@ function openSession(cwd: string, model: string, baseUrl: string, apiKey?: strin
     checks: bar?.checks.map((c: Check) => c.name) ?? [],
   });
 
+  // A rate only counts if it was recorded for the model about to run. Reusing
+  // the last model's rate is how a Claude session came to be billed at grok's
+  // $2/$6 and shown a total 40% under the truth — the exact failure the meter
+  // exists to prevent — so a mismatch seeds nothing and waits for the fetch.
+  const stored = storedEndpoint(configDir());
+  const seeded = stored.priceModel === model;
+
   const engine = new Engine({
     journal,
     baseUrl,
-    apiKey,
+    apiKey: keyFor(baseUrl, apiKey, readAuth(configDir())),
+    priceInPerMtok: seeded ? stored.priceIn : undefined,
+    priceOutPerMtok: seeded ? stored.priceOut : undefined,
+    priceCachedInPerMtok: seeded ? stored.priceCachedIn : undefined,
+    priceSource: seeded ? "stored" : undefined,
     model,
     provider,
     cwd,
@@ -181,8 +198,29 @@ function stateOf(s: Session | null) {
   };
 }
 
+/**
+ * The app's own art, for the surfaces the packager cannot reach.
+ *
+ * A packaged build takes its icon from the bundle — .icns on macOS, .ico in the
+ * exe, a .desktop entry on Linux — but a dev run gets Electron's default atom,
+ * and on Windows and Linux the window and taskbar read whatever `icon` the
+ * BrowserWindow was given. The build copies `build/icon.png` to `out/icon.png`
+ * beside this bundle so all three read the same file the dock does.
+ *
+ * Missing or unreadable returns undefined rather than throwing: `dock.setIcon`
+ * rejects an empty image, and an app that refuses to start because it could not
+ * decorate itself is worse than one that starts plain.
+ */
+function appIcon() {
+  const file = join(here, "icon.png");
+  if (!existsSync(file)) return undefined;
+  const img = nativeImage.createFromPath(file);
+  return img.isEmpty() ? undefined : img;
+}
+
 function createWindow(): void {
   win = new BrowserWindow({
+    icon: appIcon(),
     width: 1280,
     height: 840,
     minWidth: 900,
@@ -293,6 +331,24 @@ function createWindow(): void {
           document.getElementById("send").click();
           return 0;
         })()`);
+        // Auto-draft holds for review. The first click filled the panel; a
+        // second click is the person's approval and the one that starts work.
+        if (process.env.MOLT_E2E_AUTO === "1") {
+          let held = false;
+          for (let i = 0; i < 100; i++) {
+            held = await win!.webContents.executeJavaScript(
+              `document.getElementById("send").classList.contains("hidden") === false && document.getElementById("ck-open").textContent.includes("criteria ·")`,
+            );
+            if (held) break;
+            await new Promise((r) => setTimeout(r, 100));
+          }
+          if (!held) {
+            console.error("[self-drive] auto-draft never held for review");
+            app.exit(1);
+            return;
+          }
+          await win!.webContents.executeJavaScript(`document.getElementById("send").click()`);
+        }
         // Wait for the turn to finish, seen from the page rather than guessed.
         let done = false;
         for (let i = 0; i < 300; i++) {
@@ -628,7 +684,62 @@ function createWindow(): void {
   });
 }
 
+/**
+ * Ask the user's login shell for its PATH, once, at startup.
+ *
+ * `spawnSync` here and nowhere else. molt's rule against it exists because a
+ * synchronous spawn stops the event loop for the life of the call, which froze
+ * the TUI for the whole of every bash call. This runs before the window is
+ * created and before any session exists, so there is no loop to starve and
+ * nothing to render — and it must finish before the first check can spawn,
+ * which is exactly what a synchronous call guarantees and an async one would
+ * make a race.
+ */
+function fixPath(): PathFixReport {
+  const report = resolvePath({
+    current: process.env.PATH,
+    // node, not npm: every bar check ultimately needs it, and a project whose
+    // checks are cargo or make still needs the directory node came from.
+    cmd: "node",
+    platform: process.platform,
+    home: process.env.HOME,
+    probe: () => {
+      if (process.platform === "win32") return null;
+      const shell = process.env.SHELL || "/bin/sh";
+      try {
+        const r = spawnSync(shell, ["-ilc", PATH_PROBE], {
+          encoding: "utf8",
+          timeout: 3000,
+          // An rc file that reads from stdin would otherwise hang until the
+          // timeout on every launch.
+          stdio: ["ignore", "pipe", "ignore"],
+        });
+        return r.stdout ?? null;
+      } catch {
+        return null;
+      }
+    },
+  });
+  if (report.outcome !== "already-usable" && report.path) process.env.PATH = report.path;
+  return report;
+}
+
+const pathFix = fixPath();
+
 app.whenReady().then(() => {
+  if (pathFix.outcome === "already-usable") {
+    console.log("[molt] PATH already resolves node");
+  } else if (pathFix.added.length) {
+    console.log(`[molt] PATH ${pathFix.outcome}: added ${pathFix.added.join(", ")}`);
+  } else {
+    console.error("[molt] PATH could not be repaired — bar checks may fail with exit 127");
+  }
+  // macOS reads the dock icon from the bundle, which an unpackaged run has not
+  // got — so `npm run app` would otherwise show Electron's atom in the dock.
+  if (process.platform === "darwin" && !app.isPackaged) {
+    const icon = appIcon();
+    if (icon) app.dock?.setIcon(icon);
+  }
   createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -668,12 +779,70 @@ ipcMain.handle(
     try {
       session = openSession(opts.cwd, opts.model, opts.baseUrl, opts.apiKey);
       rememberEndpoint(opts.baseUrl, opts.model);
+      // Quietly at open: the endpoint is already named in the title bar, and
+      // an unprompted price line is not what you are looking at just then.
+      void refreshPricing(session, false);
       return { ok: true, state: stateOf(session) };
     } catch (e) {
       return { ok: false, error: String(e) };
     }
   },
 );
+
+/**
+ * Ask the endpoint what it charges, and tell the engine.
+ *
+ * The window never did this. The CLI has asked since it grew a meter — prices
+ * come from the endpoint that will do the billing rather than from a table
+ * molt ships — but the desktop only ever *read* `engine.pricing()`, for the
+ * `/price` command, and nothing ever wrote it. So `costUsd()` returned
+ * undefined, the renderer's `if (s.costUsd !== null)` never fired, and the
+ * status bar showed tokens and cached with no money beside them. Anthropic
+ * hid it: its rates are carried in `providers.ts` because it publishes no
+ * price API, so a session against Claude found a price anyway and a session
+ * against grok — which does publish one, at /language-models — found none.
+ *
+ * Not awaited by its callers. It is a network round trip, and a workspace must
+ * open whether or not a price list answers.
+ */
+/** The model a "publishes no price" line has already been shown for. */
+let noPriceAnnouncedFor: string | null = null;
+
+async function refreshPricing(s: Session, announce: boolean): Promise<void> {
+  const model = s.model;
+  if (!model) return;
+  const p = await fetchPricing(s.baseUrl, model, s.engine.apiKey).catch(() => null);
+  if (p) {
+    s.engine.setPricing({ in: p.in, out: p.out, cached: p.cached, source: p.source });
+    savePricing(model, p, configDir());
+    if (announce)
+      send("engine:event", {
+        kind: "info",
+        text:
+          `pricing · $${p.in}/M in` +
+          (p.cached === undefined ? "" : ` · $${p.cached}/M cached`) +
+          ` · $${p.out}/M out · from ${p.source}`,
+      });
+    return;
+  }
+  // Nothing published for this model. Any rate still set was recorded for a
+  // different one, so it is cleared rather than quietly applied to this.
+  const stored = storedEndpoint(configDir());
+  if (stored.priceModel !== model && s.engine.pricing().in !== undefined) {
+    s.engine.setPricing({});
+    savePricing(model, null, configDir());
+    if (announce)
+      send("engine:event", {
+        kind: "info",
+        text: `${s.provider} publishes no price for ${model} — the meter will show tokens only. The previous model's rate does not carry over.`,
+      });
+  } else if (announce) {
+    send("engine:event", {
+      kind: "info",
+      text: `${s.provider} publishes no price for ${model} — the meter will show tokens only.`,
+    });
+  }
+}
 
 /**
  * An engine to ask an endpoint what it serves.
@@ -770,13 +939,23 @@ ipcMain.handle(
     if (opts.baseUrl && opts.baseUrl !== session.baseUrl) {
       session.baseUrl = opts.baseUrl;
       session.provider = providerName(opts.baseUrl);
-      session.engine.setBaseUrl(opts.baseUrl, opts.apiKey, session.provider);
+      // Without the lookup this cleared the key: `setBaseUrl` assigns whatever
+      // it is handed, so picking a model from the picker with the Settings key
+      // box empty — the ordinary way to switch — unauthenticated the session.
+      session.engine.setBaseUrl(
+        opts.baseUrl,
+        keyFor(opts.baseUrl, opts.apiKey, readAuth(configDir())),
+        session.provider,
+      );
     } else if (opts.apiKey) {
       session.engine.setApiKey(opts.apiKey);
     }
     session.model = opts.model;
     session.engine.setModel(opts.model);
     saveEndpoint(session.baseUrl, opts.model, configDir());
+    // Out loud here: you just changed what the next turn costs, and a rate
+    // that changed silently is one nobody remembers agreeing to.
+    void refreshPricing(session, true);
     rememberEndpoint(session.baseUrl, opts.model);
     // `note`, not a new JournalKind: src/ is the CLI's engine unmodified, and
     // adding a kind here would fork the two copies over a line of bookkeeping.
@@ -817,7 +996,9 @@ ipcMain.handle("session:autonomy", (_e, level: string) => {
  */
 ipcMain.handle("command:run", async (_e, name: string, arg: string) => {
   if (!session) return { kind: "error", text: "no workspace is open" };
-  if (running && (name === "/shed" || name === "/regrow" || name === "/prove")) {
+  // Only the forms that actually change something — `/shed --explain` computes
+  // a plan and returns it without touching the transcript.
+  if (running && mutatesSession(name, arg)) {
     return { kind: "error", text: `${name} changes session state — stop the turn first` };
   }
   try {
@@ -929,22 +1110,34 @@ ipcMain.handle("session:run", async (_e, text: string, ask: boolean, criteria?: 
       );
     });
 
+  // A session whose price never resolved shows tokens and no money for as long
+  // as it lasts. Retried here, where one request is invisible beside the turn
+  // it precedes, rather than once at open where a single failure was final.
+  {
+    const { refresh, announce } = shouldRefreshPrice({
+      priceIn: session.engine.pricing().in,
+      model: session.model,
+      announcedNoPriceFor: noPriceAnnouncedFor,
+    });
+    if (refresh) {
+      await refreshPricing(session, announce);
+      if (session.engine.pricing().in === undefined) noPriceAnnouncedFor = session.model;
+    }
+  }
+
   try {
     // Turned into real checks here, at the boundary, so the shape the engine
     // seals is one this process built rather than one the renderer sent.
-    const taskChecks = (criteria?.checks ?? []).map((c) => ({
-      name: c.name,
-      kind: "command" as const,
-      run: c.run,
-      timeoutMs: 120_000,
-      expectExit: 0,
-      tags: ["task"],
-    }));
-    for await (const ev of session.engine.run(text, confirm, {
-      ask,
-      taskChecks,
-      taskNotes: criteria?.notes ?? [],
-    })) {
+    // taskChecksFrom is the whole of that claim: without it, a non-string
+    // `run` or an uncapped shell string from a compromised page becomes
+    // `shell: true` in the workspace.
+    // runOptions carries that, and wires `onCeiling` — without it the window
+    // stopped dead at the step guard while the TUI asked whether to carry on.
+    for await (const ev of session.engine.run(
+      text,
+      confirm,
+      runOptions({ ask, criteria, confirm, maxSteps: MAX_STEPS }),
+    )) {
       send("engine:event", ev satisfies EngineEvent);
     }
     return { ok: true };
@@ -993,16 +1186,7 @@ ipcMain.handle("journal:read", () => {
   if (!session) return [];
   const p = session.journal.path;
   if (!p || !existsSync(p)) return [];
-  return readFileSync(p, "utf8")
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return JSON.parse(line) as unknown;
-      } catch {
-        return { kind: "unparsed", line };
-      }
-    });
+  return parseJournal(readFileSync(p, "utf8"));
 });
 
 ipcMain.handle("session:stats", () => {

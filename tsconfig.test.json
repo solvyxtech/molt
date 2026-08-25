@@ -12,6 +12,7 @@
     "test/**/*",
     "electron/**/*",
     "ui/markdown.ts",
-    "ui/bounds.ts"
+    "ui/bounds.ts",
+    "ui/criteria-hold.ts"
   ]
 }

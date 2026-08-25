@@ -7,6 +7,7 @@
       content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'"
     />
     <title>molt</title>
+    <link rel="icon" href="logo.png" />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -19,26 +20,31 @@
         <button id="crumb-model" class="crumb link-quiet" title="Change model">no model</button>
         <span id="crumb-local" class="pill hidden">local</span>
       </div>
-      <div class="state">
-        <span id="state-dot" class="dot"></span>
+      <div class="state" role="status" aria-live="polite">
+        <span id="state-dot" class="dot" aria-hidden="true"></span>
         <span id="state-text">idle</span>
       </div>
     </header>
 
     <nav class="tabs" id="tabs" role="tablist">
-      <button class="tab active" data-tab="session" role="tab">Session</button>
-      <button class="tab" data-tab="view" role="tab">View</button>
-      <button class="tab" data-tab="checks" role="tab">Checks<span class="badge hidden" id="badge-checks"></span></button>
-      <button class="tab" data-tab="receipts" role="tab">Receipts<span class="badge hidden" id="badge-receipts"></span></button>
-      <button class="tab" data-tab="log" role="tab">Log</button>
-      <button class="tab" data-tab="settings" role="tab">Settings</button>
+      <button class="tab active" id="tab-session" data-tab="session" role="tab" aria-controls="panel-session" aria-selected="true" tabindex="0">Session</button>
+      <button class="tab" id="tab-view" data-tab="view" role="tab" aria-controls="panel-view" aria-selected="false" tabindex="-1">View</button>
+      <button class="tab" id="tab-checks" data-tab="checks" role="tab" aria-controls="panel-checks" aria-selected="false" tabindex="-1">Checks<span class="badge hidden" id="badge-checks"></span></button>
+      <button class="tab" id="tab-receipts" data-tab="receipts" role="tab" aria-controls="panel-receipts" aria-selected="false" tabindex="-1">Receipts<span class="badge hidden" id="badge-receipts"></span></button>
+      <button class="tab" id="tab-log" data-tab="log" role="tab" aria-controls="panel-log" aria-selected="false" tabindex="-1">Log</button>
+      <button class="tab" id="tab-settings" data-tab="settings" role="tab" aria-controls="panel-settings" aria-selected="false" tabindex="-1">Settings</button>
     </nav>
 
     <main id="panels">
-      <section class="panel active" id="panel-session">
+      <section class="panel active" id="panel-session" role="tabpanel" aria-labelledby="tab-session" tabindex="0">
         <div class="stream" id="stream">
           <div class="empty" id="stream-empty">
-            <i class="empty-mark" aria-hidden="true"></i>
+            <!-- The mark's box doubles as the splash's stage: the animation
+                 is drawn over it and allowed to overflow, so nothing in the
+                 column below moves while the water is still going. -->
+            <div class="mark-stage">
+              <i class="empty-mark" aria-hidden="true"></i>
+            </div>
             <p>A coding agent that can't say <em>done</em> without proving it.</p>
             <p class="muted">
               Open a workspace in <button class="link" data-goto="settings">Settings</button> to begin.
@@ -47,7 +53,7 @@
         </div>
       </section>
 
-      <section class="panel" id="panel-view">
+      <section class="panel" id="panel-view" role="tabpanel" aria-labelledby="tab-view" tabindex="0">
         <div class="panel-head">
           <h2>Wire view</h2>
           <p class="muted">
@@ -62,7 +68,7 @@
         <div class="wire" id="wire"></div>
       </section>
 
-      <section class="panel" id="panel-checks">
+      <section class="panel" id="panel-checks" role="tabpanel" aria-labelledby="tab-checks" tabindex="0">
         <div class="panel-head">
           <h2>The bar</h2>
           <p class="muted" id="checks-sub">No workspace open.</p>
@@ -70,7 +76,7 @@
         <div class="checks" id="checks"></div>
       </section>
 
-      <section class="panel" id="panel-receipts">
+      <section class="panel" id="panel-receipts" role="tabpanel" aria-labelledby="tab-receipts" tabindex="0">
         <div class="split">
           <aside class="list" id="receipt-list"></aside>
           <article class="doc" id="receipt-doc">
@@ -79,7 +85,7 @@
         </div>
       </section>
 
-      <section class="panel" id="panel-log">
+      <section class="panel" id="panel-log" role="tabpanel" aria-labelledby="tab-log" tabindex="0">
         <div class="panel-head">
           <h2>Journal</h2>
           <p class="muted">
@@ -93,7 +99,7 @@
         <div class="log" id="log"></div>
       </section>
 
-      <section class="panel" id="panel-settings">
+      <section class="panel" id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" tabindex="0">
         <div class="settings">
           <fieldset>
             <legend>Workspace</legend>
@@ -153,7 +159,7 @@
         <span class="spacer"></span>
         <button class="btn ghost sm" id="ck-add">+ check</button>
         <button class="btn ghost sm" id="ck-add-note">+ note</button>
-        <label class="ck-auto" title="Draft criteria from the task when you press Run">
+        <label class="ck-auto" title="Draft criteria from the task; review them, then Run again to start">
           <input type="checkbox" id="ck-auto" checked /> automatic
         </label>
         <button class="btn ghost sm" id="ck-draft">Draft now</button>
@@ -171,6 +177,7 @@
       <textarea
         id="prompt"
         rows="1"
+        aria-label="Describe the change to make"
         placeholder="Describe the change. molt will prove it or refuse to say it is done."
         spellcheck="false"
       ></textarea>
@@ -195,9 +202,9 @@
       <span id="st-session" class="muted"></span>
     </footer>
 
-    <div class="modal hidden" id="picker">
+    <div class="modal hidden" id="picker" role="dialog" aria-modal="true" aria-labelledby="picker-title">
       <div class="modal-box">
-        <h3>Model</h3>
+        <h3 id="picker-title">Model</h3>
         <p class="muted" id="picker-sub">Asking every endpoint you hold a key for…</p>
         <div class="picker-list" id="picker-list"></div>
         <div class="add-endpoint">
@@ -216,7 +223,7 @@
       </div>
     </div>
 
-    <div class="modal hidden" id="confirm">
+    <div class="modal hidden" id="confirm" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
       <div class="modal-box">
         <h3 id="confirm-title">Permission</h3>
         <pre id="confirm-detail"></pre>

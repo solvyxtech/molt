@@ -57,7 +57,7 @@ body {
 
 .hidden { display: none !important; }
 .muted { color: var(--dim); }
-.sep { color: var(--line); margin: 0 6px; }
+.sep { color: var(--dim); margin: 0 6px; }
 .spacer { flex: 1; }
 
 /* ── title bar ─────────────────────────────────────────────────────────── */
@@ -87,27 +87,92 @@ body {
   color: var(--accent);
 }
 /*
- * The mark, drawn rather than typed.
+ * The mark.
  *
  * It was ▚ (U+259A) — which renders as a solid pair of quadrants on macOS, as
  * a different weight on Windows, and as a tofu box wherever the font lacks it.
- * A logo that depends on the user's font stack is not a logo. This is the same
- * diagonal split as the app icon, in CSS, identical on all three platforms.
+ * A logo that depends on the user's font stack is not a logo. Then it was a
+ * CSS gradient standing in for the icon; now it is the icon itself, shipped
+ * beside the page as `logo.png`, so the tile in the title bar, the mark on the
+ * empty session, and the app in the dock are one image rather than three
+ * approximations of each other.
+ *
+ * The corner radius is 22% of the box on both, which is the proportion the
+ * icon's own squircle is cut at — so the art keeps its shape at every size.
  */
 .mark {
   display: inline-block;
-  width: 13px; height: 13px;
-  vertical-align: -2px;
-  margin-right: 5px;
-  border-radius: 3px;
-  background: linear-gradient(135deg, var(--accent) 0 46%, var(--dim) 46% 54%, var(--ghost) 54% 100%);
+  width: 16px; height: 16px;
+  vertical-align: -3px;
+  margin-right: 6px;
+  border-radius: 4px;
+  background: url("logo.png") center / cover no-repeat;
 }
 .empty-mark {
   display: block;
-  width: 56px; height: 56px;
-  border-radius: 13px;
-  background: linear-gradient(135deg, var(--ghost) 0 46%, var(--line) 46% 54%, var(--bg-sunken) 54% 100%);
+  width: 96px; height: 96px;
+  border-radius: 21px;
+  background: url("logo.png") center / cover no-repeat;
 }
+
+/* ── the splash ────────────────────────────────────────────────────────── */
+/*
+ * The window molts on launch, from the same frames the terminal does. The
+ * stage is exactly the mark's box; the grid and the shell are drawn over it
+ * and overflow it, so the tagline below never moves — it is only held back
+ * with opacity while the water is going, and fades in when it settles.
+ */
+.mark-stage { position: relative; width: 96px; height: 96px; }
+
+.empty.splashing .empty-mark,
+.empty.splashing p { opacity: 0; }
+/* After, not before: the two rules have equal specificity, and the reveal has
+   to be the one that wins once both classes are on the block. */
+.empty.revealing .empty-mark { opacity: 1; transition: opacity 620ms ease-out; }
+.empty.revealing p { opacity: 1; transition: opacity 560ms ease-out 200ms; }
+
+.splash-grid {
+  position: absolute;
+  left: 50%; top: 50%;
+  transform: translate(-50%, -50%);
+  margin: 0;
+  /* Tighter than the body's 1.55: seven rows of waterline want to read as one
+     picture, and the terminal's rows are square-ish. */
+  font: 13px/1.22 var(--mono);
+  white-space: pre;
+  pointer-events: none;
+  user-select: none;
+}
+.splash-grid .t-accent { color: var(--accent); font-weight: 600; }
+.splash-grid .t-mid { color: var(--accent); }
+.splash-grid .t-dim { color: var(--dim); }
+.splash-grid .t-ghost { color: var(--ghost); }
+.empty.revealing .splash-grid { opacity: 0; transition: opacity 400ms ease-out; }
+
+/* The shell the cast husks build: one `)` per chamber, the same glyph the
+   wavefronts are drawn with, laid on a logarithmic spiral. */
+.splash-shell { position: absolute; inset: 0; pointer-events: none; user-select: none; }
+.arc {
+  position: absolute;
+  left: 50%; top: 50%;
+  font-family: var(--mono);
+  font-style: normal;
+  line-height: 1;
+  color: var(--dim);
+  opacity: 0;
+  transition: opacity 300ms ease-out, color 500ms linear;
+}
+.arc > b {
+  display: block;
+  font-weight: inherit;
+  transform: scale(1.4);
+  transition: transform 320ms cubic-bezier(0.2, 0.8, 0.3, 1);
+}
+.arc.in { opacity: 1; }
+.arc.in > b { transform: scale(1); }
+/* A chamber arrives lit and cools, the way the wavefront that left it does. */
+.arc.hot { color: var(--accent); }
+.empty.revealing .splash-shell { opacity: 0; transition: opacity 540ms ease-out 140ms; }
 
 .crumbs { display: flex; align-items: center; gap: 0; min-width: 0; }
 .crumb {
@@ -227,7 +292,10 @@ main { position: relative; overflow: hidden; }
   text-transform: uppercase;
   padding-top: 2px;
 }
-.said .what { white-space: pre-wrap; overflow-wrap: anywhere; }
+/* The blocks below (tools, proofs) stay wide because they carry commands and
+   output. Prose does not benefit: on a 2560px display a paragraph ran to about
+   160 characters a line, which is roughly twice a comfortable measure. */
+.said .what { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 100ch; }
 .said.user .what { color: var(--accent); }
 .said.error .what { color: var(--fail); }
 .said.info .what { color: var(--warn); }
@@ -287,16 +355,22 @@ main { position: relative; overflow: hidden; }
 .proof.fail h4 { color: var(--fail); }
 .proof .check {
   display: grid;
-  grid-template-columns: 62px 1fr auto;
+  /* verdict · name · what it said · how long. The name column was missing
+     entirely, so a block of four "PASS" rows named nothing it had proved. */
+  grid-template-columns: 54px minmax(80px, 150px) 1fr auto;
   gap: 10px;
   padding: 5px 11px;
   border-top: 1px solid var(--line-soft);
 }
 .proof .check:first-of-type { border-top: 0; }
-.proof .verdict { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; }
-.proof .verdict.pass { color: var(--ok); }
-.proof .verdict.fail { color: var(--fail); }
-.proof .est { opacity: 0.8; overflow-wrap: anywhere; }
+.proof .cname { color: var(--accent); overflow-wrap: anywhere; }
+/*
+ * Check output is a test runner's, and a test runner's output is lines. This
+ * was `normal`, which ran a whole assertion failure — expected, actual, the
+ * file it came from — into one wrapped paragraph.
+ */
+.proof .est { opacity: 0.85; overflow-wrap: anywhere; white-space: pre-wrap; }
+.proof h4 .dur { text-transform: none; color: var(--dim); }
 
 .receipt-link {
   display: inline-flex; align-items: center; gap: 7px;
@@ -340,6 +414,13 @@ main { position: relative; overflow: hidden; }
 .check-card.running { border-left-color: var(--accent); }
 .check-card .top { display: flex; align-items: center; gap: 10px; }
 .check-card .nm { color: var(--accent); }
+.verdict { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+.verdict.pass { color: var(--ok); }
+.verdict.fail { color: var(--fail); }
+.verdict.note { color: var(--warn); }
+/* Defined, and not reached by the run that just finished. */
+.verdict.skipped { color: var(--dim); }
+.check-card .ms { color: var(--dim); font-size: 11px; }
 .check-card .tag {
   font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
   color: var(--dim); border: 1px solid var(--line); border-radius: 999px; padding: 0 6px;
@@ -412,7 +493,13 @@ legend {
 .row.end { justify-content: flex-end; }
 .hint { color: var(--dim); font-size: 12px; }
 
-input[type="text"], input[type="password"], input[type="search"], select, textarea {
+/*
+ * `input:not([type])` matters: the criteria rows build their inputs in script
+ * and never set the attribute, so they matched none of these selectors and
+ * rendered as the browser's default — white box, black text, in a dark window.
+ */
+input[type="text"], input[type="password"], input[type="search"], input:not([type]),
+select, textarea {
   flex: 1;
   min-width: 0;
   background: var(--bg-sunken);
@@ -427,7 +514,14 @@ input:focus, select:focus, textarea:focus {
   border-color: var(--dim);
   box-shadow: inset 0 0 0 1px var(--ghost);
 }
-input::placeholder, textarea::placeholder { color: var(--line); }
+/*
+ * --line is the colour of a 1px rule, and eight things were using it as ink.
+ * Against --bg-sunken that is 1.5:1 — placeholder text, the palette's key
+ * hints and the criteria panel's empty line were all technically painted and
+ * effectively invisible. --dim is the palette's own secondary tone and roughly
+ * doubles it; nothing here needs a colour the theme does not already have.
+ */
+input::placeholder, textarea::placeholder { color: var(--dim); opacity: 0.85; }
 select { flex: 0 0 auto; min-width: 150px; cursor: pointer; }
 
 .btn {
@@ -449,6 +543,33 @@ select { flex: 0 0 auto; min-width: 150px; cursor: pointer; }
 .btn.danger:hover { background: var(--fail); color: #1a0b0b; }
 .btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
+/*
+ * Keyboard focus, drawn once for everything.
+ *
+ * Inputs cleared the UA outline and replaced it with a border tint that is
+ * nearly the border they already had; buttons, tabs and the list rows kept the
+ * default ring, which is a colour from outside the palette. :focus-visible, so
+ * a pointer click never draws it.
+ */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/*
+ * Repeated rather than inherited from the rule above: `input:focus { outline:
+ * none }` is an element plus a pseudo-class, which outranks a bare
+ * :focus-visible, so the ring stayed suppressed on exactly the controls that
+ * are hardest to locate without one. Inset, because a field's ring reads
+ * better inside its own border than floating outside it.
+ */
+input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+/* The panel is a tab stop, so it can take focus; a ring around the whole
+   scroll area belongs inside it, not drawn over the tab strip above. */
+.panel:focus-visible { outline-offset: -3px; }
+
 .link {
   background: none; border: 0; color: var(--accent);
   font: inherit; cursor: pointer; border-bottom: 1px dashed var(--dim);
@@ -467,7 +588,32 @@ select { flex: 0 0 auto; min-width: 150px; cursor: pointer; }
 .composer textarea { resize: none; max-height: 200px; line-height: 1.5; }
 .composer-side { display: flex; align-items: center; gap: 10px; }
 .ask { color: var(--dim); font-size: 12px; white-space: nowrap; cursor: pointer; }
-.ask input { accent-color: var(--dim); }
+.ask input { accent-color: var(--accent); }
+/*
+ * Unchecked checkboxes are drawn by the platform as a white tile, which is the
+ * brightest thing on the screen and sits next to the two settings that decide
+ * what a turn is allowed to do. accent-color only paints the checked state, so
+ * the box itself is drawn here.
+ */
+input[type="checkbox"] {
+  appearance: none;
+  width: 13px; height: 13px;
+  border: 1px solid var(--dim);
+  border-radius: 2px;
+  background: var(--bg-sunken);
+  cursor: pointer;
+  position: relative;
+  flex: 0 0 auto;
+}
+input[type="checkbox"]:checked { background: var(--accent); border-color: var(--accent); }
+input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute; left: 3.5px; top: 0.5px;
+  width: 3px; height: 7px;
+  border: solid var(--bg);
+  border-width: 0 2px 2px 0;
+  transform: rotate(42deg);
+}
 
 /* ── status bar ────────────────────────────────────────────────────────── */
 
@@ -535,7 +681,7 @@ select { flex: 0 0 auto; min-width: 150px; cursor: pointer; }
 }
 .picker-list .grp:first-child { border-top: 0; }
 .picker-list .grp .err { color: var(--fail); text-transform: none; letter-spacing: 0; font-size: 11px; }
-.picker-list .grp .host { color: var(--line); text-transform: none; letter-spacing: 0; }
+.picker-list .grp .host { color: var(--dim); text-transform: none; letter-spacing: 0; }
 .picker-list button {
   display: flex; align-items: center; gap: 10px;
   width: 100%; text-align: left;
@@ -545,7 +691,7 @@ select { flex: 0 0 auto; min-width: 150px; cursor: pointer; }
 .picker-list button:hover { background: var(--ghost); color: var(--accent); }
 .picker-list button.current { color: var(--accent); }
 .picker-list button.current::before { content: "▸"; margin-left: -13px; margin-right: 3px; }
-.picker-list .empty-grp { padding: 5px 11px 7px 22px; color: var(--line); font-size: 12px; }
+.picker-list .empty-grp { padding: 5px 11px 7px 22px; color: var(--dim); font-size: 12px; }
 
 /* ── the waiting row ───────────────────────────────────────────────────── */
 
@@ -646,7 +792,9 @@ select { flex: 0 0 auto; min-width: 150px; cursor: pointer; }
   background: none; border: 0; color: var(--text);
   font: inherit; padding: 5px 12px; cursor: pointer;
 }
-.palette-rows button .cmd { color: var(--accent); white-space: nowrap; }
+/* A column, not a ragged edge: the summary of every row starts in the same
+   place, which is the only reason a list of thirteen is scannable at all. */
+.palette-rows button .cmd { color: var(--accent); white-space: nowrap; flex: 0 0 25ch; }
 .palette-rows button .sum { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .palette-rows button.on { background: var(--ghost); }
 .palette-rows button.on .sum { color: var(--text); }
@@ -655,7 +803,7 @@ select { flex: 0 0 auto; min-width: 150px; cursor: pointer; }
   padding: 5px 12px;
   border-top: 1px solid var(--line-soft);
   background: var(--bg-sunken);
-  color: var(--line);
+  color: var(--dim);
   font-size: 11px;
 }
 
@@ -671,7 +819,7 @@ select { flex: 0 0 auto; min-width: 150px; cursor: pointer; }
 }
 .picker-list .forget {
   margin-left: auto;
-  background: none; border: 0; color: var(--line);
+  background: none; border: 0; color: var(--dim);
   font: inherit; font-size: 11px; text-transform: none; letter-spacing: 0;
   cursor: pointer;
 }
@@ -704,13 +852,17 @@ select { flex: 0 0 auto; min-width: 150px; cursor: pointer; }
    the other is intent, and they must never look alike. */
 .ck-row.check .ck-kind { color: var(--ok); border-color: var(--ok); }
 .ck-row.note  .ck-kind { color: var(--warn); border-color: var(--warn); }
-.ck-name { flex: 0 0 150px; }
+/* Outranks the shared `input[type="text"] { flex: 1 }` above, which an
+   attribute selector would otherwise win on specificity — leaving a 900px box
+   for a word like "lint" and squeezing the command it belongs to. */
+.ck-row input.ck-name { flex: 0 0 150px; }
 .ck-row input { padding: 4px 8px; font-size: 12px; }
 .ck-del {
-  background: none; border: 0; color: var(--line); font: inherit; cursor: pointer; padding: 0 4px;
+  background: none; border: 0; color: var(--dim); font: inherit; cursor: pointer; padding: 2px 6px;
+  border-radius: var(--r);
 }
 .ck-del:hover { color: var(--fail); }
-.ck-empty { color: var(--line); font-size: 12px; padding: 3px 0; }
+.ck-empty { color: var(--dim); font-size: 12px; padding: 3px 0; }
 
 /* The sealed summary, once a turn has started. */
 .sealed { margin: 6px 0 6px 90px; }

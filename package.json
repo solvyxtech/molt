@@ -1,7 +1,7 @@
 {
   "name": "molt-desktop",
   "version": "0.1.0",
-  "description": "molt, with a window. A coding agent that can't say done without proving it.",
+  "description": "molt, with a window. A coding agent that can't say \"done\" without proving it.",
   "keywords": [
     "ai",
     "agent",
