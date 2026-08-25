@@ -30,8 +30,14 @@ export interface ArchiveLike {
   list(): ArchiveEntry[];
   read(index: number): string;
   grep?(pattern: string): { index: number; excerpt: string }[];
-  /** Write evidence recovered from every archived batch, including prior sessions. */
-  ledger?(): LedgerEntry[];
+  /**
+   * Write evidence recovered from archived batches.
+   *
+   * `only` selects exuvia indices — in practice the ones the running session
+   * shed. Omitting it reads every batch in the directory, which is the right
+   * answer for browsing history and the wrong one for judging a turn.
+   */
+  ledger?(only?: ReadonlySet<number>): LedgerEntry[];
   dir: string;
 }
 
@@ -130,9 +136,26 @@ export class Archive implements ArchiveLike {
    * Every write recorded in every archived batch, oldest first. Spans
    * sessions: a batch shed yesterday still yields its evidence today.
    */
-  ledger(): LedgerEntry[] {
+  /**
+   * Write evidence from archived batches, optionally only the given indices.
+   *
+   * The directory outlives the session. Reading all of it made every turn be
+   * judged against the accumulated writes of every session that ever shed
+   * context here — a real receipt shows a turn whose only work was
+   * `src/files.ts` having its lines mutated in `electron/main.ts` and
+   * `ui/index.html`, written days earlier by someone else. Worse, `files-changed`
+   * then reports "contents changed since molt wrote it" for any of those a
+   * later commit touched, and the only way a model can clear that is to
+   * rewrite a file it has no reason to touch. One did exactly that: six
+   * comment-only word swaps in one step, and the bar accepted the turn.
+   *
+   * A check that can be satisfied by editing something irrelevant is not a
+   * check. So callers judging a turn pass the batches that turn shed.
+   */
+  ledger(only?: ReadonlySet<number>): LedgerEntry[] {
     const out: LedgerEntry[] = [];
     for (const entry of this.list()) {
+      if (only && !only.has(entry.index)) continue;
       const body = readFileSync(join(this.dir, entry.file), "utf8");
       const re = new RegExp("```" + LEDGER_MARKER + "\\n([\\s\\S]*?)\\n```", "g");
       let m: RegExpExecArray | null;

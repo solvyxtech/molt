@@ -8,7 +8,7 @@
  * than pick.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
@@ -140,6 +140,84 @@ describe("listing", () => {
         r.entries.map((e) => e.path).sort(),
         ["src/auth.ts", "src/deep/nested.ts", "src/util.ts"],
       );
+    } finally {
+      p.cleanup();
+    }
+  });
+
+  it("refuses a symlink that points out of the workspace", async () => {
+    // walk used statSync, which follows links, so a symlink to /etc or to
+    // another temp dir was listed and grepped as if it lived in the project.
+    const inside = workspace();
+    const outside = workspace();
+    try {
+      writeFileSync(join(outside.dir, "secret.txt"), "SENSITIVE-OUTSIDE\n");
+      mkdirSync(join(inside.dir, "inner"));
+      writeFileSync(join(inside.dir, "inner", "a.txt"), "in\n");
+      writeFileSync(join(inside.dir, "ok.txt"), "safe\n");
+      writeFileSync(join(inside.dir, "..foo"), "dotdot\n");
+      // A sibling whose path is the workspace path plus a suffix: a prefix
+      // check without a separator would treat it as inside.
+      const sibling = inside.dir + "-out";
+      mkdirSync(sibling);
+      writeFileSync(join(sibling, "secret2.txt"), "SIBLING-PREFIX\n");
+      symlinkSync(sibling, join(inside.dir, "side"));
+      symlinkSync(outside.dir, join(inside.dir, "escape"));
+      symlinkSync(join(outside.dir, "secret.txt"), join(inside.dir, "leak.txt"));
+      symlinkSync(join(outside.dir, "does-not-exist"), join(inside.dir, "ghost"));
+      symlinkSync(join(inside.dir, "ok.txt"), join(inside.dir, "alias.txt"));
+      symlinkSync(join(inside.dir, ".."), join(inside.dir, "parent"));
+      symlinkSync(join(inside.dir, "inner"), join(inside.dir, "nest"));
+      symlinkSync(inside.dir, join(inside.dir, "here"));
+      symlinkSync(join(inside.dir, "..foo"), join(inside.dir, "dotlink"));
+
+      const r = walk(inside.dir, { depth: 5 });
+      const paths = r.entries.map((e) => e.path);
+      assert.ok(paths.includes("ok.txt"), "lost a real file");
+      assert.ok(paths.includes("..foo"), "lost a real file whose name starts with ..");
+      assert.ok(paths.includes("alias.txt"), "refused an in-workspace file link");
+      assert.ok(paths.includes("dotlink"), "refused an in-workspace link to ..foo");
+      assert.ok(paths.includes("inner/"), "lost a real directory");
+      assert.ok(paths.includes("inner/a.txt"), "did not walk a real directory");
+      assert.ok(paths.includes("nest/"), "refused an in-workspace directory link");
+      assert.ok(paths.includes("nest/a.txt"), "did not walk through an in-workspace directory link");
+      assert.ok(paths.includes("here/"), "refused a link to the walk root");
+      assert.ok(!paths.includes("escape"), "listed an outbound directory link");
+      assert.ok(!paths.includes("escape/"), "listed an outbound directory link as a dir");
+      assert.ok(
+        !paths.some((p) => p.startsWith("escape/")),
+        `walked through an outbound directory link: ${paths.join(",")}`,
+      );
+      assert.ok(!paths.includes("leak.txt"), "listed a file symlink that points out");
+      assert.ok(!paths.includes("ghost"), "listed a dangling symlink");
+      assert.ok(!paths.includes("parent"), "listed a link to the parent of the workspace");
+      assert.ok(!paths.includes("parent/"), "walked through a link to the parent of the workspace");
+      assert.ok(!paths.includes("side"), "listed a sibling whose path is a prefix of the workspace");
+      assert.ok(!paths.includes("side/"), "walked a sibling whose path starts with the workspace path");
+      assert.ok(
+        !paths.some((p) => p.startsWith("side/")),
+        `followed a prefix-sibling symlink: ${paths.join(",")}`,
+      );
+
+      const hits = await grepFiles(inside.dir, "SENSITIVE-OUTSIDE");
+      assert.equal(hits.matches.length, 0, "grep read through an outbound symlink");
+      const sib = await grepFiles(inside.dir, "SIBLING-PREFIX");
+      assert.equal(sib.matches.length, 0, "grep read a sibling via a prefix-matching path");
+      const safe = await grepFiles(inside.dir, "safe");
+      assert.notEqual(safe.matches.length, 0, "grep stopped seeing in-workspace files");
+    } finally {
+      rmSync(inside.dir + "-out", { recursive: true, force: true });
+      inside.cleanup();
+      outside.cleanup();
+    }
+  });
+
+  it("returns nothing when the walk root cannot be resolved", () => {
+    const p = workspace();
+    try {
+      const r = walk(join(p.dir, "gone"), { depth: 2 });
+      assert.equal(r.entries.length, 0);
+      assert.equal(r.truncated, false);
     } finally {
       p.cleanup();
     }

@@ -78,6 +78,13 @@ export type BarContext = {
    */
   expectedArchivedWrites?: number;
   /**
+   * Exuvia indices the running session shed.
+   *
+   * Without it the archive answers with every batch in the directory, which
+   * is the whole project's history rather than this turn's evidence.
+   */
+  sessionArchives?: ReadonlySet<number>;
+  /**
    * Archive files this project's session logs say exist. Survives process
    * restart, so a deleted exuvia is caught tomorrow as well as today.
    */
@@ -997,7 +1004,7 @@ function runBuiltin(
       }
     }
 
-    const fromArchive = ctx.archive.ledger?.() ?? [];
+    const fromArchive = ctx.archive.ledger?.(ctx.sessionArchives) ?? [];
     const expected = ctx.expectedArchivedWrites ?? 0;
     if (fromArchive.length < expected) {
       return {

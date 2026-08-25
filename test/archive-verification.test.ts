@@ -117,6 +117,66 @@ describe("write evidence survives shedding", () => {
     );
   });
 
+  /**
+   * The archive directory outlives the session; the ledger a turn is judged
+   * against must not.
+   *
+   * From a real accepted receipt: a turn whose only work was `src/files.ts`
+   * had `work-checked` breaking lines in `electron/main.ts` and
+   * `ui/index.html` — written days earlier by someone else — and
+   * `work-landed` reporting "contents changed since molt wrote it" for four
+   * files that session never opened, because a later commit had touched them.
+   * The model cleared it the only way available to it: six comment-only word
+   * swaps across six untouched files, in one step, to make stale hashes
+   * match. The bar accepted the turn.
+   */
+  it("does not judge a new session against a previous session's writes", async () => {
+    const dir = ws();
+    writeBar(dir, "version: 1\nchecks:\n  - name: landed\n    builtin: files-changed\n");
+    await sessionWithShedWrite(dir);
+
+    // Tomorrow. Nothing has been written yet in this one.
+    const fresh = new Engine({
+      baseUrl: "http://mock/v1",
+      model: "m",
+      cwd: dir,
+      bar: loadBar(dir),
+      archive: new Archive(dir),
+    });
+
+    assert.ok(
+      fresh.mergedLedger().some((e) => e.path === "early.ts"),
+      "yesterday's work must stay auditable",
+    );
+    assert.deepEqual(
+      fresh.sessionLedger(),
+      [],
+      "a new session inherited a previous session's writes as if it had made them",
+    );
+  });
+
+  it("refuses a turn that wrote nothing, however much the project has written", async () => {
+    // The consequence that matters. With the project's history in the ledger,
+    // files-changed judged a turn that did nothing against files it never
+    // opened — passing, failing on a stale hash, or being cleared by an edit
+    // made only to clear it. All three are wrong; the honest answer is that
+    // this turn wrote nothing.
+    const dir = ws();
+    writeBar(dir, "version: 1\nchecks:\n  - name: landed\n    builtin: files-changed\n");
+    await sessionWithShedWrite(dir);
+
+    const fresh = new Engine({
+      baseUrl: "http://mock/v1",
+      model: "m",
+      cwd: dir,
+      bar: loadBar(dir),
+      archive: new Archive(dir),
+    });
+    const result = await runBar(loadBar(dir)!, fresh.barContext());
+    assert.equal(result.ok, false, "credited a turn with work a previous session did");
+    assert.match(result.results[0]!.output, /No file was modified in this session/);
+  });
+
   it("rebases surviving entries so they do not point at the wrong turn", async () => {
     const dir = ws();
     writeBar(dir, "version: 1\nchecks:\n  - name: landed\n    builtin: files-changed\n");
