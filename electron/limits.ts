@@ -15,6 +15,22 @@ export function tailLines(text: string, cap: number): string[] {
 }
 
 /**
+ * What `journal:read` actually sends.
+ *
+ * Parsing lives here so a test that overflows the cap is a test of the
+ * handler, not of a helper the handler forgot to call.
+ */
+export function parseJournal(text: string, cap = JOURNAL_IPC_CAP): unknown[] {
+  return tailLines(text, cap).map((line) => {
+    try {
+      return JSON.parse(line) as unknown;
+    } catch {
+      return { kind: "unparsed", line };
+    }
+  });
+}
+
+/**
  * What `/init` should say.
  *
  * `writeDefaultBar` returns an object either way. Treating that object as a
@@ -25,4 +41,19 @@ export function barInitText(existed: boolean, file: string, checks: number): str
   return existed
     ? `${file} already exists — left alone`
     : `wrote ${file} — ${checks} check(s). Edit it to match this project.`;
+}
+
+/**
+ * May this command run while a turn is in flight?
+ *
+ * Three commands change session state and must wait for the turn to end. The
+ * guard matched on the bare name, which also caught `/shed --explain` — the
+ * read-only form that computes a shed plan and returns it without touching the
+ * transcript, and the one question most worth asking *while* something is
+ * running and the context is growing under you.
+ */
+export function mutatesSession(name: string, arg: string): boolean {
+  if (name === "/regrow" || name === "/prove") return true;
+  if (name !== "/shed") return false;
+  return !/^(--explain|explain)$/.test(arg.trim());
 }

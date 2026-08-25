@@ -13,7 +13,11 @@
  */
 
 import { renderMarkdown } from "./markdown.js";
+import { playSplash } from "./splash.js";
+import { fmtCost } from "../src/format.js";
+import { matchCommands } from "../src/commands.js";
 import { JOURNAL_RENDER_CAP, STREAM_CAP, newest, trimOldest } from "./bounds.js";
+import { holdAfterAutoDraft } from "./criteria-hold.js";
 
 // ── the bridge ───────────────────────────────────────────────────────────────
 
@@ -144,8 +148,25 @@ const fmtInt = (n: number): string =>
       ? `${(n / 1000).toFixed(1)}k`
       : String(n);
 
-const fmtMs = (ms: number): string =>
-  ms >= 60_000 ? `${Math.round(ms / 60_000)}m` : ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+/**
+ * A duration, at the precision the number deserves.
+ *
+ * It was `${Math.round(ms / 60_000)}m` past a minute, which rounded 90s to
+ * "2m" and printed a 64s test run and a 119s one identically. On a screen whose
+ * whole claim is that the numbers are real, a duration that rounds to the
+ * nearest minute is the wrong kind of approximate.
+ */
+const fmtMs = (ms: number): string => {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  let m = Math.floor(ms / 60_000);
+  let s = Math.round((ms % 60_000) / 1000);
+  if (s === 60) {
+    m += 1;
+    s = 0;
+  }
+  return s ? `${m}m ${s}s` : `${m}m`;
+};
 
 // ── state ────────────────────────────────────────────────────────────────────
 
@@ -162,14 +183,28 @@ let pendingReceipt: string | null = null;
 // ── tabs ─────────────────────────────────────────────────────────────────────
 
 function showTab(name: string): void {
-  for (const t of document.querySelectorAll<HTMLElement>(".tab"))
-    t.classList.toggle("active", t.dataset.tab === name);
+  for (const t of document.querySelectorAll<HTMLElement>(".tab")) {
+    const on = t.dataset.tab === name;
+    t.classList.toggle("active", on);
+    // The strip already said role="tab" and never said which one was chosen,
+    // so a screen reader announced six tabs and no selection. Roving tabindex
+    // with it: a tablist is one stop, and the arrows move inside it.
+    t.setAttribute("aria-selected", String(on));
+    t.tabIndex = on ? 0 : -1;
+  }
   for (const p of document.querySelectorAll<HTMLElement>(".panel"))
     p.classList.toggle("active", p.id === `panel-${name}`);
   // The composer belongs to the session; showing it elsewhere invites you to
   // type a task into a screen that will not run one.
   $("composer").classList.toggle("hidden", name !== "session");
   if (name !== "session") closePalette();
+  // Not at boot: with no workspace open the window lands on Settings, and a
+  // splash that molts behind a form nobody is looking at has been spent. It
+  // plays the first time the session is actually on screen.
+  if (name === "session") {
+    const empty = document.getElementById("stream-empty");
+    if (empty) playSplash(empty);
+  }
   if (name === "receipts") void loadReceipts();
   if (name === "log") void loadJournal();
   if (name === "checks") clearBadge("checks");
@@ -188,6 +223,24 @@ function clearBadge(which: "checks" | "receipts"): void {
 document.getElementById("tabs")!.addEventListener("click", (e) => {
   const t = (e.target as HTMLElement).closest<HTMLElement>(".tab");
   if (t?.dataset.tab) showTab(t.dataset.tab);
+});
+
+/** Arrow keys move within the strip, which is what a tablist promises. */
+document.getElementById("tabs")!.addEventListener("keydown", (e) => {
+  if (!["ArrowRight", "ArrowLeft", "Home", "End"].includes(e.key)) return;
+  const tabs = [...document.querySelectorAll<HTMLElement>(".tab")];
+  const at = tabs.findIndex((t) => t.classList.contains("active"));
+  const to =
+    e.key === "Home"
+      ? 0
+      : e.key === "End"
+        ? tabs.length - 1
+        : (at + (e.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+  const next = tabs[to];
+  if (!next?.dataset.tab) return;
+  e.preventDefault();
+  showTab(next.dataset.tab);
+  next.focus();
 });
 document.body.addEventListener("click", (e) => {
   const g = (e.target as HTMLElement).closest<HTMLElement>("[data-goto]");
@@ -369,26 +422,39 @@ function proofBlock(ev: Ev): HTMLElement {
   const passed = rows.filter((c) => c.ok).length;
 
   const box = el("div", `proof ${ok ? (advisoryOnly && failed ? "note" : "pass") : "fail"}`);
+  // The duration is kept out of the headline string: the headline is
+  // uppercased, and "1m" uppercases to "1M", which reads as a size.
   let head: string;
+  let dur = "";
   if (advisoryOnly) {
-    head =
-      failed === 0
-        ? `answered — ${passed} check(s) reported, all clear · ${fmtMs(r.durationMs ?? 0)}`
-        : `answered — ${failed} of ${rows.length} check(s) already failing, before this question`;
+    if (failed === 0) {
+      head = `answered — ${passed} check(s) reported, all clear`;
+      dur = fmtMs(r.durationMs ?? 0);
+    } else {
+      head = `answered — ${failed} of ${rows.length} check(s) already failing, before this question`;
+    }
   } else if (ok) {
-    head = `bar met — ${passed} of ${rows.length} checks · ${fmtMs(r.durationMs ?? 0)}`;
+    head = `bar met — ${passed} of ${rows.length} checks`;
+    dur = fmtMs(r.durationMs ?? 0);
   } else {
     head = `bar not met — ${passed} of ${rows.length} checks${
       ev.attempt ? ` · attempt ${ev.attempt}` : ""
     }`;
   }
-  box.appendChild(el("h4", undefined, head));
+  const h = el("h4", undefined, head);
+  if (dur) h.appendChild(el("span", "dur", ` · ${dur}`));
+  box.appendChild(h);
 
   for (const c of rows) {
     const row = el("div", "check");
     const label = c.ok ? "pass" : c.advisory ? "note" : "FAIL";
     const cls = c.ok ? "pass" : c.advisory ? "note" : "fail";
     row.appendChild(el("div", `verdict ${cls}`, label));
+    // The name was missing entirely. Four rows reading "PASS" with a blank
+    // middle told you the bar was met and refused to say by what — and on a
+    // failure you could not tell which check had refused the claim, which is
+    // the one fact the block exists to carry.
+    row.appendChild(el("div", "cname", c.name ?? ""));
     row.appendChild(el("div", "est", c.output || c.detail || ""));
     row.appendChild(el("div", "ms muted", c.durationMs ? fmtMs(c.durationMs) : ""));
     box.appendChild(row);
@@ -439,6 +505,11 @@ function renderChecks(result?: Ev): void {
     top.appendChild(el("span", "nm", r.name));
     top.appendChild(el("span", "tag", r.kind ?? ""));
     top.appendChild(el("span", "spacer"));
+    // The stream's proof block times every check and this screen — the one
+    // headed "the bar" — did not, so the slow check was only ever findable by
+    // scrolling back into the session. Left of the verdict, which stays the
+    // rightmost thing on every row so the column of them reads straight down.
+    if (r.durationMs) top.appendChild(el("span", "ms", fmtMs(r.durationMs)));
     top.appendChild(
       el("span", r.ok ? "verdict pass" : "verdict fail", r.ok ? "pass" : "FAIL"),
     );
@@ -453,6 +524,14 @@ function renderChecks(result?: Ev): void {
     top.appendChild(el("span", "nm", c.name));
     top.appendChild(el("span", "tag", c.kind));
     for (const t of c.tags ?? []) top.appendChild(el("span", "tag", t));
+    // Only meaningful once something has run: before that every check is
+    // unrun, and labelling them all would be noise. After a run, a check with
+    // no verdict is a fact — it was skipped — and a blank right-hand side left
+    // that indistinguishable from a check that passed quietly.
+    if (results.length) {
+      top.appendChild(el("span", "spacer"));
+      top.appendChild(el("span", "verdict skipped", "not run"));
+    }
     card.appendChild(top);
     box.appendChild(card);
   }
@@ -703,13 +782,58 @@ function showTabHint(): void {
   hinted = true;
 }
 
+/**
+ * What opening something over the page costs you.
+ *
+ * Focus moves in and comes back where it was, and Escape closes it. Neither
+ * was true of either dialog: the picker could only be dismissed by finding its
+ * Close button with the mouse, and the permission prompt trapped nothing,
+ * focused nothing, and left Tab wandering into the composer behind it.
+ */
+let modalReturn: HTMLElement | null = null;
+
+function openModal(id: string, focusId?: string): void {
+  modalReturn = document.activeElement as HTMLElement | null;
+  $(id).classList.remove("hidden");
+  if (focusId) $(focusId).focus();
+}
+
+function closeModal(id: string): void {
+  $(id).classList.add("hidden");
+  modalReturn?.focus?.();
+  modalReturn = null;
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  // Innermost surface first, one per press.
+  if (!$("confirm").classList.contains("hidden")) {
+    // Escape is an answer here, and the only answer it can safely mean.
+    e.preventDefault();
+    ($("confirm-no") as HTMLButtonElement).click();
+    return;
+  }
+  if (!$("picker").classList.contains("hidden")) {
+    e.preventDefault();
+    closeModal("picker");
+    return;
+  }
+  if (!$("criteria").classList.contains("hidden")) {
+    e.preventDefault();
+    $("criteria").classList.add("hidden");
+  }
+});
+
 molt.onConfirm((req) => {
   $("confirm-title").textContent = req.name;
   $("confirm-detail").textContent = req.detail;
-  $("confirm").classList.remove("hidden");
+  // Refuse takes focus, not Allow. A permission prompt appears without being
+  // asked for, often while the pointer is somewhere else entirely, and the
+  // key someone is most likely to hit next must not grant anything.
+  openModal("confirm", "confirm-no");
   const answer = (ok: boolean) => () => {
     molt.answerConfirm(req.id, ok);
-    $("confirm").classList.add("hidden");
+    closeModal("confirm");
   };
   const yes = $("confirm-yes");
   const no = $("confirm-no");
@@ -722,13 +846,14 @@ molt.onConfirm((req) => {
 molt.onIdle(() => {
   stopActivity();
   busy = false;
+  hintedBusy = false;
   $("send").classList.remove("hidden");
   $("stop").classList.add("hidden");
   // Stop (and the turn ending any other way) resolves a pending confirm to
   // false on the main side. The dialog is only hidden by its own buttons,
   // so without this a cancelled permission prompt stays on screen and
   // answers nothing.
-  $("confirm").classList.add("hidden");
+  if (!$("confirm").classList.contains("hidden")) closeModal("confirm");
   if (!$("state-dot").classList.contains("ok") && !$("state-dot").classList.contains("fail"))
     setState("idle", "idle");
   void refreshStats();
@@ -748,8 +873,9 @@ promptBox.addEventListener("input", () => {
 });
 
 promptBox.addEventListener("keydown", (e) => {
-  // While the palette is open the arrow keys belong to it, not to the caret.
-  if (paletteMatches.length > 0) {
+  // While the palette is still choosing, the arrow keys belong to it, not to
+  // the caret — but once an argument is being typed the line is yours again.
+  if (paletteChoosing()) {
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
       const d = e.key === "ArrowDown" ? 1 : -1;
@@ -768,6 +894,8 @@ promptBox.addEventListener("keydown", (e) => {
     }
     if (e.key === "Escape") {
       e.preventDefault();
+      // Or the same press closes the palette and then the criteria panel.
+      e.stopPropagation();
       closePalette();
       return;
     }
@@ -788,9 +916,12 @@ promptBox.addEventListener("keydown", (e) => {
 
 const ask0 = (): boolean => ($("ask") as HTMLInputElement).checked;
 
+/** Reset each time the engine goes idle, so the hint is once per turn. */
+let hintedBusy = false;
+
 async function send(): Promise<void> {
   const text = promptBox.value.trim();
-  if (!text || busy) return;
+  if (!text) return;
   // A line beginning with / is a command. Sending it to the model instead is
   // how "/budget 40000" becomes a request to write a budgeting feature.
   if (text.startsWith("/")) {
@@ -804,6 +935,27 @@ async function send(): Promise<void> {
     await runCommand(name, arg);
     return;
   }
+  // A command is not a turn.
+  //
+  // The composer refused everything while one was running, which took the whole
+  // palette away at exactly the moment most of it is worth having: /wire,
+  // /stats, /receipts and `/shed --explain` all answer questions you only think
+  // to ask while something is in flight. Worse, Enter did nothing at all and
+  // said nothing about why, which reads as a broken key rather than a refusal.
+  // Only a prompt for the model has to wait for the model.
+  if (busy) {
+    if (!hintedBusy) {
+      hintedBusy = true;
+      say(
+        "",
+        "a turn is running — press Stop to interrupt it, or send a /command " +
+          "(/shed --explain, /stats, /wire) which runs alongside it",
+        "info",
+      );
+    }
+    return;
+  }
+
   // "? question" is the terminal's shorthand for ask-only.
   if (text.startsWith("?")) {
     ($("ask") as HTMLInputElement).checked = true;
@@ -815,6 +967,48 @@ async function send(): Promise<void> {
     $("set-status").textContent = "Open a workspace first.";
     return;
   }
+  const ask = ask0();
+  const auto = ($("ck-auto") as HTMLInputElement).checked;
+  const hadRows = rows.length > 0;
+
+  // Drafted from what you just typed, unless you already wrote some yourself.
+  // Announced rather than silent: criteria decide whether the turn can be
+  // called done, and finding out afterwards that something was added on your
+  // behalf is the wrong way to learn it.
+  //
+  // A drafted `run` is a process (`shell: true` at proof time), not a
+  // stricter boolean. Filling the panel and starting the turn in one press
+  // is how a model-chosen command runs with no extra click. Hold instead:
+  // the first press drafts, the second seals what is still in the panel.
+  if (auto && !hadRows && !ask) {
+    busy = true;
+    $("send").classList.add("hidden");
+    $("stop").classList.remove("hidden");
+    setState("busy", "drafting");
+    startActivity("drafting criteria");
+    await draftInto(text, true);
+    const drafted = criteriaPayload();
+    if (
+      holdAfterAutoDraft({
+        auto,
+        hadRows,
+        ask,
+        drafted: !!(drafted.checks.length || drafted.notes.length),
+      })
+    ) {
+      $("criteria").classList.remove("hidden");
+      drawCriteria();
+      $("ck-state").textContent = "review the draft, then Run again to seal it";
+      say("", "drafted criteria — review them, then Run to start the turn", "info");
+      stopActivity();
+      busy = false;
+      $("send").classList.remove("hidden");
+      $("stop").classList.add("hidden");
+      setState("idle", "review criteria");
+      return;
+    }
+  }
+
   promptBox.value = "";
   autogrow();
   say("you", text, "user");
@@ -824,17 +1018,7 @@ async function send(): Promise<void> {
   setState("busy", "thinking");
   // Before the first event: the request is in flight and the window must say
   // so, or the gap between Run and the first token reads as a dead click.
-  startActivity(ask0() ? "asking" : "thinking");
-  const ask = ($("ask") as HTMLInputElement).checked;
-
-  // Drafted from what you just typed, unless you already wrote some yourself.
-  // Announced rather than silent: criteria decide whether the turn can be
-  // called done, and finding out afterwards that something was added on your
-  // behalf is the wrong way to learn it.
-  if (($("ck-auto") as HTMLInputElement).checked && rows.length === 0 && !ask) {
-    setPhase("drafting criteria");
-    await draftInto(text, true);
-  }
+  startActivity(ask ? "asking" : "thinking");
 
   const criteria = criteriaPayload();
   if (criteria.checks.length || criteria.notes.length) {
@@ -957,6 +1141,10 @@ function drawCriteria(): void {
 
     if (r.kind === "check") {
       const name = el("input", "ck-name") as HTMLInputElement;
+      // Explicit, because the stylesheet selects on input[type="text"] and an
+      // input with no attribute does not match it — these rows rendered as
+      // white boxes with black text in the middle of a dark window.
+      name.type = "text";
       name.value = r.name;
       name.placeholder = "name";
       name.spellcheck = false;
@@ -964,7 +1152,8 @@ function drawCriteria(): void {
       row.appendChild(name);
     }
 
-    const text = el("input") as HTMLInputElement;
+    const text = el("input", "ck-text") as HTMLInputElement;
+    text.type = "text";
     text.value = r.text;
     text.placeholder = r.kind === "check" ? "shell command that must exit 0" : "what should be true";
     text.spellcheck = false;
@@ -1019,12 +1208,12 @@ $("ck-add-note").addEventListener("click", () => {
 /**
  * Draft criteria from the task text.
  *
- * Safe to run without asking, which is why it is automatic by default. Task
- * checks are appended to the project's bar and a name collision resolves toward
- * the project, so a drafted criterion can only make the gate stricter — the
- * worst a bad draft can do is leave you where you started. The project bar is
- * the one that must never come from a prompt, because that one can be
- * weakened, and a model that sets its own passing conditions always passes.
+ * Automatic by default, but `send` holds after a non-empty draft so a person
+ * sees the commands before they run. A drafted check is a process, not a
+ * stricter boolean — `true` does not weaken the project bar, and `rm -rf`
+ * still runs. The project bar is the one that must never come from a prompt,
+ * because that one can be weakened, and a model that sets its own passing
+ * conditions always passes.
  */
 async function draftInto(task: string, quiet = false): Promise<void> {
   if (!task) {
@@ -1069,43 +1258,6 @@ $("ck-draft").addEventListener("click", () => void draftInto(promptBox.value.tri
 let paletteMatches: AppState["commands"] = [];
 let paletteIndex = 0;
 
-function isSubsequence(needle: string, hay: string): boolean {
-  if (needle.length === 0) return true;
-  let i = 0;
-  for (const ch of hay) {
-    if (ch === needle[i]) i++;
-    if (i === needle.length) return true;
-  }
-  return false;
-}
-
-/** Mirrors matchCommands in src/commands.ts, including the tie-breaks. */
-function matchCommands(input: string): AppState["commands"] {
-  const all = state?.commands ?? [];
-  const trimmed = input.trim();
-  if (!trimmed.startsWith("/")) return [];
-  // Once there is an argument the command is settled — stop suggesting.
-  if (/\s/.test(trimmed)) return [];
-  const q = trimmed.slice(1).toLowerCase();
-  if (q === "") return all;
-
-  const scored: { c: AppState["commands"][number]; rank: number }[] = [];
-  for (const c of all) {
-    const name = c.name.slice(1).toLowerCase();
-    const terms = [name, ...(c.aliases ?? [])].map((t) => t.toLowerCase());
-    let rank = -1;
-    if (name === q) rank = 0;
-    else if (terms.some((t) => t.startsWith(q))) rank = 1;
-    else if (isSubsequence(q, name)) rank = 2;
-    else if (c.summary.toLowerCase().split(/\W+/).some((w) => w.startsWith(q))) rank = 3;
-    if (rank >= 0) scored.push({ c, rank });
-  }
-  scored.sort(
-    (a, b) => a.rank - b.rank || a.c.name.length - b.c.name.length || a.c.name.localeCompare(b.c.name),
-  );
-  return scored.map((s) => s.c);
-}
-
 function drawPalette(): void {
   const box = $("palette-rows");
   box.textContent = "";
@@ -1130,9 +1282,24 @@ function refreshPalette(): void {
     closePalette();
     return;
   }
-  paletteMatches = matchCommands(promptBox.value);
+  paletteMatches = matchCommands(promptBox.value, state?.commands ?? []);
   if (paletteIndex >= paletteMatches.length) paletteIndex = 0;
   drawPalette();
+}
+
+/**
+ * Is the palette still a menu, or already just a label?
+ *
+ * The shared matcher keeps returning the settled command once an argument is
+ * being typed — deliberately, so the row stays on screen as a reminder of which
+ * command you are inside and what it takes. That makes it a hint, not a
+ * chooser, and the keyboard has to know the difference: with `/model grok-4.6`
+ * typed, Enter must send the line. Routed to the palette it would have run
+ * "needs an argument, so complete rather than run" and replaced everything
+ * after `/model ` with nothing.
+ */
+function paletteChoosing(): boolean {
+  return paletteMatches.length > 0 && !/\s/.test(promptBox.value.trim());
 }
 
 function closePalette(): void {
@@ -1145,6 +1312,13 @@ function closePalette(): void {
 async function runPaletteChoice(): Promise<void> {
   const c = paletteMatches[paletteIndex];
   if (!c) return;
+  // Clicking the hint row for a command you have already begun arguing with
+  // means "yes, that one" — not "throw away what I typed".
+  if (!paletteChoosing()) {
+    closePalette();
+    promptBox.focus();
+    return;
+  }
   closePalette();
   if (c.args) {
     // Needs an argument, so complete rather than run — firing /regrow with no
@@ -1354,10 +1528,16 @@ async function sources(force = false): Promise<ModelSource[]> {
 }
 
 async function openPicker(): Promise<void> {
-  $("picker").classList.remove("hidden");
+  openModal("picker");
   $("picker-sub").textContent = "Asking every endpoint you hold a key for…";
   $("picker-list").textContent = "";
   await drawPicker(await sources());
+  // Focus lands on the list once it exists, so the model you are switching to
+  // is one Tab away rather than four.
+  const first =
+    $("picker-list").querySelector<HTMLElement>("button.current") ??
+    $("picker-list").querySelector<HTMLElement>("button");
+  (first ?? $("picker-close")).focus();
 }
 
 async function drawPicker(list: ModelSource[]): Promise<void> {
@@ -1410,7 +1590,7 @@ async function chooseModel(id: string, url: string): Promise<void> {
     ($("set-model") as HTMLInputElement).value = id;
     ($("set-url") as HTMLInputElement).value = url;
     syncModelPick(id);
-    $("picker").classList.add("hidden");
+    closeModal("picker");
     $("set-status").textContent = `${id} selected — open a workspace to use it.`;
     showTab("settings");
     return;
@@ -1423,12 +1603,18 @@ async function chooseModel(id: string, url: string): Promise<void> {
   }
   state = r.state!;
   applyState();
-  $("picker").classList.add("hidden");
+  closeModal("picker");
   say("", `model is now ${id}`, "info");
 }
 
 $("crumb-model").addEventListener("click", () => void openPicker());
-$("picker-close").addEventListener("click", () => $("picker").classList.add("hidden"));
+$("picker-close").addEventListener("click", () => closeModal("picker"));
+// The backdrop dismisses the picker, which costs nothing to reopen. It does
+// not dismiss the permission prompt: that one is a question, and a stray click
+// beside it must not be able to answer it either way.
+$("picker").addEventListener("click", (e) => {
+  if (e.target === $("picker")) closeModal("picker");
+});
 $("picker-add").addEventListener("click", () => void addEndpoint());
 $("picker-url").addEventListener("keydown", (e) => {
   if ((e as KeyboardEvent).key === "Enter") void addEndpoint();
@@ -1539,7 +1725,14 @@ function applyState(): void {
   if (!state) return;
   $("crumb-cwd").textContent = state.cwd ?? "no workspace";
   $("crumb-cwd").className = state.cwd ? "crumb" : "crumb muted";
+  // Both crumbs ellipsise at 340px, and a deep path or a long local model id
+  // is longer than that far more often than not. Without a tooltip the tail —
+  // which is the part that identifies it — was simply unreadable.
+  $("crumb-cwd").title = state.cwd ?? "no workspace open";
   $("crumb-model").textContent = state.model ?? "no model";
+  $("crumb-model").title = state.model
+    ? `${state.model}${state.baseUrl ? ` — ${state.baseUrl}` : ""}\nClick to change`
+    : "Click to choose a model";
   // Keep link-quiet: the crumb is the way into the model picker, and assigning
   // className wholesale here would quietly strip the affordance that says so.
   $("crumb-model").classList.toggle("muted", !state.model);
@@ -1548,6 +1741,13 @@ function applyState(): void {
     ? `bar: ${state.checks.length} check(s)`
     : "no bar — unverified";
   $("st-session").textContent = state.sessionId ? `session ${state.sessionId}` : "";
+  // Settings is where you go to see what is open, and its workspace box was
+  // filled from nothing — a session could be running against a directory while
+  // the field that names it sat empty behind a placeholder. Never while it has
+  // focus: overwriting a path someone is halfway through typing is worse than
+  // showing them nothing.
+  const cwdBox = $("set-cwd") as HTMLInputElement;
+  if (state.cwd && document.activeElement !== cwdBox) cwdBox.value = state.cwd;
   renderAutonomy();
   $("local-hint").textContent = state.selfHosted
     ? "Self-hosted: no spending ceiling applies, and molt will not warn about caching it cannot see."
@@ -1565,7 +1765,10 @@ async function refreshStats(): Promise<void> {
   // empty session showed "— · — · —", which reads as broken rather than idle.
   const parts = [`${fmtInt(s.tokens)} tokens`];
   if (s.cached > 0) parts.push(`${fmtInt(s.cached)} cached`);
-  if (s.costUsd !== null) parts.push(`$${s.costUsd.toFixed(4)}`);
+  // The terminal's rule, not a second one: always dollars, three decimals at
+  // most, "<$0.001" below that. `toFixed(4)` printed "$0.0001" as a run of
+  // zeros to count, and read differently from the same session in the CLI.
+  if (s.costUsd !== null) parts.push(fmtCost(s.costUsd));
   if (s.shedBatches > 0) parts.push(`${s.shedBatches} shed`);
   $("st-usage").textContent = s.tokens > 0 ? parts.join("  ·  ") : "";
 }
