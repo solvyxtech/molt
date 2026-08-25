@@ -579,6 +579,43 @@ describe("work landing means work, not a keystroke", () => {
     assert.equal((await runCheckFor(ledgerOf("src/cli.tsx", 1))).ok, true);
   });
 
+  it("refuses comment-only files riding along with one real change", async () => {
+    // Exploit: one substantive edit plus six comment-only word swaps.
+    // Path: runBuiltin("files-changed") in src/bar.ts sums substance across
+    // the whole turn (`total === 0` is the only refusal). One real line
+    // makes total === 1, so the six empty files never trip the gate.
+    // Receipt it would produce: work-landed ok, "7 file(s) modified and
+    // verified byte-for-byte on disk" — accepted. That is receipt 0037's
+    // remaining hole: the comment-only rule is a SUM, not per file.
+    const riders = [
+      "src/untouched-a.ts",
+      "src/untouched-b.ts",
+      "src/untouched-c.ts",
+      "src/untouched-d.ts",
+      "src/untouched-e.ts",
+      "src/untouched-f.ts",
+    ];
+    const out = await runCheckFor([
+      { path: "src/fix.ts", before: "aaa", after: "bbb", callId: "c1", substance: 1 },
+      ...riders.map((path, i) => ({
+        path,
+        before: "aaa",
+        after: "bbb",
+        callId: `c${i + 2}`,
+        substance: 0,
+      })),
+    ]);
+    assert.equal(
+      out.ok,
+      false,
+      "one real line must not launder comment-only files into an accepted receipt",
+    );
+    for (const path of riders) {
+      assert.match(out.output, new RegExp(path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    }
+    assert.match(out.output, /comment-only: allow/);
+  });
+
   it("lets a project say documentation is the work", async () => {
     assert.equal((await runCheckFor(ledgerOf("docs/guide.md", 0), true)).ok, true);
   });

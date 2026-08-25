@@ -874,7 +874,7 @@ function runBuiltin(
     }
     if (problems.length) return { ok: false, output: problems.join("\n") };
 
-    // A file changed, and every changed line was a comment or a blank.
+    // A file changed, and the change was only comments or blanks.
     //
     // This is the hole receipt 0025 went through. `work-landed` had asked only
     // whether a file changed; the model added a comment restating a function's
@@ -883,22 +883,31 @@ function runBuiltin(
     // was the reason the change existed, which is the one thing a gate must
     // never be.
     //
+    // Judged per file, not as a sum. Receipt 0037's remaining hole: one real
+    // line made `total === 1` and six comment-only word swaps rode along
+    // inside the same accepted turn. A file whose every changed line is a
+    // comment is still not work, even when a sibling file is.
+    //
     // `substance` is absent on entries restored from an older archive. Unknown
     // is not zero: an entry that cannot be judged is left alone rather than
     // held against the model.
-    const judged = ctx.ledger.filter((e) => typeof e.substance === "number");
-    const total = judged.reduce((n, e) => n + (e.substance ?? 0), 0);
-    if (!allowCommentOnly && judged.length === ctx.ledger.length && total === 0) {
-      return {
-        ok: false,
-        output:
-          `Every changed line is a comment or blank: ${ctx.ledger.map((e) => e.path).join(", ")}.\n` +
-          "A comment added so this check would pass is not the task being done, and " +
-          "writing one is a worse outcome than saying the work is unfinished.\n" +
-          "If the task genuinely was documentation, set `comment-only: allow` under " +
-          "work-landed in .molt/done.yml. If it needed no file change at all, say so " +
-          "plainly and stop — molt reports that as an answer, not a failure.",
-      };
+    if (!allowCommentOnly) {
+      const empty = ctx.ledger.filter((e) => e.substance === 0);
+      if (empty.length) {
+        const allEmpty = empty.length === ctx.ledger.length;
+        return {
+          ok: false,
+          output:
+            (allEmpty
+              ? `Every changed line is a comment or blank: ${empty.map((e) => e.path).join(", ")}.\n`
+              : `Comment-only change(s) riding along with real work: ${empty.map((e) => e.path).join(", ")}.\n`) +
+            "A comment added so this check would pass is not the task being done, and " +
+            "writing one is a worse outcome than saying the work is unfinished.\n" +
+            "If the task genuinely was documentation, set `comment-only: allow` under " +
+            "work-landed in .molt/done.yml. If it needed no file change at all, say so " +
+            "plainly and stop — molt reports that as an answer, not a failure.",
+        };
+      }
     }
     return {
       ok: true,
