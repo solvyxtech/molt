@@ -1072,6 +1072,15 @@ export class Engine {
    */
   private archivedWrites = 0;
 
+  /**
+   * Exuvia indices this session shed, so the bar reads back this session's
+   * archived writes and not the whole project's history.
+   *
+   * The archive directory outlives the session; the ledger a turn is judged
+   * against must not.
+   */
+  private sessionArchives = new Set<number>();
+
   constructor(cfg: EngineConfig) {
     this.cfg = cfg;
     this.transcript = new Transcript(systemPromptFor(this.cwd));
@@ -1177,6 +1186,7 @@ export class Engine {
     this.transcript = new Transcript(systemPromptFor(this.cwd));
     this.ledger = [];
     this.archivedWrites = 0;
+    this.sessionArchives = new Set();
     this.sessionPrompt = 0;
     this.sessionCompletion = 0;
     this.sessionCached = 0;
@@ -1358,8 +1368,42 @@ export class Engine {
    * Deduplicated by path — the earliest `before` with the latest `after`, so
    * the pair describes the whole effect on that file.
    */
+  /**
+   * Every write this project can still prove, across all sessions.
+   *
+   * For auditing history — "was this work ever done, and is the evidence
+   * still there". Not for judging a turn: see `sessionLedger`.
+   */
   mergedLedger(): LedgerEntry[] {
     const archived = this.cfg.archive?.ledger?.() ?? [];
+    const byPath = new Map<string, LedgerEntry>();
+    for (const e of [...archived, ...this.ledger]) {
+      const prior = byPath.get(e.path);
+      byPath.set(e.path, prior ? { ...e, before: prior.before } : { ...e });
+    }
+    return [...byPath.values()];
+  }
+
+  /**
+   * What THIS session wrote: live memory plus the batches it shed.
+   *
+   * The distinction from `mergedLedger` is the whole of a real failure. The
+   * archive directory outlives the session, so judging a turn against every
+   * batch in it judges the turn against the project's history. A receipt from
+   * a turn whose only work was `src/files.ts` shows `work-checked` breaking
+   * lines in `electron/main.ts` and `ui/index.html` — written days earlier, by
+   * someone else — and `work-landed` reporting "contents changed since molt
+   * wrote it" for four files this session never opened, because a later commit
+   * had touched them.
+   *
+   * There is no honest way for a model to clear that. One cleared it the only
+   * way available: six comment-only word swaps across six untouched files, in
+   * a single step, purely to make stale hashes match. The bar then accepted
+   * the turn. That is the exact outcome `files-changed` names as the worst
+   * one, produced by the check itself.
+   */
+  sessionLedger(): LedgerEntry[] {
+    const archived = this.cfg.archive?.ledger?.(this.sessionArchives) ?? [];
     const byPath = new Map<string, LedgerEntry>();
     for (const e of [...archived, ...this.ledger]) {
       const prior = byPath.get(e.path);
@@ -1376,11 +1420,12 @@ export class Engine {
       record: this.transcript.record(),
       read: [...this.readPaths],
       cache: this.cache,
-      ledger: this.mergedLedger(),
+      ledger: this.sessionLedger(),
       liveLedger: [...this.ledger],
       archive: this.cfg.archive,
       archivedBatches: this.transcript.shedCount,
       expectedArchivedWrites: this.archivedWrites,
+      sessionArchives: this.sessionArchives,
       expectedArchiveFiles: Journal.expectedArchives(this.cwd),
       claim,
     };
@@ -1429,6 +1474,7 @@ export class Engine {
       const entry = this.cfg.archive.write(plan.exuvia, cut, firstAsk, departing);
       path = entry.file;
       this.archivedWrites += departing.length;
+      this.sessionArchives.add(entry.index);
     }
 
     this.transcript.commitShed(plan);
@@ -2072,7 +2118,7 @@ export class Engine {
       : withTaskChecks(this.cfg.bar, taskChecks);
     const barNow = (): Bar | null =>
       opts.ask
-        ? asQuestion(withTaskChecks(this.cfg.bar, taskChecks), this.mergedLedger().length === 0)
+        ? asQuestion(withTaskChecks(this.cfg.bar, taskChecks), this.sessionLedger().length === 0)
         : withTaskChecks(this.cfg.bar, taskChecks);
     if (opts.ask) {
       const dropped = (this.cfg.bar?.checks.length ?? 0) - (bar?.checks.length ?? 0);
@@ -3232,7 +3278,7 @@ export class Engine {
           costUsd: this.costUsd(),
           costEstimated: this.costEstimated,
           shedBatches: this.transcript.shedCount,
-          changed: this.mergedLedger().map((e) => ({ path: e.path, before: e.before, after: e.after })),
+          changed: this.sessionLedger().map((e) => ({ path: e.path, before: e.before, after: e.after })),
           did: [...this.did],
           task: taskSeal
             ? {

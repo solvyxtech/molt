@@ -21,7 +21,7 @@
  * result is unlimited, and every truncation says what it left out.
  */
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 
 /**
@@ -172,6 +172,26 @@ export type WalkResult = {
 };
 
 /**
+ * The real path of `abs` if it resolves inside `rootReal`, otherwise
+ * undefined. Dangling links fail `realpath` and are refused — `insideProject`
+ * cannot be reused here, because it reconstructs a missing link as a new
+ * path under cwd.
+ *
+ * Compared with `relative(root, target).startsWith("..")`, a prefix on the
+ * real path keeps an in-workspace file named `..foo` inside.
+ */
+function realPathInside(rootReal: string, abs: string): string | undefined {
+  let target: string;
+  try {
+    target = realpathSync(abs);
+  } catch {
+    return undefined;
+  }
+  if (target === rootReal || target.startsWith(rootReal + sep)) return target;
+  return undefined;
+}
+
+/**
  * The traversal itself, as a generator so it can be drained two ways.
  *
  * Yields between directories. A synchronous caller drains it in one go; a
@@ -184,6 +204,18 @@ function* walkSteps(root: string, opts: WalkOptions, out: WalkResult): Generator
   const limit = opts.limit ?? MAX_ENTRIES;
   const examine = opts.examine ?? MAX_EXAMINED;
 
+  // Bound every followed path against the real workspace, not the lexical
+  // one. `statSync` resolves links, so a symlink to /etc or to
+  // ~/.config/molt/auth.json would otherwise be listed and grepped as if it
+  // lived in the project. A root that cannot be resolved is not a tree we
+  // can police, so the walk is empty rather than unbounded.
+  let rootReal: string;
+  try {
+    rootReal = realpathSync(root);
+  } catch {
+    return;
+  }
+
   const queue: { dir: string; level: number }[] = [{ dir: root, level: 0 }];
   while (queue.length > 0) {
     const { dir, level } = queue.shift()!;
@@ -194,7 +226,7 @@ function* walkSteps(root: string, opts: WalkOptions, out: WalkResult): Generator
       continue; // unreadable directory: reported by its absence, never fatal
     }
     for (const name of names) {
-      // Checked here, where the cost is: one `statSync` per entry is cheap
+      // Checked here, where the cost is: one `lstatSync` per entry is cheap
       // and a million of them is not.
       out.examined += 1;
       if (out.examined > examine) {
@@ -211,9 +243,20 @@ function* walkSteps(root: string, opts: WalkOptions, out: WalkResult): Generator
       let isDir = false;
       let bytes: number | undefined;
       try {
-        const st = statSync(abs);
-        isDir = st.isDirectory();
-        bytes = isDir ? undefined : st.size;
+        const st = lstatSync(abs);
+        if (st.isSymbolicLink()) {
+          // Dangling, or a target outside rootReal: refuse. `insideProject`
+          // cannot be reused here — it reconstructs a missing link as a new
+          // path under cwd, which would let a broken outbound link through.
+          const target = realPathInside(rootReal, abs);
+          if (target === undefined) continue;
+          const followed = statSync(target);
+          isDir = followed.isDirectory();
+          bytes = isDir ? undefined : followed.size;
+        } else {
+          isDir = st.isDirectory();
+          bytes = isDir ? undefined : st.size;
+        }
       } catch {
         continue;
       }
