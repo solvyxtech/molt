@@ -17,7 +17,7 @@ import { playSplash } from "./splash.js";
 import { fmtCost } from "../src/format.js";
 import { matchCommands } from "../src/commands.js";
 import { JOURNAL_RENDER_CAP, STREAM_CAP, newest, trimOldest } from "./bounds.js";
-import { holdAfterAutoDraft } from "./criteria-hold.js";
+import { holdAfterAutoDraft, taskForRun } from "./criteria-hold.js";
 
 // ── the bridge ───────────────────────────────────────────────────────────────
 
@@ -919,8 +919,16 @@ const ask0 = (): boolean => ($("ask") as HTMLInputElement).checked;
 /** Reset each time the engine goes idle, so the hint is once per turn. */
 let hintedBusy = false;
 
+/**
+ * A task the first Run drafted for but did not start.
+ *
+ * Held here rather than in the composer, so a held turn does not look like a
+ * refused one. Cleared the moment the turn actually starts.
+ */
+let pendingTask: string | null = null;
+
 async function send(): Promise<void> {
-  const text = promptBox.value.trim();
+  const { text, resuming } = taskForRun(promptBox.value, pendingTask);
   if (!text) return;
   // A line beginning with / is a command. Sending it to the model instead is
   // how "/budget 40000" becomes a request to write a budgeting feature.
@@ -996,6 +1004,13 @@ async function send(): Promise<void> {
         drafted: !!(drafted.checks.length || drafted.notes.length),
       })
     ) {
+      // Taken out of the composer and echoed, so the screen shows a message
+      // that was received and a turn that is waiting on you — not a Run that
+      // did nothing.
+      pendingTask = text;
+      promptBox.value = "";
+      autogrow();
+      if (!resuming) say("you", text, "user");
       $("criteria").classList.remove("hidden");
       drawCriteria();
       $("ck-state").textContent = "review the draft, then Run again to seal it";
@@ -1011,7 +1026,9 @@ async function send(): Promise<void> {
 
   promptBox.value = "";
   autogrow();
-  say("you", text, "user");
+  // Already on screen if this Run is resuming a held one.
+  if (!resuming) say("you", text, "user");
+  pendingTask = null;
   busy = true;
   $("send").classList.add("hidden");
   $("stop").classList.remove("hidden");
