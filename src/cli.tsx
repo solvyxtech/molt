@@ -584,7 +584,12 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         // you can audit and one you can only pay.
         const sp = ev.spend;
         const cached = sp.cachedTokens > 0 ? ` (${sp.cachedTokens} cached)` : "";
-        const did = ev.outcome === "claim" ? "claims done" : ev.tools.join(", ") || "no tools";
+        const did =
+          ev.outcome === "claim"
+            ? "claims done"
+            : ev.outcome === "empty"
+              ? "empty turn"
+              : ev.tools.join(", ") || "no tools";
         const spent =
           sp.costUsd === undefined ? "" : ` · ${sp.estimated ? "~" : ""}${fmtCost(sp.costUsd)}`;
         process.stdout.write(

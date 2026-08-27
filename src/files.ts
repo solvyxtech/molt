@@ -539,6 +539,100 @@ export type EditResult =
   | { ok: false; why: string };
 
 /**
+ * Paths whose content is *supposed* to be a diff. Nothing below applies to
+ * them.
+ */
+export function isPatchPath(path: string): boolean {
+  return /\.(diff|patch|rej|orig)$/i.test(path.trim());
+}
+
+/**
+ * Does this text look like unified-diff body rather than the file content it
+ * claims to be?
+ *
+ * Receipt 0040. Asked to add a comment to `src/engine.ts`, a 20B local model
+ * sent `new_text` as diff body and molt wrote it literally:
+ *
+ *     +// TODO: Implement multi-agent support. This will allow running several
+ *     +// concurrent agent instances to speed up work. The current engine only
+ *     +// handles one agent loop at a time.
+ *     import { runCommand } from "./run.ts";
+ *
+ * `tsc` said `TS1109: Expression expected` and stayed saying it. The model then
+ * spent 47 steps and roughly 800,000 tokens re-reading those same twenty lines
+ * without ever once seeing the character it had put there. A refusal at the
+ * moment of writing costs one step; this cost a session.
+ *
+ * Note the shape, because it decides the rule: that payload is not a clean
+ * diff. Three lines carry a marker and the fourth does not. A test for "every
+ * line looks like diff" — the obvious rule, and the first one written here —
+ * passes it straight through. What is actually diagnostic is a `+` at column
+ * zero, more than once.
+ *
+ * Precision matters far more than recall: wrongly refusing a legal edit blocks
+ * real work, while a miss costs one bad write that the bar still catches. So:
+ *
+ *  - markers must sit at column 0. Indented `+` is string concatenation or a
+ *    continued expression — ordinary code, never refused.
+ *  - `+ ` followed by a single space and text is a markdown bullet, not an
+ *    added line. Diff hunks indent by the original line's own indentation, so
+ *    a real added line reads `+import`, `+// x`, or `+    const x`.
+ *  - two such lines, or one paired with a removal. A lone marked line is too
+ *    little to be sure of.
+ *
+ * Hunk and file headers are conclusive on their own.
+ *
+ * Returns the reason it looks like a diff, or null if it does not.
+ */
+export function diffSyntaxIn(text: string): string | null {
+  if (/^@@ +-\d+(,\d+)? +\+\d+(,\d+)? +@@/m.test(text)) {
+    return "it contains a unified-diff hunk header (`@@ ... @@`)";
+  }
+  if (/^--- [^\n]*\n\+\+\+ /m.test(text)) {
+    return "it contains unified-diff file headers (`--- ` then `+++ `)";
+  }
+  const lines = text.split("\n");
+  const marked = (mark: string) =>
+    lines.filter(
+      (l) =>
+        l.startsWith(mark) &&
+        l.slice(1).trim() !== "" &&
+        // `+ item` / `- item`: a list, in markdown or YAML.
+        !new RegExp(`^\\${mark} \\S`).test(l),
+    ).length;
+  const added = marked("+");
+  if (added === 0) return null;
+  const removed = marked("-");
+  if (added < 2 && removed === 0) return null;
+  return (
+    `${added} line${added === 1 ? "" : "s"} begin${added === 1 ? "s" : ""} with \`+\`` +
+    (removed > 0 ? ` and ${removed} with \`-\`` : "") +
+    " at column 0"
+  );
+}
+
+/**
+ * Does this text already hold diff-shaped lines? Then diff-shaped lines belong
+ * in it, and the guard above has nothing to say about an edit to it.
+ *
+ * Used on both the text being replaced and the file around it: a doc comment
+ * quoting a patch, a test fixture, a changelog, a markdown list bulleted with
+ * `+`. The file itself is the evidence.
+ */
+export function holdsDiffText(text: string): boolean {
+  return text.split("\n").some((l) => l.startsWith("+") && l.slice(1).trim() !== "");
+}
+
+/** What to tell a model that sent a diff where file content belongs. */
+export function diffSyntaxRefusal(field: string, why: string): string {
+  return (
+    `${field} looks like a unified diff, not file content: ${why}. molt writes what you ` +
+    `send, byte for byte — those markers would go into the file and break it. Send the ` +
+    `literal lines as they should appear on disk, with no leading \`+\`, \`-\` or diff headers.`
+  );
+}
+
+/**
  * Replace exact text in a file.
  *
  * Refuses rather than guesses. Text that is absent is a failed edit, and text
@@ -551,9 +645,18 @@ export function applyEdit(
   oldText: string,
   newText: string,
   replaceAll = false,
+  opts: { allowDiffText?: boolean } = {},
 ): EditResult {
   if (oldText === "") return { ok: false, why: "old_text is empty; nothing to find" };
   if (oldText === newText) return { ok: false, why: "old_text and new_text are identical" };
+
+  // Only when the text being REPLACED is not itself diff-shaped. A model
+  // editing an example diff — in a doc comment, a test fixture, a changelog —
+  // is doing something legitimate, and the surrounding text is the evidence.
+  if (!opts.allowDiffText && !holdsDiffText(oldText) && !holdsDiffText(current)) {
+    const why = diffSyntaxIn(newText);
+    if (why) return { ok: false, why: diffSyntaxRefusal("new_text", why) };
+  }
 
   const parts = current.split(oldText);
   const found = parts.length - 1;

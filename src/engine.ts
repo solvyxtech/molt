@@ -36,6 +36,9 @@ import {
   SKIP_DIRS,
   WALK_DEADLINE_MS,
   applyEdit,
+  diffSyntaxIn,
+  diffSyntaxRefusal,
+  isPatchPath,
   formatListing,
   formatMatches,
   grepFiles,
@@ -379,6 +382,29 @@ export function resultBudgetBytes(window: number, scale: number, cap = READ_MAX_
 }
 export const MAX_STEPS = 32;
 export const MAX_PROOF_ATTEMPTS = 4;
+/**
+ * How many empty assistant turns to ask through before treating one as a
+ * claim of completion.
+ *
+ * Two, because the failure it covers is a dropped turn rather than a decision:
+ * session 0581ccd8 step 11 came back with no text, no tool call and
+ * `finish_reason: stop`, molt read that as "I am finished", and a 26-second
+ * bar ran to establish that nothing had happened. Asking again is one cheap
+ * request. Asking forever would be a hang, so the third one is allowed to mean
+ * what molt used to assume the first one meant.
+ */
+export const EMPTY_TURN_RETRIES = 2;
+/**
+ * Consecutive dry steps before molt says so IN THE TRANSCRIPT rather than only
+ * on screen.
+ *
+ * The per-call pointer already tells the model that one call repeated. What it
+ * never told the model was that the whole step did, four steps running — that
+ * escalation was a `kind: "info"` event, which reaches the user's screen and
+ * no part of the conversation. So the human watching session 0581ccd8 could
+ * see it was looping and the only party able to stop it could not.
+ */
+export const DRY_STREAK_NUDGE = 3;
 export const DEFAULT_BASH_TIMEOUT_MS = 60_000;
 
 /**
@@ -1572,8 +1598,14 @@ export class Engine {
             /* unreadable: the change scores as substantive, which never blocks work */
           }
         }
-        mkdirSync(dirname(abs), { recursive: true });
         const content = String(args.content ?? "");
+        // A whole file that is really a diff of one. Same failure as the
+        // edit_file guard below, and the same one-step refusal.
+        if (!isPatchPath(rel)) {
+          const why = diffSyntaxIn(content);
+          if (why) return `write refused: ${diffSyntaxRefusal("content", why)}`;
+        }
+        mkdirSync(dirname(abs), { recursive: true });
         writeFileSync(abs, content, "utf8");
         const after = createHash("sha256").update(content, "utf8").digest("hex");
         const at = isAbsolute(rel) ? relative(this.cwd, abs) : rel;
@@ -1637,6 +1669,7 @@ export class Engine {
           String(args.old_text ?? ""),
           String(args.new_text ?? ""),
           args.replace_all === true,
+          { allowDiffText: isPatchPath(rel) },
         );
         if (!edit.ok) return `edit refused: ${edit.why}`;
         writeFileSync(abs, edit.text, "utf8");
@@ -2105,6 +2138,10 @@ export class Engine {
     const shown = new Map<string, { from: number; to: number }[]>();
     /** Consecutive steps in which nothing new came back. */
     let dryStreak = 0;
+    /** Consecutive assistant turns that arrived with nothing in them. */
+    let emptyTurns = 0;
+    /** The dry streak molt has already written into the transcript. */
+    let nudgedAtStreak = 0;
 
     // A question changes nothing, so a check that demands a change can only
     // ever fail it. `ask` drops exactly those checks for this turn and runs
@@ -2918,7 +2955,7 @@ export class Engine {
         billed: typeof billedUsd === "number",
       };
       /** Close out the step with what it did and what it cost. */
-      const summary = (tools: string[], outcome: "tools" | "claim"): EngineEvent => ({
+      const summary = (tools: string[], outcome: "tools" | "claim" | "empty"): EngineEvent => ({
         kind: "step_summary",
         job,
         step,
@@ -2941,6 +2978,49 @@ export class Engine {
       // model wrote appears above the work it was introducing rather than
       // after it — and so the next step starts on a line of its own.
       yield { kind: "message_end" };
+
+      // ---- A turn with nothing in it is not a claim. ----
+      //
+      // No text, no tool call. molt used to fall straight through to the proof
+      // loop and run the whole bar against an unchanged tree, because "the
+      // model stopped calling tools" was taken to mean "the model says it is
+      // done". For a model that simply drops a turn — and small local ones do
+      // it constantly — that is a full suite spent proving that nothing
+      // happened, and a receipt whose claim reads "(no final message)".
+      //
+      // Say what arrived and ask again. Only if it keeps arriving empty does
+      // it get treated as the claim it never was, so this can slow a turn down
+      // by EMPTY_TURN_RETRIES requests but can never stop one.
+      if (!msg.tool_calls?.length && !(msg.content ?? "").trim()) {
+        emptyTurns += 1;
+        if (emptyTurns <= EMPTY_TURN_RETRIES) {
+          log?.append("empty_turn", {
+            step,
+            attempt: emptyTurns,
+            finishReason: finishReason ?? null,
+          });
+          this.transcript.push({
+            role: "user",
+            content:
+              "[molt: that turn arrived empty — no text and no tool call, so nothing ran " +
+              "and nothing was checked. Either call a tool to carry on with the work, or " +
+              "write out what you have found. An empty turn is not an answer.]",
+            molt: { nudge: true },
+          });
+          yield summary([], "empty");
+          yield {
+            kind: "info",
+            text:
+              `the model returned an empty turn` +
+              (finishReason ? ` (${finishReason})` : "") +
+              ` — asking again rather than running the bar on nothing` +
+              (emptyTurns === EMPTY_TURN_RETRIES ? "; the next one is taken as its answer" : ""),
+          };
+          continue;
+        }
+      } else {
+        emptyTurns = 0;
+      }
 
       if (msg.tool_calls?.length) {
         const called: string[] = [];
@@ -3173,8 +3253,36 @@ export class Engine {
                   `without learning anything. shift+V to watch what it is reaching for.`
                 : ""),
           };
+          // The streak, said to the party that can end it.
+          //
+          // Everything above this line is for the human: the log line is for
+          // the audit and the info event is for the screen. The model was told
+          // only ever about the single call in front of it — "this is the same
+          // read you made at step 41" — which it can answer by making a
+          // slightly different read, forty times running, and did. Nothing in
+          // its context said "you have now spent four steps learning nothing".
+          //
+          // This does not end the turn. Ending a turn on repetition was tried
+          // and reverted for good reasons, recorded above: repetition is a
+          // guess at waste and a bad one. Telling the model what molt can
+          // plainly see costs a few hundred tokens and takes nothing away.
+          if (dryStreak >= DRY_STREAK_NUDGE && dryStreak - nudgedAtStreak >= DRY_STREAK_NUDGE) {
+            nudgedAtStreak = dryStreak;
+            this.transcript.push({
+              role: "user",
+              content:
+                `[molt: ${dryStreak} steps in a row have now returned things you had already ` +
+                `been given. Re-reading a file molt has already shown you, or re-running a ` +
+                `search you have already run, cannot tell you anything new — the answers are ` +
+                `above in this conversation. If you know what to change, change it. If you do ` +
+                `not, say plainly what is blocking you and stop; molt records an unfinished ` +
+                `turn honestly. Do not keep looking.]`,
+              molt: { nudge: true },
+            });
+          }
         } else {
           dryStreak = 0;
+          nudgedAtStreak = 0;
         }
         continue; // let the model see tool results
       }
