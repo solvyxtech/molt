@@ -35,6 +35,8 @@ export type JournalKind =
   | "bar_skipped"
   /** A step that mostly repeated itself. Recorded, never fatal. */
   | "repeat_step"
+  /** An assistant turn that arrived with no text and no tool call. */
+  | "empty_turn"
   /**
    * Retired. molt used to end a turn after two repeated steps; spend is
    * bounded by /budget and the turn ceiling instead. Kept in the union so

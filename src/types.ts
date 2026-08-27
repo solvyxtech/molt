@@ -36,6 +36,12 @@ export type MsgMeta = {
   /** True for a bar-failure notice injected by the proof loop. */
   barFailure?: true;
   /**
+   * True for a note molt wrote to the model about the model's own behaviour
+   * — an empty turn, or a step that only repeated itself. Distinct from a
+   * bar failure: nothing was checked, and nothing is being demanded.
+   */
+  nudge?: true;
+  /**
    * True for the standing note of what this turn is for.
    *
    * Shedding is mechanical and lossy by design, and the thing it loses first
@@ -395,8 +401,12 @@ export type EngineEvent =
       sessionTokens: number;
       sessionCostUsd?: number;
       durationMs: number;
-      /** What the model did with the step: called tools, or claimed done. */
-      outcome: "tools" | "claim";
+      /**
+       * What the model did with the step: called tools, claimed done, or
+       * returned nothing at all. `empty` is its own outcome because it is
+       * not a claim — see the empty-turn guard in engine.ts.
+       */
+      outcome: "tools" | "claim" | "empty";
       /** Provider-reported stop reason, when one was given. */
       finishReason?: string;
     }

@@ -802,7 +802,12 @@ export function App({
           // is reconciled step by step, so a surprising bill has a line
           // where it came from rather than only a final number.
           const s = ev.spend;
-          const did = ev.outcome === "claim" ? "claims done" : ev.tools.join(", ") || "no tools";
+          const did =
+            ev.outcome === "claim"
+              ? "claims done"
+              : ev.outcome === "empty"
+                ? "empty turn"
+                : ev.tools.join(", ") || "no tools";
           add(
             "info",
             `step ${ev.step + 1} · ${did} · ${spendText(s)} · ${fmtDuration(ev.durationMs)}` +

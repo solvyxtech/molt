@@ -15,6 +15,8 @@ import {
   MAX_MATCHES,
   SEARCH_DEADLINE_MS,
   applyEdit,
+  diffSyntaxIn,
+  isPatchPath,
   formatListing,
   formatMatches,
   globToRegExp,
@@ -404,6 +406,93 @@ describe("editing", () => {
   it("refuses edits that cannot mean anything", () => {
     assert.ok(!applyEdit("abc", "", "x").ok);
     assert.ok(!applyEdit("abc", "abc", "abc").ok);
+  });
+
+  it("refuses a diff sent as file content", () => {
+    // Receipt 0040, verbatim. molt wrote these `+` characters into a
+    // TypeScript file and the model then spent 47 steps failing to see them.
+    const r = applyEdit(
+      'import { runCommand } from "./run.js";\n',
+      'import { runCommand } from "./run.js";',
+      "+// TODO: Implement multi-agent support. This will allow running several\n" +
+        "+// concurrent agent instances to speed up work. The current engine only\n" +
+        "+// handles one agent loop at a time.\n" +
+        'import { runCommand } from "./run.ts";',
+    );
+    assert.ok(!r.ok);
+    assert.match(r.ok ? "" : r.why, /looks like a unified diff/);
+  });
+
+  it("allows a diff where the file already holds one", () => {
+    // A doc comment, a test fixture, a changelog: the text being replaced is
+    // the evidence that diff-shaped text belongs here.
+    const r = applyEdit(
+      "example:\n-old line\n+new line\n",
+      "-old line\n+new line",
+      "-old line\n+newer line",
+    );
+    assert.ok(r.ok, r.ok ? "" : r.why);
+  });
+
+  it("allows a diff into a file that is meant to be one", () => {
+    const r = applyEdit("placeholder\n", "placeholder", "-old\n+new");
+    assert.ok(!r.ok, "refused by default");
+    const allowed = applyEdit("placeholder\n", "placeholder", "-old\n+new", false, {
+      allowDiffText: true,
+    });
+    assert.ok(allowed.ok, allowed.ok ? "" : allowed.why);
+  });
+});
+
+describe("telling a diff from file content", () => {
+  it("recognises diff bodies", () => {
+    for (const text of [
+      "+one\n+two",
+      "+added\n unchanged\n-removed",
+      "@@ -1,3 +1,4 @@\nwhatever follows",
+      "--- a/x.ts\n+++ b/x.ts\n@@ -1 +1 @@\n-a\n+b",
+      "-old\n+new",
+    ]) {
+      assert.ok(diffSyntaxIn(text), `missed: ${JSON.stringify(text)}`);
+    }
+  });
+
+  it("leaves real code alone", () => {
+    // Every one of these is a legal thing to write into a file, and refusing
+    // any of them would block work. Precision matters more than recall: the
+    // cost of a miss is one bad edit, the cost of a false positive is a tool
+    // that will not let the model work.
+    for (const text of [
+      // Indented continuation — string concatenation, not a diff marker.
+      '  const s = "a"\n    + "b"\n    + "c";',
+      // A YAML sequence or a markdown list: `-` at column 0, no `+` anywhere.
+      "- one\n- two\n- three",
+      "- name: build\n- name: test",
+      // Markdown also allows `+` as a bullet. A diff hunk carries the original
+      // line's own indentation, so `+ text` with exactly one space is a list.
+      "+ one\n+ two\n+ three",
+      // Ordinary code, ordinary prose.
+      "const a = 1;\nconst b = 2;",
+      "export function f() {\n  return 1;\n}",
+      "  indented\n  lines\n  only",
+      // A single line, whatever it starts with: too little to be a body.
+      "+x",
+      "-x",
+      // CSS custom properties, indented as they normally are.
+      "  --color: red;\n  --size: 2px;",
+      "",
+    ]) {
+      assert.equal(diffSyntaxIn(text), null, `false positive: ${JSON.stringify(text)}`);
+    }
+  });
+
+  it("knows which paths are supposed to hold diffs", () => {
+    for (const p of ["fix.patch", "a/b.diff", "x.REJ", "conflict.orig"]) {
+      assert.ok(isPatchPath(p), p);
+    }
+    for (const p of ["src/engine.ts", "notes.md", "patchwork.ts", "diffs.json"]) {
+      assert.ok(!isPatchPath(p), p);
+    }
   });
 });
 
