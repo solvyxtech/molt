@@ -11,19 +11,43 @@ agent, then refuses to accept "done" until every check in your project's
 claim; molt checks the claim and writes a receipt either way.
 
 <p align="center">
-  <img src="docs/images/session.png" alt="molt desktop: a turn, its tool calls, a sealed task criterion, and the bar's verdict" width="900">
+  <img src="docs/images/refused.png" alt="molt refusing its own fix: 10 of 11 checks pass, the mutation check fails" width="900">
 </p>
+
+<p align="center"><em>molt, working on molt. It found the failing test, fixed the
+cause, and said the existing test covered it — so molt broke the line it had
+just written and showed that nothing noticed. Refused twice for the same
+reason, it stopped rather than spend more.</em></p>
 
 ## What it does
 
 | | |
 |---|---|
-| **Refuses unproven claims** | The model's final answer runs the bar. Any failing check goes back to the model with its real output. Up to N attempts, then molt reports failure, never success. |
+| **Refuses unproven claims** | A final answer is a claim, not a result. It runs the bar; any failing check goes back to the model with its real output. After N attempts molt reports failure, never success. |
 | **Judges the disk, not the transcript** | Every write is ledgered with before/after hashes. A file that changed on disk that no tool wrote, a comment-only edit, a deleted assertion, an added line no test executes, a line no test would notice broken: each is its own check. |
 | **Keeps the evidence** | One receipt per attempt, refusals included. A hash-chained journal of every call. Context that is compacted is archived verbatim, never summarised. `molt verify` recomputes all of it. |
 | **Says what it knows** | Token counts and prices come from the provider; anything estimated is marked `~`. A reused check result is marked reused. An unverified answer is called unverified. |
 | **Works with any model** | OpenAI, xAI, OpenRouter, Groq, Mistral, Ollama, llama.cpp, vLLM, Anthropic. Prompt caching where the provider supports it. |
 | **Same engine, two surfaces** | A terminal UI and a desktop window share `src/` unmodified. A proof from either is the same proof. |
+
+## The loop
+
+```
+you ask  →  the model works  →  it says "done"
+                                     │
+                     .molt/done.yml runs against the disk
+                                     │
+              ┌──────────────────────┴──────────────────────┐
+         every check passed                          something failed
+              │                                             │
+      receipt: accepted                    the failures go back to the model,
+      (and the answer)                     with their real output — it keeps
+                                           working, up to N attempts, then
+                                           molt reports failure
+```
+
+Either way a receipt is written, the journal is appended, and both are
+hash-chained.
 
 ## Quick start
 
@@ -36,12 +60,20 @@ npm start              # the terminal UI (node dist/cli.js)
 First run: `/login`, pick a provider, paste a key, `/model`, go. Keys live in
 `~/.config/molt/auth.json` at mode 0600.
 
+Or use a Claude Pro/Max plan instead of a key — `/login` → **claude code (your
+Pro/Max plan)** in the terminal, **Settings → Model → "Use my Claude plan"** in
+the window, or `--url claude-code` headless. molt runs the Claude Code you
+already logged in and never sees the credential; Claude Code is given none of
+its own tools, so every write still lands in molt's ledger and the bar can
+still refuse the claim. A plan is not a bill, so the meter shows tokens and no
+money.
+
 Headless, for CI or a script:
 
 ```sh
 molt init                                   # writes .molt/done.yml from your package scripts
 molt run "make fmtDuration read hours" --yes --attempts 3
-molt run "add fmtBytes" --criterion "unit=node -e \"…\"" --note "no new deps"
+molt run "fix the failing test" --criterion "gate=npm test -- fmtDuration"
 molt ask "what does the bar check?"         # a question: write checks are not applied
 molt prove                                  # run the bar now, no model
 molt verify                                 # recompute every hash chain
@@ -83,7 +115,26 @@ as `task:<name>`. Editing `done.yml` mid-session is itself a failing check.
 
 ## What a refusal looks like
 
-Real output. The model was told to make the change with `sed` and claim:
+The run above, in the terminal. The model had fixed the failing test and said
+so; `work-checked` broke the line it had just written and nothing noticed:
+
+```
+bar not met — 10 of 11 checks
+FAIL  work-checked
+      1 of 1 mutation(s) changed the code and nothing failed:
+        src/session-commands.ts:64 (< to <=) — if (ms < 1000) return `${Math.round(ms)}ms`;
+
+      Those lines run but nothing checks what they do. A test that executes
+      code without asserting on it leaves the code exactly as unproven as no
+      test at all.
+
+the bar failed in exactly the same way twice, on: `work-checked`. Continuing
+would spend more tokens on a check the work is not moving — either the work
+cannot satisfy it, or the check is wrong about the work.
+```
+
+A different route, refused by a different check. The model was told to make
+the change with `sed` and claim:
 
 ```
 checking 10 condition(s) from .molt/done.yml: types, tests, app-boots, app-drives, work-landed, …
@@ -128,8 +179,19 @@ verified change over all of them, and says what it does not count.
 ## The desktop
 
 <p align="center">
+  <img src="docs/images/accepted.png" alt="The same defect, fixed and accepted: 11 of 11 checks" width="900">
+</p>
+
+<p align="center"><em>The same task again, told to add the test the mutation
+check asked for. Eleven of eleven, and a receipt.</em></p>
+
+<p align="center">
   <img src="docs/images/receipts.png" alt="Receipts tab" width="440">
   <img src="docs/images/log.png" alt="Log tab" width="440">
+</p>
+<p align="center">
+  <img src="docs/images/view.png" alt="View tab: every byte to and from the model" width="440">
+  <img src="docs/images/picker.png" alt="Model picker across every endpoint you hold a key for" width="440">
 </p>
 
 | tab | holds |
@@ -141,8 +203,7 @@ verified change over all of them, and says what it does not count.
 | **Settings** | workspace, model, endpoint, keys, autonomy, theme |
 
 <p align="center">
-  <img src="docs/images/palette.png" alt="Command palette" width="440">
-  <img src="docs/images/picker.png" alt="Model picker across providers" width="440">
+  <img src="docs/images/palette.png" alt="The command palette, on /" width="900">
 </p>
 
 ## Verifying the record

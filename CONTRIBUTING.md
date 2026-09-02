@@ -18,11 +18,13 @@ are explicit non-goals for now.
 
 ```bash
 npm install
-npm run check          # typecheck + full suite
-./rnd/demo.sh          # four scripted model personalities, graded
+npm run check          # typecheck · suite · e2e turn · window self-check
+npm run app            # the desktop window
+npm start              # the terminal UI
 ```
 
-Node 20.11+. No global tooling required.
+Node 22+. No global tooling required. `npm run check` is what the project's
+own bar runs, so a change that passes it is a change molt would accept.
 
 ## The test suite
 
@@ -30,12 +32,17 @@ Node 20.11+. No global tooling required.
 |---|---|
 | `test/proof-loop.test.ts` | the gate: refusal, retry, exhaustion, receipts |
 | `test/bar.test.ts` | `done.yml` parsing, builtins, tamper detection |
+| `test/tree-accounted.test.ts` | the disk against the ledger; assertions removed by any route |
+| `test/record-scope.test.ts` | what a turn is judged on, and what a cancel does |
+| `test/integrity.test.ts` | the cross-linked evidence chain and its root of trust |
+| `test/archive-verification.test.ts` | write evidence surviving compaction |
 | `test/transcript.test.ts` | shed planning, digest merging, round-trip recovery |
 | `test/wire-validity.test.ts` | 400-transcript fuzz: payloads stay provider-valid |
-| `test/integration.test.ts` | end-to-end over a real socket |
+| `test/desktop-shell.test.ts` | the window's own logic, without an Electron process |
 
-`rnd/mock-provider.mjs` is an OpenAI-compatible server that lies on a script.
-Use it rather than a real provider — deterministic, free, and instant.
+`scriptedProvider` in `test/helpers.ts` replays assistant turns from a script,
+and `test-e2e/drive.mjs` stands up an OpenAI-compatible stub server for the
+window. Use those rather than a real provider — deterministic, free, instant.
 
 ## Rules for changes
 
@@ -66,5 +73,5 @@ mounting a terminal.
 
 The most valuable bug report for this project is a case where molt accepted a
 completion it should have refused. Include the bar, the scenario, and ideally a
-`rnd/mock-provider.mjs` script that reproduces it. Those go to the front of the
+scripted-provider test that reproduces it. Those go to the front of the
 queue.
