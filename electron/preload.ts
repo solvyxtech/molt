@@ -44,6 +44,8 @@ contextBridge.exposeInMainWorld("molt", {
   run: (text: string, ask = false, criteria?: unknown) =>
     ipcRenderer.invoke("session:run", text, ask, criteria),
   draftCriteria: (task: string) => ipcRenderer.invoke("criteria:draft", task),
+  interview: (opts: unknown) => ipcRenderer.invoke("interview:turn", opts),
+  applyBar: (adds: unknown) => ipcRenderer.invoke("bar:apply", adds),
   cancel: () => ipcRenderer.send("session:cancel"),
   answerConfirm: (id: string, ok: boolean) => ipcRenderer.send("confirm:reply", id, ok),
 
@@ -51,6 +53,7 @@ contextBridge.exposeInMainWorld("molt", {
   receipt: (file: string) => ipcRenderer.invoke("receipts:read", file),
   journal: () => ipcRenderer.invoke("journal:read"),
   stats: () => ipcRenderer.invoke("session:stats"),
+  verify: () => ipcRenderer.invoke("integrity:verify"),
 
   onEvent: (fn: (ev: any) => void) => on("engine:event", fn),
   onConfirm: (fn: (req: { id: string; name: string; detail: string }) => void) =>

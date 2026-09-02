@@ -51,6 +51,12 @@ describe("matchCommands", () => {
     assert.ok(names("/exuviae").includes("/archive"));
   });
 
+  it("registers /interview without stealing /ask", () => {
+    assert.equal(names("/interview")[0], "/interview");
+    assert.ok(names("/spec").includes("/interview"));
+    assert.equal(names("/ask")[0], "/ask");
+  });
+
   it("orders prefix matches ahead of subsequence matches", () => {
     const r = names("/ba");
     assert.equal(r[0], "/bar");

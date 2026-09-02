@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.2.0 — the disk is the evidence, and the bar reaches the terminal
+
+An audit through the live record found checks that passed on nothing: the
+coverage check had never matched a file, the evidence chain never read back
+the journal roots it bound, and every ledger builtin was blind to a file
+changed through `bash`. Each was reproduced against a live model before it
+was fixed, and each fix ships with a test that goes red without it.
+
+### Added
+
+- **`tree-accounted` builtin.** A snapshot of the working tree is taken when
+  a turn begins; any file changed, created or deleted on disk that no tool
+  call wrote refuses the claim and names the path. `spec-intact` reads the
+  same snapshot, so an assertion removed by `sed` or a script is named too.
+  In molt's own bar and the default bar. `outside: allow` is the escape.
+- **Criteria from the command line.** `molt run --criterion name=command`
+  and `--note "..."`, sealed before the work starts and shown on the receipt
+  as `task:<name>` — the window's criteria panel, headless.
+- **`--capture <dir>`.** One redacted JSON per completion attempt with the
+  full wire transcript, ledger, bar result and receipt, for training a small
+  model that predicts the bar's verdict. `finetune/` holds the extractor,
+  the generator and the recipe.
+- **`/attempts` and `/autoshed`** on both surfaces, from one implementation.
+- **`Integrity.verifyProject`**: journals and the ledger as one verdict, used
+  by `molt verify` and the window's "verify evidence chain" button alike.
+
+### Fixed
+
+- Coverage is reported in source coordinates (`--enable-source-maps`), so
+  `diff-covered` examines the lines the ledger names.
+- The integrity ledger checks that every bound journal root still names an
+  entry; a journal rewritten and re-chained is drift.
+- A turn that wrote nothing is refused even when the session wrote earlier.
+- ctrl+C during a bar check ends the turn as cancelled: no receipt, no
+  request billed, nothing cached as a failure.
+- `record-intact` fails on an unreadable evidence block in any session;
+  `molt verify` no longer prints "ok" for an empty or garbage journal.
+- Receipts list only what the turn ran; every `/shed` is journalled.
+- `molt stats` counts one row per receipt file, separates answered questions
+  and unchanged acceptances from verified changes, divides dollars by priced
+  changes only, and marks estimates. `receipts --repair` backfills change
+  counts from receipt bodies.
+- The `tests` check watches `electron/**` and `ui/**`, which the suite
+  compiles and asserts on.
+- The View tab renders the engine's request events instead of a placeholder.
+
 ## 1.0.0-rc.4 — the meter says what it knows, and you set the ceiling
 
 The status line quoted a cost to six decimal places from a price nobody had

@@ -301,7 +301,10 @@ describe("the proof loop", () => {
       | { result: { results: { output: string }[] } }
       | undefined;
     const out = refusal?.result.results.map((r) => r.output).join("\n") ?? "";
-    assert.match(out, /no longer on disk/);
+    // Every write vanished, so nothing was done — which is a different
+    // sentence from "a file you wrote is missing", and the right one when the
+    // turn has nothing left to show for itself.
+    assert.match(out, /Nothing this turn wrote is still on disk/);
   });
 
   it("catches a rewrite that changed nothing", async () => {

@@ -11,6 +11,7 @@
  * tool whose whole pitch is an auditable record never writes a credential
  * into one.
  */
+import { CLAUDE_CODE_URL, isClaudeCode } from "./claude-code.js";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -33,6 +34,16 @@ export const PROVIDERS: Record<string, Provider> = {
   },
   openai: { url: "https://api.openai.com/v1", needsKey: true },
   xai: { url: "https://api.x.ai/v1", needsKey: true },
+  /**
+   * Not an endpoint. molt runs the Claude Code you already logged in, and the
+   * CLI authenticates itself — so there is no key to hold, and `needsKey` is
+   * false for a provider that is anything but free. See claude-code.ts.
+   */
+  "claude-code": {
+    url: CLAUDE_CODE_URL,
+    needsKey: false,
+    hint: "runs your own logged-in Claude Code — a Pro/Max plan pays for it, not a key",
+  },
   groq: { url: "https://api.groq.com/openai/v1", needsKey: true },
 };
 
@@ -393,7 +404,38 @@ export function resolveProvider(sel: string): string | null {
  * internet is treated as billable, so a ceiling is never lifted from something
  * that might charge for the next token.
  */
+/**
+ * The key for the endpoint being addressed — not for the one last stored.
+ *
+ * `storedEndpoint()` only ever returned an `apiKey` when `config.json`'s
+ * `baseUrl` happened to match a known provider, so `molt run --url
+ * https://api.x.ai/v1` returned 401 on a machine with a perfectly good xai key
+ * in `auth.json`, because the stored endpoint was a local llama.cpp. The
+ * window never had this bug: its `keyFor()` keys off the URL being opened.
+ * The fifth thing to exist on one surface and not the other.
+ *
+ * A key typed or exported outranks a stored one — that is what typing it is
+ * for, and it is how a rotated key gets used before it is saved.
+ */
+export function keyForUrl(
+  baseUrl: string,
+  typed: string | undefined,
+  auth: Record<string, string> = readAuth(),
+): string | undefined {
+  if (typed) return typed;
+  return auth[providerName(baseUrl)];
+}
+
 export function isSelfHosted(baseUrl: string): boolean {
+  /**
+   * Somebody else's computer, on somebody else's plan.
+   *
+   * The URL has no dots in it, which every other rule here reads as a LAN
+   * hostname — and self-hosted turns the repo map off, which is measurably
+   * wrong for a frontier model: with the map it won 3 of 3 paired runs and
+   * cost 23% less. Said first, before the address is parsed at all.
+   */
+  if (isClaudeCode(baseUrl)) return false;
   let host = "";
   try {
     host = new URL(baseUrl).hostname.toLowerCase();

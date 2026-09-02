@@ -12,7 +12,7 @@ import { runCommand } from "./run.js";
 import { parseLcov, coverageFor, unprovenIn, type Unproven } from "./coverage.js";
 import { planMutations, applyMutation, type Mutation } from "./mutate.js";
 import { proposeBar, type Detected } from "./detect.js";
-import { fingerprint } from "./files.js";
+import { assertionsIn, fingerprint, isTestPath, treeChanges, type TreeSnapshot } from "./files.js";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -30,12 +30,21 @@ import type {
 
 export const BAR_FILENAME = "done.yml";
 export const DEFAULT_TIMEOUT_MS = 120_000;
-const OUTPUT_MAX = 2000;
+/**
+ * How much of a failing command's output the model is given.
+ *
+ * 2000 was not enough to hold a node:test failure summary once the head is
+ * kept as well, and this is the one string in the program whose whole job is
+ * to tell a model what to fix.
+ */
+const OUTPUT_MAX = 4000;
 
 export const BUILTINS: BuiltinCheck[] = [
   "files-changed",
   "record-intact",
   "claims-grounded",
+  "spec-intact",
+  "tree-accounted",
   "diff-covered",
   "mutation",
 ];
@@ -67,6 +76,24 @@ export type BarContext = {
   ledger: LedgerEntry[];
   /** Only what is still in memory. Used to detect evidence lost with a shed. */
   liveLedger?: LedgerEntry[];
+  /**
+   * The subset of `ledger` this TURN wrote.
+   *
+   * The session ledger is the right thing to judge — a write shed three
+   * turns ago is still this session's work — and the wrong thing to be
+   * satisfied by on its own. Turn one wrote a file; turn two wrote nothing,
+   * claimed a refactor, and `files-changed` found turn one's file still on
+   * disk and passed it: a receipt headed "What the model changed" listing a
+   * file that turn never opened. Absent when the caller has no notion of a
+   * turn (`molt prove`), in which case the session ledger stands alone.
+   */
+  turnLedger?: LedgerEntry[];
+  /**
+   * The working tree as it stood when the turn began. `tree-accounted` and
+   * `spec-intact` compare the disk against it, so a change made by any route
+   * — not only through the tools — is seen and can be judged.
+   */
+  treeBefore?: TreeSnapshot;
   archive?: ArchiveLike;
   /** How many batches the transcript believes it has archived. */
   archivedBatches: number;
@@ -229,6 +256,36 @@ export function parseBar(source: string): Bar {
         }
       }
       const commentOnly = c["comment-only"] === "allow" ? { commentOnly: "allow" as const } : {};
+      if (c["removals"] !== undefined) {
+        if (c["removals"] !== "allow" && c["removals"] !== "refuse") {
+          throw new BarError(
+            `done.yml: check "${name}" has \`removals: ${JSON.stringify(c["removals"])}\` ` +
+              `— it takes "allow" or "refuse".`,
+          );
+        }
+        if (c.builtin !== "spec-intact") {
+          throw new BarError(
+            `done.yml: check "${name}" sets \`removals\`, which only applies to the ` +
+              `spec-intact builtin.`,
+          );
+        }
+      }
+      const removals = c["removals"] === "allow" ? { removals: "allow" as const } : {};
+      if (c["outside"] !== undefined) {
+        if (c["outside"] !== "allow" && c["outside"] !== "refuse") {
+          throw new BarError(
+            `done.yml: check "${name}" has \`outside: ${JSON.stringify(c["outside"])}\` ` +
+              `— it takes "allow" or "refuse".`,
+          );
+        }
+        if (c.builtin !== "tree-accounted") {
+          throw new BarError(
+            `done.yml: check "${name}" sets \`outside\`, which only applies to the ` +
+              `tree-accounted builtin.`,
+          );
+        }
+      }
+      const outside = c["outside"] === "allow" ? { outside: "allow" as const } : {};
 
       // diff-covered cannot work without being told where the report is, and
       // a check that cannot work must say so at parse time rather than fail
@@ -268,6 +325,8 @@ export function parseBar(source: string): Bar {
         tags,
         ...advisory,
         ...commentOnly,
+        ...removals,
+        ...outside,
         ...lcov,
         ...mut,
       };
@@ -363,10 +422,56 @@ export function writeDefaultBar(cwd: string): { path: string; detected: Detected
   return { path: p, detected, existed: false };
 }
 
+/**
+ * Cut the middle out of an output, never the end.
+ *
+ * This kept the first N bytes and threw the rest away, which is the wrong end
+ * of a test run. `npm test` on this project emits ninety kilobytes of `✔`
+ * before it says what failed, so a model told "your suite is red" was handed
+ * two thousand bytes of passing tests and `[molt: truncated 90318 bytes]`, and
+ * the assertion it had actually broken was in the part that was discarded. A
+ * local 30B spent two full attempts guessing at a failure molt had hidden from
+ * it, and the run was scored as the model's failure.
+ *
+ * Every test runner, compiler and linter in common use reports its verdict at
+ * the END. So the head is kept for context — which command ran, how it started
+ * — and the tail is kept because that is the part with the answer in it.
+ *
+ * Cut on line boundaries: a byte-sliced UTF-8 string can end mid-character,
+ * and a failure message with a replacement character in it is a failure
+ * message somebody has to squint at.
+ */
+export function clipEnds(s: string, n: number): string {
+  if (Buffer.byteLength(s, "utf8") <= n) return s;
+  const lines = s.split("\n");
+  const headBudget = Math.floor(n * 0.3);
+  const head: string[] = [];
+  let used = 0;
+  for (const line of lines) {
+    const cost = Buffer.byteLength(line, "utf8") + 1;
+    if (used + cost > headBudget) break;
+    head.push(line);
+    used += cost;
+  }
+  const tail: string[] = [];
+  used = 0;
+  for (let i = lines.length - 1; i >= head.length; i--) {
+    const cost = Buffer.byteLength(lines[i]!, "utf8") + 1;
+    if (used + cost > n - headBudget) break;
+    tail.unshift(lines[i]!);
+    used += cost;
+  }
+  const cut = lines.length - head.length - tail.length;
+  if (cut <= 0) return s;
+  return [
+    ...head,
+    `[molt: ${cut} line(s) cut from the middle. The end is kept: that is where failures are reported.]`,
+    ...tail,
+  ].join("\n");
+}
+
 function truncate(s: string, n = OUTPUT_MAX): string {
-  const bytes = Buffer.byteLength(s, "utf8");
-  if (bytes <= n) return s;
-  return Buffer.from(s, "utf8").subarray(0, n).toString("utf8") + `\n[molt: truncated ${bytes - n} bytes]`;
+  return clipEnds(s, n);
 }
 
 /** sha256 of a file, or "" if it cannot be read. Used to verify a restore. */
@@ -468,6 +573,55 @@ export function mentionedPaths(claim: string): string[] {
   for (const m of text.matchAll(/[\w./@-]*[\w-]\.[A-Za-z][\w]{0,9}\b/g)) add(m[0]);
 
   return [...found];
+}
+
+/**
+ * Which of `mentioned` file paths a claim asserts were CREATED or ADDED this
+ * turn — as opposed to merely referenced or changed.
+ *
+ * Creation is the strongest claim a completion can make about a file, and it
+ * is the one a fabrication is most likely to lean on ("I created src/auth.ts"
+ * while the file pre-existed or was never touched). A change to an existing
+ * file is grounded by the ledger once; a creation is a claim of a WRITE, and
+ * can only be grounded by the ledger showing that write.
+ *
+ * Deliberately narrow: a file is only flagged when a creation/implementation
+ * verb appears immediately before or after it, so "added coverage for f" is
+ * caught but "the fix touches f and g" is not. Over-matching here would fail
+ * correct work — asserting a change is not the same as asserting a creation,
+ * and the two must never be conflated.
+ */
+export function claimedCreated(claim: string, mentioned: string[]): string[] {
+  const out: string[] = [];
+  for (const path of mentioned) {
+    // The path as it might appear verbatim in the claim, minus the leading ./.
+    const bare = path.replace(/^\.\//, "");
+    // A creation/implementation verb inside a short window on either side of
+    // the path. A path in backticks ("created `src/x.ts`") is the most common
+    // shape and the one a parser must not miss.
+    const inBackticks = new RegExp(
+      `\\b(?:created?|added?|introduced?|implemented|built|wrote|writes)\\b[^\\n.]{0,40}\`${escapeRe(bare)}\``,
+      "i",
+    );
+    const backtickFirst = new RegExp(
+      `\`${escapeRe(bare)}\`[^\\n.]{0,40}\\b(?:created?|added?|introduced?|implemented|built|wrote|writes)\\b`,
+      "i",
+    );
+    const prose = new RegExp(
+      `\\b(?:created?|added?|introduced?|implemented|built|wrote|writes)\\b[^\\n.]{0,60}${escapeRe(bare)}\\b` +
+        `|` +
+        `\\b${escapeRe(bare)}\\b[^\\n.]{0,60}(?:created?|added?|introduced?|implemented|built|wrote|writes)\\b`,
+      "i",
+    );
+    if (inBackticks.test(claim) || backtickFirst.test(claim) || prose.test(claim)) {
+      if (!out.includes(bare)) out.push(bare);
+    }
+  }
+  return out;
+}
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
@@ -826,13 +980,100 @@ function diffCovered(ctx: BarContext, lcovPath?: string): { ok: boolean; output:
   };
 }
 
+/**
+ * Every file that changed on disk this turn was written through a tool.
+ *
+ * The check the ledger builtins were missing underneath them. `files-changed`
+ * proves the tools' writes landed; `spec-intact` reads the assertions the
+ * tools removed; neither could see a file rewritten by `node fix.cjs`, by
+ * `sed -i`, or by `cp /dev/null` — and at `--yes` none of those asks. A real
+ * run deleted an assertion by exactly that route and was accepted with
+ * "no test file was changed". Commandment 7, "do not route around a refusal
+ * with another tool", was a sentence in the refusal text; this is the check.
+ *
+ * Fails closed. A tree that could not be snapshotted in full proves nothing
+ * about the part that was not read, and "nothing is claimed" here has to be a
+ * refusal rather than a pass, because the whole point is what the ledger
+ * cannot see.
+ */
+function treeAccounted(ctx: BarContext, allowOutside: boolean): { ok: boolean; output: string } {
+  if (!ctx.treeBefore) {
+    return {
+      ok: false,
+      output:
+        "tree-accounted needs a snapshot of the working tree taken when the turn began, and " +
+        "this run has none — `molt prove` has no turn. Nothing can be established here; " +
+        "`--skip session` runs the command checks on their own.",
+    };
+  }
+  const bounded = (snap: { truncated: boolean; examined?: number }) =>
+    snap.truncated
+      ? {
+          ok: false,
+          output:
+            `The working tree could not be snapshotted in full (${snap.examined ?? "?"} entries ` +
+            "examined before the bound), so a change made outside the tools cannot be told from " +
+            "one made through them. Nothing is claimed. Narrow the project, or set `outside: allow` " +
+            "on this check.",
+        }
+      : null;
+  const early = bounded(ctx.treeBefore);
+  if (early) return early;
+  const diff = treeChanges(ctx.cwd, ctx.treeBefore);
+  const late = bounded(diff);
+  if (late) return late;
+
+  // What this turn wrote through the tools. A path the ledger holds is
+  // accounted for whatever the disk did to it afterwards — `files-changed`
+  // is the check that notices a ledgered file drifting.
+  const accounted = new Set((ctx.turnLedger ?? ctx.ledger).map((e) => e.path));
+  const outside = [
+    ...diff.changed.filter((p) => !accounted.has(p)).map((p) => `${p} (changed)`),
+    ...diff.created.filter((p) => !accounted.has(p)).map((p) => `${p} (created)`),
+    ...diff.deleted.filter((p) => !accounted.has(p)).map((p) => `${p} (deleted)`),
+  ];
+  const total = diff.changed.length + diff.created.length + diff.deleted.length;
+  if (outside.length === 0) {
+    return {
+      ok: true,
+      output:
+        total === 0
+          ? "the working tree did not change this turn"
+          : `${total} file(s) changed on disk this turn, every one written through a tool and in the ledger`,
+    };
+  }
+  const shown = outside.slice(0, 12);
+  const more = outside.length > shown.length ? `\n  … and ${outside.length - shown.length} more` : "";
+  if (allowOutside) {
+    return {
+      ok: true,
+      output: `${outside.length} file(s) changed outside the tools, allowed by \`outside: allow\`: ${outside.join(", ")}`,
+    };
+  }
+  return {
+    ok: false,
+    output:
+      `${outside.length} file(s) changed on disk this turn that no tool call wrote:\n` +
+      shown.map((s) => `  ${s}`).join("\n") +
+      more +
+      "\n\nA change made through bash — a script, sed, cp, a generator — has no entry in the " +
+      "write ledger, so nothing here can prove what it did or judge it. Make changes with " +
+      "write_file and edit_file. If a command was meant to change these (an install, a build " +
+      "step), say which command and why, and stop: that is a decision for a person, or " +
+      "`outside: allow` on this check in .molt/done.yml.",
+  };
+}
+
 function runBuiltin(
   builtin: BuiltinCheck,
   ctx: BarContext,
   allowCommentOnly = false,
   lcovPath?: string,
+  allowRemovals = false,
+  allowOutside = false,
 ): { ok: boolean; output: string } {
   if (builtin === "diff-covered") return diffCovered(ctx, lcovPath);
+  if (builtin === "tree-accounted") return treeAccounted(ctx, allowOutside);
   if (builtin === "files-changed") {
     const attempted = claimedWrites(ctx.record);
     if (ctx.ledger.length === 0) {
@@ -856,11 +1097,54 @@ function runBuiltin(
               `(denied, errored, or never executed): ${attempted.join(", ")}`,
       };
     }
+    if (ctx.turnLedger !== undefined && ctx.turnLedger.length === 0) {
+      return {
+        ok: false,
+        output:
+          `No file was modified in this turn. ${ctx.ledger.length} file(s) written earlier in this ` +
+          `session are still on disk (${ctx.ledger.map((e) => e.path).join(", ")}), but a ` +
+          `completion claim is judged on what the turn did, and this turn did nothing that can ` +
+          `be shown. If the task required a change, make it. If it did not — a question, a ` +
+          `review — say that plainly and stop, or ask it with /ask, which drops this check.`,
+      };
+    }
     const problems: string[] = [];
+    /**
+     * Created by this turn and gone again: a scratch file.
+     *
+     * A model that writes a helper script, runs it, and cleans up after
+     * itself has done nothing wrong — it has done the thing a careful person
+     * does. The first version of this check failed the whole turn for it,
+     * because the path it had ledgered was no longer on disk, and a local
+     * 30B lost a run that way: it wrote `test-duration.js` to verify its own
+     * change, `mv`'d it to `.cjs` so node would run it under an ESM package,
+     * and was told its work had not landed. It then spent its last attempt
+     * fighting that message instead of the real failure sitting beside it.
+     *
+     * A path that did not exist before the turn and does not exist after it
+     * contributed nothing to the tree. It cannot be evidence of work, and it
+     * is not evidence of a false claim either — `claims-grounded` is the
+     * check that catches "I created X" when X is absent. So it is named in
+     * the output and never fatal.
+     *
+     * A file that DID exist and is now gone is still a problem: that is work
+     * being destroyed, not a scratch file being tidied.
+     */
+    const scratch: string[] = [];
+    const landed: typeof ctx.ledger = [];
+    // A path the claim itself names is not scratch, whatever became of it.
+    // "I added src/fix.ts" over a file that is not there is the reverted-work
+    // case, and it must keep failing here rather than relying on the project
+    // having wired up `claims-grounded` as well.
+    const named = new Set(mentionedPaths(ctx.claim ?? ""));
     for (const entry of ctx.ledger) {
       const abs = resolve(ctx.cwd, entry.path);
       const now = sha256File(abs);
       if (now === null) {
+        if (entry.before === null && !named.has(entry.path)) {
+          scratch.push(entry.path);
+          continue;
+        }
         problems.push(`${entry.path}: written during this session but no longer on disk`);
         continue;
       }
@@ -870,9 +1154,24 @@ function runBuiltin(
       }
       if (entry.before === entry.after) {
         problems.push(`${entry.path}: rewritten with identical contents — no actual change`);
+        continue;
       }
+      landed.push(entry);
     }
     if (problems.length) return { ok: false, output: problems.join("\n") };
+
+    // Every write was a scratch file. Nothing survives, so nothing was done —
+    // said plainly, because "you cleaned up after yourself" and "you did the
+    // task" must never read the same.
+    if (!landed.length) {
+      return {
+        ok: false,
+        output:
+          `Nothing this turn wrote is still on disk. ${scratch.length} file(s) were created and ` +
+          `then removed or renamed (${scratch.join(", ")}), and nothing else changed. A scratch ` +
+          `file that has been tidied away is not the task being done.`,
+      };
+    }
 
     // A file changed, and the change was only comments or blanks.
     //
@@ -892,7 +1191,7 @@ function runBuiltin(
     // is not zero: an entry that cannot be judged is left alone rather than
     // held against the model.
     if (!allowCommentOnly) {
-      const empty = ctx.ledger.filter((e) => e.substance === 0);
+      const empty = landed.filter((e) => e.substance === 0);
       if (empty.length) {
         const allEmpty = empty.length === ctx.ledger.length;
         return {
@@ -912,10 +1211,76 @@ function runBuiltin(
     return {
       ok: true,
       output:
-        `${ctx.ledger.length} file(s) modified and verified byte-for-byte on disk` +
+        `${landed.length} file(s) modified and verified byte-for-byte on disk` +
         (attempted.length > ctx.ledger.length
           ? ` (${attempted.length - ctx.ledger.length} further write(s) in the record did not land)`
-          : ""),
+          : "") +
+        // Named, not hidden: the turn touched these and they are gone, and a
+        // reader of the receipt should be able to see that for themselves.
+        (scratch.length ? ` · ${scratch.length} scratch file(s) created and tidied away: ${scratch.join(", ")}` : ""),
+    };
+  }
+
+  if (builtin === "spec-intact") {
+    // Adding tests is free. Deleting an assertion is a change to what the
+    // project promises, and the reason this check exists is that a model asked
+    // to prove a defect inverted the assertion that pinned the old behaviour
+    // instead of writing a new test — making the specification agree with its
+    // change rather than the change answer to the specification.
+    const rewritten: { path: string; removed: string[]; route: "tool" | "disk" }[] = ctx.ledger
+      .filter((e) => e.specRemoved?.length)
+      .map((e) => ({ path: e.path, removed: e.specRemoved ?? [], route: "tool" as const }));
+    // Any route. The ledger sees what the tools removed; a test file rewritten
+    // by a script the model ran, or by `sed -i`, has no entry — and one real
+    // run deleted an assertion exactly that way and was told "no test file was
+    // changed". The tree snapshot taken when the turn began holds every test
+    // file's assertions, so the disk can be asked as well as the ledger.
+    const ledgered = new Set(ctx.ledger.map((e) => e.path));
+    if (ctx.treeBefore && !ctx.treeBefore.truncated) {
+      for (const [path, before] of ctx.treeBefore.assertions) {
+        if (ledgered.has(path)) continue;
+        let now: string[] = [];
+        try {
+          now = assertionsIn(readFileSync(resolve(ctx.cwd, path), "utf8"));
+        } catch {
+          now = []; // deleted or unreadable: every assertion it held is gone
+        }
+        const kept = new Set(now);
+        const removed = before.filter((a) => !kept.has(a));
+        if (removed.length) rewritten.push({ path, removed, route: "disk" });
+      }
+    }
+    if (!rewritten.length) {
+      const tests = ctx.ledger.filter((e) => isTestPath(e.path)).length;
+      return {
+        ok: true,
+        output: tests
+          ? `${tests} test file(s) changed, no assertion removed`
+          : "no test file was changed",
+      };
+    }
+    if (allowRemovals) {
+      return {
+        ok: true,
+        output:
+          `${rewritten.length} test file(s) lost assertion(s), allowed by \`removals: allow\`: ` +
+          rewritten.map((e) => e.path).join(", "),
+      };
+    }
+    const lines = rewritten.flatMap((e) =>
+      e.removed.map(
+        (a) => `  ${e.path}: ${a}${e.route === "disk" ? "  (changed on disk, not through a tool)" : ""}`,
+      ),
+    );
+    return {
+      ok: false,
+      output:
+        `This turn deleted ${lines.length} assertion(s) from ${rewritten.length} test file(s):\n` +
+        `${lines.join("\n")}\n` +
+        `A test that contradicts your change is not an obstacle to remove. Either the code ` +
+        `is wrong and you fix the code, or the test is wrong — and a test being wrong is a ` +
+        `decision for a person, so say which assertion you believe is wrong and why, and ` +
+        `stop. If it really is obsolete, set \`removals: allow\` on this check.`,
     };
   }
 
@@ -961,9 +1326,38 @@ function runBuiltin(
           `Either create them or stop referring to them.`,
       };
     }
+
+    // The second layer: does the claim ASSERT work on a file the ledger
+    // contradicts? A referenced file that simply exists on disk is grounded
+    // — but a claim that says it *created*, *added*, or *implemented* a file
+    // is a claim of a WRITE, and a write is only grounded by the ledger, not
+    // by the file existing. "Created src/auth.ts" over a pre-existing file is
+    // exactly the confident fabrication this builtin exists to catch, and the
+    // exists-on-disk test above cannot see it.
+    const assertedCreated = claimedCreated(claim, mentioned);
+    if (assertedCreated.length) {
+      const created = assertedCreated.filter((p) => !written.has(p));
+      if (created.length) {
+        return {
+          ok: false,
+          output:
+            `The completion claim says ${created.length} file(s) were ${created.length > 1 ? "created or added" : "created or added"} but ` +
+            `none appear in this session's write ledger: ${created.join(", ")}. ` +
+            `A file that existed before the turn is not work this turn did — say ` +
+            `you changed it, not that you created it.`,
+        };
+      }
+    }
+
+    const notes: string[] = [];
+    if (assertedCreated.length) {
+      notes.push(`${assertedCreated.length} asserted as created`);
+    }
     return {
       ok: true,
-      output: `${mentioned.length} file reference(s) in the claim all resolve: ${mentioned.join(", ")}`,
+      output:
+        `${mentioned.length} file reference(s) in the claim all resolve: ${mentioned.join(", ")}` +
+        (notes.length ? ` — ${notes.join("; ")}` : ""),
     };
   }
 
@@ -1013,6 +1407,23 @@ function runBuiltin(
       }
     }
 
+    // An evidence block that is there and cannot be read. Within the session
+    // that shed it, the count below catches this; in every later session the
+    // count it is compared against is zero, so a corrupted block was absent
+    // evidence nobody reported — sixteen write records in this project's own
+    // archive could be made unreadable and the check went on saying "archived
+    // and readable". Project-wide, like the missing-file check above: an
+    // archive holding less than was put there is never normal.
+    const damaged = ctx.archive.damaged?.() ?? [];
+    if (damaged.length > 0) {
+      return {
+        ok: false,
+        output:
+          `${damaged.length} archived batch(es) hold a write-evidence block that cannot be ` +
+          `read: ${damaged.join(", ")}. The work recorded there can no longer be proven.`,
+      };
+    }
+
     const fromArchive = ctx.archive.ledger?.(ctx.sessionArchives) ?? [];
     const expected = ctx.expectedArchivedWrites ?? 0;
     if (fromArchive.length < expected) {
@@ -1045,7 +1456,14 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
     const { ok, output } =
       check.builtin === "mutation"
         ? await mutationCheck(ctx, check.run ?? "", check.sample ?? 4, check.timeoutMs ?? 600_000)
-        : runBuiltin(check.builtin, ctx, check.commentOnly === "allow", check.lcov);
+        : runBuiltin(
+            check.builtin,
+            ctx,
+            check.commentOnly === "allow",
+            check.lcov,
+            check.removals === "allow",
+            check.outside === "allow",
+          );
     return {
       name: check.name,
       ...(check.advisory ? { advisory: true } : {}),
@@ -1164,7 +1582,26 @@ export async function runBar(bar: Bar, ctx: BarContext): Promise<BarResult> {
   const protect = bar.checks
     .map((c) => (c.kind === "builtin" ? c.lcov : undefined))
     .filter((p): p is string => typeof p === "string" && p.length > 0);
+  // A cancelled bar is not a failed one. A check killed by ctrl+C exits
+  // non-zero, and that read as the suite being red — refused receipt, failure
+  // sent to the model, another request billed, and the killed result cached
+  // as a failure until a watched file moved. Nothing a signal ended is a
+  // verdict on the work, so it is neither cached nor allowed to stand as one.
+  const aborted = () => ctx.signal?.aborted === true;
   for (const c of bar.checks) {
+    if (aborted()) {
+      results.push({
+        name: c.name,
+        ...(c.advisory ? { advisory: true } : {}),
+        tags: c.tags,
+        kind: c.kind,
+        detail: c.kind === "command" ? c.run : c.builtin,
+        ok: false,
+        output: "not run — the bar was cancelled before this check",
+        durationMs: 0,
+      });
+      continue;
+    }
     const reused = ctx.cache?.get(c, ctx.cwd) ?? null;
     if (reused) {
       results.push(reused);
@@ -1172,6 +1609,10 @@ export async function runBar(bar: Bar, ctx: BarContext): Promise<BarResult> {
       continue;
     }
     const fresh = await runCheck(c, { ...ctx, earlier, protect });
+    if (aborted()) {
+      results.push({ ...fresh, ok: false, output: "cancelled while running\n" + fresh.output });
+      continue;
+    }
     ctx.cache?.put(c, ctx.cwd, fresh);
     results.push(fresh);
     earlier.push({ check: c, result: fresh });
@@ -1180,7 +1621,8 @@ export async function runBar(bar: Bar, ctx: BarContext): Promise<BarResult> {
   return {
     // An advisory failure is not a failed contract. It is still reported, and
     // still goes to the model — it just does not refuse the completion.
-    ok: results.every((r) => r.ok || r.advisory),
+    ok: !aborted() && results.every((r) => r.ok || r.advisory),
+    ...(aborted() ? { cancelled: true } : {}),
     ...(warnings.length ? { warnings } : {}),
     results,
     durationMs: Date.now() - t0,
@@ -1193,7 +1635,22 @@ export async function runBar(bar: Bar, ctx: BarContext): Promise<BarResult> {
  * check failed" without the error is how you get a second wrong guess.
  */
 export function formatBarFailure(result: BarResult, attempt: number, maxAttempts: number): string {
-  const failed = result.results.filter((r) => !r.ok && !r.advisory);
+  // Ordered, not just listed.
+  //
+  // The failures arrived flat, and a model with one attempt left picks the
+  // one it reads first. A local 30B read "a file you wrote is no longer on
+  // disk" before "your test suite is red", spent its last attempt on the
+  // scratch file it could not delete, and never touched the assertion it had
+  // broken — the one failure it could actually have fixed.
+  //
+  // A command check carries the project's own output: a compiler error, a
+  // failing test, a line number. A builtin reports molt's bookkeeping about
+  // the session. When both fail, the first is the one to act on, so it goes
+  // first and says so.
+  const all = result.results.filter((r) => !r.ok && !r.advisory);
+  const commands = all.filter((r) => r.kind === "command");
+  const builtins = all.filter((r) => r.kind !== "command");
+  const failed = [...commands, ...builtins];
   const lines = [
     `[molt] You indicated the task is complete, but ${failed.length} of ${result.results.length} ` +
       `checks in .molt/done.yml did not pass. This is attempt ${attempt} of ${maxAttempts}.`,
@@ -1202,6 +1659,13 @@ export function formatBarFailure(result: BarResult, attempt: number, maxAttempts
     "do not modify .molt/done.yml to make the checks pass.",
     "",
   ];
+  if (commands.length && builtins.length) {
+    lines.push(
+      `Start with ${commands.map((r) => `\`${r.name}\``).join(", ")} — that is your project's own ` +
+        `output. The rest is molt's bookkeeping about this session and is usually downstream of it.`,
+      "",
+    );
+  }
   for (const r of failed) {
     lines.push(`--- FAILED: ${r.name} (${r.detail})`);
     if (r.exitCode !== undefined) lines.push(`exit code: ${r.exitCode}`);

@@ -11,6 +11,7 @@ import { Archive } from "../src/archive.js";
 import {
   BarError,
   FALLBACK_BAR,
+  claimedCreated,
   claimedWrites,
   loadBar,
   mentionedPaths,
@@ -67,6 +68,18 @@ describe("claims-grounded grounds a read", () => {
       read: ["/opt/homebrew/lib/node_modules/@solvyx/molt/src/engine.ts", "/elsewhere/bar.ts"],
     });
     assert.equal(grounded.ok, true, grounded.results[0]?.output);
+  });
+});
+
+describe("claimedCreated", () => {
+  it("flags a file asserted as created, not one merely referenced", () => {
+    assert.deepEqual(claimedCreated("I created `src/new.ts`.", ["src/new.ts"]), ["src/new.ts"]);
+    assert.deepEqual(claimedCreated("Added tests in `test/x.test.ts`.", ["test/x.test.ts"]), [
+      "test/x.test.ts",
+    ]);
+    // A mere change is not a creation, whichever side the verb sits on.
+    assert.deepEqual(claimedCreated("The fix touches `src/a.ts`.", ["src/a.ts"]), []);
+    assert.deepEqual(claimedCreated("`src/b.ts` now handles errors.", ["src/b.ts"]), []);
   });
 });
 

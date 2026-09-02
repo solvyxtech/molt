@@ -44,6 +44,17 @@ export type ReceiptRecord = {
   barMs: number;
   failed: string[];
   file: string;
+  /** How many files the turn changed. Absent on rows written before this existed. */
+  changed?: number;
+  /**
+   * True for a question. The bar ran advisory because the turn wrote
+   * nothing, so no check could refuse it — and an accepted answer is not a
+   * verified change. Five of this project's sixteen "verified changes" were
+   * questions before this field existed.
+   */
+  ask?: boolean;
+  /** True when the cost rests on molt's own token estimate anywhere in the session. */
+  costEstimated?: boolean;
   /**
    * Set when the receipt file is gone but the index row remains.
    *
@@ -62,7 +73,26 @@ export type RepairReport = {
   kept: number;
   /** Rows already marked missing, left alone. */
   alreadyMissing: number;
+  /**
+   * Rows that recorded no change count and whose receipt body says how many
+   * files changed. The count is copied in, so stats can tell an accepted
+   * change from an accepted answer on receipts written before the field
+   * existed — five of this project's sixteen "verified changes" were
+   * questions that changed nothing, and their receipts said so all along.
+   */
+  backfilled: number;
 };
+
+/**
+ * How many files a receipt body says the turn changed, or undefined when the
+ * body has no such section (a receipt from before the table existed).
+ */
+export function changedCountIn(body: string): number | undefined {
+  const section = body.split("## What the model changed")[1]?.split("\n## ")[0];
+  if (section === undefined) return undefined;
+  if (/Nothing\. No file was modified/.test(section)) return 0;
+  return (section.match(/^\| `/gm) ?? []).length;
+}
 
 /**
  * The headline number, and the one that needs its denominator said out loud.
@@ -87,10 +117,27 @@ export type Stats = {
    */
   falseClaimRate: number;
   totalTokens: number;
-  /** Tokens spent per ACCEPTED completion. Undefined with nothing accepted. */
+  /**
+   * Accepted claims that changed something. The denominator of both ratios
+   * below: an accepted question changed nothing and is counted in `answered`
+   * instead. A row written before `changed` was recorded is counted here —
+   * unknown is not zero.
+   */
+  verifiedChanges: number;
+  /** Accepted answers to questions. Recorded, never counted as changes. */
+  answered: number;
+  /**
+   * Accepted claims whose receipt records no file changed and that were not
+   * marked as questions — receipts from before `ask` was recorded, mostly.
+   * Not verified changes either.
+   */
+  unchanged: number;
+  /** Tokens spent per verified change. Undefined with none. */
   tokensPerVerifiedChange?: number;
   /** USD spent across these sessions, when a price was known. */
   totalUsd?: number;
+  /** True when any priced session's figure rests on molt's own token estimate. */
+  costEstimated: boolean;
   /**
    * Dollars per ACCEPTED completion — the number to compare harnesses on, and
    * the one molt's own pitch stands or falls by. Same denominator caveat as
@@ -141,6 +188,8 @@ export class Receipts {
     costUsd?: number;
     /** True when that figure rests on molt's own token estimate. */
     costEstimated?: boolean;
+    /** True for a question: the bar ran advisory and could not refuse. */
+    ask?: boolean;
     /** Every file the turn changed, with the hashes that prove it. */
     changed?: { path: string; before: string | null; after: string }[];
     /**
@@ -166,7 +215,11 @@ export class Receipts {
     // with a provider name and a token count, which answer neither question,
     // and put the work itself nowhere at all.
     const verdictLine =
-      args.verdict === "accepted"
+      args.verdict === "accepted" && args.ask
+        ? "molt recorded this answer. A question runs the bar advisory — a turn that wrote " +
+          "nothing cannot have broken anything — so no check could refuse it, and nothing " +
+          "here is a verified change."
+        : args.verdict === "accepted"
         ? "molt accepted this claim: every check that can block a completion passed."
         : args.verdict === "refused"
           ? "molt refused this claim and sent the failures back to the model."
@@ -320,6 +373,12 @@ export class Receipts {
       sessionTokens: args.sessionTokens,
       ...(args.session ? { session: args.session } : {}),
       ...(args.costUsd === undefined ? {} : { costUsd: args.costUsd }),
+      ...(args.costEstimated ? { costEstimated: true } : {}),
+      ...(args.ask ? { ask: true } : {}),
+      // Only when the caller said what changed. A row with no count is
+      // unknown, and unknown is not zero — it is counted as a change, which is
+      // what every row written before this field existed already was.
+      ...(args.changed === undefined ? {} : { changed: changed.length }),
       shedBatches: args.shedBatches,
       barMs: args.result.durationMs,
       failed: args.result.results.filter((r) => !r.ok).map((r) => r.name),
@@ -340,12 +399,13 @@ export class Receipts {
    * change.
    */
   repair(): RepairReport {
-    if (!existsSync(this.indexPath)) return { marked: 0, kept: 0, alreadyMissing: 0 };
+    if (!existsSync(this.indexPath)) return { marked: 0, kept: 0, alreadyMissing: 0, backfilled: 0 };
     const lines = readFileSync(this.indexPath, "utf8").split("\n").filter((l) => l.trim());
     const out: string[] = [];
     let marked = 0;
     let kept = 0;
     let alreadyMissing = 0;
+    let backfilled = 0;
     let changed = false;
     for (const line of lines) {
       let row: ReceiptRecord;
@@ -362,6 +422,17 @@ export class Receipts {
       const onDisk = typeof row.file === "string" && existsSync(join(this.dir, row.file));
       if (onDisk) {
         kept += 1;
+        // The one fact repair may add: what the receipt itself says changed.
+        // Nothing is invented — a body with no table leaves the row as it was.
+        if (row.changed === undefined) {
+          const n = changedCountIn(readFileSync(join(this.dir, row.file), "utf8"));
+          if (n !== undefined) {
+            backfilled += 1;
+            changed = true;
+            out.push(JSON.stringify({ ...row, changed: n }));
+            continue;
+          }
+        }
         out.push(line);
         continue;
       }
@@ -375,7 +446,7 @@ export class Receipts {
       out.push(JSON.stringify({ ...row, missing: true }));
     }
     if (changed) writeFileSync(this.indexPath, out.join("\n") + "\n");
-    return { marked, kept, alreadyMissing };
+    return { marked, kept, alreadyMissing, backfilled };
   }
 
   records(): ReceiptRecord[] {
@@ -397,13 +468,23 @@ export class Receipts {
     // Verdicts, rates, and cost are computed over receipts still on disk.
     // Counting a gone file as a refused claim produces a rate nobody can
     // open; the index still records the attempt.
-    const presentRows = rows.filter(
-      (r) => typeof r.file === "string" && existsSync(join(this.dir, r.file)),
-    );
+    // One receipt file, one row. Before `nextSeq` read the index, a deleted
+    // receipt's number was reissued, so two rows can name the same file with
+    // different facts in them; the later row is the one whose receipt is on
+    // disk, and counting both made "still on disk" one larger than the
+    // directory. This project's own index carried exactly that phantom.
+    const byFile = new Map<string, ReceiptRecord>();
+    for (const r of rows) {
+      if (typeof r.file === "string" && existsSync(join(this.dir, r.file))) byFile.set(r.file, r);
+    }
+    const presentRows = [...byFile.values()];
     const byModel: Stats["byModel"] = {};
     let accepted = 0;
     let refused = 0;
     let exhausted = 0;
+    let verifiedChanges = 0;
+    let answered = 0;
+    let unchanged = 0;
     let totalTokens = 0;
     let totalUsd: number | undefined;
 
@@ -413,6 +494,9 @@ export class Receipts {
       if (r.verdict === "accepted") {
         accepted += 1;
         m.accepted += 1;
+        if (r.ask) answered += 1;
+        else if (r.changed === 0) unchanged += 1;
+        else verifiedChanges += 1;
       } else {
         refused += r.verdict === "refused" ? 1 : 0;
         exhausted += r.verdict === "exhausted" ? 1 : 0;
@@ -427,19 +511,36 @@ export class Receipts {
     // session it only rises, so a drop is a new session.
     let group = 0;
     let previous = -1;
-    const perSession = new Map<string, { tokens: number; usd?: number }>();
+    const perSession = new Map<
+      string,
+      { tokens: number; usd?: number; verified: number; estimated: boolean }
+    >();
     for (const r of presentRows) {
       if (r.session === undefined && r.sessionTokens < previous) group += 1;
       previous = r.session === undefined ? r.sessionTokens : -1;
       const key = r.session ?? `inferred-${group}`;
-      const seen = perSession.get(key) ?? { tokens: 0 };
+      const seen = perSession.get(key) ?? { tokens: 0, verified: 0, estimated: false };
       seen.tokens = Math.max(seen.tokens, r.sessionTokens);
       if (typeof r.costUsd === "number") seen.usd = Math.max(seen.usd ?? 0, r.costUsd);
+      if (r.costEstimated) seen.estimated = true;
+      if (r.verdict === "accepted" && !r.ask && (r.changed === undefined || r.changed > 0)) {
+        seen.verified += 1;
+      }
       perSession.set(key, seen);
     }
-    for (const { tokens, usd } of perSession.values()) {
+    // Dollars are divided only by the changes that were priced. Dividing the
+    // priced sessions' dollars by every acceptance — four of this project's
+    // sixteen came from sessions with no price — reported $0.68 where the
+    // priced changes cost $0.90 each.
+    let pricedVerified = 0;
+    let costEstimated = false;
+    for (const { tokens, usd, verified, estimated } of perSession.values()) {
       totalTokens += tokens;
-      if (usd !== undefined) totalUsd = (totalUsd ?? 0) + usd;
+      if (usd !== undefined) {
+        totalUsd = (totalUsd ?? 0) + usd;
+        pricedVerified += verified;
+        if (estimated) costEstimated = true;
+      }
     }
 
     return {
@@ -448,12 +549,16 @@ export class Receipts {
       accepted,
       refused,
       exhausted,
+      verifiedChanges,
+      answered,
+      unchanged,
       falseClaimRate: presentRows.length ? (refused + exhausted) / presentRows.length : 0,
       totalTokens,
-      tokensPerVerifiedChange: accepted ? Math.round(totalTokens / accepted) : undefined,
+      tokensPerVerifiedChange: verifiedChanges ? Math.round(totalTokens / verifiedChanges) : undefined,
       totalUsd,
       usdPerVerifiedChange:
-        accepted && totalUsd !== undefined ? totalUsd / accepted : undefined,
+        pricedVerified && totalUsd !== undefined ? totalUsd / pricedVerified : undefined,
+      costEstimated,
       byModel,
     };
   }

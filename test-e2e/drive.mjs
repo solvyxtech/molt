@@ -76,7 +76,12 @@ const server = createServer((req, res) => {
   req.on("end", () => {
     // The criteria drafter is a separate, single-shot call. Recognised by its
     // system prompt so the scripted turn below is not consumed by it.
-    if (body.includes("You draft acceptance criteria")) {
+    if (
+      body.includes("You draft acceptance criteria") ||
+      body.includes("You interview a person about one coding task")
+    ) {
+      // Spec-first interviews before work. The reply must not consume the
+      // scripted turn below, or the second Run has nothing left to write.
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
@@ -85,8 +90,11 @@ const server = createServer((req, res) => {
               message: {
                 role: "assistant",
                 content: JSON.stringify({
-                  checks: [{ name: "drafted", run: "true" }],
-                  notes: ["it should read plainly"],
+                  proposal: {
+                    bar: [],
+                    checks: [{ name: "drafted", run: "true" }],
+                    notes: ["it should read plainly"],
+                  },
                 }),
               },
               finish_reason: "stop",
@@ -176,11 +184,42 @@ const child = spawn(electron, ["out/main.cjs", "--self-drive"], {
   },
 });
 
+/**
+ * The window's own evidence chain, checked on the workspace a real turn just
+ * ran in. Only the desktop session wiring an Integrity into its engine can
+ * make this file exist, and no unit test can tell the difference between a
+ * ledger that is empty because nothing happened and one that is empty because
+ * the surface never wired it up. This can.
+ */
+function ledgerVerdict() {
+  const file = join(ws, ".molt", "integrity", "ledger.jsonl");
+  const records = existsSync(file)
+    ? readFileSync(file, "utf8")
+        .split("\n")
+        .filter((l) => l.trim())
+        .map((l) => JSON.parse(l))
+    : [];
+  const kinds = new Set(records.map((r) => r.kind));
+  const want = process.env.MOLT_E2E_NO_WRITE === "1" ? ["session_start"] : ["session_start", "receipt"];
+  const missing = want.filter((k) => !kinds.has(k));
+  if (missing.length) {
+    console.log(
+      `[e2e] integrity FAIL · ${records.length} record(s), missing ${missing.join(", ")}` +
+        " — the window ran a whole turn and bound none of it",
+    );
+    return 1;
+  }
+  console.log(`[e2e] integrity  ${records.length} record(s) · ${[...kinds].join(", ")}`);
+  return 0;
+}
+
 child.on("exit", (code) => {
   server.close();
   other.close();
+  let exit = code ?? 1;
+  if (exit === 0) exit = ledgerVerdict();
   rmSync(cfg, { recursive: true, force: true });
   rmSync(ws, { recursive: true, force: true });
-  console.log(code === 0 ? "\ne2e: PASS" : `\ne2e: FAIL (exit ${code})`);
-  process.exit(code ?? 1);
+  console.log(exit === 0 ? "\ne2e: PASS" : `\ne2e: FAIL (exit ${exit})`);
+  process.exit(exit);
 });

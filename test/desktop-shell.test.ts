@@ -26,14 +26,21 @@ import {
   PATH_END,
 } from "../electron/login-path.js";
 import { holdAfterAutoDraft, taskForRun } from "../ui/criteria-hold.js";
-import { JOURNAL_RENDER_CAP, STREAM_CAP, newest, trimOldest } from "../ui/bounds.js";
+import { JOURNAL_RENDER_CAP, STREAM_CAP, contextCap, contextFill, newest, trimOldest } from "../ui/bounds.js";
 import { renderMarkdown } from "../ui/markdown.js";
 import { buildFrame } from "../src/banner-frames.js";
 import { keyFor } from "../electron/endpoint-key.js";
 import { mutatesSession } from "../electron/limits.js";
 import { fmtCost } from "../src/format.js";
-import { matchCommands } from "../src/commands.js";
+import { COMMANDS, matchCommands } from "../src/commands.js";
 import { providerName } from "../src/providers.js";
+import {
+  INTERVIEW_MAX_ROUNDS,
+  applyBarAdds,
+  parseInterviewReply,
+  parseQuestions,
+} from "../electron/interview.js";
+import { parseBar } from "../src/bar.js";
 
 /** The nearest ancestor holding a package.json. */
 function repoRoot(): string {
@@ -176,6 +183,68 @@ describe("title bar padding", () => {
   });
 });
 
+describe("the bar stays on screen while the work happens", () => {
+  it("ships a context meter, not a copied todo list", () => {
+    const html = readFileSync(path.join(repoRoot(), "ui", "index.html"), "utf8");
+    assert.match(html, /id="ctx"/);
+    assert.match(html, /id="ctx-fill"/);
+    assert.match(html, /id="spine-list"/);
+    // The checklist under the meter is the bar. A second Todo heading
+    // would be OpenCode's list, not molt's.
+    assert.doesNotMatch(html, />Todo</);
+  });
+
+  it("fills against a named window, never an invented one", () => {
+    assert.equal(contextCap(16384, 40000), 16384);
+    assert.equal(contextCap(0, 40000), 40000);
+    assert.equal(contextCap(0, null), 0);
+    assert.equal(contextFill(8192, 16384), 0.5);
+    assert.equal(contextFill(200, 0), 0, "no denominator, no percentage");
+    assert.equal(contextFill(0, 16384), 0);
+  });
+
+  it("ships a spine, a live jump, and a stage the settings form can hide", () => {
+    const html = readFileSync(path.join(repoRoot(), "ui", "index.html"), "utf8");
+    const css = readFileSync(path.join(repoRoot(), "ui", "styles.css"), "utf8");
+    // The unique surface: the bar is a column you watch, not a tab you
+    // remember. Every other wrapper is a chat column with a drawer.
+    assert.match(html, /id="spine"/);
+    assert.match(html, /id="spine-list"/);
+    assert.match(html, /id="jump"/);
+    assert.match(html, /id="stage"/);
+    assert.match(css, /\.stage\.no-spine \.spine/);
+    assert.match(css, /\.spine-list li\.pass/);
+    assert.match(css, /\.jump \{/);
+  });
+
+  it("hides the spine completely, with no leftover strip", () => {
+    const css = readFileSync(path.join(repoRoot(), "ui", "styles.css"), "utf8");
+    assert.match(css, /\.stage\.no-spine \.spine \{\s*display:\s*none/);
+  });
+
+  it("ships five tabs and no copy of the bar", () => {
+    const html = readFileSync(path.join(repoRoot(), "ui", "index.html"), "utf8");
+    const tabs = [...html.matchAll(/data-tab="([^"]+)"/g)].map((m) => m[1]);
+    assert.deepEqual(tabs, ["session", "view", "receipts", "log", "settings"]);
+    assert.doesNotMatch(html, /id="checks"/);
+    assert.doesNotMatch(html, /tab-checks/);
+    assert.doesNotMatch(html, /st-usage/);
+    assert.doesNotMatch(html, /st-bar/);
+    assert.doesNotMatch(html, /id="ask"/);
+    assert.doesNotMatch(html, /ck-open/);
+    assert.doesNotMatch(html, />Todo</);
+  });
+
+  it("registers /interview without stealing /ask", () => {
+    const interview = COMMANDS.find((c) => c.name === "/interview");
+    const ask = COMMANDS.find((c) => c.name === "/ask");
+    assert.ok(interview, "/interview must be on the palette");
+    assert.ok(interview!.aliases?.includes("spec"));
+    assert.ok(ask, "/ask stays a question, not a spec interview");
+    assert.equal(ask!.name, "/ask");
+  });
+});
+
 describe("/init reports whether it wrote", () => {
   it("does not claim a write when the bar already existed", () => {
     // writeDefaultBar returns `{ existed }`. That object is always truthy, so
@@ -240,13 +309,14 @@ describe("session:run sanitizes renderer-supplied criteria", () => {
   });
 });
 
-describe("auto-draft holds until a second Run", () => {
-  it("holds only when auto filled an empty panel on a real turn", () => {
-    assert.equal(holdAfterAutoDraft({ auto: true, hadRows: false, ask: false, drafted: true }), true);
-    assert.equal(holdAfterAutoDraft({ auto: true, hadRows: false, ask: false, drafted: false }), false);
-    assert.equal(holdAfterAutoDraft({ auto: true, hadRows: true, ask: false, drafted: true }), false);
-    assert.equal(holdAfterAutoDraft({ auto: true, hadRows: false, ask: true, drafted: true }), false);
-    assert.equal(holdAfterAutoDraft({ auto: false, hadRows: false, ask: false, drafted: true }), false);
+describe("spec-first holds until a second Run", () => {
+  it("holds the first Run of a real turn, even before the spec lands", () => {
+    assert.equal(holdAfterAutoDraft({ auto: true, hadRows: false, ask: false }), true);
+    assert.equal(holdAfterAutoDraft({ auto: true, hadRows: false, ask: false, drafted: false }), true);
+    assert.equal(holdAfterAutoDraft({ auto: true, hadRows: true, ask: false }), false);
+    assert.equal(holdAfterAutoDraft({ auto: true, hadRows: false, ask: true }), false);
+    assert.equal(holdAfterAutoDraft({ auto: false, hadRows: false, ask: false }), false);
+    assert.equal(holdAfterAutoDraft({ auto: true, hadRows: false, ask: false, resuming: true }), false);
   });
 });
 
@@ -856,5 +926,178 @@ describe("the task a Run acts on", () => {
 
   it("does nothing when there is nothing to run", () => {
     assert.deepEqual(taskForRun("", null), { text: "", resuming: false });
+  });
+});
+
+describe("the evidence chain is wired on both surfaces", () => {
+  it("gives the window's engine a ledger, not just a button that reads one", () => {
+    const src = readFileSync(path.join(repoRoot(), "electron", "main.ts"), "utf8");
+    // Shipped state before this: `integrity:verify`, a preload binding and a
+    // "verify evidence chain" button — over an engine that was never given a
+    // ledger to write. The button could only ever answer "0 records", and it
+    // would have answered it in the confident green of a passing check.
+    assert.match(src, /new Integrity\(cwd\)/, "the window never builds a ledger");
+    const engine = src.slice(src.indexOf("new Engine({"));
+    assert.match(
+      engine.slice(0, 900),
+      /\n\s+integrity,/,
+      "the window's engine is built without the ledger, so nothing is ever bound",
+    );
+  });
+
+  it("reports an unestablished chain as unestablished, not as intact", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    assert.match(ui, /if \(!ev\.established\)/, "an empty chain takes the intact path");
+    assert.match(ui, /if \(ev\.root\)/, "a null root of trust would print as \"null\"");
+  });
+});
+
+describe("interview replies become checks a person can run", () => {
+  it("accepts fenced JSON", () => {
+    const t = parseInterviewReply(
+      "```json\n" +
+        JSON.stringify({
+          questions: [{ id: "q1", prompt: "Which failure mode?", options: ["a", "b"] }],
+        }) +
+        "\n```",
+      1,
+    );
+    assert.equal(t.kind, "ask");
+    if (t.kind === "ask") {
+      assert.equal(t.questions[0]?.id, "q1");
+      assert.deepEqual(t.questions[0]?.options, ["a", "b"]);
+    }
+  });
+
+  it("proposes on the last round even if the model kept asking", () => {
+    const t = parseInterviewReply(
+      JSON.stringify({
+        questions: [{ id: "q1", prompt: "One more?", options: ["yes", "no"] }],
+        proposal: {
+          checks: [{ name: "lint", run: "npm test" }],
+          notes: ["the picker lists the second server"],
+        },
+      }),
+      INTERVIEW_MAX_ROUNDS,
+    );
+    assert.equal(t.kind, "propose");
+    if (t.kind === "propose") {
+      assert.equal(t.proposal.checks[0]?.name, "lint");
+      assert.equal(t.proposal.notes[0], "the picker lists the second server");
+    }
+  });
+
+  it("drops a question with fewer than two options", () => {
+    assert.deepEqual(parseQuestions([{ id: "q1", prompt: "Only one?", options: ["a"] }]), []);
+    assert.equal(
+      parseQuestions([{ id: "q1", prompt: "A real choice?", options: ["a", "b"] }]).length,
+      1,
+    );
+  });
+
+  it("writes only new command checks and leaves builtins and existing names alone", () => {
+    const d = mkdtempSync(path.join(tmpdir(), "molt-iv-"));
+    try {
+      const current = parseBar(
+        [
+          "version: 1",
+          "checks:",
+          "  - name: files-changed",
+          "    builtin: files-changed",
+          "  - name: lint",
+          "    run: npm run lint",
+        ].join("\n"),
+      );
+      const r = applyBarAdds(
+        d,
+        [
+          { name: "lint", run: "false" },
+          { name: "typecheck", run: "npx tsc --noEmit" },
+        ],
+        current,
+      );
+      assert.equal(r.ok, true, r.ok ? "" : r.error);
+      if (!r.ok) return;
+      const lint = r.bar.checks.find((c) => c.name === "lint");
+      const files = r.bar.checks.find((c) => c.name === "files-changed");
+      const added = r.bar.checks.find((c) => c.name === "typecheck");
+      assert.equal(lint?.kind, "command");
+      if (lint?.kind === "command") assert.equal(lint.run, "npm run lint");
+      assert.equal(files?.kind, "builtin");
+      if (files?.kind === "builtin") assert.equal(files.builtin, "files-changed");
+      assert.equal(added?.kind, "command");
+      if (added?.kind === "command") assert.equal(added.run, "npx tsc --noEmit");
+      const yaml = readFileSync(path.join(d, ".molt", "done.yml"), "utf8");
+      assert.match(yaml, /name: typecheck/);
+      assert.match(yaml, /run: npm run lint/);
+      assert.doesNotMatch(yaml, /run: false/);
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("writes nothing when parseBar would reject the result", () => {
+    const d = mkdtempSync(path.join(tmpdir(), "molt-iv-bad-"));
+    try {
+      const current = {
+        version: 1 as const,
+        checks: [
+          {
+            name: "broken",
+            kind: "command" as const,
+            run: "",
+            timeoutMs: 120_000,
+            expectExit: 0,
+            tags: [],
+          },
+        ],
+      };
+      const r = applyBarAdds(d, [{ name: "ok", run: "true" }], current);
+      assert.equal(r.ok, false);
+      assert.equal(existsSync(path.join(d, ".molt", "done.yml")), false);
+    } finally {
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the stream still names each check", () => {
+  it("renders compact per-check rows under the proof headline", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    const fn = ui.slice(ui.indexOf("function proofBlock"));
+    const body = fn.slice(0, fn.indexOf("\nfunction "));
+    assert.match(body, /for \(const c of rows\)/, "the headline is all that remains");
+    assert.match(body, /cname/, "a row of PASS with no name");
+    assert.match(body, /c\.output \|\| c\.detail/, "hid what the check said");
+    assert.match(body, /c\.durationMs/, "hid how long it took");
+    const css = readFileSync(path.join(repoRoot(), "ui", "styles.css"), "utf8");
+    assert.match(css, /\.proof \.check \{/, "rows with no stylesheet");
+  });
+});
+
+describe("Escape closes the innermost surface first", () => {
+  it("orders confirm, then picker, then interview, then criteria", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    const handler = ui.slice(ui.indexOf('if (e.key !== "Escape") return;'));
+    const confirm = handler.indexOf('$("confirm")');
+    const picker = handler.indexOf('$("picker")');
+    const interview = handler.indexOf('$("interview-panel")');
+    const criteria = handler.indexOf('$("criteria")');
+    assert.ok(confirm >= 0 && picker > confirm, "picker closed before the permission prompt");
+    assert.ok(interview > picker, "interview closed before the picker");
+    assert.ok(criteria > interview, "criteria closed before the interview");
+  });
+});
+
+describe("/clear drops a held spec, not just the stream", () => {
+  it("forgets the pending task, the panel, and the interview", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    const clear = ui.slice(ui.indexOf('case "/clear"'));
+    const body = clear.slice(0, clear.indexOf("case \"/init\""));
+    assert.match(body, /pendingTask = null/, "a held spec-first task would survive a reset");
+    assert.match(body, /pendingBarAdds = \[\]/, "Seal into bar stayed armed");
+    assert.match(body, /rows = \[\]/, "drafted checks would apply to the next Run");
+    assert.match(body, /closeInterview\(\)/, "the interview panel stayed on screen");
+    assert.match(body, /lastProof = undefined/, "the spine would keep lighting yesterday's bar");
   });
 });

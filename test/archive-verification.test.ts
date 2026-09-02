@@ -427,6 +427,47 @@ describe("deleting the archive changes an outcome", () => {
   });
 });
 
+describe("corrupted evidence in a later session", () => {
+  it("record-intact fails on an unreadable evidence block, whichever session shed it", async () => {
+    // Within the session that shed it, the write count catches a corrupted
+    // block (the test above). Tomorrow the count it is compared against is
+    // zero, so the same corruption passed — this project's own exuvia 0011
+    // could have its 16 write records made unreadable and record-intact went
+    // on reporting "archived and readable".
+    const dir = ws();
+    writeBar(dir, "version: 1\nchecks:\n  - name: intact\n    builtin: record-intact\n");
+    await sessionWithShedWrite(dir);
+
+    const exuviae = join(dir, ".molt", "exuviae");
+    let corrupted = 0;
+    for (const f of readdirSync(exuviae)) {
+      if (!f.endsWith(".md") || f === "index.md") continue;
+      const p = join(exuviae, f);
+      const body = readFileSync(p, "utf8");
+      if (!body.includes(LEDGER_MARKER)) continue;
+      writeFileSync(
+        p,
+        body.replace(new RegExp("(```" + LEDGER_MARKER + "\\n)[\\s\\S]*?(\\n```)"), "$1[GARBAGE$2"),
+      );
+      corrupted += 1;
+    }
+    assert.ok(corrupted > 0, "the fixture must have shed a write");
+
+    // A fresh process: nothing in memory, no expectation but the disk.
+    const fresh = new Engine({
+      baseUrl: "http://mock/v1",
+      model: "m",
+      cwd: dir,
+      bar: loadBar(dir),
+      archive: new Archive(dir),
+    });
+    const result = await runBar(loadBar(dir)!, fresh.barContext());
+    assert.equal(result.ok, false, "unreadable evidence passed as archived and readable");
+    assert.match(result.results[0]!.output, /cannot be read/);
+    assert.deepEqual(new Archive(dir).damaged().length, corrupted);
+  });
+});
+
 describe("claims-grounded", () => {
   function ctx(over: Partial<BarContext> = {}): BarContext {
     return { cwd: ws(), record: [], ledger: [], archivedBatches: 0, ...over };
@@ -454,6 +495,30 @@ describe("claims-grounded", () => {
     mkdirSync(join(dir, "docs"), { recursive: true });
     writeFileSync(join(dir, "docs", "guide.md"), "hi\n");
     const r = await runBar(bar, ctx({ cwd: dir, claim: "See docs/guide.md for details." }));
+    assert.equal(r.ok, true);
+  });
+
+  it("fails a claim that says it CREATED a file the ledger never wrote, even if it exists", async () => {
+    // A pre-existing file is not work the turn did. "Created src/auth.ts" over
+    // a file that was already there is a separately catchable fabrication: the
+    // old check only asked whether the file resolves, and existence on disk
+    // satisfied it. A change and a creation are different claims — a creation
+    // demands a write, and only the ledger can show one.
+    const dir = ws();
+    mkdirSync(join(dir, "src"), { recursive: true });
+    writeFileSync(join(dir, "src", "auth.ts"), "pre-existing\n", "utf8");
+    const r = await runBar(bar, ctx({ cwd: dir, claim: "Done — I created `src/auth.ts`." }));
+    assert.equal(r.ok, false);
+    assert.match(r.results[0].output, /created or added/);
+    assert.match(r.results[0].output, /write ledger/);
+  });
+
+  it("passes a claim that CREATED a file the ledger actually wrote", async () => {
+    const dir = ws();
+    const ledger: LedgerEntry[] = [
+      { path: "src/new.ts", before: null, after: "abc", callId: "c1" },
+    ];
+    const r = await runBar(bar, ctx({ cwd: dir, claim: "I created `src/new.ts`.", ledger }));
     assert.equal(r.ok, true);
   });
 

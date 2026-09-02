@@ -135,7 +135,16 @@ export class StreamAccumulator {
       const slot = this.calls.get(index) ?? { id: "", name: "", args: "" };
       if (tc.id) slot.id = tc.id;
       if (tc.function?.name) {
-        slot.name += tc.function.name;
+        // Assemble the name across fragments — `"write"` then `"_file"` must
+        // become `"write_file"` — but not across re-sends. Some providers
+        // split the name over deltas; aggregation/adaptor layers instead
+        // re-deliver the whole tool-call shape on later deltas, and appending
+        // that would turn `read_file` into `read_fileread_file`. A fragment
+        // extends the name; a re-send is already a suffix of it, so appending
+        // only when the new part is not already a suffix covers both.
+        if (!slot.name.endsWith(tc.function.name)) {
+          slot.name += tc.function.name;
+        }
         // The first moment anyone can know a tool is coming.
         //
         // A step streams its narration, then its tool calls, and until now the
@@ -144,7 +153,7 @@ export class StreamAccumulator {
         // waffling — and three runs in one session were cancelled inside it,
         // one of them three seconds before `list_files` would have fired. The
         // name is known here, several hundred milliseconds before the call is
-        // complete, so it is announced here.
+        // complete, so it is announced here — once per call, not per chunk.
         if (!this.announced.has(index)) {
           this.announced.add(index);
           this.pending.push(slot.name);
@@ -205,8 +214,8 @@ export class StreamAccumulator {
 
 /**
  * Split a raw SSE byte stream into JSON payloads. Handles events arriving
- * mid-line, `[DONE]`, comment lines, and CRLF — all of which appear in the
- * wild across providers.
+ * mid-line, `[DONE]`, comment lines, and CRLF or bare-CR line endings — all of
+ * which appear in the wild across providers.
  */
 export class SseParser {
   private buffer = "";
@@ -214,7 +223,13 @@ export class SseParser {
 
   /** Feed decoded text; returns whole `data:` payloads found so far. */
   push(text: string): string[] {
-    this.buffer += text.replace(/\r\n/g, "\n");
+    // Normalize CRLF *and* bare CR to LF. The SSE spec terminates a line with
+    // `\r`, `\n`, or `\r\n`, and an event with a blank line that may be `\r\r`,
+    // `\n\n`, `\r\n\r\n`, or `\n\r`. Collapsing every CR to LF folds all four
+    // event separators onto the single `\n\n` this parser splits on — otherwise
+    // a `\r`-terminated stream is silently dropped, taking whole events with
+    // the line terminator it uses.
+    this.buffer += text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     const out: string[] = [];
 
     let idx: number;

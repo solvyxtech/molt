@@ -399,16 +399,159 @@ function isText(buf: Buffer): boolean {
  * line trimmed. A search that returns everything is a search nobody reads.
  */
 /**
- * A quantifier inside a quantified group: `(a+)+`, `(\s*)*`, `([a-z]+)*`.
+ * A quantifier inside a quantified group — `(a+)+`, `(\s*)*`, `([a-z]+)*`.
  *
  * This is the shape behind catastrophic backtracking, and JavaScript offers no
  * way to time-limit a regex once it starts — so the only defence is to decline
  * the pattern before running it. Refusing is safe: every such pattern has a
  * simpler equivalent, and the message says so. Detection is conservative and
  * will miss exotic cases, which is why the deadline below exists as well.
+ *
+ * Two shapes are caught. The plain one has a single group whose body holds a
+ * quantifier and whose close is itself followed by a quantifier. The nested
+ * one — `((a)*)*` — hides the quantified group a level deeper: a group that
+ * contains an inner quantified group and is itself quantified. Both trap
+ * backtracking; a missed nested one was a real ≤10 s per-line hang on a single
+ * line of matches.
  */
 export function isCatastrophic(pattern: string): boolean {
-  return /\([^)]*[+*{][^)]*\)\s*[+*{]/.test(pattern);
+  return (
+    // (a+)+  (a*)*  (\s*)*  ([a-z]+)*
+    /\([^)]*[+*{][^)]*\)\s*[+*{]/.test(pattern) ||
+    // ((a)*)*  ((ab)+)*  — an inner group `(a)` quantified, then the whole
+    // thing closed and quantified again: `\( * (\( * \) [quant]) * \) [quant]`
+    /\([^)]*\([^)]*\)\s*[+*{][^)]*\)\s*[+*{]/.test(pattern)
+  );
+}
+
+/**
+ * A file whose job is to pin behaviour down.
+ *
+ * Anything under a `test/` or `tests/` directory, or named `*.test.*` /
+ * `*.spec.*`. The distinction matters because editing a line of source is
+ * ordinary work, and editing the line that says what the source must do is a
+ * change to the specification — a different act, needing a different answer.
+ */
+export function isTestPath(path: string): boolean {
+  return /(^|\/)tests?\//.test(path) || /\.(test|spec)\.[cm]?[jt]sx?$/.test(path);
+}
+
+/**
+ * The assertions a file makes, normalised for comparison.
+ *
+ * Whitespace is collapsed so reindenting a test is not mistaken for rewriting
+ * it. Only the assertion line itself is kept: a test's name, its comments and
+ * its scaffolding may all change freely, and none of that alters what the file
+ * promises.
+ */
+export function assertionsIn(text: string): string[] {
+  const out: string[] = [];
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!/^(?:await\s+)?(?:assert|expect|chai|should)\b|\bexpect\(|\bassert\(/.test(t)) continue;
+    out.push(t.replace(/\s+/g, " "));
+  }
+  return out;
+}
+
+/**
+ * Assertions that were in the file before this write and are not in it after.
+ *
+ * This is the shape of a specific manipulation, observed rather than imagined:
+ * asked to prove a defect with a failing test, a model instead opened the test
+ * that pinned the existing behaviour and inverted its assertion —
+ * `assert.equal(r.ok, true)` became `assert.equal(r.ok, false)` — so that the
+ * suite agreed with the change it had already made. Red-before-green is
+ * satisfied by that trivially, and it proves nothing at all: the specification
+ * was rewritten to match the code rather than the code corrected to match the
+ * specification.
+ *
+ * Compared as a set, so moving an assertion within a file is not a removal.
+ */
+export function removedAssertions(before: string, after: string): string[] {
+  const now = new Set(assertionsIn(after));
+  return assertionsIn(before).filter((a) => !now.has(a));
+}
+
+/**
+ * The working tree, as content hashes, at one moment.
+ *
+ * Taken when a turn begins and compared when the turn claims to be done. The
+ * write ledger sees what the tools wrote; this sees what changed. A test
+ * file rewritten by a script the model ran, an assertion commented out with
+ * `sed -i`, a file emptied with `cp /dev/null` — none of those has a ledger
+ * entry, and every ledger-reading check was blind to them. One real run
+ * deleted an assertion through `node fix.cjs` and was accepted with
+ * `spec-intact: no test file was changed`.
+ *
+ * Test files also carry their assertions, so a specification removed by any
+ * route can be named, not only one removed through `edit_file`.
+ *
+ * Bounded like every other walk. A tree that cannot be read in full within
+ * the bound yields `truncated`, and a check reading it must fail closed: a
+ * snapshot of an unknown subset proves nothing about the rest.
+ */
+export type TreeSnapshot = {
+  /** project-relative path -> sha256 of contents (or size:mtime past the hash cap). */
+  files: Map<string, string>;
+  /** test path -> its assertions, normalised, at snapshot time. */
+  assertions: Map<string, string[]>;
+  truncated: boolean;
+  examined: number;
+};
+
+/** Never part of the work: molt's own record, build output, dependencies. */
+export const TREE_SKIP = new Set([...SKIP_DIRS, ".molt", "dist-test", "release"]);
+/** Past this size a file is identified by size and mtime rather than hashed. */
+const TREE_HASH_CAP = 8 * 1024 * 1024;
+
+export function snapshotTree(root: string): TreeSnapshot {
+  const out: TreeSnapshot = { files: new Map(), assertions: new Map(), truncated: false, examined: 0 };
+  const walked = walk(root, {
+    depth: 24,
+    limit: 20_000,
+    skip: TREE_SKIP,
+    deadline: Date.now() + WALK_DEADLINE_MS,
+  });
+  out.truncated = walked.truncated;
+  out.examined = walked.examined;
+  for (const e of walked.entries) {
+    if (e.kind !== "file") continue;
+    const abs = join(root, e.path);
+    try {
+      if ((e.bytes ?? 0) > TREE_HASH_CAP) {
+        out.files.set(e.path, `size:${e.bytes}:${statSync(abs).mtimeMs}`);
+        continue;
+      }
+      const buf = readFileSync(abs);
+      out.files.set(e.path, createHash("sha256").update(buf).digest("hex"));
+      if (isTestPath(e.path) && isText(buf)) out.assertions.set(e.path, assertionsIn(buf.toString("utf8")));
+    } catch {
+      // Unreadable now is unreadable then: absent from the map on both sides.
+    }
+  }
+  return out;
+}
+
+/** What moved on disk since `before`, in project-relative paths. */
+export function treeChanges(
+  root: string,
+  before: TreeSnapshot,
+): { changed: string[]; created: string[]; deleted: string[]; truncated: boolean } {
+  const now = snapshotTree(root);
+  const changed: string[] = [];
+  const created: string[] = [];
+  const deleted: string[] = [];
+  for (const [p, sha] of now.files) {
+    const was = before.files.get(p);
+    if (was === undefined) created.push(p);
+    else if (was !== sha) changed.push(p);
+  }
+  for (const p of before.files.keys()) if (!now.files.has(p)) deleted.push(p);
+  changed.sort();
+  created.sort();
+  deleted.sort();
+  return { changed, created, deleted, truncated: now.truncated };
 }
 
 export type GrepResult = {

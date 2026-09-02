@@ -22,6 +22,16 @@ import { resolveReceipt } from "./receipts-path.js";
 import { sessionOpenReject } from "./session-open.js";
 import { keyFor } from "./endpoint-key.js";
 import { draftCriteria, type Draft } from "./criteria.js";
+import {
+  applyBarAdds,
+  interviewTurn,
+  parseQuestions,
+  projectScripts,
+  sanitizeAnswers,
+  INTERVIEW_MAX_ROUNDS,
+  type InterviewAnswer,
+  type InterviewQuestion,
+} from "./interview.js";
 import { runOptions, shouldRefreshPrice } from "./run-options.js";
 import { desktopSurfaces } from "./theme-surfaces.js";
 import { barInitText, parseJournal, mutatesSession } from "./limits.js";
@@ -30,6 +40,8 @@ import { Engine, MAX_STEPS } from "../src/engine.js";
 import { Archive } from "../src/archive.js";
 import { Receipts } from "../src/receipts.js";
 import { Journal } from "../src/journal.js";
+import { Integrity } from "../src/integrity.js";
+import { buildRepoMap } from "../src/repomap.js";
 import { loadBar, BarError, writeDefaultBar, BAR_FILENAME } from "../src/bar.js";
 import type { Bar, Check } from "../src/types.js";
 import { AUTONOMY_LEVELS, AUTONOMY_SUMMARY, isAutonomy, type Autonomy } from "../src/autonomy.js";
@@ -130,6 +142,12 @@ function openSession(cwd: string, model: string, baseUrl: string, apiKey?: strin
 
   const journal = new Journal(cwd);
   const receipts = new Receipts(cwd);
+  // The window ships a "verify evidence chain" button. Without this line the
+  // engine behind it never writes a ledger, so the button answers "0 records"
+  // for every session however long it ran — a check that verifies nothing
+  // while being counted as one. The fourth engine option to exist on one
+  // surface and not the other; see run-options.ts for the last three.
+  const integrity = new Integrity(cwd);
   const provider = providerName(baseUrl);
 
   journal.append("session_start", {
@@ -165,6 +183,7 @@ function openSession(cwd: string, model: string, baseUrl: string, apiKey?: strin
     autonomy,
     archive: new Archive(cwd),
     receipts,
+    integrity,
   });
 
   return { engine, cwd, model, baseUrl, provider, bar, barError, journal, receipts };
@@ -312,7 +331,7 @@ function createWindow(): void {
         // one a person uses — not a shortcut into the IPC handler.
         if (process.env.MOLT_E2E_CRITERION && process.env.MOLT_E2E_AUTO !== "1") {
           await win!.webContents.executeJavaScript(`(() => {
-            document.getElementById("ck-open").click();
+            document.getElementById("criteria").classList.remove("hidden");
             document.getElementById("ck-add").click();
             const row = document.querySelector("#ck-rows .ck-row.check");
             const ins = row.querySelectorAll("input");
@@ -323,11 +342,24 @@ function createWindow(): void {
             return 0;
           })()`);
         }
+        // A real provider runs commands, and at the default level the window
+        // asks before each one — with nobody to answer. MOLT_E2E_AUTONOMY sets
+        // the level through the control a person would use.
+        if (process.env.MOLT_E2E_AUTONOMY) {
+          await win!.webContents.executeJavaScript(`(() => {
+            const want = ${JSON.stringify(process.env.MOLT_E2E_AUTONOMY)};
+            const bars = [...document.querySelectorAll("#autonomy .au")];
+            const idx = ["low", "medium", "high"].indexOf(want);
+            if (idx >= 0 && bars[idx]) bars[idx].click();
+            return 0;
+          })()`);
+          await new Promise((r) => setTimeout(r, 200));
+        }
         await win!.webContents.executeJavaScript(`(() => {
-          document.getElementById("ask").checked = ${process.env.MOLT_E2E_ASK === "1"};
-          document.getElementById("prompt").value = ${JSON.stringify(
-            process.env.MOLT_E2E_TASK ?? "say hello",
-          )};
+          const task = ${JSON.stringify(process.env.MOLT_E2E_TASK ?? "say hello")};
+          document.getElementById("prompt").value = ${
+            process.env.MOLT_E2E_ASK === "1" ? '"? " + task' : "task"
+          };
           document.getElementById("send").click();
           return 0;
         })()`);
@@ -337,7 +369,7 @@ function createWindow(): void {
           let held = false;
           for (let i = 0; i < 100; i++) {
             held = await win!.webContents.executeJavaScript(
-              `document.getElementById("send").classList.contains("hidden") === false && document.getElementById("ck-open").textContent.includes("criteria ·")`,
+              `document.getElementById("send").classList.contains("hidden") === false && !document.getElementById("criteria").classList.contains("hidden")`,
             );
             if (held) break;
             await new Promise((r) => setTimeout(r, 100));
@@ -371,8 +403,11 @@ function createWindow(): void {
           await win!.webContents.executeJavaScript(`document.getElementById("send").click()`);
         }
         // Wait for the turn to finish, seen from the page rather than guessed.
+        // MOLT_E2E_WAIT_MS lengthens the wait for a real provider and a real
+        // bar, which take minutes where the stub takes seconds.
         let done = false;
-        for (let i = 0; i < 300; i++) {
+        const waitMs = Number(process.env.MOLT_E2E_WAIT_MS) || 30_000;
+        for (let i = 0; i < waitMs / 100; i++) {
           done = await win!.webContents.executeJavaScript(
             `window.__turnDone === true && document.getElementById("send").classList.contains("hidden") === false`,
           );
@@ -380,7 +415,7 @@ function createWindow(): void {
           await new Promise((r) => setTimeout(r, 100));
         }
         if (!done) {
-          console.error("[self-drive] turn never produced a verdict within 30s");
+          console.error(`[self-drive] turn never produced a verdict within ${Math.round(waitMs / 1000)}s`);
           app.exit(1);
           return;
         }
@@ -419,9 +454,9 @@ function createWindow(): void {
                sawActivity: window.__sawActivity === true,
                activityLeft: document.querySelectorAll("#stream .activity").length,
                sealedShown: document.querySelectorAll("#stream .sealed").length,
-               checkNamesRun: [...document.querySelectorAll("#checks .check-card .nm")].map((n) => n.textContent),
-               checksRun: [...document.querySelectorAll("#stream .proof .check .est")].length,
-               checkNames: [...document.querySelectorAll("#checks .check-card .nm")].map((n) => n.textContent),
+               checkNamesRun: [...document.querySelectorAll("#spine-list li[data-name]")].map((n) => n.dataset.name),
+               checksRun: [...document.querySelectorAll("#spine-list li.pass, #spine-list li.fail")].length,
+               checkNames: [...document.querySelectorAll("#spine-list li[data-name]")].map((n) => n.dataset.name),
                proofHead: (document.querySelector("#stream .proof h4")||{}).textContent||"",
                pickerRows: document.querySelectorAll("#picker-list button").length,
                pickerText: (document.getElementById("picker-list")||{}).textContent||"",
@@ -432,6 +467,9 @@ function createWindow(): void {
                tools: document.querySelectorAll("#stream .tool").length,
                proofs: document.querySelectorAll("#stream .proof").length,
                wire: document.querySelectorAll("#wire .frame").length,
+               // The wire view must show the request as the engine stated it —
+               // a step number and a message count — not a placeholder.
+               wireRequest: [...document.querySelectorAll("#wire .frame")].map((f) => f.textContent || "").find((t) => /messages/.test(t)) || "",
                text: (document.getElementById("stream")||{}).textContent||"",
              })`,
           )
@@ -440,7 +478,7 @@ function createWindow(): void {
             console.log(`[self-drive] said rows  ${r.rows}`);
             console.log(`[self-drive] tool rows  ${r.tools}`);
             console.log(`[self-drive] proofs     ${r.proofs}`);
-            console.log(`[self-drive] wire rows  ${r.wire}`);
+            console.log(`[self-drive] wire rows  ${r.wire} · request frame: ${String(r.wireRequest).slice(0, 60) || "MISSING"}`);
             console.log(`[self-drive] active     ${r.activeTab} / ${r.activePanel}`);
             console.log(`[self-drive] picker     ${r.pickerRows} model(s) in ${r.pickerGroups} group(s)`);
             console.log(
@@ -458,6 +496,7 @@ function createWindow(): void {
             const ok =
               Number(r.rows) > 0 &&
               text.includes(process.env.MOLT_E2E_EXPECT ?? "") &&
+              /step \d+ · \d+ messages/.test(String(r.wireRequest)) &&
               Number(r.pickerRows) >= 2 &&
               // A server the app was never pointed at, only remembered, must
               // still be asked — that is the whole of the reported bug.
@@ -483,13 +522,27 @@ function createWindow(): void {
               // one statement ago has not been painted yet, and the capture
               // returns the previous frame — which is how a screenshot can
               // disagree with the assertions taken beside it.
-              setTimeout(() => {
-                void win!.webContents.capturePage().then((img) => {
-                  writeFileSync(shot, img.toPNG());
-                  console.log(`[self-drive] shot        ${shot}`);
-                  app.exit(ok ? 0 : 1);
-                });
-              }, 250);
+              //
+              // MOLT_SHOT_TAB picks the tab to photograph after the turn —
+              // the assertions above always read the session tab, and the
+              // README needs the others too.
+              // The assertions above opened the model picker to read it;
+              // a photograph of the work should not have a dialog over it.
+              const tab = process.env.MOLT_SHOT_TAB;
+              void win!.webContents.executeJavaScript(
+                `(document.getElementById("picker-close")?.click(), ` +
+                  `document.querySelector('.tab[data-tab=${JSON.stringify(tab || "session")}]')?.click(), 0)`,
+              );
+              setTimeout(
+                () => {
+                  void win!.webContents.capturePage().then((img) => {
+                    writeFileSync(shot, img.toPNG());
+                    console.log(`[self-drive] shot        ${shot}`);
+                    app.exit(ok ? 0 : 1);
+                  });
+                },
+                900,
+              );
               return;
             }
             app.exit(ok ? 0 : 1);
@@ -526,7 +579,7 @@ function createWindow(): void {
       void win!.webContents
         .executeJavaScript(
           `(async () => {
-             const need = ["tabs","panels","stream","wire","checks","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","autonomy","ask","criteria","ck-rows","ck-open","ck-draft","ck-auto"];
+             const need = ["tabs","panels","stream","wire","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","autonomy","interview","criteria","ck-rows","ck-draft","ck-auto","spine","spine-list","jump","ctx","ctx-fill","ctx-line"];
              const missing = need.filter((id) => !document.getElementById(id));
              const tabs = [...document.querySelectorAll(".tab")].map((t) => t.dataset.tab);
              const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
@@ -541,7 +594,7 @@ function createWindow(): void {
                // depends on a reader telling them apart at a glance.
                autoCriteriaDefault: document.getElementById("ck-auto").checked,
                criteriaRows: await (async () => {
-                 document.getElementById("ck-open").click();
+                 document.getElementById("interview").click();
                  document.getElementById("ck-add").click();
                  document.getElementById("ck-add-note").click();
                  await new Promise((r) => setTimeout(r, 60));
@@ -626,7 +679,7 @@ function createWindow(): void {
             Array.isArray(r.missing) &&
             r.missing.length === 0 &&
             Array.isArray(r.tabs) &&
-            r.tabs.length === 6 &&
+            r.tabs.length === 5 &&
             r.nulRoundTrip === true &&
             r.autonomyButtons === 3 &&
             String(r.autonomyOn).length > 0 &&
@@ -800,6 +853,9 @@ ipcMain.handle(
     try {
       session = openSession(opts.cwd, opts.model, opts.baseUrl, opts.apiKey);
       rememberEndpoint(opts.baseUrl, opts.model);
+      // The map of this workspace, so the first turn does not spend four
+      // steps discovering what is here. Quietly, and off the open path.
+      void primeRepoMap(session);
       // Quietly at open: the endpoint is already named in the title bar, and
       // an unprompted price line is not what you are looking at just then.
       void refreshPricing(session, false);
@@ -809,6 +865,27 @@ ipcMain.handle(
     }
   },
 );
+
+/**
+ * Build this workspace's repository map and give it to the engine.
+ *
+ * Off the open path because it walks the disk and the window must not wait
+ * for it. Dropped rather than applied if a turn has already started: the
+ * system message is the cached prefix, and rewriting it mid-turn throws away
+ * the cache that turn is in the middle of using.
+ */
+async function primeRepoMap(target: Session): Promise<void> {
+  // Same rule as the terminal: a model you are hosting yourself is, today, a
+  // small one, and a repo map makes a small model browse rather than work.
+  // Measured both ways — see defaultMapTokens in src/cli.tsx.
+  if (isSelfHosted(target.baseUrl)) return;
+  try {
+    const map = await buildRepoMap(target.cwd);
+    if (session === target && running === null && map.text) target.engine.setRepoMap(map.text);
+  } catch {
+    /* a map is a hint; the session is fine without one */
+  }
+}
 
 /**
  * Ask the endpoint what it charges, and tell the engine.
@@ -1065,23 +1142,69 @@ ipcMain.handle("bar:init", () => {
 ipcMain.handle("criteria:draft", async (_e, task: string) => {
   if (!session) return { ok: false, error: "no workspace is open" };
   if (!task.trim()) return { ok: false, error: "nothing to draft from" };
-  let scripts: string[] = [];
-  try {
-    const pkg = JSON.parse(readFileSync(join(session.cwd, "package.json"), "utf8")) as {
-      scripts?: Record<string, string>;
-    };
-    scripts = Object.keys(pkg.scripts ?? {});
-  } catch {
-    /* not a node project, or no package.json — the drafter is told "(none found)" */
-  }
   return draftCriteria({
     task,
-    scripts,
+    scripts: projectScripts(session.cwd),
     barChecks: session.bar?.checks.map((c: Check) => c.name) ?? [],
     baseUrl: session.baseUrl,
     apiKey: session.engine.apiKey,
     model: session.model,
   });
+});
+
+/**
+ * One round of interview. Separate from the work transcript: the model asks,
+ * a person answers, and what comes back is editable checks — never a write.
+ */
+ipcMain.handle(
+  "interview:turn",
+  async (
+    _e,
+    opts: {
+      task?: unknown;
+      round?: unknown;
+      history?: unknown;
+    },
+  ) => {
+    if (!session) return { kind: "error", error: "no workspace is open" };
+    if (running) return { kind: "error", error: "a turn is running — stop it first" };
+    const task = typeof opts?.task === "string" ? opts.task : "";
+    const round = Math.max(1, Math.min(INTERVIEW_MAX_ROUNDS, Number(opts?.round) || 1));
+    const history = Array.isArray(opts?.history)
+      ? (opts.history as { questions?: unknown; answers?: unknown }[])
+          .slice(0, INTERVIEW_MAX_ROUNDS)
+          .map((h) => ({
+            questions: parseQuestions(h.questions) as InterviewQuestion[],
+            answers: sanitizeAnswers(h.answers) as InterviewAnswer[],
+          }))
+      : [];
+    return interviewTurn({
+      task,
+      scripts: projectScripts(session.cwd),
+      barChecks: session.bar?.checks.map((c: Check) => c.name) ?? [],
+      history,
+      round,
+      baseUrl: session.baseUrl,
+      apiKey: session.engine.apiKey,
+      model: session.model,
+    });
+  },
+);
+
+/**
+ * Write proposed command checks into `.molt/done.yml` after a person seals.
+ * parseBar is the authority; a malformed proposal writes nothing.
+ */
+ipcMain.handle("bar:apply", (_e, adds: unknown) => {
+  if (!session) return { ok: false, error: "no workspace is open" };
+  if (running) return { ok: false, error: "a turn is running — stop it first" };
+  const list = Array.isArray(adds) ? adds : [];
+  const r = applyBarAdds(session.cwd, list, session.bar);
+  if (!r.ok) return r;
+  session.bar = r.bar;
+  session.barError = null;
+  session.engine.setBar(session.bar);
+  return { ok: true, state: stateOf(session) };
 });
 
 ipcMain.handle("auth:save", (_e, provider: string, key: string) =>
@@ -1210,14 +1333,49 @@ ipcMain.handle("journal:read", () => {
   return parseJournal(readFileSync(p, "utf8"));
 });
 
+/**
+ * Verify the whole evidence chain for the open workspace: the journals' own
+ * chains plus the project-level integrity ledger that binds journals,
+ * receipts and exuviae together. Returns the verdict, any drift, and the
+ * root of trust the workspace could ship somewhere molt cannot write.
+ */
+ipcMain.handle("integrity:verify", () => {
+  if (!session) return null;
+  // The same verdict `molt verify` prints, from the same function. This ran
+  // `Integrity.verify` alone and answered "intact" over a journal whose chain
+  // the terminal reported broken at entry 16 — the sixth engine capability to
+  // exist on one surface and not the other.
+  const p = Integrity.verifyProject(session.cwd);
+  const i = p.ledger;
+  return {
+    ok: p.ok,
+    established: i.established,
+    records: i.records,
+    brokenAt: i.brokenAt ?? null,
+    reason: i.reason ?? null,
+    drift: i.drift,
+    unbound: i.unbound,
+    journals: p.journals.map((j) => ({ file: j.file, ok: j.ok, entries: j.entries, reason: j.reason ?? null })),
+    root: p.root,
+    generatedAt: new Date().toISOString(),
+  };
+});
+
 ipcMain.handle("session:stats", () => {
   if (!session) return null;
   const e = session.engine;
+  const b = e.bom();
   return {
     tokens: e.sessionTokens,
     cached: e.sessionCachedTokens,
     costUsd: e.costUsd() ?? null,
+    costEstimated: b.costEstimated === true,
     shedBatches: e.shedBatches,
     hasBar: e.hasBar,
+    // The next request, not the session total. Context fill is "how full
+    // is the window right now", and billed tokens across a day are not that.
+    requestEst: b.requestTotalEst,
+    window: e.learnedWindow,
+    budget: e.budgetTokens ?? null,
   };
 });

@@ -45,7 +45,9 @@ html, body {
 
 body {
   display: grid;
-  grid-template-rows: auto auto 1fr auto auto;
+  /* titlebar · stage · interview (when open) · criteria (when open) · composer */
+  grid-template-rows: auto minmax(0, 1fr) auto auto auto;
+  position: relative;
 }
 
 ::selection { background: var(--dim); color: #fff; }
@@ -193,7 +195,43 @@ body {
   text-transform: uppercase;
 }
 
-.state { margin-left: auto; display: flex; align-items: center; gap: 7px; color: var(--dim); }
+.title-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-left: auto;
+  -webkit-app-region: no-drag;
+}
+.title-actions .link-quiet { font-size: 12px; color: var(--dim); }
+.title-actions .link-quiet:hover,
+.title-actions .link-quiet[aria-pressed="true"] { color: var(--accent); }
+
+.keys {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: 14px;
+  color: var(--dim);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  -webkit-app-region: no-drag;
+  user-select: none;
+}
+.keys span { display: flex; align-items: center; gap: 3px; opacity: 0.72; }
+@media (max-width: 1080px) { .keys { display: none; } }
+kbd {
+  display: inline-block;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 2px;
+  padding: 0 4px;
+  font: inherit;
+  font-size: 10px;
+  color: var(--text);
+  line-height: 1.5;
+}
+
+.state { margin-left: 14px; display: flex; align-items: center; gap: 7px; color: var(--dim); }
 .dot {
   width: 7px; height: 7px; border-radius: 50%;
   background: var(--dim);
@@ -207,7 +245,25 @@ body {
 
 /* ── tabs ──────────────────────────────────────────────────────────────── */
 
+/* ── stage: work on the right, the bar on the left ─────────────────────── */
+/*
+ * Every other wrapper is a chat column with a settings drawer. This one is
+ * a proof: the bar stays on screen while the model works, so "done" is a
+ * column of checks you can watch light up, not a tab you remember to open.
+ */
+.stage {
+  display: grid;
+  grid-template-columns: 232px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+.stage.no-spine { grid-template-columns: minmax(0, 1fr); }
+.stage.no-spine .spine { display: none; }
+.stage.no-spine main { grid-column: 1; }
+
 .tabs {
+  grid-column: 1 / -1;
   display: flex;
   gap: 2px;
   padding: 0 var(--pad);
@@ -243,8 +299,19 @@ body {
 
 /* ── panels ────────────────────────────────────────────────────────────── */
 
-main { position: relative; overflow: hidden; }
-.panel { position: absolute; inset: 0; display: none; overflow: auto; }
+main {
+  position: relative;
+  overflow: hidden;
+  min-width: 0;
+  min-height: 0;
+  grid-row: 2;
+  grid-column: 2;
+}
+.stage.no-spine main { grid-column: 1; }
+.panel {
+  position: absolute; inset: 0; display: none; overflow: auto;
+  contain: layout style;
+}
 .panel.active { display: block; }
 
 .panel-head {
@@ -263,9 +330,141 @@ main { position: relative; overflow: hidden; }
 .panel-head p { max-width: 78ch; }
 .controls { display: flex; gap: 10px; align-items: center; margin-top: 10px; }
 
+/* ── evidence-chain verify result ──────────────────────────────────────── */
+
+.verify {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 12px;
+}
+.verify.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 8%, transparent); }
+.verify.fail { color: var(--fail); background: color-mix(in srgb, var(--fail) 8%, transparent); }
+.verify.warn { color: var(--warn); }
+.verify .verify-root {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11px;
+  margin-top: 4px;
+  word-break: break-all;
+}
+
+/* ── the bar, always on ────────────────────────────────────────────────── */
+
+.spine {
+  grid-row: 2;
+  grid-column: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  border-right: 1px solid var(--line);
+  background: var(--bg-sunken);
+  contain: layout style;
+}
+.ctx {
+  padding: 10px 12px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.ctx .spine-head { padding: 0 0 6px; }
+.ctx-pct {
+  font-size: 11px;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.ctx-bar {
+  height: 3px;
+  background: var(--line);
+  border-radius: 2px;
+  overflow: hidden;
+  margin: 2px 0 8px;
+}
+.ctx-bar > i {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transform-origin: left;
+}
+.ctx-bar.hot > i { background: var(--warn); }
+.ctx-bar.full > i { background: var(--fail); }
+.ctx-line, .ctx-cost {
+  color: var(--dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.ctx-cost { margin-top: 2px; color: var(--text); opacity: 0.85; }
+
+.spine-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 6px;
+}
+.spine-kicker {
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  font-weight: 600;
+}
+.spine-sub {
+  padding: 0 12px 10px;
+  color: var(--dim);
+  font-size: 11px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.spine-list {
+  list-style: none;
+  overflow: auto;
+  padding: 6px 0 12px;
+  content-visibility: auto;
+}
+.spine-list li {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: baseline;
+  padding: 5px 12px;
+  border-left: 2px solid transparent;
+  contain: content;
+}
+.spine-list li.pass { border-left-color: var(--ok); }
+.spine-list li.fail { border-left-color: var(--fail); }
+.spine-list li.run { border-left-color: var(--accent); }
+.spine-list li.skip { border-left-color: var(--line); }
+.spine-list li.empty {
+  display: block;
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1.45;
+  border-left: 0;
+  padding: 8px 12px 12px;
+}
+.spine-mark {
+  color: var(--dim);
+  font-size: 11px;
+  text-align: center;
+}
+.spine-list li.pass .spine-mark { color: var(--ok); }
+.spine-list li.fail .spine-mark { color: var(--fail); }
+.spine-list li.run .spine-mark { color: var(--accent); animation: pulse 1s ease-in-out infinite; }
+.spine-nm {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.spine-list li.pass .spine-nm { color: var(--ok); }
+.spine-list li.fail .spine-nm { color: var(--fail); }
+.spine-ms {
+  color: var(--dim);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ── session stream ────────────────────────────────────────────────────── */
 
-.stream { padding: var(--pad) var(--pad) 26px; }
+.stream { padding: var(--pad) var(--pad) 26px; contain: layout; }
+.turn, .said, .tool, .proof { contain: content; }
 
 .empty {
   height: 60vh;
@@ -399,38 +598,11 @@ main { position: relative; overflow: hidden; }
   font-size: 12px; opacity: 0.9;
 }
 
-/* ── checks ────────────────────────────────────────────────────────────── */
-
-.checks { padding: var(--pad); display: flex; flex-direction: column; gap: 9px; }
-.check-card {
-  border: 1px solid var(--line-soft);
-  border-left: 2px solid var(--line);
-  border-radius: var(--r);
-  background: var(--bg-sunken);
-  padding: 10px 12px;
-}
-.check-card.pass { border-left-color: var(--ok); }
-.check-card.fail { border-left-color: var(--fail); }
-.check-card.running { border-left-color: var(--accent); }
-.check-card .top { display: flex; align-items: center; gap: 10px; }
-.check-card .nm { color: var(--accent); }
 .verdict { font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
 .verdict.pass { color: var(--ok); }
 .verdict.fail { color: var(--fail); }
 .verdict.note { color: var(--warn); }
-/* Defined, and not reached by the run that just finished. */
 .verdict.skipped { color: var(--dim); }
-.check-card .ms { color: var(--dim); font-size: 11px; }
-.check-card .tag {
-  font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase;
-  color: var(--dim); border: 1px solid var(--line); border-radius: 999px; padding: 0 6px;
-}
-.check-card pre {
-  margin-top: 8px; padding-top: 8px;
-  border-top: 1px solid var(--line-soft);
-  white-space: pre-wrap; overflow-wrap: anywhere;
-  font-size: 12px; opacity: 0.85;
-}
 
 /* ── receipts ──────────────────────────────────────────────────────────── */
 
@@ -578,6 +750,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
 /* ── composer ──────────────────────────────────────────────────────────── */
 
 .composer {
+  position: relative;
   display: flex;
   gap: 11px;
   align-items: flex-end;
@@ -585,10 +758,26 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   background: var(--bg-raised);
   border-top: 1px solid var(--line);
 }
+.jump {
+  position: absolute;
+  right: var(--pad);
+  top: -34px;
+  appearance: none;
+  background: var(--ghost);
+  border: 1px solid var(--dim);
+  border-radius: 999px;
+  color: var(--accent);
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 3px 10px;
+  cursor: pointer;
+  z-index: 8;
+}
+.jump:hover { background: var(--dim); color: #04161c; }
 .composer textarea { resize: none; max-height: 200px; line-height: 1.5; }
 .composer-side { display: flex; align-items: center; gap: 10px; }
-.ask { color: var(--dim); font-size: 12px; white-space: nowrap; cursor: pointer; }
-.ask input { accent-color: var(--accent); }
 /*
  * Unchecked checkboxes are drawn by the platform as a white tile, which is the
  * brightest thing on the screen and sits next to the two settings that decide
@@ -613,18 +802,6 @@ input[type="checkbox"]:checked::after {
   border: solid var(--bg);
   border-width: 0 2px 2px 0;
   transform: rotate(42deg);
-}
-
-/* ── status bar ────────────────────────────────────────────────────────── */
-
-.status {
-  display: flex; align-items: center; gap: 14px;
-  height: 26px;
-  padding: 0 var(--pad);
-  background: var(--bg-sunken);
-  border-top: 1px solid var(--line);
-  color: var(--dim);
-  font-size: 11px;
 }
 
 /* ── modal ─────────────────────────────────────────────────────────────── */
@@ -718,6 +895,33 @@ input[type="checkbox"]:checked::after {
 
 /* ── autonomy ──────────────────────────────────────────────────────────── */
 
+.interview {
+  background: var(--bg-sunken);
+  border-top: 1px solid var(--line);
+  padding: 10px var(--pad) 12px;
+  max-height: 42vh;
+  overflow: auto;
+}
+.interview-head { display: flex; align-items: center; gap: 9px; margin-bottom: 8px; }
+.iv-qs { display: flex; flex-direction: column; gap: 12px; }
+.iv-q { border: 1px solid var(--line-soft); border-radius: var(--r); padding: 10px 12px; }
+.iv-q .prompt { color: var(--text); margin-bottom: 8px; }
+.iv-opts { display: flex; flex-wrap: wrap; gap: 6px; }
+.iv-opts button {
+  appearance: none;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+.iv-opts button.on { border-color: var(--accent); color: var(--accent); }
+.iv-other { margin-top: 8px; width: 100%; }
+.iv-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+
 .side-stack { display: flex; flex-direction: column; gap: 7px; align-items: flex-end; }
 
 /*
@@ -769,10 +973,12 @@ input[type="checkbox"]:checked::after {
 
 .palette {
   position: absolute;
-  left: var(--pad);
+  /* Sit over the work column, not over the bar. Without a workspace the
+     spine is gone and the sibling selector below pulls it back to the pad. */
+  left: calc(232px + var(--pad));
   /* Wide enough for the longest name plus its summary, and no wider — a list
      that spans a 2560px display puts the description a foot from the name. */
-  width: min(760px, calc(100vw - var(--pad) * 2));
+  width: min(760px, calc(100vw - 232px - var(--pad) * 2));
   bottom: 74px;
   z-index: 30;
   background: var(--bg-raised);
@@ -784,6 +990,10 @@ input[type="checkbox"]:checked::after {
   max-height: 340px;
   display: flex; flex-direction: column;
   box-shadow: 0 -8px 24px rgba(2, 10, 14, 0.5);
+}
+.stage.no-spine ~ .palette {
+  left: var(--pad);
+  width: min(760px, calc(100vw - var(--pad) * 2));
 }
 .palette-rows { overflow: auto; }
 .palette-rows button {
@@ -875,3 +1085,9 @@ input[type="checkbox"]:checked::after {
 
 .ck-auto { color: var(--dim); font-size: 11px; white-space: nowrap; cursor: pointer; }
 .ck-auto input { accent-color: var(--dim); }
+
+@media (prefers-reduced-motion: reduce) {
+  .dot.busy, .dot.proving, .activity .spin, .tool.running .glyph, .spine-list li.run .spine-mark {
+    animation: none;
+  }
+}

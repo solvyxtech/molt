@@ -21,9 +21,9 @@
 import { runCommand } from "./run.js";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
-import { dirname, resolve, relative, isAbsolute } from "node:path";
+import { basename, dirname, resolve, relative, isAbsolute, join } from "node:path";
 import type { ArchiveLike } from "./archive.js";
-import { CheckCache, barFingerprint, formatBarFailure, runBar, type BarContext } from "./bar.js";
+import { CheckCache, barFingerprint, clipEnds, formatBarFailure, runBar, type BarContext } from "./bar.js";
 import {
   AUTONOMY_SUMMARY,
   DEFAULT_AUTONOMY,
@@ -45,6 +45,10 @@ import {
   changedLinesOf,
   substanceOf,
   walkAsync,
+  isTestPath,
+  removedAssertions,
+  snapshotTree,
+  type TreeSnapshot,
 } from "./files.js";
 import {
   isAnthropicNative,
@@ -57,11 +61,29 @@ import {
 } from "./anthropic.js";
 import { breakpoints, withCaching, refusedCaching, type CacheStyle, cacheStyle } from "./cache.js";
 import { Journal } from "./journal.js";
+import {
+  commitMessage,
+  commitPaths,
+  isRepo,
+  pathsIn,
+  restore as restoreFiles,
+  revertPlan,
+  snapshot,
+  type LedgerLike,
+} from "./git.js";
+import { Integrity } from "./integrity.js";
 import { authHeaders, isSelfHosted } from "./providers.js";
 import { Receipts } from "./receipts.js";
 import { readStream, type StreamAccumulator, type Usage } from "./stream.js";
 import { Fragments, SafeStream } from "./live.js";
 import { Transcript, toolDetail } from "./transcript.js";
+import {
+  CLAUDE_CODE_MODELS,
+  ClaudeCodeSession,
+  claudeCodeHealth,
+  isClaudeCode,
+  type Sdk,
+} from "./claude-code.js";
 import {
   estTokens,
   type Bar,
@@ -106,6 +128,14 @@ export const SYSTEM_PROMPT = [
   "Do not edit .molt/done.yml to make checks pass. Do not claim work you have",
   "not done — it will be checked against the full session record.",
   "",
+  "Changing what code does makes the tests that pinned the old behaviour wrong.",
+  "Update them. Adding a test for the new behaviour does not retire the old one:",
+  "both still run, and the suite stays red until the contradiction is gone.",
+  "",
+  "But a test that contradicts your change is not an obstacle to be removed. Fix",
+  "the code so it meets the test. If you believe the test itself is wrong, say",
+  "which assertion and why, and stop — that is a decision for a person.",
+  "",
   "If you are unsure whether something worked, say so and check it rather than",
   "asserting it. An unverified claim costs the same as a false one.",
 ].join("\n");
@@ -120,8 +150,9 @@ export const SYSTEM_PROMPT = [
  * directory is a constant for the whole session, so it costs one line once
  * and stays inside the cached prefix.
  */
-export function systemPromptFor(cwd: string): string {
-  return `${SYSTEM_PROMPT}\n\nThe working directory is ${cwd} — that, and not a guess, is where relative paths land.`;
+export function systemPromptFor(cwd: string, extra?: string): string {
+  const base = `${SYSTEM_PROMPT}\n\nThe working directory is ${cwd} — that, and not a guess, is where relative paths land.`;
+  return extra ? `${base}\n\n${extra}` : base;
 }
 
 /**
@@ -695,6 +726,32 @@ export function asQuestion(bar: Bar | null | undefined, wroteNothing: boolean): 
   };
 }
 
+/**
+ * What to do with the working tree once the bar has answered — the second
+ * half of `autoresearch`'s loop, with molt's bar as the judge.
+ */
+/**
+ * What a write to a pinned file says.
+ *
+ * Names the pin rather than the file system, because the model has done
+ * nothing wrong and the useful next move is to say what it wanted to change
+ * — not to retry, and not to route around it with `bash`.
+ */
+export function readOnlyRefusal(path: string): string {
+  return (
+    `write refused: ${path} is pinned read-only for this session. It can be read, not ` +
+    `changed. Do not work around this with another tool — say what you would have ` +
+    `changed there and why, and continue with the rest.`
+  );
+}
+
+export type GitPolicy = {
+  /** Commit what the bar verified, with the receipt in the message. */
+  commitOnPass?: boolean;
+  /** Put back the files this turn wrote when the bar was not met. */
+  restoreOnFail?: boolean;
+};
+
 export type EngineConfig = {
   baseUrl: string;
   apiKey?: string;
@@ -719,6 +776,14 @@ export type EngineConfig = {
    */
   nativeApi?: boolean;
   /**
+   * The Agent SDK, injected.
+   *
+   * Only tests pass one. Left out, the Claude Code backend loads the real SDK
+   * at runtime — which is also the only way a test could spend a real
+   * subscription's quota, so every test that drives the backend supplies this.
+   */
+  claudeCodeSdk?: Sdk;
+  /**
    * Response ceiling for protocols that demand one. Anthropic's Messages API
    * requires `max_tokens`; the OpenAI shape treats it as optional.
    */
@@ -739,6 +804,39 @@ export type EngineConfig = {
   receipts?: Receipts;
   /** Append-only hash-chained record of everything this session did. */
   journal?: Journal;
+  /**
+   * Project-level integrity ledger binding the journal, receipts, and exuviae
+   * into one cross-linked chain with a shippable root of trust. Optional: no
+   * ledger, no cross-link — but the other evidence is still recorded.
+   */
+  integrity?: Integrity;
+  /**
+   * What molt does with the tree once the bar has answered.
+   *
+   * Off unless asked for. Committing and reverting are both things a person
+   * expects to be in charge of, and a tool that started doing either because
+   * it was installed would be a tool people stop installing.
+   */
+  git?: GitPolicy;
+  /**
+   * A wall-clock ceiling for one turn, in milliseconds.
+   *
+   * The other two ceilings — tokens and money — measure what a turn consumes.
+   * This measures what it costs the person waiting for it, which is the limit
+   * `autoresearch` runs on: a fixed five minutes per attempt, then the judge
+   * runs whatever state the work is in. A turn that is going to take twenty
+   * minutes is usually a turn that has gone wrong, and the useful moment to
+   * find that out is at minute five.
+   */
+  turnDeadlineMs?: number;
+  /**
+   * A map of the repository, added to the system prompt. Built by the caller
+   * (it walks the disk, which the constructor must not) and paid for once,
+   * inside the cached prefix.
+   */
+  repoMap?: string;
+  /** Paths the model may read but must never write. */
+  readOnly?: string[];
   maxProofAttempts?: number;
   /**
    * Shed automatically once working history exceeds this many tokens.
@@ -753,6 +851,18 @@ export type EngineConfig = {
   elideSuperseded?: boolean;
   /** How much molt may do without asking. Defaults to asking about everything. */
   autonomy?: Autonomy;
+  /**
+   * Where to write one JSON file per completion attempt holding the whole
+   * turn: the wire transcript, the ledger, the bar's result, the receipt name.
+   *
+   * The journal deliberately records no message content, and receipts hold
+   * the claim but not the conversation that led to it — so the record molt
+   * keeps by default cannot train a model to predict a verdict from what the
+   * model saw. This is the opt-in that can. Redacted like everything else
+   * molt writes; off unless asked for, because a full transcript on disk is
+   * exactly the file that quietly accumulates credentials.
+   */
+  captureDir?: string;
 };
 
 function scrubbedEnv(): NodeJS.ProcessEnv {
@@ -957,15 +1067,53 @@ function actualReadEnd(result: string, from: number, path: string): number {
   return from + (result.match(/\n/g)?.length ?? 0) + 1;
 }
 
-function truncateResult(s: string, cap = TOOL_RESULT_MAX_BYTES): { text: string; note?: string } {
+/**
+ * `keep: "ends"` for a command, `"head"` for everything else.
+ *
+ * A model that runs `npm test` itself hits the same wall the bar hit: the
+ * verdict is at the end of the output and the head is what survived. A grep
+ * or a listing is a list, where the first N results are as good as any, so
+ * those keep the head as before.
+ */
+function truncateResult(
+  s: string,
+  cap = TOOL_RESULT_MAX_BYTES,
+  keep: "head" | "ends" = "head",
+): { text: string; note?: string } {
   const bytes = Buffer.byteLength(s, "utf8");
   if (bytes <= cap) return { text: s };
+  if (keep === "ends") {
+    return { text: clipEnds(s, cap), note: `capped at ${cap}B (was ${bytes}B)` };
+  }
   const cut = Buffer.from(s, "utf8").subarray(0, cap).toString("utf8");
   return {
     text: cut + `\n[molt: truncated ${bytes - cap} bytes]`,
     note: `capped at ${cap}B (was ${bytes}B)`,
   };
 }
+
+/** What one tool call needs to know about the turn it belongs to. */
+type ToolContext = {
+  step: number;
+  userText: string;
+  confirm: Confirm;
+  log?: Journal;
+  /** Line ranges of each file already shown, so a re-read can be named as one. */
+  shown: Map<string, { from: number; to: number }[]>;
+  /** The last result of each distinct call, so an identical one can be pointed at. */
+  answered: Map<string, { step: number; sha: string }>;
+};
+
+/** What the step loop needs to know once a tool call is finished. */
+type ToolOutcome = {
+  name: string;
+  /** What the model is told. Also what the transcript records. */
+  result: string;
+  /** True when autonomy let it run without asking. */
+  auto: boolean;
+  /** True when it returned something the model had already been given. */
+  repeated: boolean;
+};
 
 export class Engine {
   cfg: EngineConfig;
@@ -980,6 +1128,27 @@ export class Engine {
    * refused first.
    */
   private tokenScale = 1;
+
+  /**
+   * The live Claude Code session, when that is the backend.
+   *
+   * One per molt session rather than per turn: the second message into a
+   * streaming session read 2,200 tokens out of cache where the first wrote
+   * 958 fresh ones, and a session per turn pays that back every time.
+   */
+  private cc?: ClaudeCodeSession<EngineEvent>;
+  /** The system prompt the live session was started with. */
+  private ccSystem = "";
+  /**
+   * User messages Claude Code has already been given.
+   *
+   * By identity, not by index. A cancelled turn rolls the transcript back and
+   * a shed renumbers it; an object either was forwarded or was not.
+   */
+  private ccForwarded = new WeakSet<Msg>();
+  /** The turn's tool context, read by the MCP handlers as each call arrives. */
+  private ccCtx?: ToolContext;
+
   /**
    * The context window this endpoint serves, once it has said so.
    *
@@ -1034,6 +1203,16 @@ export class Engine {
     return this.cfg.nativeApi ?? isAnthropicNative(this.cfg.baseUrl);
   }
 
+  /**
+   * Is the work being done by Claude Code rather than by an HTTP endpoint?
+   *
+   * Read off the endpoint, so it survives `/endpoint` switching mid-session
+   * and cannot disagree with what the receipt records.
+   */
+  private get claudeCode(): boolean {
+    return isClaudeCode(this.cfg.baseUrl);
+  }
+
   /** Where a completion request goes, which differs between the two APIs. */
   private get endpoint(): string {
     return this.native
@@ -1063,6 +1242,19 @@ export class Engine {
    * nowhere in the document.
    */
   private did: string[] = [];
+  /**
+   * Tool calls made this turn, by id. The session ledger is keyed by call id,
+   * so this is what tells a write this turn made from one an earlier turn did
+   * — and `files-changed` needs to know, or a turn that changed nothing is
+   * accepted on the strength of the last one that did.
+   */
+  private turnCalls = new Set<string>();
+  /**
+   * The working tree when this turn began. `tree-accounted` compares the
+   * disk against it at claim time, so a change the ledger never saw — a
+   * script the model ran, `sed -i` — is a change the bar can refuse.
+   */
+  private turnTree: TreeSnapshot | null = null;
   /**
    * Results reused while their watched files have not moved.
    *
@@ -1106,14 +1298,46 @@ export class Engine {
    * against must not.
    */
   private sessionArchives = new Set<number>();
+  /**
+   * Project-relative paths this session created — files that did not exist
+   * when molt first wrote them. Deleting one destroys nothing that was not
+   * molt's own doing, which is what makes the gate's delete exception safe.
+   */
+  private createdThisSession(): ReadonlySet<string> {
+    const out = new Set<string>();
+    for (const e of this.sessionLedger()) if (e.before === null) out.add(e.path);
+    return out;
+  }
+
+  /** Files this TURN wrote, with what was there before — what a revert acts on. */
+  private turnWrites: LedgerLike[] = [];
+  /** The pre-turn working tree, as a commit object nothing else can see. */
+  private turnSnapshot: string | null = null;
+  private turnSnapshotPaths = new Set<string>();
+  private turnStartedAt = 0;
+  private repoMapText = "";
+  private readOnlyPaths = new Set<string>();
 
   constructor(cfg: EngineConfig) {
     this.cfg = cfg;
-    this.transcript = new Transcript(systemPromptFor(this.cwd));
+    // Both go into the system message, so they must exist before it is built.
+    this.repoMapText = cfg.repoMap ?? "";
+    for (const p of cfg.readOnly ?? []) this.readOnlyPaths.add(p);
+    this.transcript = new Transcript(this.systemPrompt());
     this.barHash = barFingerprint(this.cwd);
     // The key molt was handed is the one secret it can mask exactly.
     cfg.journal?.protect(cfg.apiKey, process.env.MOLT_API_KEY);
     cfg.receipts?.protect(cfg.apiKey, process.env.MOLT_API_KEY);
+    cfg.integrity?.protect(cfg.apiKey, process.env.MOLT_API_KEY);
+    // Bind the session's opening to the journal's genesis state, so the
+    // integrity chain can prove a session began from the record we shipped.
+    if (cfg.integrity && cfg.journal) {
+      cfg.integrity.append({
+        kind: "session_start",
+        session: cfg.journal.sessionId,
+        journalRoot: cfg.journal.chainRoot(),
+      });
+    }
   }
 
   get model(): string {
@@ -1144,6 +1368,15 @@ export class Engine {
   }
   get hasBar(): boolean {
     return Boolean(this.cfg.bar && this.cfg.bar.checks.length > 0);
+  }
+  /**
+   * The window this endpoint named, or 0 until an overflow teaches it.
+   *
+   * The desktop meter fills against this. Inventing a 128k default is how
+   * a local 16k server would read as 8% full while it was about to refuse.
+   */
+  get learnedWindow(): number {
+    return this.contextWindow;
   }
   get archive(): ArchiveLike | undefined {
     return this.cfg.archive;
@@ -1209,7 +1442,7 @@ export class Engine {
   }
 
   reset(): void {
-    this.transcript = new Transcript(systemPromptFor(this.cwd));
+    this.transcript = new Transcript(this.systemPrompt());
     this.ledger = [];
     this.archivedWrites = 0;
     this.sessionArchives = new Set();
@@ -1235,10 +1468,132 @@ export class Engine {
   cancel(): void {
     this.inFlight?.abort();
     this.running?.abort();
+    /**
+     * The Claude Code subprocess has to be told too.
+     *
+     * Nothing else reaches it: `inFlight` guards a fetch this backend never
+     * makes, and stopping molt's reader would leave a `claude` process
+     * working through the rest of the turn on the plan's quota with nobody
+     * watching. Ending the session is the only way to unask the question, so
+     * the next turn starts a new one.
+     */
+    if (this.cc) void this.dropClaudeCode();
   }
 
   get streaming(): boolean {
     return this.cfg.stream !== false;
+  }
+
+  /**
+   * The system message: the constant prompt, this directory, and the two
+   * facts a session can be handed before it starts — a map of the repository
+   * and the files it may read but never write.
+   *
+   * Both live here rather than in a first user message because everything in
+   * the system message sits inside the cached prefix: it is paid for once per
+   * session instead of once per step, which is the only reason a repo map is
+   * affordable at all.
+   */
+  private systemPrompt(): string {
+    const parts: string[] = [];
+    if (this.repoMapText) parts.push(this.repoMapText);
+    if (this.readOnlyPaths.size) {
+      parts.push(
+        `These files are READ-ONLY for this session: ${[...this.readOnlyPaths].sort().join(", ")}.\n` +
+          `Read them as much as you like. A write to one is refused — if the work needs a ` +
+          `change there, say so and stop rather than working around it.`,
+      );
+    }
+    return systemPromptFor(this.cwd, parts.join("\n\n") || undefined);
+  }
+
+  /** The repository map in force, as the model sees it. */
+  get repoMap(): string {
+    return this.repoMapText;
+  }
+
+  /**
+   * Replace the map. Rebuilds the system message, which resets the cached
+   * prefix — so this is a session-start operation, not a per-turn one, and
+   * `/map` says so when it is used mid-session.
+   */
+  setRepoMap(text: string): void {
+    this.repoMapText = text;
+    this.transcript.setSystem(this.systemPrompt());
+  }
+
+  get readOnly(): string[] {
+    return [...this.readOnlyPaths].sort();
+  }
+
+  /** Pin paths as readable but unwritable. Returns the ones newly added. */
+  addReadOnly(paths: string[]): string[] {
+    const added: string[] = [];
+    for (const p of paths) {
+      const rel = p.trim();
+      if (!rel || this.readOnlyPaths.has(rel)) continue;
+      this.readOnlyPaths.add(rel);
+      added.push(rel);
+    }
+    if (added.length) this.transcript.setSystem(this.systemPrompt());
+    return added;
+  }
+
+  clearReadOnly(): number {
+    const n = this.readOnlyPaths.size;
+    this.readOnlyPaths.clear();
+    this.transcript.setSystem(this.systemPrompt());
+    return n;
+  }
+
+  /** Is this path pinned read-only? Compared as written, and resolved. */
+  private isReadOnly(rel: string, abs: string): boolean {
+    if (this.readOnlyPaths.has(rel)) return true;
+    for (const p of this.readOnlyPaths) {
+      if (resolve(this.cwd, p) === abs) return true;
+    }
+    return false;
+  }
+
+  get gitPolicy(): GitPolicy {
+    return this.cfg.git ?? {};
+  }
+
+  setGitPolicy(p: GitPolicy): void {
+    this.cfg.git = { ...this.gitPolicy, ...p };
+  }
+
+  /** The wall-clock ceiling for one turn, in ms. 0 or undefined means none. */
+  get turnDeadlineMs(): number {
+    return this.cfg.turnDeadlineMs ?? 0;
+  }
+
+  setTurnDeadline(ms?: number): void {
+    this.cfg.turnDeadlineMs = ms && ms > 0 ? ms : undefined;
+  }
+
+  /** Completion attempts before a turn reports failure. */
+  get maxProofAttempts(): number {
+    return this.cfg.maxProofAttempts ?? MAX_PROOF_ATTEMPTS;
+  }
+
+  setMaxProofAttempts(n: number): void {
+    this.cfg.maxProofAttempts = Math.max(1, Math.floor(n));
+  }
+
+  /** The history size a shed is triggered at, in molt's own token units. 0 is off. */
+  get autoShedAtTokens(): number {
+    return this.cfg.autoShedAtTokens ?? DEFAULT_AUTO_SHED_TOKENS;
+  }
+
+  setAutoShed(tokens: number): void {
+    this.cfg.autoShedAtTokens = Math.max(0, Math.floor(tokens));
+  }
+
+  /** Has this turn run past its wall-clock ceiling? */
+  private pastDeadline(): boolean {
+    const ms = this.turnDeadlineMs;
+    return ms > 0 && this.turnStartedAt > 0 && Date.now() - this.turnStartedAt >= ms;
   }
 
   /** Values that must not appear on screen or in a file molt writes. */
@@ -1296,6 +1651,15 @@ export class Engine {
    * before the standard rate is applied rather than counted twice.
    */
   costUsd(): number | undefined {
+    /**
+     * A subscription run costs no money, so it gets no dollar figure.
+     *
+     * The tokens are real and are still counted, but pricing them off a table
+     * would put a number on a receipt for money nobody was charged — and
+     * `anthropicPricing` would happily match the model alias and do it. The
+     * token ceiling still applies; `/budget` in dollars has nothing to bound.
+     */
+    if (this.claudeCode) return undefined;
     if (this.costBilled) return this.sessionBilled;
     const { priceInPerMtok: pin, priceOutPerMtok: pout, priceCachedInPerMtok: pcache } = this.cfg;
     if (pin === undefined || pout === undefined) return undefined;
@@ -1447,6 +1811,8 @@ export class Engine {
       read: [...this.readPaths],
       cache: this.cache,
       ledger: this.sessionLedger(),
+      turnLedger: this.sessionLedger().filter((e) => this.turnCalls.has(e.callId)),
+      treeBefore: this.turnTree ?? undefined,
       liveLedger: [...this.ledger],
       archive: this.cfg.archive,
       archivedBatches: this.transcript.shedCount,
@@ -1501,11 +1867,35 @@ export class Engine {
       path = entry.file;
       this.archivedWrites += departing.length;
       this.sessionArchives.add(entry.index);
+      // Bind the exuvia and the journal's current state into the integrity
+      // chain, so a deletion or edit of this archived batch is provable later
+      // even across process restarts.
+      if (this.cfg.integrity && this.cfg.journal) {
+        this.cfg.integrity.append({
+          kind: "shed",
+          session: this.cfg.journal.sessionId,
+          exuvia: entry.file,
+          exuviaSha: entry.sha256,
+          journalRoot: this.cfg.journal.chainRoot(),
+        });
+      }
     }
 
     this.transcript.commitShed(plan);
 
     this.ledger = staying;
+    // Journalled here, on every path. It was journalled by the two auto-shed
+    // call sites and by neither surface's `/shed`, so a batch shed by hand
+    // was in the archive and the integrity ledger and not in the session log
+    // — and the log is the expectation `record-intact` reads back tomorrow.
+    // This project's exuvia 0000 is one the log cannot explain.
+    this.cfg.journal?.append("shed", {
+      dropped: plan.droppedCount,
+      before: plan.beforeTokens,
+      after: plan.afterTokens,
+      archive: path,
+      estimated: true,
+    });
     return {
       before: plan.beforeTokens,
       after: plan.afterTokens,
@@ -1587,6 +1977,10 @@ export class Engine {
       case "write_file": {
         const rel = String(args.path ?? "");
         const abs = resolve(this.cwd, rel);
+        // Refused before anything is read or written. A read-only pin is a
+        // promise to the person who made it, and a promise that holds only
+        // when the model cooperates is not one.
+        if (this.isReadOnly(rel, abs)) return readOnlyRefusal(rel);
         const before = sha256Of(abs);
         // The text as well as the hash: a hash proves the file changed, and
         // only the text can say whether the change was a comment.
@@ -1610,6 +2004,7 @@ export class Engine {
         const after = createHash("sha256").update(content, "utf8").digest("hex");
         const at = isAbsolute(rel) ? relative(this.cwd, abs) : rel;
         if (!isGenerated(at)) {
+          const specGone = isTestPath(at) ? removedAssertions(priorText, content) : [];
           this.ledger.push({
             path: at,
             before,
@@ -1617,7 +2012,9 @@ export class Engine {
             callId,
             substance: substanceOf(priorText, content),
             changedLines: changedLinesOf(priorText, content),
+            ...(specGone.length ? { specRemoved: specGone } : {}),
           });
+          this.turnWrites.push({ path: at, before });
         }
         return (
           `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${rel}` +
@@ -1661,6 +2058,7 @@ export class Engine {
         const rel = String(args.path ?? "");
         const abs = resolve(this.cwd, rel);
         this.mustBeInside(abs, rel);
+        if (this.isReadOnly(rel, abs)) return readOnlyRefusal(rel);
         if (!existsSync(abs)) return `no such file: ${rel} — write_file creates a new one`;
         const before = sha256Of(abs);
         const current = readFileSync(abs, "utf8");
@@ -1677,6 +2075,7 @@ export class Engine {
         // prove a surgical edit the same way they prove a whole-file rewrite.
         const editedAt = isAbsolute(rel) ? relative(this.cwd, abs) : rel;
         if (!isGenerated(editedAt)) {
+          const specGone = isTestPath(editedAt) ? removedAssertions(current, edit.text) : [];
           this.ledger.push({
             path: editedAt,
             before,
@@ -1684,7 +2083,9 @@ export class Engine {
             callId,
             substance: substanceOf(current, edit.text),
             changedLines: changedLinesOf(current, edit.text),
+            ...(specGone.length ? { specRemoved: specGone } : {}),
           });
+          this.turnWrites.push({ path: editedAt, before });
         }
         const delta = Buffer.byteLength(edit.text, "utf8") - Buffer.byteLength(current, "utf8");
         return (
@@ -1920,6 +2321,8 @@ export class Engine {
         shedBatches: this.transcript.shedCount,
       });
       log?.append("receipt", { verdict: "exhausted", file: receipt.path, attempt: attempts });
+      this.bindReceipt(receipt.path, "exhausted");
+      this.capture(receipt.path, "exhausted", this.transcript.record().find((m) => m.role === "user")?.content ?? "", result, claim);
       yield { kind: "receipt", path: receipt.path };
     }
     log?.append("session_end", { reason: "bar not met", attempts });
@@ -1934,6 +2337,188 @@ export class Engine {
         : `bar not met after ${attempts} attempts. molt is reporting failure rather ` +
           `than success. See .molt/receipts/ for what was checked.`,
     };
+    yield* this.settleFailed(log);
+  }
+
+  /**
+   * Photograph the working tree before the turn touches it.
+   *
+   * Only when a revert could actually happen: two git calls are nothing
+   * beside a model round trip, but a policy that is switched off should cost
+   * exactly zero.
+   */
+  private async captureTree(): Promise<void> {
+    this.turnSnapshot = null;
+    this.turnSnapshotPaths = new Set();
+    if (!this.gitPolicy.restoreOnFail) return;
+    if (!(await isRepo(this.cwd))) return;
+    const ref = await snapshot(this.cwd);
+    if (!ref) return;
+    this.turnSnapshot = ref;
+    this.turnSnapshotPaths = await pathsIn(this.cwd, ref);
+  }
+
+  /**
+   * The bar was met: keep the change.
+   *
+   * The commit carries the receipt's name and the checks that passed, so
+   * `git log` makes the same claim the receipt does and can be followed back
+   * to the evidence. Only the paths this turn wrote are staged — never `-A`,
+   * never another session's work.
+   */
+  private async *settlePassed(
+    task: string,
+    attempts: number,
+    checks: string[],
+    receipt: string | undefined,
+    log?: Journal,
+  ): AsyncGenerator<EngineEvent> {
+    if (!this.gitPolicy.commitOnPass) return;
+    const paths = [...new Set(this.turnWrites.map((w) => w.path))].sort();
+    // A turn that wrote nothing and passed is a question that was answered.
+    // There is nothing to commit and nothing to say about it.
+    if (!paths.length) return;
+    if (!(await isRepo(this.cwd))) {
+      yield { kind: "info", text: "verified, but this is not a git repository — nothing to commit to." };
+      return;
+    }
+    const r = await commitPaths(
+      this.cwd,
+      paths,
+      commitMessage({ task, receipt, checks, attempts, session: this.cfg.journal?.sessionId }),
+    );
+    if (!r.ok) {
+      log?.append("note", { text: `commit skipped: ${r.reason}` });
+      yield { kind: "info", text: `not committed: ${r.reason}` };
+      return;
+    }
+    log?.append("git_commit", {
+      sha: r.sha,
+      files: r.files.length,
+      receipt: receipt ?? "",
+      checks: checks.join(", "),
+    });
+    yield {
+      kind: "info",
+      text:
+        `committed ${r.sha.slice(0, 8)} · ${r.files.length} file(s) · the receipt is named in ` +
+        `the message · /undo takes the commit back and keeps the work`,
+    };
+  }
+
+  /**
+   * The bar was not met: put the tree back where the turn found it.
+   *
+   * The evidence is deliberately untouched — receipts, the journal and the
+   * integrity ledger live under `.molt/`, which no turn writes through the
+   * tools, so what happened survives the code being reverted. Undoing the
+   * work must never undo the record of it.
+   */
+  private async *settleFailed(log?: Journal): AsyncGenerator<EngineEvent> {
+    if (!this.gitPolicy.restoreOnFail) return;
+    if (!this.turnWrites.length) return;
+    if (!this.turnSnapshot) {
+      yield {
+        kind: "info",
+        text:
+          "not restored: no pre-turn snapshot exists, so there is nothing to put the files " +
+          "back to. They are as the turn left them.",
+      };
+      return;
+    }
+    const plan = revertPlan(this.turnWrites, (p) => this.turnSnapshotPaths.has(p));
+    const done = await restoreFiles(this.cwd, this.turnSnapshot, plan);
+    log?.append("git_restore", {
+      restored: done.restored.length,
+      removed: done.removed.length,
+      kept: done.kept.length,
+      failed: done.failed.length,
+    });
+    const parts: string[] = [];
+    if (done.restored.length) parts.push(`${done.restored.length} put back`);
+    if (done.removed.length) parts.push(`${done.removed.length} removed`);
+    if (done.kept.length) {
+      parts.push(`${done.kept.length} left alone (git had no copy to restore)`);
+    }
+    if (done.failed.length) parts.push(`${done.failed.length} could not be restored`);
+    yield {
+      kind: "info",
+      text:
+        `the bar was not met, so the tree is back where the turn found it: ` +
+        `${parts.join(" · ") || "nothing to undo"}. The receipt and the journal are untouched.`,
+    };
+  }
+
+  /**
+   * One file per attempt with everything a verdict was made from, for
+   * training the safeguard. Written beside the receipt, never instead of it,
+   * and never on the model's screen — a capture is a record, not a result.
+   */
+  private capture(
+    receiptPath: string,
+    verdict: string,
+    task: string,
+    result: BarResult,
+    claim: string,
+  ): void {
+    const dir = this.cfg.captureDir;
+    if (!dir) return;
+    try {
+      mkdirSync(dir, { recursive: true });
+      const name = `${this.cfg.journal?.sessionId ?? "nosession"}-${basename(receiptPath).replace(/\.md$/, "")}.json`;
+      const body = {
+        version: 1,
+        generatedAt: new Date().toISOString(),
+        session: this.cfg.journal?.sessionId ?? null,
+        receipt: basename(receiptPath),
+        verdict,
+        model: this.cfg.model,
+        provider: this.provider,
+        task,
+        claim,
+        transcript: this.transcript.wire(),
+        ledger: this.sessionLedger(),
+        turnLedger: this.sessionLedger().filter((e) => this.turnCalls.has(e.callId)),
+        did: [...this.did],
+        result,
+        sessionTokens: this.sessionTokens,
+        costUsd: this.costUsd() ?? null,
+        costEstimated: this.costEstimated,
+      };
+      writeFileSync(join(dir, name), redact(JSON.stringify(body, null, 1), this.secrets()), "utf8");
+    } catch {
+      // A capture that could not be written is a training example lost, not a
+      // turn broken. The receipt and the journal still hold the verdict.
+    }
+  }
+
+  /**
+   * Bind a written receipt into the integrity chain.
+   *
+   * The receipt file's own sha256 is bound together with the journal's root
+   * at the moment of writing, so later edits to the receipt (or the journal
+   * turning out to have been edited) show up as drift in `Integrity.verify`
+   * — independently of the journal's own chain.
+   */
+  private bindReceipt(file: string, verdict: string): void {
+    if (!this.cfg.integrity || !this.cfg.journal) return;
+    // `Receipts.write` returns the receipt's FULL path. Joining it onto
+    // `.molt/receipts` again produced a path that does not exist, so the sha
+    // came out empty and was bound as empty — and an empty bound hash was
+    // skipped by the verifier, which is how a receipt could be rewritten
+    // afterwards and still verify clean. Hash the file that is really there,
+    // and record the bare name, which is what the receipts index uses and
+    // what survives the project being moved.
+    const path = isAbsolute(file) ? file : join(this.cwd, ".molt", "receipts", file);
+    const sha = existsSync(path) ? sha256Of(path) ?? "" : "";
+    this.cfg.integrity.append({
+      kind: "receipt",
+      session: this.cfg.journal.sessionId,
+      receiptFile: basename(file),
+      receiptSha: sha,
+      journalRoot: this.cfg.journal.chainRoot(),
+      verdict,
+    });
   }
 
   /** Run the bar without touching the loop — backs the /prove command. */
@@ -1980,6 +2565,14 @@ export class Engine {
     const job = ++this.jobCount;
     const startedAt = Date.now();
     const before = this.meter();
+    this.turnStartedAt = startedAt;
+    this.turnWrites = [];
+    this.turnCalls = new Set();
+    // Per turn, or receipt five lists what turn one ran. It did: receipts
+    // 0043–0047 of this project each open with the same three reads.
+    this.did = [];
+    await this.captureTree();
+    this.turnTree = snapshotTree(this.cwd);
     let steps = 0;
     let cancelled = false;
     let errored = false;
@@ -2024,7 +2617,9 @@ export class Engine {
         : errored
           ? "error"
           : proven
-            ? "verified"
+            ? opts.ask && this.turnWrites.length === 0
+              ? "answered"
+              : "verified"
             : answered
               ? "unverified"
               : "stopped";
@@ -2037,6 +2632,442 @@ export class Engine {
       durationMs: Date.now() - startedAt,
       outcome,
     };
+  }
+
+  /**
+   * The live Claude Code session, started when it is first needed.
+   *
+   * Rebuilt whenever molt's system prompt changes — `/map`, `/read` and a
+   * repo-map refresh all rewrite it — because a session carrying the old one
+   * is working from instructions molt no longer holds. Rebuilding costs the
+   * cached prefix, which is the same trade `setSystem` already documents.
+   */
+  private async claudeCodeSession(): Promise<ClaudeCodeSession<EngineEvent>> {
+    const system = this.transcript.systemText;
+    if (this.cc && this.ccSystem !== system) {
+      await this.cc.close();
+      this.cc = undefined;
+    }
+    if (!this.cc) {
+      this.ccSystem = system;
+      this.ccForwarded = new WeakSet<Msg>();
+      this.cc = new ClaudeCodeSession<EngineEvent>({
+        model: this.cfg.model,
+        cwd: this.cwd,
+        systemPrompt: system,
+        tools: TOOLS,
+        sdk: this.cfg.claudeCodeSdk,
+        /**
+         * Every tool call Claude Code makes runs here, through the same
+         * method the step loop uses: the same autonomy gate, the same ledger
+         * entry, the same journal lines, the same events on screen. Claude
+         * Code has no tools of its own, so this is the only way anything
+         * reaches the disk — which is what lets `tree-accounted` mean
+         * something on this backend.
+         */
+        runTool: async (name, args, callId, emit) => {
+          const ctx = this.ccCtx;
+          if (!ctx) return "[molt: no turn is running]";
+          const calls = this.invokeTool(
+            { id: callId, name, rawArgs: JSON.stringify(args) },
+            ctx,
+          );
+          for (;;) {
+            const next = await calls.next();
+            if (next.done) return next.value.result;
+            emit(next.value);
+          }
+        },
+      });
+    }
+    return this.cc;
+  }
+
+  /**
+   * One step of a turn, done by Claude Code instead of by an HTTP request.
+   *
+   * A "step" here is everything up to the model falling silent: it may have
+   * called twenty tools on the way, and each was gated, run and recorded by
+   * molt as it happened. What comes back is what the HTTP path produces — a
+   * final message, its token cost, and why it stopped — so the bar, the
+   * receipt and the ceilings downstream cannot tell the two apart.
+   *
+   * Returns null when the turn cannot continue; it has already said why.
+   */
+  private async *claudeCodeStep(
+    step: number,
+    ctx: ToolContext,
+  ): AsyncGenerator<
+    EngineEvent,
+    { msg: Msg; usage: Usage; finishReason?: string; streamed: boolean } | null
+  > {
+    this.ccCtx = ctx;
+    let cc: ClaudeCodeSession<EngineEvent>;
+    try {
+      cc = await this.claudeCodeSession();
+    } catch (e) {
+      ctx.log?.append("error", { text: String(e) });
+      yield { kind: "error", text: String(e) };
+      return null;
+    }
+
+    /**
+     * Everything molt has said that Claude Code has not been told yet.
+     *
+     * The ask, the sealed criteria, an empty-turn nudge, a refused bar — molt
+     * writes all of them to the transcript as user messages, so forwarding
+     * what has not gone yet keeps the two conversations saying the same
+     * things in the same order without a second code path per kind.
+     */
+    const pending = this.transcript
+      .all()
+      .filter((m) => m.role === "user" && !this.ccForwarded.has(m));
+    for (const m of pending) this.ccForwarded.add(m);
+    const texts = pending.map((m) => m.content ?? "").filter((t) => t.trim().length > 0);
+    if (texts.length === 0) {
+      // Nothing new to say and no reply owed. Sending nothing would hang on a
+      // session that only speaks when spoken to.
+      texts.push("[molt: carry on, or say what is blocking you.]");
+    }
+    /**
+     * One molt step is one message and one answer.
+     *
+     * molt writes the ask and its sealed criteria as separate messages so a
+     * shed can drop one without the other; this backend never sheds, so the
+     * distinction buys nothing here and costs the invariant that makes the
+     * step boundary legible — send once, read until it stops.
+     */
+    const said = [texts.join("\n\n")];
+
+    ctx.log?.append("request", {
+      step,
+      messages: texts.length,
+      estTokens: this.bom().requestTotalEst,
+      estimated: true,
+      stream: true,
+      model: this.cfg.model,
+      endpoint: this.cfg.baseUrl,
+    });
+    yield {
+      kind: "request",
+      step,
+      messages: texts.length,
+      estTokens: this.bom().requestTotalEst,
+      model: this.cfg.model,
+      stream: true,
+    };
+
+    /**
+     * An assistant message with no tool calls, held back one beat.
+     *
+     * The last one is the turn's claim and the shared code downstream pushes
+     * it; pushing it here as well is how the same sentence lands in the
+     * transcript twice. Anything that turns out not to be last is pushed as
+     * soon as the next message proves it.
+     */
+    let deferred: string | null = null;
+    let done:
+      | {
+          text: string;
+          promptTokens: number;
+          completionTokens: number;
+          cachedTokens: number;
+          cumulativeCostUsd: number;
+          error?: string;
+        }
+      | undefined;
+
+    for await (const ev of cc.send(said)) {
+      if (ev.kind === "host") {
+        yield ev.event;
+      } else if (ev.kind === "delta") {
+        yield { kind: "delta", text: redact(ev.text, this.secrets()) };
+      } else if (ev.kind === "info") {
+        ctx.log?.append("note", { text: ev.text });
+        yield { kind: "info", text: ev.text };
+      } else if (ev.kind === "assistant") {
+        if (deferred !== null) {
+          this.transcript.push({ role: "assistant", content: deferred });
+          deferred = null;
+        }
+        if (ev.toolCalls.length) {
+          this.transcript.push({
+            role: "assistant",
+            content: ev.text || null,
+            tool_calls: ev.toolCalls.map((c) => ({
+              id: c.id,
+              type: "function" as const,
+              function: { name: c.name, arguments: JSON.stringify(c.args) },
+            })),
+          });
+        } else {
+          deferred = ev.text;
+        }
+      } else if (ev.kind === "done") {
+        done = ev;
+      }
+    }
+
+    if (!done) {
+      yield { kind: "error", text: "the Claude Code session ended without answering" };
+      await this.dropClaudeCode();
+      return null;
+    }
+    if (done.error) {
+      ctx.log?.append("error", { text: done.error });
+      yield {
+        kind: "error",
+        text:
+          `Claude Code: ${done.error}. Nothing was verified. The work above still ` +
+          `happened; what follows is a report on it, not a completion.`,
+      };
+      // The session cannot be trusted to continue after it has failed, and a
+      // new one costs a cached prefix rather than the turn.
+      await this.dropClaudeCode();
+      return null;
+    }
+
+    /**
+     * What the SDK thinks the same work would have cost on the API.
+     *
+     * Journalled, never metered. It is the one number that would let someone
+     * compare a plan against a bill, and it is exactly the number that must
+     * not turn up in `costUsd()` as though it had been charged.
+     */
+    ctx.log?.append("note", {
+      text: `claude-code: ${done.cumulativeCostUsd.toFixed(4)} USD would have been billed on the API`,
+      costEstimateUsd: done.cumulativeCostUsd,
+      subscription: true,
+    });
+
+    return {
+      msg: { role: "assistant", content: done.text || deferred || "" },
+      usage: {
+        prompt_tokens: done.promptTokens,
+        completion_tokens: done.completionTokens,
+        prompt_tokens_details: { cached_tokens: done.cachedTokens },
+        cache_read_input_tokens: done.cachedTokens,
+        // No `cost`: see costUsd().
+      },
+      finishReason: "stop",
+      streamed: true,
+    };
+  }
+
+  /** End the Claude Code session, so the next turn starts a fresh one. */
+  private async dropClaudeCode(): Promise<void> {
+    const cc = this.cc;
+    this.cc = undefined;
+    this.ccCtx = undefined;
+    await cc?.close();
+  }
+
+  /**
+   * One tool call, from the decision to allow it through to the record of it.
+   *
+   * Lifted out of the step loop when a second backend arrived. Claude Code
+   * runs molt's tools through an MCP server rather than through the loop, so
+   * without this the gate, the ledger, the read-coverage map, the repeat
+   * pointer and three journal entries would exist twice — and this repo has
+   * shipped the same bug on two surfaces six times over. There is one copy,
+   * and both backends call it.
+   *
+   * A generator because everything in here reports: the caller drains the
+   * events to its own consumer and reads the outcome off the return.
+   */
+  private async *invokeTool(
+    call: { id: string; name: string; rawArgs: string },
+    ctx: ToolContext,
+  ): AsyncGenerator<EngineEvent, ToolOutcome> {
+    /** Whether this call told the model something it had already been told. */
+    let repeatedHere = false;
+    const { id: callId, name } = call;
+    let args: Record<string, unknown> = {};
+    let malformed = false;
+    try {
+      args = JSON.parse(call.rawArgs || "{}") as Record<string, unknown>;
+    } catch {
+      // Running with empty arguments produced a misleading error — a
+      // malformed read_file became "EISDIR: illegal operation on a
+      // directory", which sends the model to debug a path it never
+      // sent. Say what actually happened instead.
+      malformed = true;
+    }
+    const detail = toolDetail(name, args);
+    this.turnCalls.add(callId);
+    // What the current autonomy level says about this exact call. The
+    // decision is mechanical and the reason travels with it, so an
+    // approval prompt can say which rule produced it rather than
+    // asking the same way about everything.
+    const decision = gate(this.autonomy, {
+      name,
+      args,
+      cwd: this.cwd,
+      // What molt itself put on disk this session. Lets a model tidy
+      // away its own scratch files without waking anyone.
+      created: this.createdThisSession(),
+    });
+    // The prompt shows the command in full. You are being asked to judge
+    // it, and a redacted command is one you cannot judge.
+    const allowed = decision.ask ? await ctx.confirm(name, `${detail}${decision.why ? ` — ${decision.why}` : ""}`) : true;
+
+    let result: string;
+    let note: string | undefined;
+    if (malformed) {
+      const raw = capture(call.rawArgs);
+      yield {
+        kind: "tool",
+        name,
+        detail: "malformed arguments",
+        note: "malformed",
+        args: raw,
+        bytes: 0,
+        preview: raw,
+        auto: true,
+      };
+      const complaint =
+        `[molt: the arguments for ${name} were not valid JSON, so nothing ran. ` +
+        `Send them again as a JSON object. What arrived was: ${raw}]`;
+      this.transcript.push({ role: "tool", tool_call_id: callId, content: complaint });
+      return { name, result: complaint, auto: true, repeated: false };
+    }
+    // Timed around execution only. Waiting on a human to approve a gated
+    // tool is not the tool being slow, and folding the two together
+    // would make every gated call look like one.
+    let durationMs: number | undefined;
+    if (!allowed) {
+      result = "User denied this action.";
+      note = "denied";
+    } else {
+      yield { kind: "tool_start", name, detail };
+      const toolStartedAt = Date.now();
+      // Scoped to this one call, so ctrl+C reaches the command that is
+      // actually running and nothing that ran before it.
+      this.running = new AbortController();
+      try {
+        // read_file budgets itself, to the byte, so that the notice
+        // saying how to continue survives. Capping it again here is what
+        // cut that notice off and left the model with no way forward.
+        const raw = await this.runTool(name, args, callId);
+        const t =
+          name === "read_file"
+            ? { text: raw, note: undefined }
+            : truncateResult(
+                raw,
+                Math.min(TOOL_RESULT_MAX_BYTES, this.resultBudget()),
+                name === "bash" ? "ends" : "head",
+              );
+        result = t.text;
+        note = t.note;
+      } catch (e) {
+        result = `tool error: ${String(e)}`;
+        note = "error";
+      } finally {
+        this.running = undefined;
+      }
+      durationMs = Date.now() - toolStartedAt;
+
+      // A read of lines the model has already been shown, whatever
+      // offset it spelled them with.
+      if (name === "read_file" && note !== "error") {
+        const path = String(args.path ?? "");
+        const from = num(args.offset, 0);
+        const to = actualReadEnd(result, from, path);
+        const covered = ctx.shown.get(path) ?? [];
+        // How much of this window is genuinely new. Containment alone is
+        // too strict: a read that overlaps an earlier one by 99% and
+        // runs three lines past it is not contained, and a model
+        // drifting its offset by a few lines a step walked straight
+        // through that test for thirty-two steps.
+        let fresh = 0;
+        for (let line = from; line < to; line++) {
+          if (!covered.some((r) => line >= r.from && line < r.to)) fresh += 1;
+        }
+        const span = Math.max(1, to - from);
+        const already = fresh === 0 || (fresh / span < 0.25 && fresh < 40);
+        if (already) {
+          const seen = covered.reduce((n, r) => Math.max(n, r.to), 0);
+          result =
+            `[molt: you have already been shown lines ${from + 1}-${to} of ${path}` +
+            (fresh === 0 ? "" : ` (all but ${fresh} line(s) of it)`) +
+            `. Scroll up rather than reading it again — nothing has changed since. To ` +
+            `see a part you do not have, ask for offset=${seen} or later; if you have ` +
+            `what you need, answer.]`;
+          note = "repeat";
+          repeatedHere = true;
+        } else {
+          covered.push({ from, to });
+          ctx.shown.set(path, covered);
+        }
+      }
+
+      // The same call, returning the same bytes it returned before.
+      // Send a pointer instead of the payload: the answer is already in
+      // the conversation, and saying so is both cheaper and truer than
+      // repeating it.
+      // Canonical key: {path} and {path, offset: 0} are the same call,
+      // and a model that spells out a default must not thereby look like
+      // it is asking something new.
+      const key = callKey(name, args);
+      const sha = createHash("sha256").update(result, "utf8").digest("hex");
+      const prior = ctx.answered.get(key);
+      if (prior && prior.sha === sha) {
+        result =
+          `[molt: this is the same ${name} call you made at step ${prior.step + 1}, and ` +
+          `nothing has changed since. Its result is already above in this conversation. ` +
+          `Repeating it cannot tell you anything new — act on what you have, or say ` +
+          `plainly what is blocking you.]`;
+        note = "repeat";
+        repeatedHere = true;
+      }
+      ctx.answered.set(key, { step: ctx.step, sha });
+    }
+    // Both branches are recorded. A call that ran without being asked
+    // about is exactly the thing an audit needs to be able to find, and
+    // it is recorded with the level that let it through.
+    ctx.log?.append("permission", {
+      name,
+      detail,
+      allowed,
+      asked: decision.ask,
+      autonomy: this.autonomy,
+      ...(decision.why ? { why: decision.why } : {}),
+    });
+    ctx.log?.append("tool_call", { step: ctx.step, name, detail, allowed });
+    ctx.log?.append("tool_result", {
+      name,
+      bytes: Buffer.byteLength(result, "utf8"),
+      truncated: Boolean(note?.startsWith("capped")),
+      note,
+      sha256: createHash("sha256").update(result, "utf8").digest("hex").slice(0, 16),
+    });
+    if ((name === "write_file" || name === "edit_file") && allowed) {
+      ctx.shown.delete(String(args.path ?? ""));
+      this.pinTask(ctx.userText);
+    }
+    this.did.push(
+      `${allowed ? "" : "refused: "}${name} ${detail}` +
+        (note && note !== "repeat" ? ` [${note}]` : ""),
+    );
+    if (allowed) this.actsSinceBar += 1;
+    // Everything that scrolls is redacted. A transcript is pasted into
+    // bug reports and screenshotted into chat windows, which makes the
+    // screen a distribution channel like any other — and unlike the
+    // prompt above, nobody is judging a command from the scrollback.
+    const hide = (t: string) => redact(t, this.secrets());
+    yield {
+      kind: "tool",
+      name,
+      detail: hide(detail),
+      note,
+      durationMs,
+      args: hide(capture(call.rawArgs)),
+      bytes: Buffer.byteLength(result, "utf8"),
+      preview: hide(capture(result)),
+      auto: !decision.ask,
+    };
+    this.transcript.push({ role: "tool", tool_call_id: callId, content: result });
+    return { name, result, auto: !decision.ask, repeated: repeatedHere };
   }
 
   private async *runTurn(
@@ -2115,6 +3146,7 @@ export class Engine {
     let lastResult: BarResult | null = null;
     /** The previous attempt's failures, to notice a bar going nowhere. */
     let lastFailure = "";
+    let lastReceipt: string | undefined;
     this.actsSinceBar = 0;
 
     /**
@@ -2192,6 +3224,26 @@ export class Engine {
           text: `carrying on past ${spent}. Another ${MAX_STEPS} steps before molt asks again.`,
         };
       }
+      // The wall clock, checked where the other ceilings are. This is
+      // `autoresearch`'s fixed budget: the attempt gets its minutes, and
+      // whatever state the work is in when they are up is the state the judge
+      // sees. Unlike a token ceiling it is not a proxy for anything — it is
+      // the thing the person waiting actually spends.
+      if (this.pastDeadline()) {
+        const spentMs = Date.now() - this.turnStartedAt;
+        log?.append("deadline", { limitMs: this.turnDeadlineMs, spentMs });
+        const clock = (ms: number) => (ms < 1000 ? `${Math.round(ms)}ms` : `${Math.round(ms / 1000)}s`);
+        yield {
+          kind: "info",
+          text:
+            `time budget reached (${clock(spentMs)} of ${clock(this.turnDeadlineMs)}) — no more ` +
+            `tool calls. The bar still decides what the work was worth: nothing is committed ` +
+            `that it did not pass.`,
+        };
+        yield* this.salvage("Your time budget for this turn is up.", fetchFn, log);
+        return;
+      }
+
       // An explicit budget speaks for itself, and speaks first: one knob
       // should not produce two different messages.
       if (this.overBudget()) {
@@ -2295,10 +3347,19 @@ export class Engine {
         return;
       }
 
+      /**
+       * Context management, for the backend that has any.
+       *
+       * Claude Code holds its own conversation and compacts it its own way;
+       * molt's transcript is a record of what was said, not the thing being
+       * sent. Eliding and shedding it there would buy nothing, and shedding
+       * would archive into exuviae a context that was never in flight —
+       * evidence of a conversation molt did not have.
+       */
       // Cheap, mechanical, and strictly a subset of shedding: prune tool
       // results that later work has made irrelevant before considering the
       // much heavier option of shedding.
-      if (this.cfg.elideSuperseded !== false) {
+      if (!this.claudeCode && this.cfg.elideSuperseded !== false) {
         const pruned = this.transcript.elideSupersededReads();
         if (pruned.elided > 0) {
           log?.append("elide", { elided: pruned.elided, tokensSaved: pruned.tokensSaved });
@@ -2309,7 +3370,7 @@ export class Engine {
         }
       }
 
-      const auto = this.cfg.autoShedAtTokens ?? DEFAULT_AUTO_SHED_TOKENS;
+      const auto = this.claudeCode ? 0 : this.cfg.autoShedAtTokens ?? DEFAULT_AUTO_SHED_TOKENS;
       if (auto > 0 && this.transcript.historyTokens() > auto) {
         const shed = this.shed();
         if (shed) {
@@ -2321,435 +3382,477 @@ export class Engine {
           // its 31 repeat-refusals after a shed, for exactly this reason.
           shown.clear();
           answered.clear();
-          log?.append("shed", {
-            dropped: shed.dropped,
-            before: shed.before,
-            after: shed.after,
-            archive: shed.path,
-            estimated: true,
-          });
           yield { kind: "shed", ...shed };
         }
       }
 
-      const stream = this.cfg.stream !== false;
-      const controller = new AbortController();
-      this.inFlight = controller;
       const stepStartedAt = Date.now();
-
       const wire = this.transcript.wire();
       const requestEst = this.bom().requestTotalEst;
-      log?.append("request", {
-        step,
-        messages: wire.length,
-        estTokens: requestEst,
-        estimated: true,
-        stream,
-        model: this.cfg.model,
-        endpoint: this.cfg.baseUrl,
-      });
-      yield {
-        kind: "request",
-        step,
-        messages: wire.length,
-        estTokens: requestEst,
-        model: this.cfg.model,
-        stream,
-      };
-
-      /**
-       * Streaming responses carry no usage block unless it is asked for.
-       * Without this flag molt fell back to counting the wire JSON itself —
-       * an estimate presented in a meter that reads as a measurement, on
-       * the code path that is on by default. Asking costs one field.
-       */
-      const askForUsage = stream && !this.streamUsageUnsupported && !this.native;
-      const send = (withUsage: boolean, withCache = !this.cachingUnsupported): Promise<Response> => {
-        const marks = withCache && this.cacheStyle === "explicit" ? new Set(breakpoints(wire)) : undefined;
-        const body = this.native
-          ? toRequest(wire, TOOLS, {
-              model: this.cfg.model,
-              maxTokens: this.cfg.maxTokens,
-              stream,
-              toolChoice: "auto",
-              cacheAt: marks,
-            })
-          : {
-              model: this.cfg.model,
-              // Breakpoints on providers that need them, nothing on providers
-              // that cache by themselves. Never a change to the text.
-              messages: withCaching(wire, this.cacheStyle, withCache),
-              tools: TOOLS,
-              tool_choice: "auto",
-              ...(stream ? { stream: true } : {}),
-              ...(withUsage ? { stream_options: { include_usage: true } } : {}),
-            };
-        return fetchFn(this.endpoint, {
-          method: "POST",
-          signal: controller.signal,
-          headers: {
-            "content-type": "application/json",
-            ...authHeaders(this.cfg.baseUrl, this.cfg.apiKey),
-          },
-          body: (this.lastRequestBody = JSON.stringify(body)),
-        });
-      };
-
-      // A failed step is not a verdict on the work.
-      //
-      // Everything between sending the request and holding a usable message
-      // can fail in ways that say nothing about whether the work is any good:
-      // `TypeError: fetch failed` from a DNS blip or a laptop waking, a 429
-      // because the minute's quota ran out, a 502 from a proxy, a stream that
-      // dies halfway, an HTML error page where JSON was promised. Each of
-      // those used to end the turn where it stood. One reported session lost
-      // forty-nine thousand tokens of reading that way and was told only
-      // "network: TypeError: fetch failed".
-      //
-      // So they are all one policy now: retry what a second attempt could
-      // plausibly fix, and whatever happens, close the turn the way every
-      // other stop closes — by asking for an answer with what has already been
-      // paid for. A 400 or a 401 is not retried, because the conversation or
-      // the credentials being wrong does not improve by asking again, and a
-      // second identical refusal is exactly the spending this avoids.
       let msg: Msg | undefined;
       let usage: Usage | undefined;
       let finishReason: string | undefined;
       /** Whether this step's text already went out as deltas. */
       let streamedContent = false;
-      let failure:
-        | { text: string; why: string; retryable: boolean; retryAfterMs?: number }
-        | undefined;
-      /**
-       * Shed-and-retry rounds used on this step.
-       *
-       * More than one, because a single shed is a guess: the first is sized
-       * with whatever ratio molt has learned so far, and the server's answer to
-       * it is what makes the next one right. One round was enough to fail —
-       * "shedding to 10813" was followed by a refusal at 24,307 tokens, and the
-       * turn ended there with everything it had done thrown away.
-       */
-      let overflowRounds = 0;
-      /**
-       * Whether this attempt has put text on screen.
-       *
-       * A retry replays the message from the beginning, so anything already
-       * shown belongs to an abandoned attempt and has to be taken back first —
-       * otherwise the reader sees the same sentence twice with no way to tell
-       * which one the model actually finished.
-       */
-      let shownThisAttempt = false;
 
-      for (let attempt = 0; ; attempt++) {
-        failure = undefined;
-        msg = undefined;
-        let res: Response | undefined;
-        try {
-          res = await send(askForUsage);
-          // A server that does not implement the field rejects the request. Try
-          // once without it rather than failing a turn over a request for better
-          // bookkeeping — and only conclude the field was the problem if the
-          // retry actually works, so a genuine 400 does not quietly turn usage
-          // reporting off for the rest of the session.
-          if (!res.ok && res.status === 400 && askForUsage) {
-            const retry = await send(false);
-            if (retry.ok) {
-              this.streamUsageUnsupported = true;
-              log?.append("note", {
-                text: "provider rejected stream_options — token counts fall back to molt's estimate",
-              });
-            }
-            res = retry;
-          }
+      if (this.claudeCode) {
+        // Claude Code runs the model, the tool calls and its own context. What
+        // comes back is the same three things the HTTP path produces — a final
+        // message, what it cost in tokens, and why it stopped — so everything
+        // below this branch is shared.
+        const got = yield* this.claudeCodeStep(step, {
+          step,
+          userText,
+          confirm,
+          log,
+          shown,
+          answered,
+        });
+        if (!got) return;
+        msg = got.msg;
+        usage = got.usage;
+        finishReason = got.finishReason;
+        streamedContent = got.streamed;
+      } else {
+        const stream = this.cfg.stream !== false;
+        const controller = new AbortController();
+        this.inFlight = controller;
 
-          // The body is read once. A `Response` gives its body up exactly
-          // once, so the caching fallback below and the failure report that
-          // follows it have to share the same read rather than each taking
-          // their own.
-          let body = res.ok ? "" : (await res.text().catch(() => ""));
+        log?.append("request", {
+          step,
+          messages: wire.length,
+          estTokens: requestEst,
+          estimated: true,
+          stream,
+          model: this.cfg.model,
+          endpoint: this.cfg.baseUrl,
+        });
+        yield {
+          kind: "request",
+          step,
+          messages: wire.length,
+          estTokens: requestEst,
+          model: this.cfg.model,
+          stream,
+        };
 
-          // An endpoint that will not take the markers must cost a retry, not
-          // a turn. Same shape as the stream_options fallback above: try once
-          // without, and only believe the markers were the problem if that
-          // works — so a genuine 400 is not quietly blamed on caching.
-          if (
-            !res.ok &&
-            res.status === 400 &&
-            this.cacheStyle === "explicit" &&
-            !this.cachingUnsupported &&
-            refusedCaching(body)
-          ) {
-            const retry = await send(askForUsage && !this.streamUsageUnsupported, false);
-            if (retry.ok) {
-              this.cachingUnsupported = true;
-              log?.append("note", {
-                text: "provider rejected cache_control — prompt caching is off for this session",
-              });
-            }
-            res = retry;
-            body = res.ok ? "" : (await res.text().catch(() => ""));
-          }
-
-          if (!res.ok) {
-            // "Too big" is not a verdict on the work, and it is the one
-            // refusal that says how to fix itself. Shed and send less rather
-            // than ending a turn that has done real work — molt's own
-            // threshold is 60,000 tokens and this endpoint may serve 16,384,
-            // which it has no other way to discover.
-            const over = res.status === 400 ? contextOverflow(body) : null;
-            if (over && overflowRounds < OVERFLOW_ROUNDS) {
-              overflowRounds++;
-              const bom = this.bom();
-              // What molt believed it was sending, against what the server
-              // counted. molt estimates characters/4; a real tokenizer on code
-              // disagrees, and one session shed to an estimated 11.6k only to
-              // be refused at 24,307. Every decision about what to drop was
-              // being made in a unit twice the size of the real one.
-              const scale = tokenScale(over.sent, bom.requestTotalEst);
-              if (scale > this.tokenScale) this.tokenScale = scale;
-              // Remembered for the rest of the session, so every later read is
-              // sized to fit rather than discovered to be too large.
-              if (over.window > 0) this.contextWindow = over.window;
-              const fixedEst = bom.systemTokens + bom.toolSchemaTokens;
-              const target = historyBudget(over.window, fixedEst, this.tokenScale);
-              if (target > 0) this.cfg.autoShedAtTokens = target;
-
-              log?.append("note", {
-                text:
-                  `context window ${over.window || "unknown"}; server counted ${over.sent} where ` +
-                  `molt estimated ${bom.requestTotalEst} (x${this.tokenScale.toFixed(2)}) — ` +
-                  `round ${overflowRounds}, history target ${target || "unknown"}`,
-              });
-              yield {
-                kind: "info",
-                text: over.window
-                  ? `this endpoint serves ${over.window} tokens and counted ${over.sent} in that ` +
-                    `request — about ${this.tokenScale.toFixed(1)}x molt's estimate. Carrying less ` +
-                    `and trying again` +
-                    (target > 0 && overflowRounds === 1
-                      ? ` — start with --auto-shed ${target} to skip this.`
-                      : ".")
-                  : "this endpoint refused the request as too large. Carrying less and trying again.",
+        /**
+         * Streaming responses carry no usage block unless it is asked for.
+         * Without this flag molt fell back to counting the wire JSON itself —
+         * an estimate presented in a meter that reads as a measurement, on
+         * the code path that is on by default. Asking costs one field.
+         */
+        const askForUsage = stream && !this.streamUsageUnsupported && !this.native;
+        const send = (withUsage: boolean, withCache = !this.cachingUnsupported): Promise<Response> => {
+          const marks = withCache && this.cacheStyle === "explicit" ? new Set(breakpoints(wire)) : undefined;
+          const body = this.native
+            ? toRequest(wire, TOOLS, {
+                model: this.cfg.model,
+                maxTokens: this.cfg.maxTokens,
+                stream,
+                toolChoice: "auto",
+                cacheAt: marks,
+              })
+            : {
+                model: this.cfg.model,
+                // Breakpoints on providers that need them, nothing on providers
+                // that cache by themselves. Never a change to the text.
+                messages: withCaching(wire, this.cacheStyle, withCache),
+                tools: TOOLS,
+                tool_choice: "auto",
+                ...(stream ? { stream: true } : {}),
+                ...(withUsage ? { stream_options: { include_usage: true } } : {}),
               };
+          return fetchFn(this.endpoint, {
+            method: "POST",
+            signal: controller.signal,
+            headers: {
+              "content-type": "application/json",
+              ...authHeaders(this.cfg.baseUrl, this.cfg.apiKey),
+            },
+            body: (this.lastRequestBody = JSON.stringify(body)),
+          });
+        };
 
-              // Each round keeps fewer exchanges. The threshold alone changes
-              // nothing: shed() drops everything older than `keepExchanges` and
-              // does not consult it, so a second call with the same argument
-              // finds nothing and a lower target is ignored.
-              const shed = this.shed(keepForRound(overflowRounds), keepRecentForRound(overflowRounds));
-              if (shed) {
-                log?.append("shed", {
-                  dropped: shed.dropped,
-                  before: shed.before,
-                  after: shed.after,
-                  archive: shed.path,
+        // A failed step is not a verdict on the work.
+        //
+        // Everything between sending the request and holding a usable message
+        // can fail in ways that say nothing about whether the work is any good:
+        // `TypeError: fetch failed` from a DNS blip or a laptop waking, a 429
+        // because the minute's quota ran out, a 502 from a proxy, a stream that
+        // dies halfway, an HTML error page where JSON was promised. Each of
+        // those used to end the turn where it stood. One reported session lost
+        // forty-nine thousand tokens of reading that way and was told only
+        // "network: TypeError: fetch failed".
+        //
+        // So they are all one policy now: retry what a second attempt could
+        // plausibly fix, and whatever happens, close the turn the way every
+        // other stop closes — by asking for an answer with what has already been
+        // paid for. A 400 or a 401 is not retried, because the conversation or
+        // the credentials being wrong does not improve by asking again, and a
+        // second identical refusal is exactly the spending this avoids.
+        let failure:
+          | { text: string; why: string; retryable: boolean; retryAfterMs?: number }
+          | undefined;
+        /**
+         * Shed-and-retry rounds used on this step.
+         *
+         * More than one, because a single shed is a guess: the first is sized
+         * with whatever ratio molt has learned so far, and the server's answer to
+         * it is what makes the next one right. One round was enough to fail —
+         * "shedding to 10813" was followed by a refusal at 24,307 tokens, and the
+         * turn ended there with everything it had done thrown away.
+         */
+        let overflowRounds = 0;
+        /**
+         * Whether this attempt has put text on screen.
+         *
+         * A retry replays the message from the beginning, so anything already
+         * shown belongs to an abandoned attempt and has to be taken back first —
+         * otherwise the reader sees the same sentence twice with no way to tell
+         * which one the model actually finished.
+         */
+        let shownThisAttempt = false;
+
+        for (let attempt = 0; ; attempt++) {
+          failure = undefined;
+          msg = undefined;
+          let res: Response | undefined;
+          try {
+            res = await send(askForUsage);
+            // A server that does not implement the field rejects the request. Try
+            // once without it rather than failing a turn over a request for better
+            // bookkeeping — and only conclude the field was the problem if the
+            // retry actually works, so a genuine 400 does not quietly turn usage
+            // reporting off for the rest of the session.
+            if (!res.ok && res.status === 400 && askForUsage) {
+              const retry = await send(false);
+              if (retry.ok) {
+                this.streamUsageUnsupported = true;
+                log?.append("note", {
+                  text: "provider rejected stream_options — token counts fall back to molt's estimate",
+                });
+              }
+              res = retry;
+            }
+
+            // The body is read once. A `Response` gives its body up exactly
+            // once, so the caching fallback below and the failure report that
+            // follows it have to share the same read rather than each taking
+            // their own.
+            let body = res.ok ? "" : (await res.text().catch(() => ""));
+
+            // An endpoint that will not take the markers must cost a retry, not
+            // a turn. Same shape as the stream_options fallback above: try once
+            // without, and only believe the markers were the problem if that
+            // works — so a genuine 400 is not quietly blamed on caching.
+            if (
+              !res.ok &&
+              res.status === 400 &&
+              this.cacheStyle === "explicit" &&
+              !this.cachingUnsupported &&
+              refusedCaching(body)
+            ) {
+              const retry = await send(askForUsage && !this.streamUsageUnsupported, false);
+              if (retry.ok) {
+                this.cachingUnsupported = true;
+                log?.append("note", {
+                  text: "provider rejected cache_control — prompt caching is off for this session",
+                });
+              }
+              res = retry;
+              body = res.ok ? "" : (await res.text().catch(() => ""));
+            }
+
+            if (!res.ok) {
+              // "Too big" is not a verdict on the work, and it is the one
+              // refusal that says how to fix itself. Shed and send less rather
+              // than ending a turn that has done real work — molt's own
+              // threshold is 60,000 tokens and this endpoint may serve 16,384,
+              // which it has no other way to discover.
+              const over = res.status === 400 ? contextOverflow(body) : null;
+              if (over && overflowRounds < OVERFLOW_ROUNDS) {
+                overflowRounds++;
+                const bom = this.bom();
+                // What molt believed it was sending, against what the server
+                // counted. molt estimates characters/4; a real tokenizer on code
+                // disagrees, and one session shed to an estimated 11.6k only to
+                // be refused at 24,307. Every decision about what to drop was
+                // being made in a unit twice the size of the real one.
+                const scale = tokenScale(over.sent, bom.requestTotalEst);
+                if (scale > this.tokenScale) this.tokenScale = scale;
+                // Remembered for the rest of the session, so every later read is
+                // sized to fit rather than discovered to be too large.
+                if (over.window > 0) this.contextWindow = over.window;
+                const fixedEst = bom.systemTokens + bom.toolSchemaTokens;
+                const target = historyBudget(over.window, fixedEst, this.tokenScale);
+                if (target > 0) this.cfg.autoShedAtTokens = target;
+
+                log?.append("note", {
+                  text:
+                    `context window ${over.window || "unknown"}; server counted ${over.sent} where ` +
+                    `molt estimated ${bom.requestTotalEst} (x${this.tokenScale.toFixed(2)}) — ` +
+                    `round ${overflowRounds}, history target ${target || "unknown"}`,
                 });
                 yield {
-                  kind: "shed",
-                  dropped: shed.dropped,
-                  before: shed.before,
-                  after: shed.after,
-                  path: shed.path,
+                  kind: "info",
+                  text: over.window
+                    ? `this endpoint serves ${over.window} tokens and counted ${over.sent} in that ` +
+                      `request — about ${this.tokenScale.toFixed(1)}x molt's estimate. Carrying less ` +
+                      `and trying again` +
+                      (target > 0 && overflowRounds === 1
+                        ? ` — start with --auto-shed ${target} to skip this.`
+                        : ".")
+                    : "this endpoint refused the request as too large. Carrying less and trying again.",
                 };
-                failure = {
-                  text: "context window too small for what molt was carrying",
-                  why: "The endpoint could not hold the conversation.",
-                  retryable: true,
-                };
-                if (shownThisAttempt) {
-                  shownThisAttempt = false;
-                  yield { kind: "stream_reset", why: "shed and retried" };
-                }
-                continue;
-              }
 
-              // Nothing older to drop. Before concluding anything, check
-              // whether the problem is even age: a shed that freed 400 tokens
-              // out of 18,300 was not failing, it was working on the wrong
-              // thing. The bulk was a single file read the shed keeps by
-              // design, and shrinking that is the only move left.
-              if (over.window > 0) {
-                const per = Math.max(
-                  256,
-                  Math.floor((over.window * RESULT_WINDOW_SHARE) / Math.max(this.tokenScale, 1)),
-                );
-                const trim = this.transcript.trimOversized(per);
-                if (trim.trimmed > 0) {
-                  log?.append("elide", {
-                    trimmed: trim.trimmed,
-                    tokensSaved: trim.tokensSaved,
-                    reason: `oversized for a ${over.window}-token window`,
-                  });
+                // Each round keeps fewer exchanges. The threshold alone changes
+                // nothing: shed() drops everything older than `keepExchanges` and
+                // does not consult it, so a second call with the same argument
+                // finds nothing and a lower target is ignored.
+                const shed = this.shed(keepForRound(overflowRounds), keepRecentForRound(overflowRounds));
+                if (shed) {
                   yield {
-                    kind: "info",
-                    text:
-                      `nothing older left to shed, so ${trim.trimmed} oversized result(s) were ` +
-                      `trimmed to fit — ${trim.tokensSaved} tokens freed. The files are still ` +
-                      `on disk; re-read a narrower range to see what was cut.`,
+                    kind: "shed",
+                    dropped: shed.dropped,
+                    before: shed.before,
+                    after: shed.after,
+                    path: shed.path,
                   };
                   failure = {
                     text: "context window too small for what molt was carrying",
                     why: "The endpoint could not hold the conversation.",
                     retryable: true,
                   };
+                  if (shownThisAttempt) {
+                    shownThisAttempt = false;
+                    yield { kind: "stream_reset", why: "shed and retried" };
+                  }
                   continue;
                 }
-              }
 
-              // Now it is genuinely the window. That verdict is drawn from an
-              // empty transcript rather than from a ratio, which is noisy
-              // enough to condemn a server that would have fitted.
-              const fixedReal = Math.round(fixedEst * this.tokenScale);
-              const need = Math.max(32_768, 2 ** Math.ceil(Math.log2(Math.max(fixedReal, 1) * 3)));
+                // Nothing older to drop. Before concluding anything, check
+                // whether the problem is even age: a shed that freed 400 tokens
+                // out of 18,300 was not failing, it was working on the wrong
+                // thing. The bulk was a single file read the shed keeps by
+                // design, and shrinking that is the only move left.
+                if (over.window > 0) {
+                  const per = Math.max(
+                    256,
+                    Math.floor((over.window * RESULT_WINDOW_SHARE) / Math.max(this.tokenScale, 1)),
+                  );
+                  const trim = this.transcript.trimOversized(per);
+                  if (trim.trimmed > 0) {
+                    log?.append("elide", {
+                      trimmed: trim.trimmed,
+                      tokensSaved: trim.tokensSaved,
+                      reason: `oversized for a ${over.window}-token window`,
+                    });
+                    yield {
+                      kind: "info",
+                      text:
+                        `nothing older left to shed, so ${trim.trimmed} oversized result(s) were ` +
+                        `trimmed to fit — ${trim.tokensSaved} tokens freed. The files are still ` +
+                        `on disk; re-read a narrower range to see what was cut.`,
+                    };
+                    failure = {
+                      text: "context window too small for what molt was carrying",
+                      why: "The endpoint could not hold the conversation.",
+                      retryable: true,
+                    };
+                    continue;
+                  }
+                }
+
+                // Now it is genuinely the window. That verdict is drawn from an
+                // empty transcript rather than from a ratio, which is noisy
+                // enough to condemn a server that would have fitted.
+                const fixedReal = Math.round(fixedEst * this.tokenScale);
+                const need = Math.max(32_768, 2 ** Math.ceil(Math.log2(Math.max(fixedReal, 1) * 3)));
+                failure = {
+                  text: over.window
+                    ? `this endpoint serves ${over.window} tokens of context and there is nothing ` +
+                      `left to shed — molt's system prompt and tool definitions alone are about ` +
+                      `${fixedReal} as it counts them. Restart the server with a larger context ` +
+                      `(-c ${need} or more), or use an endpoint that serves one.`
+                    : "the endpoint refused the request as too large and there is nothing left to shed.",
+                  why: "Shedding cannot make this request fit.",
+                  retryable: false,
+                };
+                break;
+              }
+              const transient = res.status === 408 || res.status === 429 || res.status >= 500;
               failure = {
-                text: over.window
-                  ? `this endpoint serves ${over.window} tokens of context and there is nothing ` +
-                    `left to shed — molt's system prompt and tool definitions alone are about ` +
-                    `${fixedReal} as it counts them. Restart the server with a larger context ` +
-                    `(-c ${need} or more), or use an endpoint that serves one.`
-                  : "the endpoint refused the request as too large and there is nothing left to shed.",
-                why: "Shedding cannot make this request fit.",
-                retryable: false,
+                text: `HTTP ${res.status}: ${body.slice(0, 300)}`,
+                why: `The provider refused the request with HTTP ${res.status}.`,
+                retryable: transient,
               };
-              break;
-            }
-            const transient = res.status === 408 || res.status === 429 || res.status >= 500;
-            failure = {
-              text: `HTTP ${res.status}: ${body.slice(0, 300)}`,
-              why: `The provider refused the request with HTTP ${res.status}.`,
-              retryable: transient,
-            };
-            // A rate limit usually says when to come back. Believe it over a
-            // fixed backoff — guessing shorter earns a second refusal, and
-            // guessing longer wastes the wait.
-            if (transient) failure.retryAfterMs = retryAfterMs(res);
-          } else {
-            const contentType = res.headers?.get?.("content-type") ?? "";
-            const isSse = stream && res.body != null && contentType.includes("event-stream");
-            if (isSse && this.native) {
-              // Anthropic's stream is block-oriented rather than
-              // choice-oriented, so it gets its own reader.
-              const fragments: string[] = [];
-              const result = await readNativeStream(res.body!, (f) => {
-                fragments.push(f);
-              });
-              msg = result.message;
-              finishReason = result.finishReason;
-              usage = {
-                prompt_tokens: result.promptTokens,
-                completion_tokens: result.completionTokens,
-                ...(result.cachedTokens === undefined
-                  ? {}
-                  : { prompt_tokens_details: { cached_tokens: result.cachedTokens } }),
-                cache_read_input_tokens: result.cachedTokens,
-                cache_creation_input_tokens: result.cacheWriteTokens,
-              };
-            } else if (isSse) {
-              // Yielded as they arrive. This was buffered until the read
-              // completed, on the reasoning that a few hundred milliseconds of
-              // earlier paint was not worth the complexity — but on a local
-              // endpoint a step is tens of seconds, and buffering meant the
-              // window showed nothing at all for the whole of it. Three runs in
-              // one session were cancelled during that silence.
-              const frag = new Fragments();
-              const safe = new SafeStream((t: string) => redact(t, this.secrets()));
-              let streamAcc: StreamAccumulator | undefined;
-              let live = "";
-              shownThisAttempt = false;
-              const reading = readStream(
-                res.body!,
-                (fragment) => frag.push(fragment),
-                (a) => (streamAcc = a),
-              )
-                .then((r) => {
-                  frag.finish();
-                  return r;
-                })
-                .catch((e: unknown) => {
-                  frag.finish();
-                  throw e;
+              // A rate limit usually says when to come back. Believe it over a
+              // fixed backoff — guessing shorter earns a second refusal, and
+              // guessing longer wastes the wait.
+              if (transient) failure.retryAfterMs = retryAfterMs(res);
+            } else {
+              const contentType = res.headers?.get?.("content-type") ?? "";
+              const isSse = stream && res.body != null && contentType.includes("event-stream");
+              if (isSse && this.native) {
+                // Anthropic's stream is block-oriented rather than
+                // choice-oriented, so it gets its own reader.
+                const fragments: string[] = [];
+                const result = await readNativeStream(res.body!, (f) => {
+                  fragments.push(f);
                 });
-              for await (const fragment of frag.drain()) {
-                live += fragment;
-                const showable = safe.take(fragment);
-                if (showable) {
+                msg = result.message;
+                finishReason = result.finishReason;
+                usage = {
+                  prompt_tokens: result.promptTokens,
+                  completion_tokens: result.completionTokens,
+                  ...(result.cachedTokens === undefined
+                    ? {}
+                    : { prompt_tokens_details: { cached_tokens: result.cachedTokens } }),
+                  cache_read_input_tokens: result.cachedTokens,
+                  cache_creation_input_tokens: result.cacheWriteTokens,
+                };
+              } else if (isSse) {
+                // Yielded as they arrive. This was buffered until the read
+                // completed, on the reasoning that a few hundred milliseconds of
+                // earlier paint was not worth the complexity — but on a local
+                // endpoint a step is tens of seconds, and buffering meant the
+                // window showed nothing at all for the whole of it. Three runs in
+                // one session were cancelled during that silence.
+                const frag = new Fragments();
+                const safe = new SafeStream((t: string) => redact(t, this.secrets()));
+                let streamAcc: StreamAccumulator | undefined;
+                let live = "";
+                shownThisAttempt = false;
+                const reading = readStream(
+                  res.body!,
+                  (fragment) => frag.push(fragment),
+                  (a) => (streamAcc = a),
+                )
+                  .then((r) => {
+                    frag.finish();
+                    return r;
+                  })
+                  .catch((e: unknown) => {
+                    frag.finish();
+                    throw e;
+                  });
+                for await (const fragment of frag.drain()) {
+                  live += fragment;
+                  const showable = safe.take(fragment);
+                  if (showable) {
+                    streamedContent = true;
+                    shownThisAttempt = true;
+                    yield { kind: "delta", text: showable };
+                  }
+                  // The model names a tool several hundred milliseconds before
+                  // its arguments finish. Said as soon as it is known, because
+                  // the gap between narration ending and a tool row appearing is
+                  // where a person decides the model has stalled.
+                  for (const name of streamAcc?.drainPending() ?? []) {
+                    yield { kind: "tool_pending", name };
+                  }
+                }
+                const tail = safe.flush();
+                if (tail) {
                   streamedContent = true;
                   shownThisAttempt = true;
-                  yield { kind: "delta", text: showable };
+                  yield { kind: "delta", text: tail };
                 }
-                // The model names a tool several hundred milliseconds before
-                // its arguments finish. Said as soon as it is known, because
-                // the gap between narration ending and a tool row appearing is
-                // where a person decides the model has stalled.
-                for (const name of streamAcc?.drainPending() ?? []) {
-                  yield { kind: "tool_pending", name };
+                const result = await reading;
+                msg = result.message;
+                finishReason = result.finishReason;
+                usage = {
+                  prompt_tokens: result.promptTokens,
+                  completion_tokens: result.completionTokens,
+                  ...(result.cachedTokens === undefined
+                    ? {}
+                    : { prompt_tokens_details: { cached_tokens: result.cachedTokens } }),
+                  ...(result.reasoningTokens === undefined
+                    ? {}
+                    : { completion_tokens_details: { reasoning_tokens: result.reasoningTokens } }),
+                  ...(result.costUsd === undefined ? {} : { cost: result.costUsd }),
+                };
+              } else {
+                type Payload = {
+                  choices?: { message?: Msg; finish_reason?: string | null }[];
+                  usage?: Usage;
+                };
+                let json: Payload | undefined;
+                try {
+                  json = (await res.json()) as Payload;
+                } catch {
+                  // Named for what it is. An HTML error page from a proxy is the
+                  // usual cause, and "network: SyntaxError" sends whoever reads
+                  // it to debug the wrong layer.
+                  failure = {
+                    text: "provider returned non-JSON response",
+                    why: "The provider returned something that was not JSON.",
+                    retryable: true,
+                  };
+                }
+                if (json && this.native) {
+                  const native = json as unknown as {
+                    content?: { type: string; text?: string; id?: string; name?: string; input?: unknown }[];
+                    stop_reason?: string | null;
+                    usage?: Record<string, unknown>;
+                  };
+                  msg = toMessage(native);
+                  finishReason = finishReasonFor(native.stop_reason);
+                  usage = usageFor(native.usage);
+                } else if (json) {
+                  msg = json.choices?.[0]?.message;
+                  finishReason = json.choices?.[0]?.finish_reason ?? undefined;
+                  usage = json.usage;
                 }
               }
-              const tail = safe.flush();
-              if (tail) {
-                streamedContent = true;
-                shownThisAttempt = true;
-                yield { kind: "delta", text: tail };
-              }
-              const result = await reading;
-              msg = result.message;
-              finishReason = result.finishReason;
-              usage = {
-                prompt_tokens: result.promptTokens,
-                completion_tokens: result.completionTokens,
-                ...(result.cachedTokens === undefined
-                  ? {}
-                  : { prompt_tokens_details: { cached_tokens: result.cachedTokens } }),
-                ...(result.reasoningTokens === undefined
-                  ? {}
-                  : { completion_tokens_details: { reasoning_tokens: result.reasoningTokens } }),
-                ...(result.costUsd === undefined ? {} : { cost: result.costUsd }),
-              };
-            } else {
-              type Payload = {
-                choices?: { message?: Msg; finish_reason?: string | null }[];
-                usage?: Usage;
-              };
-              let json: Payload | undefined;
-              try {
-                json = (await res.json()) as Payload;
-              } catch {
-                // Named for what it is. An HTML error page from a proxy is the
-                // usual cause, and "network: SyntaxError" sends whoever reads
-                // it to debug the wrong layer.
+              if (!failure && !msg) {
+                // A response shaped wrong is usually a proxy or a bad gateway
+                // answering in the provider's place, which the next attempt
+                // often gets past.
                 failure = {
-                  text: "provider returned non-JSON response",
-                  why: "The provider returned something that was not JSON.",
+                  text: "provider response missing choices[0].message",
+                  why: "The provider returned a response with no assistant message in it.",
                   retryable: true,
                 };
               }
-              if (json && this.native) {
-                const native = json as unknown as {
-                  content?: { type: string; text?: string; id?: string; name?: string; input?: unknown }[];
-                  stop_reason?: string | null;
-                  usage?: Record<string, unknown>;
-                };
-                msg = toMessage(native);
-                finishReason = finishReasonFor(native.stop_reason);
-                usage = usageFor(native.usage);
-              } else if (json) {
-                msg = json.choices?.[0]?.message;
-                finishReason = json.choices?.[0]?.finish_reason ?? undefined;
-                usage = json.usage;
-              }
             }
-            if (!failure && !msg) {
-              // A response shaped wrong is usually a proxy or a bad gateway
-              // answering in the provider's place, which the next attempt
-              // often gets past.
-              failure = {
-                text: "provider response missing choices[0].message",
-                why: "The provider returned a response with no assistant message in it.",
-                retryable: true,
-              };
+          } catch (e) {
+            if (controller.signal.aborted) {
+              this.inFlight = undefined;
+              this.transcript.rollbackTo(turnStart);
+              const wrote = [...new Set(this.ledger.map((e) => e.path))];
+              log?.append("cancelled", { step, rolledBack: true, filesWritten: wrote });
+              yield { kind: "cancelled", filesWritten: wrote };
+              return;
             }
+            failure = {
+              text: `network: ${String(e)}`,
+              why: "The connection to the provider failed and could not be re-established.",
+              retryable: true,
+            };
           }
-        } catch (e) {
+
+          if (!failure) break;
+          if (!failure.retryable || attempt >= NETWORK_RETRIES) break;
+          // About to replay this message from the beginning. Anything already on
+          // screen belongs to an attempt that is being abandoned, and leaving it
+          // there would show the reader the same sentence twice with no way to
+          // tell which one the model actually finished.
+          if (shownThisAttempt) {
+            shownThisAttempt = false;
+            yield { kind: "stream_reset", why: failure.text };
+          }
+          const backoff = this.cfg.retryBackoffMs ?? NETWORK_BACKOFF_MS;
+          const wait = failure.retryAfterMs ?? backoff[attempt] ?? backoff.at(-1) ?? 4_000;
+          log?.append("note", { text: `${failure.text} — retrying in ${wait}ms` });
+          yield {
+            kind: "info",
+            text:
+              `${failure.text} — retrying in ${Math.round(wait / 100) / 10}s, ` +
+              `attempt ${attempt + 2} of ${NETWORK_RETRIES + 1}`,
+          };
+          await sleepUnlessAborted(wait, controller.signal);
           if (controller.signal.aborted) {
             this.inFlight = undefined;
             this.transcript.rollbackTo(turnStart);
@@ -2758,81 +3861,48 @@ export class Engine {
             yield { kind: "cancelled", filesWritten: wrote };
             return;
           }
-          failure = {
-            text: `network: ${String(e)}`,
-            why: "The connection to the provider failed and could not be re-established.",
-            retryable: true,
-          };
         }
 
-        if (!failure) break;
-        if (!failure.retryable || attempt >= NETWORK_RETRIES) break;
-        // About to replay this message from the beginning. Anything already on
-        // screen belongs to an attempt that is being abandoned, and leaving it
-        // there would show the reader the same sentence twice with no way to
-        // tell which one the model actually finished.
-        if (shownThisAttempt) {
-          shownThisAttempt = false;
-          yield { kind: "stream_reset", why: failure.text };
-        }
-        const backoff = this.cfg.retryBackoffMs ?? NETWORK_BACKOFF_MS;
-        const wait = failure.retryAfterMs ?? backoff[attempt] ?? backoff.at(-1) ?? 4_000;
-        log?.append("note", { text: `${failure.text} — retrying in ${wait}ms` });
-        yield {
-          kind: "info",
-          text:
-            `${failure.text} — retrying in ${Math.round(wait / 100) / 10}s, ` +
-            `attempt ${attempt + 2} of ${NETWORK_RETRIES + 1}`,
-        };
-        await sleepUnlessAborted(wait, controller.signal);
-        if (controller.signal.aborted) {
-          this.inFlight = undefined;
-          this.transcript.rollbackTo(turnStart);
-          const wrote = [...new Set(this.ledger.map((e) => e.path))];
-          log?.append("cancelled", { step, rolledBack: true, filesWritten: wrote });
-          yield { kind: "cancelled", filesWritten: wrote };
+        this.inFlight = undefined;
+
+        if (failure || !msg) {
+          const text = failure?.text ?? "provider response missing choices[0].message";
+          log?.append("error", { text });
+          yield {
+            kind: "error",
+            text:
+              `${text}${failure?.retryable ? ` — gave up after ${NETWORK_RETRIES + 1} attempts` : ""}. ` +
+              `Nothing was verified. The work above still happened; what follows is a report ` +
+              `on it, not a completion.`,
+          };
+          // Only where a last request could plausibly do better. A 400 or a 401
+          // is the conversation, the model id, or the credentials being wrong,
+          // and a salvage would be refused in exactly the same way — paying
+          // twice to be told the same thing is the spending this avoids.
+          if (failure?.retryable !== false) {
+            yield* this.salvage(failure?.why ?? "The provider returned nothing usable.", fetchFn, log);
+          }
           return;
         }
-      }
 
-      this.inFlight = undefined;
-
-      if (failure || !msg) {
-        const text = failure?.text ?? "provider response missing choices[0].message";
-        log?.append("error", { text });
-        yield {
-          kind: "error",
-          text:
-            `${text}${failure?.retryable ? ` — gave up after ${NETWORK_RETRIES + 1} attempts` : ""}. ` +
-            `Nothing was verified. The work above still happened; what follows is a report ` +
-            `on it, not a completion.`,
-        };
-        // Only where a last request could plausibly do better. A 400 or a 401
-        // is the conversation, the model id, or the credentials being wrong,
-        // and a salvage would be refused in exactly the same way — paying
-        // twice to be told the same thing is the spending this avoids.
-        if (failure?.retryable !== false) {
-          yield* this.salvage(failure?.why ?? "The provider returned nothing usable.", fetchFn, log);
+        // The attempt stuck, so the text it produced can go to the screen.
+        //
+        // A provider that does not stream sends its prose in the message body,
+        // and nothing carried it: `assistant_text` is the turn's final answer
+        // and is only sent at the end, so with `--no-stream` every word the
+        // model wrote on the way — what it was about to do and why — was thrown
+        // away and only the tool calls showed. Sent as a delta, which is the
+        // event that means "the model is talking", so both kinds of provider
+        // reach the screen the same way.
+        // Only for a provider that did not stream. The SSE path now yields its
+        // fragments as they arrive, and repeating the joined text here is how the
+        // whole message came out twice.
+        const said = streamedContent ? "" : redact(msg.content ?? "", this.secrets());
+        if (said) {
+          streamedContent = true;
+          yield { kind: "delta", text: said };
         }
-        return;
-      }
 
-      // The attempt stuck, so the text it produced can go to the screen.
-      //
-      // A provider that does not stream sends its prose in the message body,
-      // and nothing carried it: `assistant_text` is the turn's final answer
-      // and is only sent at the end, so with `--no-stream` every word the
-      // model wrote on the way — what it was about to do and why — was thrown
-      // away and only the tool calls showed. Sent as a delta, which is the
-      // event that means "the model is talking", so both kinds of provider
-      // reach the screen the same way.
-      // Only for a provider that did not stream. The SSE path now yields its
-      // fragments as they arrive, and repeating the joined text here is how the
-      // whole message came out twice.
-      const said = streamedContent ? "" : redact(msg.content ?? "", this.secrets());
-      if (said) {
-        streamedContent = true;
-        yield { kind: "delta", text: said };
       }
 
       const reportedUsage =
@@ -3027,186 +4097,17 @@ export class Engine {
         let autoRan = 0;
         let repeated = 0;
         for (const call of msg.tool_calls) {
-          const name = call.function?.name ?? "unknown";
-          let args: Record<string, unknown> = {};
-          let malformed = false;
-          try {
-            args = JSON.parse(call.function?.arguments || "{}") as Record<string, unknown>;
-          } catch {
-            // Running with empty arguments produced a misleading error — a
-            // malformed read_file became "EISDIR: illegal operation on a
-            // directory", which sends the model to debug a path it never
-            // sent. Say what actually happened instead.
-            malformed = true;
-          }
-          const detail = toolDetail(name, args);
-          // What the current autonomy level says about this exact call. The
-          // decision is mechanical and the reason travels with it, so an
-          // approval prompt can say which rule produced it rather than
-          // asking the same way about everything.
-          const decision = gate(this.autonomy, { name, args, cwd: this.cwd });
-          // The prompt shows the command in full. You are being asked to judge
-          // it, and a redacted command is one you cannot judge.
-          const allowed = decision.ask ? await confirm(name, `${detail}${decision.why ? ` — ${decision.why}` : ""}`) : true;
-
-          let result: string;
-          let note: string | undefined;
-          if (malformed) {
-            const raw = capture(call.function?.arguments ?? "");
-            yield {
-              kind: "tool",
-              name,
-              detail: "malformed arguments",
-              note: "malformed",
-              args: raw,
-              bytes: 0,
-              preview: raw,
-              auto: true,
-            };
-            this.transcript.push({
-              role: "tool",
-              tool_call_id: call.id,
-              content:
-                `[molt: the arguments for ${name} were not valid JSON, so nothing ran. ` +
-                `Send them again as a JSON object. What arrived was: ${raw}]`,
-            });
-            called.push(name);
-            continue;
-          }
-          // Timed around execution only. Waiting on a human to approve a gated
-          // tool is not the tool being slow, and folding the two together
-          // would make every gated call look like one.
-          let durationMs: number | undefined;
-          if (!allowed) {
-            result = "User denied this action.";
-            note = "denied";
-          } else {
-            yield { kind: "tool_start", name, detail };
-            const toolStartedAt = Date.now();
-            // Scoped to this one call, so ctrl+C reaches the command that is
-            // actually running and nothing that ran before it.
-            this.running = new AbortController();
-            try {
-              // read_file budgets itself, to the byte, so that the notice
-              // saying how to continue survives. Capping it again here is what
-              // cut that notice off and left the model with no way forward.
-              const raw = await this.runTool(name, args, call.id);
-              const t =
-                name === "read_file"
-                  ? { text: raw, note: undefined }
-                  : truncateResult(raw, Math.min(TOOL_RESULT_MAX_BYTES, this.resultBudget()));
-              result = t.text;
-              note = t.note;
-            } catch (e) {
-              result = `tool error: ${String(e)}`;
-              note = "error";
-            } finally {
-              this.running = undefined;
-            }
-            durationMs = Date.now() - toolStartedAt;
-
-            // A read of lines the model has already been shown, whatever
-            // offset it spelled them with.
-            if (name === "read_file" && note !== "error") {
-              const path = String(args.path ?? "");
-              const from = num(args.offset, 0);
-              const to = actualReadEnd(result, from, path);
-              const covered = shown.get(path) ?? [];
-              // How much of this window is genuinely new. Containment alone is
-              // too strict: a read that overlaps an earlier one by 99% and
-              // runs three lines past it is not contained, and a model
-              // drifting its offset by a few lines a step walked straight
-              // through that test for thirty-two steps.
-              let fresh = 0;
-              for (let line = from; line < to; line++) {
-                if (!covered.some((r) => line >= r.from && line < r.to)) fresh += 1;
-              }
-              const span = Math.max(1, to - from);
-              const already = fresh === 0 || (fresh / span < 0.25 && fresh < 40);
-              if (already) {
-                const seen = covered.reduce((n, r) => Math.max(n, r.to), 0);
-                result =
-                  `[molt: you have already been shown lines ${from + 1}-${to} of ${path}` +
-                  (fresh === 0 ? "" : ` (all but ${fresh} line(s) of it)`) +
-                  `. Scroll up rather than reading it again — nothing has changed since. To ` +
-                  `see a part you do not have, ask for offset=${seen} or later; if you have ` +
-                  `what you need, answer.]`;
-                note = "repeat";
-                repeated += 1;
-              } else {
-                covered.push({ from, to });
-                shown.set(path, covered);
-              }
-            }
-
-            // The same call, returning the same bytes it returned before.
-            // Send a pointer instead of the payload: the answer is already in
-            // the conversation, and saying so is both cheaper and truer than
-            // repeating it.
-            // Canonical key: {path} and {path, offset: 0} are the same call,
-            // and a model that spells out a default must not thereby look like
-            // it is asking something new.
-            const key = callKey(name, args);
-            const sha = createHash("sha256").update(result, "utf8").digest("hex");
-            const prior = answered.get(key);
-            if (prior && prior.sha === sha) {
-              result =
-                `[molt: this is the same ${name} call you made at step ${prior.step + 1}, and ` +
-                `nothing has changed since. Its result is already above in this conversation. ` +
-                `Repeating it cannot tell you anything new — act on what you have, or say ` +
-                `plainly what is blocking you.]`;
-              note = "repeat";
-              repeated += 1;
-            }
-            answered.set(key, { step, sha });
-          }
-          // Both branches are recorded. A call that ran without being asked
-          // about is exactly the thing an audit needs to be able to find, and
-          // it is recorded with the level that let it through.
-          log?.append("permission", {
-            name,
-            detail,
-            allowed,
-            asked: decision.ask,
-            autonomy: this.autonomy,
-            ...(decision.why ? { why: decision.why } : {}),
-          });
-          log?.append("tool_call", { step, name, detail, allowed });
-          log?.append("tool_result", {
-            name,
-            bytes: Buffer.byteLength(result, "utf8"),
-            truncated: Boolean(note?.startsWith("capped")),
-            note,
-            sha256: createHash("sha256").update(result, "utf8").digest("hex").slice(0, 16),
-          });
-          if ((name === "write_file" || name === "edit_file") && allowed) {
-            shown.delete(String(args.path ?? ""));
-            this.pinTask(userText);
-          }
-          called.push(name);
-          this.did.push(
-            `${allowed ? "" : "refused: "}${name} ${detail}` +
-              (note && note !== "repeat" ? ` [${note}]` : ""),
+          const outcome = yield* this.invokeTool(
+            {
+              id: call.id,
+              name: call.function?.name ?? "unknown",
+              rawArgs: call.function?.arguments ?? "",
+            },
+            { step, userText, confirm, log, shown, answered },
           );
-          if (allowed) this.actsSinceBar += 1;
-          if (!decision.ask) autoRan += 1;
-          // Everything that scrolls is redacted. A transcript is pasted into
-          // bug reports and screenshotted into chat windows, which makes the
-          // screen a distribution channel like any other — and unlike the
-          // prompt above, nobody is judging a command from the scrollback.
-          const hide = (t: string) => redact(t, this.secrets());
-          yield {
-            kind: "tool",
-            name,
-            detail: hide(detail),
-            note,
-            durationMs,
-            args: hide(capture(call.function?.arguments ?? "")),
-            bytes: Buffer.byteLength(result, "utf8"),
-            preview: hide(capture(result)),
-            auto: !decision.ask,
-          };
-          this.transcript.push({ role: "tool", tool_call_id: call.id, content: result });
+          called.push(outcome.name);
+          if (outcome.repeated) repeated += 1;
+          if (outcome.auto) autoRan += 1;
         }
         yield summary(called, "tools");
 
@@ -3339,6 +4240,18 @@ export class Engine {
         names: bar.checks.map((c) => c.name),
       };
       const result = await this.runBarGuarded(claim, barNow());
+      if (result.cancelled) {
+        // ctrl+C landed while a check was running. This used to fall through:
+        // the killed check read as red, a refused receipt was written, the
+        // "failure" went back to the model, and the next request was billed —
+        // for a turn the person had just ended. Closed the way a cancelled
+        // request is closed, and named as what it was.
+        this.transcript.rollbackTo(turnStart);
+        const wrote = [...new Set(this.ledger.map((e) => e.path))];
+        log?.append("cancelled", { step, rolledBack: true, during: "bar", filesWritten: wrote });
+        yield { kind: "cancelled", filesWritten: wrote };
+        return;
+      }
       this.actsSinceBar = 0;
       lastResult = result;
       log?.append("bar_run", {
@@ -3369,9 +4282,24 @@ export class Engine {
         .map((r) => `${r.name}:${r.output.trim()}`)
         .join("|");
       const stuck = !result.ok && signature === lastFailure;
+      const stuckChecks = stuck
+        ? result.results.filter((r) => !r.ok).map((r) => r.name)
+        : [];
       lastFailure = signature;
       const exhausted = !result.ok && (stuck || proofAttempts >= maxAttempts);
       const verdict = result.ok ? "accepted" : exhausted ? "exhausted" : "refused";
+
+      // A stuck bar is its own fact, worth a separate journal entry: the run
+      // records the outcome, this records the signal that a check may be
+      // wrong about the work — the exact failure 1.13M tokens were spent on.
+      if (stuck) {
+        log?.append("bar_stuck", {
+          attempt: proofAttempts,
+          failed: stuckChecks.join(", "),
+          signature,
+          tokens: this.sessionTokens,
+        });
+      }
 
       if (this.cfg.receipts) {
         const receipt = this.cfg.receipts.write({
@@ -3386,6 +4314,9 @@ export class Engine {
           costUsd: this.costUsd(),
           costEstimated: this.costEstimated,
           shedBatches: this.transcript.shedCount,
+          // A question the bar could not refuse is recorded as one, so stats
+          // never count an answer as a verified change.
+          ask: opts.ask === true && this.sessionLedger().length === 0,
           changed: this.sessionLedger().map((e) => ({ path: e.path, before: e.before, after: e.after })),
           did: [...this.did],
           task: taskSeal
@@ -3402,12 +4333,22 @@ export class Engine {
             : undefined,
         });
         log?.append("receipt", { verdict, file: receipt.path, attempt: proofAttempts });
+        this.bindReceipt(receipt.path, verdict);
+        this.capture(receipt.path, verdict, userText, result, claim);
+        lastReceipt = basename(receipt.path);
         yield { kind: "receipt", path: receipt.path };
       }
 
       if (result.ok) {
         log?.append("session_end", { reason: "bar met", attempts: proofAttempts });
         yield { kind: "proof_result", result, attempt: proofAttempts };
+        yield* this.settlePassed(
+          userText,
+          proofAttempts,
+          result.results.map((r) => r.name),
+          lastReceipt,
+          log,
+        );
         // `streamed` says the deltas already carried this text. Still sent, so
         // that "the model gave a final answer" stays one event a caller can
         // wait on — `molt run`'s exit code turns on it — but a surface that
@@ -3430,9 +4371,10 @@ export class Engine {
           yield {
             kind: "info",
             text:
-              "the bar failed in exactly the same way twice. Continuing would spend more " +
-              "tokens on a check the work is not moving — either the work cannot satisfy " +
-              "it, or the check is wrong about the work.",
+              "the bar failed in exactly the same way twice, on: " +
+              (stuckChecks.map((n) => `\`${n}\``).join(", ") || "all checks") +
+              ". Continuing would spend more tokens on a check the work is not moving — " +
+              "either the work cannot satisfy it, or the check is wrong about the work.",
           };
         }
         yield {
@@ -3445,6 +4387,7 @@ export class Engine {
             : `bar not met after ${proofAttempts} attempts. molt is reporting failure rather ` +
               `than success. See .molt/receipts/ for what was checked.`,
         };
+        yield* this.settleFailed(log);
         return;
       }
 
@@ -3487,6 +4430,29 @@ export class Engine {
   }> {
     const fetchFn = this.cfg.fetchFn ?? fetch;
     const base = this.cfg.baseUrl.replace(/\/$/, "");
+    /**
+     * Nothing to reach, so nothing is asked.
+     *
+     * The two questions doctor answers — can molt get there, and is the model
+     * there — become one: is Claude Code installed and logged in. Fetching
+     * `claude-code://subscription/models` would fail in a way that reads as a
+     * network problem and sends someone to check their wifi.
+     */
+    if (this.claudeCode) {
+      const health = await claudeCodeHealth();
+      const ids: string[] = [...CLAUDE_CODE_MODELS];
+      const has = ids.includes(this.cfg.model) || this.cfg.model.startsWith("claude-");
+      return {
+        ok: health.ok && has,
+        reachable: health.installed,
+        modelPresent: has,
+        models: ids,
+        detail:
+          health.detail +
+          (health.fix ? ` · run \`${health.fix}\`` : "") +
+          (has ? "" : ` · ⚠ '${this.cfg.model}' is not a Claude model (try: ${ids.join(", ")})`),
+      };
+    }
     try {
       const res = await fetchFn(`${base}/models`, { headers: authHeaders(base, this.cfg.apiKey) });
       if (!res.ok) {
@@ -3530,6 +4496,10 @@ export class Engine {
   ): Promise<{ ok: true; ids: string[] } | { ok: false; error: string }> {
     const fetchFn = this.cfg.fetchFn ?? fetch;
     const base = baseUrl.replace(/\/$/, "");
+    // The CLI resolves these aliases itself against whatever the account can
+    // reach; a list fetched from an endpoint molt never contacts would be made
+    // up. See CLAUDE_CODE_MODELS.
+    if (isClaudeCode(baseUrl)) return { ok: true, ids: [...CLAUDE_CODE_MODELS] };
     try {
       const res = await fetchFn(`${base}/models`, { headers: authHeaders(base, apiKey) });
       if (!res.ok) return { ok: false, error: `HTTP ${res.status} from ${base}/models` };

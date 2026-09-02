@@ -7,6 +7,7 @@
  * bar is not met, so molt can sit in CI, in a script, or in a benchmark
  * harness without a human watching.
  */
+import { CLAUDE_CODE_URL, isClaudeCode } from "./claude-code.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Archive } from "./archive.js";
@@ -15,6 +16,10 @@ import { fmtCost, fmtDuration } from "./banner.js";
 import { BarError, hasBar, loadBar, selectChecks, writeDefaultBar } from "./bar.js";
 import { Engine } from "./engine.js";
 import { Journal } from "./journal.js";
+import { Integrity } from "./integrity.js";
+import { buildRepoMap, DEFAULT_MAP_TOKENS } from "./repomap.js";
+import { parseDuration } from "./session-commands.js";
+import { taskChecksFrom } from "./criteria.js";
 import {
   fetchPricing,
   needsPriceLookup,
@@ -22,6 +27,8 @@ import {
   savePricing,
   storedEndpoint,
   type StoredEndpoint,
+  keyForUrl,
+  isSelfHosted,
 } from "./providers.js";
 import { Receipts } from "./receipts.js";
 import type { BarResult, EngineEvent } from "./types.js";
@@ -80,6 +87,7 @@ usage
   molt stats                false-claim rate and tokens per verified change
   molt log                  what the model actually did, from the session log
   molt verify               recompute the log's hash chain
+  molt attempts             one TSV row per attempt: verdict, tokens, cost, time
   molt --help
 
 first run
@@ -91,6 +99,8 @@ options
                      any server speaking the OpenAI shape: Ollama, llama.cpp,
                      vLLM, on this machine or another. /endpoint in the TUI.
                      default http://localhost:11434/v1
+                     claude-code  runs your own logged-in Claude Code, so a
+                     Pro/Max plan pays for the turn instead of an API key
   --model <id>       model id                     (MOLT_MODEL)
                      no default — /model or --model picks one
   --key <secret>     api key, if the endpoint needs one   (MOLT_API_KEY)
@@ -104,6 +114,29 @@ options
   --budget <n>       hard token ceiling for the session
   --auto-shed <n>    shed once history exceeds n tokens (default 60000, 0 off)
   --attempts <n>     completion attempts before molt reports failure (default 4)
+  --for <5m>         wall-clock ceiling for one turn; then the bar runs on
+                     whatever exists. 30s, 5m, 1h, or off
+  --commit           when the bar is met, commit the files this turn wrote,
+                     with the receipt named in the message (/undo takes it back)
+  --revert           when the bar is not met, put those files back the way they
+                     were. The receipt and the journal are never touched.
+  --map <tokens>     size of the repository map added to the system prompt
+                     (default 900, and off for self-hosted endpoints: it helps
+                     a frontier model and distracts a small local one).
+                     --no-map leaves it out entirely.
+  --read <path,...>  files the model may read and never write; a write to one
+                     is refused at the tool. Repeatable.
+  --criterion <name=command>
+                     what "done" means for THIS task, on top of the project's
+                     bar: a command that must exit 0. Sealed before the work
+                     starts, run with the bar, named task:<name> on the receipt.
+                     Repeatable. (The window's criteria panel, headless.)
+  --note <text>      a criterion in words. Recorded on the receipt as stated
+                     intent, shown to the model, never reported as verified.
+  --capture <dir>    write one JSON per completion attempt — the full wire
+                     transcript, ledger, bar result and receipt name — for
+                     training molt's safeguard model. Redacted. Off by
+                     default. (MOLT_CAPTURE_DIR)
   --autonomy <level> low | medium | high — how much runs without asking
                      low asks about every command and write (default)
                      medium runs reads, read-only commands, project writes
@@ -138,6 +171,22 @@ type Args = {
   budget?: number;
   autoShed?: number;
   attempts?: number;
+  /** Wall-clock ceiling for one turn, in ms. `--for 5m`. */
+  forMs?: number;
+  /** Commit what the bar verifies. `--commit`. */
+  commit?: boolean;
+  /** Put the tree back when the bar is not met. `--revert`. */
+  revert?: boolean;
+  /** Token budget for the repository map; 0 turns it off. `--map`/`--no-map`. */
+  mapTokens?: number;
+  /** Files the model may read and never write. `--read`, repeatable. */
+  readOnly?: string[];
+  /** Task criteria as commands. `--criterion name=cmd`, repeatable. */
+  criteria?: { name: string; run: string }[];
+  /** Task criteria in words. `--note`, repeatable. */
+  notes?: string[];
+  /** Directory for per-attempt capture files. `--capture`, or MOLT_CAPTURE_DIR. */
+  capture?: string;
   autonomy?: Autonomy;
   only?: string[];
   skip?: string[];
@@ -242,9 +291,18 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
       case "--version":
         out.version = true;
         break;
-      case "--url":
-        out.url = next();
+      case "--url": {
+        const given = next();
+        /**
+         * `--url claude-code` is what people type.
+         *
+         * The backend's endpoint is a sentinel, not an address, and asking
+         * someone to spell `claude-code://subscription` exactly is asking them
+         * to get it wrong. The full form still works and is what gets stored.
+         */
+        out.url = given === "claude-code" ? CLAUDE_CODE_URL : given;
         break;
+      }
       case "--model":
         out.model = next();
         break;
@@ -273,6 +331,52 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         break;
       case "--attempts":
         out.attempts = positiveInt("--attempts", next());
+        break;
+      case "--for": {
+        const raw = next();
+        const ms = parseDuration(raw);
+        if (ms === null) {
+          throw new Error(`--for needs a duration like 5m, 90s or 1h, got "${raw ?? ""}"`);
+        }
+        out.forMs = ms;
+        break;
+      }
+      case "--commit":
+        out.commit = true;
+        break;
+      case "--revert":
+        out.revert = true;
+        break;
+      case "--map":
+        out.mapTokens = positiveInt("--map", next());
+        break;
+      case "--no-map":
+        out.mapTokens = 0;
+        break;
+      case "--read":
+        // Repeatable, and comma-separable: a CI job pinning six files should
+        // not have to choose which spelling this flag prefers.
+        out.readOnly = [
+          ...(out.readOnly ?? []),
+          ...next().split(",").map((t) => t.trim()).filter(Boolean),
+        ];
+        break;
+      case "--criterion": {
+        // `name=command`. A bare command gets a numbered name, so the receipt
+        // still has something to call it.
+        const raw = next();
+        const eq = raw.indexOf("=");
+        const name = eq > 0 ? raw.slice(0, eq).trim() : `criterion-${(out.criteria?.length ?? 0) + 1}`;
+        const run = (eq > 0 ? raw.slice(eq + 1) : raw).trim();
+        if (!run) throw new Error(`--criterion needs name=command, got "${raw}"`);
+        out.criteria = [...(out.criteria ?? []), { name, run }];
+        break;
+      }
+      case "--note":
+        out.notes = [...(out.notes ?? []), next()];
+        break;
+      case "--capture":
+        out.capture = resolve(next());
         break;
       case "--only":
         out.only = next().split(",").map((t) => t.trim()).filter(Boolean);
@@ -386,7 +490,9 @@ function buildEngine(args: Args, session = false): Engine {
   return new Engine({
     journal,
     baseUrl: args.url,
-    apiKey: args.key,
+    // Resolved against the endpoint this run is pointed at, so a stored key
+    // is found whatever `config.json` happens to say.
+    apiKey: keyForUrl(args.url, args.key),
     model: args.model,
     provider: args.provider ?? providerName(args.url),
     priceInPerMtok: args.priceIn,
@@ -397,8 +503,15 @@ function buildEngine(args: Args, session = false): Engine {
     bar,
     archive: new Archive(args.cwd),
     receipts: new Receipts(args.cwd),
+    integrity: new Integrity(args.cwd),
     maxProofAttempts: args.attempts,
+    turnDeadlineMs: args.forMs,
+    readOnly: args.readOnly,
+    // Off unless asked for, on both counts: committing and reverting are
+    // things a person expects to be in charge of.
+    git: { commitOnPass: args.commit === true, restoreOnFail: args.revert === true },
     autoShedAtTokens: args.autoShed,
+    captureDir: args.capture ?? process.env.MOLT_CAPTURE_DIR,
     stream: args.stream,
     // --yes predates autonomy and means the same thing as its top level.
     autonomy: args.yes ? "high" : args.autonomy,
@@ -415,7 +528,7 @@ function buildEngine(args: Args, session = false): Engine {
  */
 async function priceEngine(engine: Engine, args: Args): Promise<void> {
   if (!needsPriceLookup(args.model, engine.pricing(), storedEndpoint())) return;
-  const p = await fetchPricing(args.url, args.model, args.key);
+  const p = await fetchPricing(args.url, args.model, keyForUrl(args.url, args.key));
   if (!p) {
     // Nothing published. A price only stands if it was recorded for THIS
     // model; inheriting the last one is how a Claude session gets billed at
@@ -456,7 +569,7 @@ function printBar(result: BarResult, from: "run" | "prove"): void {
   }
   const warned = result.warnings ?? [];
   process.stdout.write(
-    (result.ok ? "\nbar met" : "\nbar NOT met") +
+    (result.cancelled ? "\nbar cancelled — not a verdict on the work" : result.ok ? "\nbar met" : "\nbar NOT met") +
       (warned.length ? ` · ${warned.length} advisory check(s) failed` : "") +
       "\n",
   );
@@ -483,6 +596,107 @@ function printBar(result: BarResult, from: "run" | "prove"): void {
   }
 }
 
+/**
+ * How big a map to build, when nobody said.
+ *
+ * Measured, not assumed, and the measurement pointed both ways. Against
+ * grok-4.6 over three paired runs the map was cheaper every time — 23% less
+ * spend, 23% fewer tool calls, first edit 1.7 steps sooner. Against two local
+ * models it lost both pairs, and the mechanism was visible: handed a list of
+ * 41 files, a 20B made 25 greps and never edited anything, while the same
+ * model without a map made 16 greps and 4 edits. A strong model reads a map
+ * and acts; a weak one reads it and goes shopping.
+ *
+ * So the default follows the signal molt already trusts for the spending
+ * ceiling: self-hosted means a model you are running yourself, which today
+ * means a small one. `--map <n>` turns it on anyway, and is the right thing to
+ * reach for the moment local models get better at this.
+ */
+export function defaultMapTokens(url: string): number {
+  return isSelfHosted(url) ? 0 : DEFAULT_MAP_TOKENS;
+}
+
+/**
+ * Give the engine its map of the repository before the first request.
+ *
+ * Built out here rather than in the engine because it walks the disk, and a
+ * constructor that reads a thousand files is a constructor that hangs a
+ * window. Failure is deliberately silent: a map is a hint, and no session
+ * should fail to start because a hint could not be assembled.
+ */
+async function primeRepoMap(engine: Engine, args: Args): Promise<void> {
+  const budget = args.mapTokens ?? defaultMapTokens(args.url);
+  if (budget <= 0) return;
+  try {
+    const map = await buildRepoMap(args.cwd, { budgetTokens: budget });
+    if (map.text) engine.setRepoMap(map.text);
+  } catch {
+    /* a hint that could not be built is not a reason to refuse to start */
+  }
+}
+
+/**
+ * `molt attempts` — one row per completion attempt, oldest first.
+ *
+ * `autoresearch` keeps a `results.tsv` and reads it as the record of whether
+ * the loop is getting anywhere. molt has the same data spread across prose
+ * receipts and a JSON index, which is worse for exactly the question the TSV
+ * answers: is this converging, and what is it costing? Tab-separated because
+ * that is what `sort`, `awk` and a spreadsheet all take without argument.
+ */
+function cmdAttempts(args: Args): number {
+  const rows = new Receipts(args.cwd).records();
+  if (!rows.length) {
+    process.stdout.write("no attempts yet — .molt/receipts is empty\n");
+    return 0;
+  }
+  const head = ["seq", "iso", "verdict", "attempt", "model", "tokens", "usd", "bar_ms", "failed", "file"];
+  const out = [head.join("\t")];
+  for (const r of rows) {
+    out.push(
+      [
+        r.seq,
+        r.iso,
+        r.verdict,
+        r.attempt,
+        r.model,
+        r.sessionTokens,
+        r.costUsd === undefined ? "" : r.costUsd.toFixed(4),
+        r.barMs,
+        r.failed.join(",") || "-",
+        r.file,
+      ].join("\t"),
+    );
+  }
+  process.stdout.write(out.join("\n") + "\n");
+  const accepted = rows.filter((r) => r.verdict === "accepted").length;
+  const spent = rows.reduce((sum, r) => sum + (r.costUsd ?? 0), 0);
+  process.stderr.write(
+    `\n${rows.length} attempt(s) · ${accepted} accepted · ` +
+      `${rows.length - accepted} not · $${spent.toFixed(2)} across all of them\n`,
+  );
+  return 0;
+}
+
+/**
+ * The task's own criteria, from the command line, in the shape the engine
+ * seals. Through the same sanitizer the window uses, so the two surfaces
+ * cannot disagree about what a criterion may be.
+ *
+ * Until this existed the headless CLI had no way to state what "done" meant
+ * for a task: `molt run` could be given rules only through the prompt, which
+ * is tier 3 — advisory — and the project's own commandments say anything
+ * checkable must never live only there. One real run "fixed" a coverage
+ * defect for $0.039, earned an accepted receipt, and was wrong in the unit it
+ * mapped; the check that would have refused it is one line of `--criterion`.
+ */
+export function criteriaFromArgs(args: Pick<Args, "criteria" | "notes">): {
+  taskChecks: ReturnType<typeof taskChecksFrom>["taskChecks"];
+  taskNotes: string[];
+} {
+  return taskChecksFrom({ checks: args.criteria ?? [], notes: args.notes ?? [] });
+}
+
 async function cmdRun(args: Args, ask = false): Promise<number> {
   if (!args.task) {
     process.stderr.write(
@@ -502,6 +716,7 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   }
   const engine = buildEngine(args, true);
   if (args.budget) engine.setBudget(args.budget);
+  await primeRepoMap(engine, args);
   await priceEngine(engine, args);
 
   let failed = false;
@@ -640,7 +855,8 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
     return false;
   };
 
-  for await (const ev of engine.run(args.task, confirm, { ask })) {
+  const { taskChecks, taskNotes } = criteriaFromArgs(args);
+  for await (const ev of engine.run(args.task, confirm, { ask, taskChecks, taskNotes })) {
     emit(ev);
     if (ev.kind === "proof_exhausted" || ev.kind === "error") failed = true;
     if (ev.kind === "assistant_text") sawAnswer = true;
@@ -659,7 +875,11 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         ` · ${b.requestTotalEst} of context` +
         ` · ${b.sessionCompletionTokens} out` +
         (b.costUsd === undefined
-          ? " · no price for this model"
+          ? // "no price" is true of a subscription run but reads as a gap in
+            // molt's knowledge. It is not one: nothing was charged.
+            isClaudeCode(engine.cfg.baseUrl)
+            ? " · your Claude plan, not metered"
+            : " · no price for this model"
           : ` · ${b.costEstimated ? "~" : ""}${fmtCost(b.costUsd)}`) +
         "\n",
     );
@@ -733,10 +953,11 @@ function cmdReceipts(args: Args): number {
     process.stdout.write(
       `${report.marked} marked missing (file gone; row kept as evidence)\n` +
         `${report.kept} left alone (file exists)\n` +
-        `${report.alreadyMissing} already marked missing\n`,
+        `${report.alreadyMissing} already marked missing\n` +
+        `${report.backfilled} given the change count their receipt body records\n`,
     );
     process.stdout.write(
-      report.marked === 0
+      report.marked === 0 && report.backfilled === 0
         ? "\nNothing changed. Safe to run again.\n"
         : "\nGhost rows are marked, not deleted — the record of a receipt is itself evidence.\n" +
             "Run again is a no-op. Repair does not rewrite receipt files or renumber anything.\n",
@@ -888,8 +1109,21 @@ function cmdStats(args: Args): number {
       `  refused               ${s.refused}\n` +
       `  exhausted             ${s.exhausted}\n\n` +
       `false-claim rate        ${rate}\n` +
+      `verified changes        ${s.verifiedChanges}` +
+      (s.answered || s.unchanged
+        ? `  (not counted: ${[
+            s.answered ? `${s.answered} accepted answer(s) to questions` : "",
+            s.unchanged ? `${s.unchanged} accepted with no file changed` : "",
+          ]
+            .filter(Boolean)
+            .join(", ")})\n`
+        : "\n") +
       `tokens per verified change  ${s.tokensPerVerifiedChange ?? "—"}\n` +
-      `cost per verified change    ${s.usdPerVerifiedChange === undefined ? "—" : `$${s.usdPerVerifiedChange.toFixed(4)}`}\n\n`,
+      `cost per verified change    ${
+        s.usdPerVerifiedChange === undefined
+          ? "—"
+          : `${s.costEstimated ? "~" : ""}$${s.usdPerVerifiedChange.toFixed(4)}  (priced sessions only)`
+      }\n\n`,
   );
   for (const [model, m] of Object.entries(s.byModel)) {
     process.stdout.write(`  ${model}: ${m.accepted} accepted / ${m.attempts} attempts\n`);
@@ -963,23 +1197,80 @@ function cmdVerify(args: Args): number {
     return 0;
   }
   let bad = 0;
+  let empty = 0;
   for (const f of files) {
     const path = join(args.cwd, ".molt", "log", f);
     const r = Journal.verify(path);
+    // A log with nothing in it is not a log that verified. "ok  0 entries"
+    // was printed for a zero-byte file and counted among the logs verified —
+    // the same word for a chain that held and a chain that was never there.
+    if (r.ok && r.entries === 0) {
+      empty++;
+      process.stdout.write(`none  ${f}  0 entries — nothing to verify\n`);
+      continue;
+    }
     process.stdout.write(
       `${r.ok ? "ok  " : "FAIL"}  ${f}  ${r.entries} entries${r.ok ? "" : `\n      ${r.reason}`}\n`,
     );
     if (!r.ok) bad++;
   }
+  const verified = files.length - empty - bad;
   process.stdout.write(
     bad === 0
-      ? `\n${files.length} log(s) verified. Each entry hashes its predecessor, so any\nalteration or deletion breaks the chain from that point on.\n`
+      ? `\n${verified} log(s) verified${empty ? ` · ${empty} empty log(s) hold nothing to verify` : ""}. Each entry hashes its predecessor, so any\nalteration or deletion breaks the chain from that point on.\n`
       : `\n${bad} log(s) failed verification.\n`,
   );
+
+  // The cross-link: journals, receipts and exuviae are only as trustworthy as
+  // the binding that connects them. Verify the project-level integrity chain
+  // too, and report the root of trust that can be shipped elsewhere.
+  const i = Integrity.verify(args.cwd);
+  const root = Integrity.exportRoot(args.cwd);
+  if (i.drift.length) process.stdout.write(`\n${driftLines(i.drift)}\n`);
+
+  if (!i.established) {
+    // Nothing has been bound. Printing "ok" would count a check that read no
+    // records as one that passed, and printing the genesis hash as a root of
+    // trust would hand over a constant that is identical in every project and
+    // matches whatever these files are changed to later.
+    process.stdout.write(
+      `integrity chain    none — no records, so nothing is bound yet\n` +
+        (i.unbound.length
+          ? `                   ${i.unbound.length} receipt(s)/exuvia(e) here predate the ledger\n`
+          : "") +
+        `                   a root of trust appears once a session binds its first receipt\n`,
+    );
+  } else {
+    const integrityStatus = i.ok ? `ok  ${i.records} record(s)` : `BROKEN ${i.records} record(s)${i.reason ? `\n      ${i.reason}` : ""}`;
+    process.stdout.write(`integrity chain    ${integrityStatus}\n`);
+    // What the chain does not reach is part of its verdict. Silence here
+    // would let "ok" be read as "all of this evidence is verified".
+    if (i.unbound.length) {
+      process.stdout.write(
+        `                   ${i.unbound.length} artifact(s) on disk are not bound by it\n`,
+      );
+    }
+    if (i.ok && !bad) {
+      process.stdout.write(`\nroot of trust: ${root.root}\n`);
+    }
+  }
+
   process.stdout.write(
     "\nThis is tamper EVIDENCE, not tamper prevention: anyone with write access can\nrewrite a log and re-chain it. What it rules out is a silent edit.\n",
   );
-  return bad === 0 ? 0 : 1;
+  return bad === 0 && i.ok ? 0 : 1;
+}
+
+function driftLines(drift: { kind: string; file: string; bound: string }[]): string {
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const d of drift) {
+    const key = `${d.kind}:${d.file}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    lines.push(`      ${d.kind} ${d.file} no longer matches its bound hash (${d.bound})`);
+  }
+  return lines.length ? lines.join("\n") : "";
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
@@ -1025,6 +1316,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return cmdLog(args);
     case "verify":
       return cmdVerify(args);
+    case "attempts":
+      return cmdAttempts(args);
     case "":
       break;
     default:
@@ -1039,6 +1332,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
 
   const engine = buildEngine(args);
   if (args.budget) engine.setBudget(args.budget);
+  // Before the window opens, so the first request already knows what is here.
+  await primeRepoMap(engine, args);
 
   // Ink and React are loaded only here. Importing them at module top made
   // `molt prove` pay ~450ms of startup for a UI it never renders, which

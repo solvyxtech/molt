@@ -7,6 +7,7 @@ export {
   barFingerprint,
   barPath,
   claimedWrites,
+  claimedCreated,
   formatBarFailure,
   hasBar,
   loadBar,
@@ -16,7 +17,44 @@ export {
   writeDefaultBar,
   type BarContext,
 } from "./bar.js";
-export { Engine, SYSTEM_PROMPT, systemPromptFor, MAX_PROOF_ATTEMPTS, type EngineConfig } from "./engine.js";
+export {
+  Engine,
+  SYSTEM_PROMPT,
+  systemPromptFor,
+  readOnlyRefusal,
+  MAX_PROOF_ATTEMPTS,
+  type EngineConfig,
+  type GitPolicy,
+} from "./engine.js";
+export { Integrity, type IntegrityEvent, type IntegrityRecord, INTEGRITY_GENESIS } from "./integrity.js";
+export {
+  commitMessage,
+  commitPaths,
+  isRepo,
+  lastCommit,
+  revertPlan,
+  undoLast,
+  MOLT_TRAILER,
+  type RevertPlan,
+} from "./git.js";
+export {
+  buildRepoMap,
+  rankFiles,
+  renderMap,
+  symbolsIn,
+  DEFAULT_MAP_TOKENS,
+  type RepoMap,
+} from "./repomap.js";
+export {
+  cmdCommit,
+  cmdFor,
+  cmdMap,
+  cmdRead,
+  cmdRevert,
+  cmdUndo,
+  parseDuration,
+  parseToggle,
+} from "./session-commands.js";
 export { Receipts, type Receipt } from "./receipts.js";
 export {
   Transcript,

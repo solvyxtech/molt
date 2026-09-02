@@ -21,10 +21,14 @@ checks:
       ["src/**", "test/**", "electron/**", "ui/**", "tsconfig*.json", "package.json"]
     tags: [fast]
 
+  # electron/** and ui/** are in the watch because tsconfig.test.json compiles
+  # them and desktop-shell.test.ts asserts on them: a behaviour change to
+  # electron/criteria.ts that broke that suite was reused as a pass, because
+  # nothing the check declared it read had moved. Same hole `types` had.
   - name: tests
     run: npm test
     timeout: 300
-    watch: ["src/**", "test/**", "tsconfig*.json", "package.json"]
+    watch: ["src/**", "test/**", "electron/**", "ui/**", "test-run.mjs", "tsconfig*.json", "package.json"]
     tags: [slow]
 
   # --- the window ---
@@ -38,7 +42,7 @@ checks:
   # fine because it had not looked at it.
   #
   #   app-boots   launches the real window and asks the page whether it wired
-  #               itself up: bridge present, elements present, six tabs.
+  #               itself up: bridge present, elements present, five tabs.
   #   app-drives  runs a real turn against a stub provider and reads the DOM
   #               back. This is the only check that crosses the IPC boundary,
   #               which is where a desktop port actually breaks.
@@ -80,6 +84,17 @@ checks:
     builtin: record-intact
     tags: [session]
 
+  # Every file that changed on disk this turn was written through a tool.
+  # The ledger builtins above read what the tools wrote; this reads what the
+  # disk did. A test file rewritten by `node fix.cjs` or `sed -i` had no ledger
+  # entry, so spec-intact said "no test file was changed" and the turn was
+  # accepted — at `--yes`, neither command asks. A change nothing recorded is
+  # a change nothing can judge, so it is refused, and the model is told to
+  # make it through the tools or to stop and say which command was meant to.
+  - name: work-accounted
+    builtin: tree-accounted
+    tags: [session]
+
   # A file changed, and the change was not only comments — neither of those can
   # say whether the new code does anything. A turn once added a constant
   # referenced nowhere and a guard whose branch no test trips, and passed six
@@ -88,6 +103,15 @@ checks:
   # Reads the lcov the `tests` check writes. A missing report fails rather than
   # passes: a check that verifies nothing when its input is absent is worse
   # than no check, because it is counted as one.
+  # A turn may add tests freely. Deleting an assertion is a change to what this
+  # project promises, and a model that does it while fixing a bug has usually
+  # rewritten the specification to agree with its own change. Observed: asked
+  # to prove a defect with a failing test, a model inverted the assertion that
+  # pinned the existing behaviour instead. `removals: allow` is the escape.
+  - name: spec-intact
+    builtin: spec-intact
+    tags: [session]
+
   - name: work-proven
     builtin: diff-covered
     lcov: coverage/lcov.info

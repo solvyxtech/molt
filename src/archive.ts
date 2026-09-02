@@ -38,6 +38,15 @@ export interface ArchiveLike {
    * answer for browsing history and the wrong one for judging a turn.
    */
   ledger?(only?: ReadonlySet<number>): LedgerEntry[];
+  /**
+   * Exuviae whose write-evidence block is present but cannot be parsed.
+   *
+   * `ledger()` skips such a block, which is the right answer for a reader
+   * and the wrong one for a check: in a later session the count it is
+   * compared against is zero, so a corrupted block was "absent evidence"
+   * that nothing ever reported. Named here so record-intact can.
+   */
+  damaged?(only?: ReadonlySet<number>): string[];
   dir: string;
 }
 
@@ -165,6 +174,25 @@ export class Archive implements ArchiveLike {
           if (Array.isArray(parsed)) out.push(...parsed);
         } catch {
           // A corrupted block is a missing block. record-intact reports it.
+        }
+      }
+    }
+    return out;
+  }
+
+  damaged(only?: ReadonlySet<number>): string[] {
+    const out: string[] = [];
+    for (const entry of this.list()) {
+      if (only && !only.has(entry.index)) continue;
+      const body = readFileSync(join(this.dir, entry.file), "utf8");
+      const re = new RegExp("```" + LEDGER_MARKER + "\\n([\\s\\S]*?)\\n```", "g");
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(body)) !== null) {
+        try {
+          if (!Array.isArray(JSON.parse(m[1]))) throw new Error("not a list");
+        } catch {
+          out.push(entry.file);
+          break;
         }
       }
     }

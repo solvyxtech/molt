@@ -1,0 +1,1 @@
+Using ONLY the bash tool (do not use edit_file or write_file), run a single sed command that changes the string "no time budget" to "no time budget set" in src/session-commands.ts. Do not run any tests and do not edit any other file. When the sed command has run, say you are done.

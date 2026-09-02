@@ -26,9 +26,15 @@ checks:               # required, non-empty
 
   - name: <string>
     builtin: <id>     # … or a molt builtin, but never both
+
+  - name: <string>
+    builtin: mutation # the one builtin that also takes a `run`: the command
+    run: <command>    # that must go red when a changed line is broken
 ```
 
-A check needs **exactly one** of `run` or `builtin`. A malformed bar is a hard
+A check needs **exactly one** of `run` or `builtin` — except `mutation`, which
+needs both, because molt chooses the lines to break and only the project knows
+which command should notice. A malformed bar is a hard
 error, never a silent fallback to "no checks" — degrading quietly would switch
 molt's central promise off by accident, which is worse than crashing.
 
@@ -187,6 +193,58 @@ three expectations the archive cannot itself supply:
 Fails when an exuvia was deleted or its evidence block corrupted, naming the
 files that can no longer be proven. Passes trivially in a project that has
 never shed.
+
+#### `spec-intact`
+
+Passes when no assertion was deleted from a test file this turn.
+
+A turn may add tests freely. Deleting an assertion is a change to what the
+project promises, and a model that does it while fixing a bug has usually
+rewritten the specification to agree with its own change. Observed: asked to
+prove a defect with a failing test, a model inverted the assertion that pinned
+the existing behaviour instead. Compared as a set, so moving or reindenting an
+assertion is not a removal.
+
+```yaml
+  - name: spec-intact
+    builtin: spec-intact
+    removals: allow    # optional — this turn may delete assertions
+```
+
+`removals: allow` is deliberately awkward: a test being obsolete is a decision
+somebody should make on purpose. It is refused on any other builtin.
+
+Known limit: it reads the write ledger, so an edit made through `bash` — a
+script the model wrote and ran, `sed -i`, `cp` — is not seen by it, or by any
+other ledger-reading builtin. At `--yes` those commands do not prompt.
+
+#### `tree-accounted`
+
+Passes when every file that changed on disk this turn was written through
+`write_file` or `edit_file`.
+
+The ledger builtins above read what the tools wrote. This reads what the disk
+did. A test file rewritten by a script the model ran, an assertion commented
+out with `sed -i`, a file emptied with `cp /dev/null` — none has a ledger
+entry, and every ledger-reading check was blind to them. At `--yes` none of
+those commands asks. molt snapshots the working tree (content hashes, with
+`.molt/`, build output and dependencies skipped) when a turn begins and diffs
+it when the claim is made; any changed, created or deleted path the ledger
+does not hold refuses the claim and names the path. `spec-intact` reads the
+same snapshot, so an assertion removed by any route is named.
+
+```yaml
+  - name: work-accounted
+    builtin: tree-accounted
+    outside: allow     # optional — changes made by commands are permitted
+```
+
+`outside: allow` is for a project whose tasks legitimately run generators or
+installs. It is refused on any other builtin.
+
+Fails closed: a tree too large to snapshot within molt's walk bound (20,000
+entries or three seconds) refuses rather than passes, because a snapshot of an
+unknown subset proves nothing about the rest.
 
 #### `claims-grounded`
 

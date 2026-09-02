@@ -216,6 +216,13 @@ export function proposeBar(cwd: string): { yaml: string; detected: Detected[] } 
     "    builtin: claims-grounded",
     "    tags: [session]",
     "",
+    "  # Every file that changed on disk this turn was written through a tool.",
+    "  # A change made by a script or sed has no ledger entry and cannot be",
+    "  # judged; `outside: allow` if this project's tasks run generators.",
+    "  - name: work-accounted",
+    "    builtin: tree-accounted",
+    "    tags: [session]",
+    "",
   ];
 
   return { yaml: [...head, ...body, ...tail].join("\n"), detected };
