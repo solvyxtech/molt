@@ -121,7 +121,8 @@ Not "first" — different, and specifically:
 
 5. **Trustworthiness is measured, not asserted.** `molt stats` reports
    false-claim rate and tokens per verified change from the receipt index,
-   and `rnd/grade.mjs` runs the same scenarios against any harness.
+   and the grader in the terminal repository runs the same scenarios against
+   any harness.
 
 That combination is what molt is. Each ingredient exists somewhere; the
 bundle is a product position, not a moat. The durable part is (3), because
