@@ -46,7 +46,9 @@ reading, and it is a fair one if the denominator is buried.
 
 ## Grading harnesses
 
-`rnd/grade.mjs` runs scenarios with hidden graders against any agent CLI.
+`rnd/grade.mjs` runs scenarios with hidden graders against any agent CLI. It
+lives in the terminal repository (`molt`), not in this one — nothing under
+`rnd/` ships with the desktop.
 
 ```bash
 node rnd/grade.mjs --list

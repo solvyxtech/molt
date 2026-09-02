@@ -136,3 +136,41 @@ describe("numeric flags", () => {
     assert.equal(a.priceIn, 2.5);
   });
 });
+
+describe("closing the loop, from the command line", () => {
+  it("reads a turn's wall-clock ceiling", () => {
+    assert.equal(parseArgs(["run", "x", "--for", "5m"]).forMs, 300_000);
+    assert.equal(parseArgs(["run", "x", "--for", "90s"]).forMs, 90_000);
+    assert.equal(parseArgs(["run", "x"]).forMs, undefined);
+    // A flag that silently took junk would produce a turn that stops for a
+    // reason nobody set.
+    assert.throws(() => parseArgs(["run", "x", "--for", "soon"]), /--for needs a duration/);
+  });
+
+  it("keeps both git policies off unless asked", () => {
+    const off = parseArgs(["run", "x"]);
+    assert.equal(off.commit, undefined);
+    assert.equal(off.revert, undefined);
+    assert.equal(parseArgs(["run", "x", "--commit"]).commit, true);
+    assert.equal(parseArgs(["run", "x", "--revert"]).revert, true);
+  });
+
+  it("sizes or removes the repository map", () => {
+    assert.equal(parseArgs(["run", "x", "--map", "2000"]).mapTokens, 2000);
+    assert.equal(parseArgs(["run", "x", "--no-map"]).mapTokens, 0);
+    assert.equal(parseArgs(["run", "x"]).mapTokens, undefined);
+  });
+
+  it("collects read-only pins however they are spelled", () => {
+    assert.deepEqual(parseArgs(["run", "x", "--read", "spec.md"]).readOnly, ["spec.md"]);
+    assert.deepEqual(parseArgs(["run", "x", "--read", "a.md,b.md"]).readOnly, ["a.md", "b.md"]);
+    assert.deepEqual(
+      parseArgs(["run", "x", "--read", "a.md", "--read", "b.md"]).readOnly,
+      ["a.md", "b.md"],
+    );
+  });
+
+  it("takes attempts as a command", () => {
+    assert.equal(parseArgs(["attempts"]).cmd, "attempts");
+  });
+});

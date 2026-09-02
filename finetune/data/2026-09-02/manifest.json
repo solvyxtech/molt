@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "generatedAt": "2026-09-02T18:10:17.884Z",
+  "roots": [
+    "/Users/control/Documents/molt-desktop",
+    "/private/tmp/claude-503/-Users-control/3246bbe8-ab78-4502-9525-67e79e246409/scratchpad/fixed",
+    "/private/tmp/claude-503/-Users-control/3246bbe8-ab78-4502-9525-67e79e246409/scratchpad/prefix",
+    "/private/tmp/claude-503/-Users-control/3246bbe8-ab78-4502-9525-67e79e246409/scratchpad/fixed2",
+    "/Users/control/Documents/molt",
+    "/private/tmp/claude-503/-Users-control/3246bbe8-ab78-4502-9525-67e79e246409/scratchpad/gen"
+  ],
+  "receiptFilesSeen": 246,
+  "uniqueReceipts": 68,
+  "duplicatesDropped": 178,
+  "withJournalTurn": 59,
+  "withCapturedTranscript": 18,
+  "verdicts": {
+    "accepted": 20,
+    "refused": 39,
+    "exhausted": 9
+  },
+  "askTurns": 14,
+  "byModel": {
+    "claude-sonnet-4-6": 3,
+    "grok-4.6": 15,
+    "claude-sonnet-5": 4,
+    "qwen3-coder-30b-a3b": 11,
+    "gpt-oss-20b-mxfp4": 2,
+    "inception/mercury-2.5-preview": 33
+  },
+  "failingChecks": {
+    "work-landed": 32,
+    "bar-unmodified": 3,
+    "types": 5,
+    "tests": 10,
+    "app-boots": 3,
+    "app-drives": 5,
+    "work-checked": 4,
+    "work-proven": 7,
+    "spec-intact": 4,
+    "work-accounted": 11
+  },
+  "split": {
+    "train": 61,
+    "valid": 7,
+    "validSessions": [
+      "37053b19",
+      "454cd1a4",
+      "695b091e",
+      "6d1e1127",
+      "bdc146e6",
+      "e0f73ae6"
+    ]
+  },
+  "longestExampleEstTokens": 1863,
+  "target": "refusal-predictor: (task, tool calls, changed files, claim, checks) -> the bar's verdict and failing checks"
+}

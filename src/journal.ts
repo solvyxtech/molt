@@ -33,6 +33,23 @@ export type JournalKind =
   | "autonomy"
   | "bar_run"
   | "bar_skipped"
+  /**
+   * The bar failed identically twice in a row. Recorded separately from
+   * `bar_run` because it is a different fact: the run is the outcome, this is
+   * the signal that the check may be wrong about the work — the thing that
+   * once burned 1.13M tokens.
+   */
+  | "bar_stuck"
+  /**
+   * The turn ran out of wall clock. Its own kind because a turn stopped by
+   * the clock is not a turn that failed: the work may be fine and merely
+   * unfinished, and a reader must be able to tell those apart later.
+   */
+  | "deadline"
+  /** A verified change was committed. Carries the sha and the receipt. */
+  | "git_commit"
+  /** An unverified change was put back. Carries what was restored, removed, kept. */
+  | "git_restore"
   /** A step that mostly repeated itself. Recorded, never fatal. */
   | "repeat_step"
   /** An assistant turn that arrived with no text and no tool call. */
@@ -75,6 +92,16 @@ export type VerifyResult = {
   /** Sequence number of the first entry whose hash does not match. */
   brokenAt?: number;
   reason?: string;
+  /**
+   * Non-empty lines that were not JSON. Present only when there were any.
+   *
+   * `read()` skips them, which is right for a reader and wrong for a verifier:
+   * a log whose every line was overwritten with garbage parsed to zero entries
+   * and verified `ok`. A half-written final line — the crash-mid-append case —
+   * is still tolerated; anything else that cannot be parsed is a chain that
+   * cannot be recomputed, and a chain that cannot be recomputed is not intact.
+   */
+  unparsed?: number;
 };
 
 export class Journal {
@@ -83,6 +110,17 @@ export class Journal {
   readonly sessionId: string;
   private seq = 0;
   private prev = GENESIS;
+
+  /**
+   * The current head of this session's hash chain — the hash of the last
+   * entry written. This is the value another record can hold to PROVE that
+   * this journal was in a particular state at a particular moment, because
+   * any later change to an earlier entry invalidates every subsequent hash
+   * and this head with it.
+   */
+  chainRoot(): string {
+    return this.prev;
+  }
 
   /**
    * Values that must never appear in the log, whatever an entry carries.
@@ -161,7 +199,34 @@ export class Journal {
    * tampered log names the tampering rather than merely failing.
    */
   static verify(file: string): VerifyResult {
-    const entries = Journal.read(file);
+    if (!existsSync(file)) return { ok: true, entries: 0 };
+    const lines = readFileSync(file, "utf8").split("\n").filter((l) => l.trim());
+    const entries: JournalEntry[] = [];
+    let unparsed = 0;
+    let lastUnparsed = false;
+    for (const l of lines) {
+      try {
+        entries.push(JSON.parse(l) as JournalEntry);
+        lastUnparsed = false;
+      } catch {
+        unparsed += 1;
+        lastUnparsed = true;
+      }
+    }
+    // One torn line at the very end is a crash mid-append, not an edit. A torn
+    // line anywhere else, or a file with content and no entries at all, is.
+    const tolerated = unparsed === 1 && lastUnparsed && entries.length > 0;
+    if (unparsed > 0 && !tolerated) {
+      return {
+        ok: false,
+        entries: entries.length,
+        unparsed,
+        reason:
+          entries.length === 0
+            ? `${unparsed} line(s) and none of them parse — the log was overwritten or corrupted`
+            : `${unparsed} line(s) could not be parsed — the chain cannot be recomputed across them`,
+      };
+    }
     if (entries.length === 0) return { ok: true, entries: 0 };
 
     let prev = GENESIS;
@@ -280,6 +345,18 @@ export class Journal {
           break;
         case "bar_run":
           out.push(`${t}  bar ${d.ok ? "PASS" : "FAIL"} ${d.passed}/${d.total}${d.failed ? ` · failed: ${d.failed}` : ""} · ${d.ms}ms`);
+          break;
+        case "deadline":
+          out.push(`${t}  deadline · ${Math.round(Number(d.spentMs ?? 0) / 1000)}s of ${Math.round(Number(d.limitMs ?? 0) / 1000)}s — stopped on the clock, not on a failure`);
+          break;
+        case "git_commit":
+          out.push(`${t}  commit ${String(d.sha ?? "").slice(0, 8)} · ${d.files} file(s) · receipt ${d.receipt || "(none)"}`);
+          break;
+        case "git_restore":
+          out.push(`${t}  restore · ${d.restored} put back · ${d.removed} removed · ${d.kept} left alone`);
+          break;
+        case "bar_stuck":
+          out.push(`${t}  bar STUCK · ${d.failed || ""} failed identically twice — the check may be wrong about the work`);
           break;
         case "shed":
           out.push(`${t}  shed ${d.dropped} msgs · ~${d.before}→~${d.after} tok · ${d.archive}`);

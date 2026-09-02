@@ -381,6 +381,28 @@ describe("SseParser stress", () => {
     assert.equal(out.length, 1);
     assert.equal(out[0], big);
   });
+
+  it("handles bare-CR line endings", () => {
+    // The SSE spec terminates lines with `\r`, `\n`, or `\r\n`. A provider
+    // that sends bare CR must not have its events dropped.
+    const parser = new SseParser();
+    const out = parser.push("data: hello\r\rdata: world\r\r");
+    assert.deepEqual(out, ["hello", "world"]);
+  });
+
+  it("handles \\n\\r as an event separator", () => {
+    const parser = new SseParser();
+    const out = parser.push("data: a\n\rdata: b\n\r");
+    assert.deepEqual(out, ["a", "b"]);
+  });
+
+  it("feeds a bare-CR event byte-by-byte", () => {
+    const parser = new SseParser();
+    const full = "data: hello\r\rdata: world\r\r";
+    const collected: string[] = [];
+    for (const ch of full) collected.push(...parser.push(ch));
+    assert.deepEqual(collected, ["hello", "world"]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -513,6 +535,33 @@ describe("StreamAccumulator stress", () => {
     const result = acc.finish();
     assert.equal(result.message.content, null);
     assert.equal(result.message.tool_calls, undefined);
+  });
+
+  it("sets the tool name once when a provider re-sends it", () => {
+    // Some aggregation/adaptor layers re-emit the full tool-call shape on
+    // later deltas of the same call. The name must be set once, not appended —
+    // concatenating turns `read_file` into `read_fileread_file`.
+    const acc = new StreamAccumulator();
+    acc.push({
+      choices: [{ delta: { tool_calls: [{ index: 0, function: { name: "read_file", arguments: '{"path":"a.ts"}' } }] } }],
+    });
+    acc.push({
+      choices: [{ delta: { tool_calls: [{ index: 0, function: { name: "read_file", arguments: "" } }] } }],
+    });
+    acc.push({
+      choices: [{ delta: { tool_calls: [{ index: 0, function: { name: "read_file", arguments: "" } }] } }],
+    });
+    const result = acc.finish();
+    assert.equal(result.message.tool_calls![0].function.name, "read_file");
+  });
+
+  it("announces a re-sent tool name only once", () => {
+    const acc = new StreamAccumulator();
+    acc.push({ choices: [{ delta: { tool_calls: [{ index: 0, function: { name: "write_file", arguments: "" } }] } }] });
+    acc.push({ choices: [{ delta: { tool_calls: [{ index: 0, function: { name: "write_file", arguments: "{}" } }] } }] });
+    const drained = acc.drainPending();
+    assert.deepEqual(drained, ["write_file"], "the name is reported once even across re-sends");
+    assert.deepEqual(acc.drainPending(), []);
   });
 });
 
@@ -722,6 +771,21 @@ describe("isCatastrophic stress", () => {
 
   it("detects (a+)+ with whitespace", () => {
     assert.ok(isCatastrophic("(a+)+ "));
+  });
+
+  it("detects a quantified group nested in a quantified group", () => {
+    // `*` sits after the *inner* group's close, so the plain multi-test above
+    // misses it. A missed one was a real ≤10 s per-line hang on a single line.
+    assert.ok(isCatastrophic("((a)*)*"));
+    assert.ok(isCatastrophic("((ab)*)*"));
+    assert.ok(isCatastrophic("((ab)+)*"));
+    assert.ok(isCatastrophic("(([a-z])+)*"));
+  });
+
+  it("does not flag a redundant parenthesis without an outer quantifier", () => {
+    // `((a+))` is just `(a+)` wrapped once more — the outer group has no
+    // quantifier, so it is not catastrophic.
+    assert.ok(!isCatastrophic("((a+))"));
   });
 });
 

@@ -16,6 +16,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { readFileSync } from "node:fs";
 import { parseLcov, coverageFor, unprovenIn, normalise } from "../src/coverage.js";
 
 const LCOV = `TN:
@@ -111,6 +112,22 @@ describe("what counts as unproven", () => {
     // instrumented", not "not run", and failing on it would refuse honest work.
     const cov = parseLcov(LCOV);
     assert.equal(unprovenIn(cov, "src/files.js", [99]), null);
+  });
+
+  it("is handed a report in source coordinates, or it can match nothing", () => {
+    // The suite compiles to dist-test/ and the ledger names src/*.ts. Without
+    // source maps the report says `dist-test/src/bar.js` with compiled line
+    // numbers, `coverageFor` matches by path suffix, and `bar.js` never
+    // matches `bar.ts` — every work-proven row this project ever issued read
+    // "0 changed file(s) executed by the tests" and passed. Both halves are
+    // needed: tsc has to emit the maps and node has to be told to read them.
+    const tsconfig = JSON.parse(readFileSync("tsconfig.test.json", "utf8")) as {
+      compilerOptions?: { sourceMap?: boolean };
+    };
+    assert.equal(tsconfig.compilerOptions?.sourceMap, true, "tsconfig.test.json must emit source maps");
+    const runner = readFileSync("test-run.mjs", "utf8");
+    assert.match(runner, /"--enable-source-maps"/, "test-run.mjs must pass --enable-source-maps");
+    assert.match(runner, /"--experimental-test-coverage"/);
   });
 
   it("says nothing about a file absent from the report", () => {

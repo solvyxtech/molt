@@ -5,6 +5,7 @@
  * terminal interface earns its keep by getting out of the way — showing the
  * work, the receipts, and the refusals, and nothing else.
  */
+import { CLAUDE_CODE_URL, claudeCodeHealth } from "./claude-code.js";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Box, Static, Text, render, useApp, useInput, useStdout } from "ink";
 import type { RenderOptions } from "ink";
@@ -21,6 +22,25 @@ import {
 import { RemappedStdin } from "./keys.js";
 import { StatusLine } from "./status-line.js";
 import { loadBar, writeDefaultBar, BarError } from "./bar.js";
+import { taskChecksFrom } from "./criteria.js";
+import {
+  applyBarAdds,
+  interviewTurn,
+  projectScripts,
+  type InterviewAnswer,
+  type InterviewProposal,
+  type InterviewQuestion,
+} from "./interview.js";
+import {
+  cmdCommit,
+  cmdAttempts,
+  cmdAutoShed,
+  cmdFor,
+  cmdMap,
+  cmdRead,
+  cmdRevert,
+  cmdUndo,
+} from "./session-commands.js";
 import type { Engine } from "./engine.js";
 import {
   PROVIDERS,
@@ -282,6 +302,16 @@ const PREVIEW_ROWS = 8;
 /** How many palette rows to show at once. */
 /** The `/login` row that is not a provider: a server you run yourself. */
 const LOCAL_ROW = "local or self-hosted…";
+/**
+ * The row for a backend that takes no key at all.
+ *
+ * `/login` lists providers you hold a key for, which is exactly why Ollama
+ * needed a row of its own — and Claude Code needs one for the same reason
+ * twice over: it takes no key, and the thing it asks for is a command you run
+ * somewhere else. Someone with a Max plan looking for where to plug it in
+ * looks here.
+ */
+const CLAUDE_CODE_ROW = "claude code (your Pro/Max plan)…";
 
 const PALETTE_ROWS = 6;
 
@@ -406,8 +436,23 @@ export function App({
     | { kind: "login-key"; provider: string }
     | { kind: "login-url" }
     | { kind: "model-select"; rows: PickerRow[]; index: number }
-    | { kind: "autonomy-select"; index: number };
+    | { kind: "autonomy-select"; index: number }
+    | {
+        kind: "interview-ask";
+        task: string;
+        round: number;
+        history: { questions: InterviewQuestion[]; answers: InterviewAnswer[] }[];
+        questions: InterviewQuestion[];
+        qIndex: number;
+        optIndex: number;
+        picks: Record<string, string>;
+      }
+    | { kind: "interview-seal"; task: string; proposal: InterviewProposal };
   const [mode, setMode] = useState<Mode>({ kind: "chat" });
+  /** Sealed at interview, consumed by the next work turn. */
+  const pendingCriteria = useRef<ReturnType<typeof taskChecksFrom> | null>(null);
+  /** Bumped on cancel so a late interview reply cannot reopen the cards. */
+  const interviewSeq = useRef(0);
 
   // What the model is doing right now, and since when. Held separately from
   // `busy` because the turn stays busy across several distinct phases.
@@ -583,6 +628,87 @@ export function App({
         resolver.current = resolve;
       }),
     [],
+  );
+
+  const interviewRound = useCallback(
+    async (
+      task: string,
+      round: number,
+      history: { questions: InterviewQuestion[]; answers: InterviewAnswer[] }[],
+    ) => {
+      if (!engine.model) {
+        add("error", "no model selected — /login to add a provider key, then /model to pick one");
+        setMode({ kind: "chat" });
+        return;
+      }
+      const seq = ++interviewSeq.current;
+      add("info", round === 1 ? "interview — asking before work" : `interview — round ${round}`);
+      setBusy(true);
+      beginActivity("interview");
+      setMode({
+        kind: "interview-ask",
+        task,
+        round,
+        history,
+        questions: [],
+        qIndex: 0,
+        optIndex: 0,
+        picks: {},
+      });
+      try {
+        const bar = loadBar(engine.cwd);
+        const r = await interviewTurn({
+          task,
+          scripts: projectScripts(engine.cwd),
+          barChecks: bar?.checks.map((c) => c.name) ?? [],
+          history,
+          round,
+          baseUrl: engine.baseUrl,
+          apiKey: engine.apiKey,
+          model: engine.model,
+          fetchFn: engine.cfg.fetchFn,
+        });
+        if (seq !== interviewSeq.current) return;
+        if (r.kind === "error") {
+          add("error", r.error);
+          setMode({ kind: "chat" });
+          return;
+        }
+        if (r.kind === "ask") {
+          setMode({
+            kind: "interview-ask",
+            task,
+            round: r.round,
+            history,
+            questions: r.questions,
+            qIndex: 0,
+            optIndex: 0,
+            picks: {},
+          });
+          return;
+        }
+        const n = r.proposal.checks.length;
+        const notes = r.proposal.notes.length;
+        const barAdds = r.proposal.barAdds.length;
+        add(
+          "info",
+          `interview proposed ${n} check(s)` +
+            (notes ? ` · ${notes} note(s)` : "") +
+            (barAdds ? ` · ${barAdds} bar addition(s)` : "") +
+            " — review, then enter to seal",
+        );
+        for (const c of r.proposal.checks) add("info", `  check ${c.name}: ${c.run}`);
+        for (const note of r.proposal.notes) add("info", `  note ${note}`);
+        for (const b of r.proposal.barAdds) add("info", `  bar ${b.name}: ${b.run}`);
+        setMode({ kind: "interview-seal", task, proposal: r.proposal });
+      } finally {
+        if (seq === interviewSeq.current) {
+          setBusy(false);
+          setActivity(null);
+        }
+      }
+    },
+    [add, beginActivity, engine],
   );
 
   // The palette is derived, never stored — it can never disagree with the
@@ -1028,6 +1154,7 @@ export function App({
         // and `/endpoint` was a command nobody would think to type.
         providers: [
           ...keyedProviders().map((name) => ({ name, hasKey: Boolean(stored[name]) })),
+          { name: CLAUDE_CODE_ROW, hasKey: false },
           { name: LOCAL_ROW, hasKey: false },
         ],
         index: 0,
@@ -1224,6 +1351,17 @@ export function App({
           return true;
         }
         case "/clear":
+          // A sealed interview is for the task that was just reviewed.
+          // Leaving it armed would quietly judge the next prompt — after a
+          // reset — against yesterday's checks. The composer is emptied too:
+          // seal left the task sitting there, and Enter after /clear would
+          // fire that work with no criteria at all.
+          pendingCriteria.current = null;
+          interviewSeq.current += 1;
+          setMode({ kind: "chat" });
+          setBusy(false);
+          setActivity(null);
+          setInput("");
           engine.reset();
           setLines([]);
           setFeed([]);
@@ -1309,6 +1447,16 @@ export function App({
             return true;
           }
           void submitRef.current?.(arg, { ask: true });
+          return true;
+        }
+        case "/interview":
+        case "/spec": {
+          const task = arg.trim();
+          if (!task) {
+            add("error", "usage: /interview <task> — ask before work; seal into the bar and criteria");
+            return true;
+          }
+          void interviewRound(task, 1, []);
           return true;
         }
         case "/autonomy":
@@ -1435,12 +1583,13 @@ export function App({
           }
           add(
             "info",
-            `${st.attempts} attempts · ${st.accepted} accepted · ` +
-              `false-claim rate ${(st.falseClaimRate * 100).toFixed(1)}% · ` +
+            `${st.attempts} attempts · ${st.accepted} accepted · ${st.verifiedChanges} verified change(s)` +
+              (st.answered ? ` · ${st.answered} answered question(s), not counted` : "") +
+              ` · false-claim rate ${(st.falseClaimRate * 100).toFixed(1)}% · ` +
               `${st.tokensPerVerifiedChange ?? "—"} tokens per verified change` +
               (st.usdPerVerifiedChange === undefined
                 ? ""
-                : ` · ${fmtCost(st.usdPerVerifiedChange)} per verified change`),
+                : ` · ${st.costEstimated ? "~" : ""}${fmtCost(st.usdPerVerifiedChange)} per verified change (priced sessions)`),
           );
           return true;
         }
@@ -1504,6 +1653,47 @@ export function App({
           }
           return true;
         }
+        // Shared with the window, verbatim — see src/session-commands.ts for
+        // why these six are not written twice like everything above them.
+        case "/commit": {
+          const r = cmdCommit(engine, arg);
+          add(r.kind, r.text);
+          return true;
+        }
+        case "/revert": {
+          const r = cmdRevert(engine, arg);
+          add(r.kind, r.text);
+          return true;
+        }
+        case "/for": {
+          const r = cmdFor(engine, arg);
+          add(r.kind, r.text);
+          return true;
+        }
+        case "/attempts": {
+          const r = cmdAttempts(engine, arg);
+          add(r.kind, r.text);
+          return true;
+        }
+        case "/autoshed": {
+          const r = cmdAutoShed(engine, arg);
+          add(r.kind, r.text);
+          return true;
+        }
+        case "/read": {
+          const r = cmdRead(engine, arg);
+          add(r.kind, r.text);
+          return true;
+        }
+        case "/undo": {
+          // git, off the render thread: the prompt stays live while it runs.
+          void cmdUndo(engine).then((r) => add(r.kind, r.text));
+          return true;
+        }
+        case "/map": {
+          void cmdMap(engine, arg).then((r) => add(r.kind, r.text));
+          return true;
+        }
         case "/prove": {
           // The bar runs off-thread now, so the command hands back immediately
           // and the result arrives when it arrives — the prompt stays live
@@ -1526,10 +1716,12 @@ export function App({
       applyAutonomy,
       engine,
       exit,
+      interviewRound,
       openAutonomy,
       persistEndpoint,
       refreshPricing,
       renderBar,
+      setInput,
       startLogin,
       startModelPicker,
       themeName,
@@ -1561,9 +1753,13 @@ export function App({
       add("user", `${asking ? "? " : ""}${text}`);
       setBusy(true);
       beginActivity("thinking");
+      const sealed = pendingCriteria.current;
+      pendingCriteria.current = null;
       try {
         for await (const ev of engine.run(text, confirm, {
           ask: asking,
+          taskChecks: sealed?.taskChecks,
+          taskNotes: sealed?.taskNotes,
           // Stopping dead at the ceiling is the most expensive outcome there
           // is: the money is already spent, and ending there turns it into
           // nothing. Only offered here, where a person is watching — a
@@ -1641,6 +1837,113 @@ export function App({
       } else if (c === "n") {
         resolver.current?.(false);
         setPending(null);
+      }
+      return;
+    }
+
+    // --- interview: cards with options, then a seal ---
+    if (mode.kind === "interview-ask") {
+      if (key.escape || (key.ctrl && char === "c")) {
+        interviewSeq.current += 1;
+        setBusy(false);
+        setActivity(null);
+        setMode({ kind: "chat" });
+        add("info", "interview cancelled — nothing sealed");
+        return;
+      }
+      if (busy) return;
+      const q = mode.questions[mode.qIndex];
+      const nOpts = (q?.options.length ?? 0) + (q?.allowOther ? 1 : 0);
+      if (key.upArrow || (key.shift && key.tab)) {
+        setMode({ ...mode, optIndex: wrapIndex(mode.optIndex - 1, Math.max(1, nOpts)) });
+        return;
+      }
+      if (key.downArrow || key.tab) {
+        setMode({ ...mode, optIndex: wrapIndex(mode.optIndex + 1, Math.max(1, nOpts)) });
+        return;
+      }
+      const typingOther = Boolean(q?.allowOther && mode.optIndex === q.options.length);
+      if (!typingOther && char.toLowerCase() === "s") {
+        void interviewRound(mode.task, mode.round + 1, [
+          ...mode.history,
+          {
+            questions: mode.questions,
+            answers: mode.questions
+              .map((qq) => ({ id: qq.id, choice: (mode.picks[qq.id] ?? "").trim() }))
+              .filter((a) => a.choice.length > 0),
+          },
+        ]);
+        return;
+      }
+      if (key.return && q) {
+        const other = q.allowOther && mode.optIndex === q.options.length;
+        const choice = other ? input.trim() : q.options[mode.optIndex] ?? "";
+        if (!choice) return;
+        const picks = { ...mode.picks, [q.id]: choice };
+        if (other) setInput("");
+        if (mode.qIndex + 1 < mode.questions.length) {
+          setMode({ ...mode, picks, qIndex: mode.qIndex + 1, optIndex: 0 });
+          return;
+        }
+        void interviewRound(mode.task, mode.round + 1, [
+          ...mode.history,
+          {
+            questions: mode.questions,
+            answers: mode.questions
+              .map((qq) => ({ id: qq.id, choice: (picks[qq.id] ?? "").trim() }))
+              .filter((a) => a.choice.length > 0),
+          },
+        ]);
+        return;
+      }
+      if (q?.allowOther && mode.optIndex === q.options.length) {
+        if (key.backspace) {
+          edit(backspace);
+          return;
+        }
+        if (char && !key.ctrl && !key.meta) {
+          edit((l) => insert(l, char));
+          return;
+        }
+      }
+      return;
+    }
+
+    if (mode.kind === "interview-seal") {
+      if (key.escape || (key.ctrl && char === "c")) {
+        interviewSeq.current += 1;
+        pendingCriteria.current = null;
+        setBusy(false);
+        setActivity(null);
+        setMode({ kind: "chat" });
+        add("info", "interview cancelled — nothing sealed");
+        return;
+      }
+      if (busy) return;
+      if (char.toLowerCase() === "b" && mode.proposal.barAdds.length) {
+        const r = applyBarAdds(engine.cwd, mode.proposal.barAdds, loadBar(engine.cwd));
+        if (!r.ok) add("error", r.error);
+        else {
+          engine.setBar(r.bar);
+          add("ok", "wrote into .molt/done.yml — task criteria still need a Run to seal");
+        }
+        return;
+      }
+      if (key.return) {
+        const sealed = taskChecksFrom({
+          checks: mode.proposal.checks,
+          notes: mode.proposal.notes,
+        });
+        pendingCriteria.current = sealed;
+        setInput(mode.task);
+        setMode({ kind: "chat" });
+        add(
+          "info",
+          `sealed ${sealed.taskChecks.length} check(s)` +
+            (sealed.taskNotes.length ? ` · ${sealed.taskNotes.length} note(s)` : "") +
+            " for this task — enter to start the work",
+        );
+        return;
       }
       return;
     }
@@ -1773,6 +2076,23 @@ export function App({
         }
         if (key.return) {
           const provider = mode.providers[mode.index]!.name;
+          if (provider === CLAUDE_CODE_ROW) {
+            setMode({ kind: "chat" });
+            void (async () => {
+              const health = await claudeCodeHealth();
+              if (!health.ok) {
+                add("error", `${health.detail}${health.fix ? ` — run \`${health.fix}\`` : ""}`);
+                return;
+              }
+              engine.setBaseUrl(CLAUDE_CODE_URL, undefined, "claude-code");
+              setTokens(0);
+              setCost(undefined);
+              setCostEstimated(false);
+              add("ok", `connected to ${health.detail} — molt runs it, your plan pays for it`);
+              add("info", "choose a model with /model (opus, sonnet, haiku)");
+            })();
+            return;
+          }
           if (provider === LOCAL_ROW) {
             add(
               "info",
@@ -2194,6 +2514,72 @@ export function App({
                 );
               })()}
               <Text color={theme.ghost}>   ↑↓ choose · enter select · esc cancel</Text>
+            </Box>
+          ) : mode.kind === "interview-ask" ? (
+            <Box flexDirection="column">
+              {(() => {
+                const q = mode.questions[mode.qIndex];
+                const typingOther = Boolean(q?.allowOther && mode.optIndex === q.options.length);
+                return (
+                  <>
+                    <Text color={theme.dim}>
+                      {mode.questions.length
+                        ? `  interview · round ${mode.round} · ${mode.qIndex + 1} of ${mode.questions.length}`
+                        : `  interview · round ${mode.round} · asking`}
+                    </Text>
+                    {q ? (
+                      <>
+                        <Text color={theme.text} wrap="wrap">{`  ${q.prompt}`}</Text>
+                        {q.options.map((opt, i) => {
+                          const active = i === mode.optIndex;
+                          return (
+                            <Text key={`${q.id}-${opt}`} color={active ? theme.accent : theme.dim} bold={active}>
+                              {active ? " ▸ " : "   "}
+                              {fit(opt)}
+                            </Text>
+                          );
+                        })}
+                        {q.allowOther ? (
+                          <Text
+                            color={typingOther ? theme.accent : theme.dim}
+                            bold={typingOther}
+                          >
+                            {typingOther ? " ▸ " : "   "}
+                            {typingOther && input ? `other · ${input}` : "other"}
+                          </Text>
+                        ) : null}
+                      </>
+                    ) : null}
+                    <Text color={theme.ghost}>
+                      {"   ↑↓ choose · enter pick · s skip rest · esc cancel"}
+                    </Text>
+                  </>
+                );
+              })()}
+            </Box>
+          ) : mode.kind === "interview-seal" ? (
+            <Box flexDirection="column">
+              <Text color={theme.dim}>  interview · review, then enter to seal</Text>
+              {mode.proposal.checks.map((c) => (
+                <Text key={`check-${c.name}`} color={theme.text} wrap="wrap">
+                  {`  check ${c.name}: ${c.run}`}
+                </Text>
+              ))}
+              {mode.proposal.notes.map((n) => (
+                <Text key={`note-${n}`} color={theme.ghost} wrap="wrap">
+                  {`  note ${n}`}
+                </Text>
+              ))}
+              {mode.proposal.barAdds.map((b) => (
+                <Text key={`bar-${b.name}`} color={theme.text} wrap="wrap">
+                  {`  bar ${b.name}: ${b.run}`}
+                </Text>
+              ))}
+              <Text color={theme.ghost}>
+                {mode.proposal.barAdds.length
+                  ? "   enter seal this task · b write bar additions · esc cancel"
+                  : "   enter seal this task · esc cancel"}
+              </Text>
             </Box>
           ) : (
             <Box flexDirection="column">

@@ -20,3 +20,14 @@ tmp/
 
 # coverage output
 coverage/
+
+# fine-tuning workspace: the venv, downloaded adapters and raw captures are not source
+finetune/.venv/
+finetune/adapters/
+finetune/captures/
+
+# agent worktrees and audit run logs are not source
+.claude/
+finetune/repro-2026-09-02/*.log
+finetune/repro-2026-09-02/index.jsonl.before-repair
+.molt/integrity/

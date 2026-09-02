@@ -67,6 +67,24 @@ export class Transcript {
     this.working.push(msg);
   }
 
+  /**
+   * Replace the system message in place.
+   *
+   * Everything before the first user message is the cached prefix, so this
+   * invalidates it: the next request pays full price for the prompt again.
+   * That is the right trade for a fact the whole session depends on — a repo
+   * map, or a file the model must not write — and the wrong one for anything
+   * that changes often, which is why nothing per-turn is allowed in here.
+   */
+  setSystem(systemPrompt: string): void {
+    this.system = { role: "system", content: systemPrompt };
+  }
+
+  /** The system prompt as it currently stands. */
+  get systemText(): string {
+    return this.system.content ?? "";
+  }
+
   /** Working context including the system prompt. Internal shape. */
   all(): Msg[] {
     const task: Msg[] = this.task

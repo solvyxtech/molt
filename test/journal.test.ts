@@ -88,6 +88,32 @@ describe("the chain", () => {
     assert.equal(Journal.verify(j.path).ok, false);
   });
 
+  it("does not call a log whose lines are not entries intact", () => {
+    // A zero-byte log and a log overwritten with garbage both parsed to zero
+    // entries and verified `ok` — the same word for a chain that held and a
+    // chain that was never there. Content that is not entries is a chain that
+    // cannot be recomputed.
+    const dir = ws();
+    const garbage = join(dir, "garbage.jsonl");
+    writeFileSync(garbage, "this is not json\n{\"seq\":0\n", "utf8");
+    const r = Journal.verify(garbage);
+    assert.equal(r.ok, false, "a log made of unparseable lines verified ok");
+    assert.equal(r.unparsed, 2);
+    assert.match(r.reason!, /none of them parse/);
+
+    // A torn line in the MIDDLE is not a crash mid-append; it is an edit.
+    const j = new Journal(dir, "chain-mid");
+    j.append("session_start", {});
+    j.append("user_message", { chars: 1 });
+    j.append("session_end", { reason: "done" });
+    const lines = readFileSync(j.path, "utf8").split("\n").filter(Boolean);
+    lines[1] = lines[1]!.slice(0, 20);
+    writeFileSync(j.path, lines.join("\n") + "\n", "utf8");
+    const mid = Journal.verify(j.path);
+    assert.equal(mid.ok, false);
+    assert.equal(mid.unparsed, 1);
+  });
+
   it("survives a truncated final line rather than failing the whole log", () => {
     const j = new Journal(ws(), "chain-5");
     j.append("session_start", {});

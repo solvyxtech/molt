@@ -20,20 +20,50 @@
         <button id="crumb-model" class="crumb link-quiet" title="Change model">no model</button>
         <span id="crumb-local" class="pill hidden">local</span>
       </div>
-      <div class="state" role="status" aria-live="polite">
+      <div class="title-actions">
+        <button class="link-quiet" id="interview" title="Ask before work (then seal into the bar)">Interview</button>
+        <button class="link-quiet" id="spine-toggle" title="Show or hide the bar (Cmd/Ctrl+B)" aria-pressed="true">bar</button>
+      </div>
+      <div class="keys" id="keys" aria-hidden="true">
+        <span><kbd data-mod></kbd>1–5</span>
+        <span><kbd data-mod></kbd>K</span>
+        <span><kbd data-mod></kbd>.</span>
+        <span><kbd data-mod></kbd>B</span>
+      </div>
+      <div class="state" role="status" aria-live="polite" id="status">
         <span id="state-dot" class="dot" aria-hidden="true"></span>
         <span id="state-text">idle</span>
       </div>
     </header>
 
+    <div class="stage" id="stage">
     <nav class="tabs" id="tabs" role="tablist">
       <button class="tab active" id="tab-session" data-tab="session" role="tab" aria-controls="panel-session" aria-selected="true" tabindex="0">Session</button>
       <button class="tab" id="tab-view" data-tab="view" role="tab" aria-controls="panel-view" aria-selected="false" tabindex="-1">View</button>
-      <button class="tab" id="tab-checks" data-tab="checks" role="tab" aria-controls="panel-checks" aria-selected="false" tabindex="-1">Checks<span class="badge hidden" id="badge-checks"></span></button>
       <button class="tab" id="tab-receipts" data-tab="receipts" role="tab" aria-controls="panel-receipts" aria-selected="false" tabindex="-1">Receipts<span class="badge hidden" id="badge-receipts"></span></button>
       <button class="tab" id="tab-log" data-tab="log" role="tab" aria-controls="panel-log" aria-selected="false" tabindex="-1">Log</button>
       <button class="tab" id="tab-settings" data-tab="settings" role="tab" aria-controls="panel-settings" aria-selected="false" tabindex="-1">Settings</button>
     </nav>
+
+    <aside class="spine" id="spine" aria-label="The bar">
+      <section class="ctx" id="ctx" aria-label="Context">
+        <div class="spine-head">
+          <span class="spine-kicker">context</span>
+          <span class="spacer"></span>
+          <span class="ctx-pct" id="ctx-pct"></span>
+        </div>
+        <div class="ctx-bar" aria-hidden="true"><i id="ctx-fill"></i></div>
+        <p class="ctx-line" id="ctx-line">no session</p>
+        <p class="ctx-cost" id="ctx-cost"></p>
+      </section>
+      <div class="spine-head">
+        <span class="spine-kicker">the bar</span>
+        <span class="spacer"></span>
+        <button class="link-quiet" id="spine-hide" title="Hide the bar (Cmd/Ctrl+B)">hide</button>
+      </div>
+      <p class="spine-sub" id="spine-sub">What "done" means. Stays on screen while the model works.</p>
+      <ol class="spine-list" id="spine-list"></ol>
+    </aside>
 
     <main id="panels">
       <section class="panel active" id="panel-session" role="tabpanel" aria-labelledby="tab-session" tabindex="0">
@@ -68,15 +98,17 @@
         <div class="wire" id="wire"></div>
       </section>
 
-      <section class="panel" id="panel-checks" role="tabpanel" aria-labelledby="tab-checks" tabindex="0">
-        <div class="panel-head">
-          <h2>The bar</h2>
-          <p class="muted" id="checks-sub">No workspace open.</p>
-        </div>
-        <div class="checks" id="checks"></div>
-      </section>
-
       <section class="panel" id="panel-receipts" role="tabpanel" aria-labelledby="tab-receipts" tabindex="0">
+        <div class="panel-head">
+          <h2>Receipts</h2>
+          <p class="muted">
+            One per completion attempt — refusals included. Review the receipt, not the diff.
+          </p>
+          <div class="controls">
+            <button class="btn ghost" id="receipt-verify">verify evidence chain</button>
+          </div>
+        </div>
+        <div class="verify hidden" id="verify-result" role="status" aria-live="polite"></div>
         <div class="split">
           <aside class="list" id="receipt-list"></aside>
           <article class="doc" id="receipt-doc">
@@ -144,11 +176,26 @@
         </div>
       </section>
     </main>
+    </div>
 
     <div class="palette hidden" id="palette">
       <div class="palette-rows" id="palette-rows"></div>
       <div class="palette-foot">
         <span>↑↓ choose</span><span>tab complete</span><span>enter run</span><span>esc close</span>
+      </div>
+    </div>
+
+    <div class="interview hidden" id="interview-panel" aria-label="Interview">
+      <div class="interview-head">
+        <span class="ck-title">Interview</span>
+        <span class="muted" id="iv-state">Ask before work. Answers seal into the bar and criteria.</span>
+        <span class="spacer"></span>
+        <button class="btn ghost sm" id="iv-hide">✕</button>
+      </div>
+      <div class="iv-qs" id="iv-qs"></div>
+      <div class="iv-actions">
+        <button class="btn ghost sm" id="iv-skip">Skip remaining</button>
+        <button class="btn primary sm" id="iv-next">Answer</button>
       </div>
     </div>
 
@@ -159,10 +206,11 @@
         <span class="spacer"></span>
         <button class="btn ghost sm" id="ck-add">+ check</button>
         <button class="btn ghost sm" id="ck-add-note">+ note</button>
-        <label class="ck-auto" title="Draft criteria from the task; review them, then Run again to start">
-          <input type="checkbox" id="ck-auto" checked /> automatic
+        <label class="ck-auto" title="Ask before work; review the spec, then Run again to start">
+          <input type="checkbox" id="ck-auto" checked /> spec first
         </label>
         <button class="btn ghost sm" id="ck-draft">Draft now</button>
+        <button class="btn ghost sm hidden" id="ck-seal">Seal into bar</button>
         <button class="btn ghost sm" id="ck-hide">✕</button>
       </div>
       <div class="ck-rows" id="ck-rows"></div>
@@ -178,29 +226,24 @@
         id="prompt"
         rows="1"
         aria-label="Describe the change to make"
-        placeholder="Describe the change. molt will prove it or refuse to say it is done."
+        placeholder="Describe the change. First Run writes a spec; second Run starts. ? asks."
         spellcheck="false"
       ></textarea>
       <div class="composer-side">
-        <div class="side-stack">
-          <label class="ask"><input type="checkbox" id="ask" /> ask only</label>
-          <button class="btn ghost sm" id="ck-open">criteria</button>
-          <div class="au-wrap">
-            <span class="au-label">autonomy <b id="au-name">medium</b></span>
-            <div class="autonomy" id="autonomy" role="group" aria-label="autonomy level"></div>
-          </div>
+        <div class="au-wrap">
+          <span class="au-label">autonomy <b id="au-name">medium</b></span>
+          <div class="autonomy" id="autonomy" role="group" aria-label="autonomy level"></div>
         </div>
         <button class="btn primary" id="send">Run</button>
         <button class="btn danger hidden" id="stop">Stop</button>
       </div>
+      <button
+        class="jump hidden"
+        id="jump"
+        type="button"
+        title="Jump to live (Cmd/Ctrl + .)"
+      >live</button>
     </div>
-
-    <footer class="status" id="status">
-      <span id="st-usage"></span>
-      <span id="st-bar">no bar</span>
-      <span class="spacer"></span>
-      <span id="st-session" class="muted"></span>
-    </footer>
 
     <div class="modal hidden" id="picker" role="dialog" aria-modal="true" aria-labelledby="picker-title">
       <div class="modal-box">

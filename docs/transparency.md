@@ -224,6 +224,53 @@ changing one bar result from FAIL to pass and hoping nobody recomputes. If you
 need stronger guarantees, commit the logs, or ship the final hash somewhere
 molt cannot write.
 
+## The project chain
+
+The per-session journal is one island; a session's receipts and sheds are
+others. `.molt/integrity/ledger.jsonl` is the cross-link that binds them into
+one chain: each entry records a receipt file's SHA-256, a shed's SHA-256, and
+the journal's chain root at that moment. `molt verify` (and the **verify
+evidence chain** button in the desktop window) then does two independent
+checks — the chain still links, and every bound artifact on disk still hashes
+to what the ledger said it was. A receipt edited after the fact *drifts* here
+even though the journal's own chain still verifies. Its head is the project's
+**root of trust**, the one value to ship somewhere molt cannot write.
+
+A chain with no records is reported as exactly that, never as "ok", and no
+root of trust is printed for it: the genesis value is the same 64 zeroes in
+every project and would still match after every receipt was rewritten.
+Evidence written before the ledger existed is counted and named as *unbound*
+rather than folded into the total — the check states its reach instead of
+letting "intact" be read as "all of this is verified".
+
+## Wrong checks can't burn tokens
+
+A bar that fails identically twice is a bar the model is not converging on —
+the work cannot satisfy it, or the check is wrong about the work (one loop
+once spent 1.13M tokens rewriting a correct document against a check that was
+wrong about it). Seen twice, it is its own journal fact (`bar_stuck`), the
+window names the failing checks, and the run gives up on the next attempt
+rather than spend on a loop that is going nowhere.
+
+## What happens to your files
+
+Nothing, unless you asked for it. `--commit`/`/commit on` and
+`--revert`/`/revert on` are both off by default, and both act only on the
+paths the turn itself wrote — never `git add -A`, never another session's
+work, never a file the model only read.
+
+A revert restores from a snapshot of the working tree taken *before* the turn
+started (`git stash create`, which writes a commit object without touching
+anything), not from HEAD — so a file you had already edited comes back as you
+had it. A file the turn created is deleted. A file that existed but that git
+has no copy of is left exactly as it is and reported as kept: there is nothing
+to restore it to, and deleting it would destroy work nothing else has.
+
+The evidence is never reverted. Receipts, the journal and the integrity ledger
+live under `.molt/`, which no turn writes through the tools, so what happened
+survives the code being taken back. Undoing the work must not undo the record
+of it.
+
 ## Credentials
 
 Masked before anything is written, and before anything scrolls.

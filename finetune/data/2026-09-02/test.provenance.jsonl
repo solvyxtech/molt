@@ -1,0 +1,7 @@
+{"roots":["molt-desktop","fixed","prefix","fixed2","molt","gen"],"receipt":"0000-accepted.md","receiptSha256":"7117dcbf5d0e8289cf9a04189011a0d95117efb4f1ee54fabb972d22fa4bb871","session":"695b091e","journal":{"from":1,"to":6}}
+{"roots":["molt-desktop","fixed","prefix","fixed2","molt","gen"],"receipt":"0002-accepted.md","receiptSha256":"51f5975f43ec415b93db1b1a8deea9440de542803dda018477030aae2eee10b1","session":"e0f73ae6","journal":{"from":1,"to":11}}
+{"roots":["molt-desktop","fixed","prefix","fixed2","gen"],"receipt":"0038-accepted.md","receiptSha256":"cf8f59a67ae90a55588de8065bb4acf77595fbb26f9769c33531936a182f6c07","session":"454cd1a4","journal":{"from":2,"to":206}}
+{"roots":["prefix"],"receipt":"0048-accepted.md","receiptSha256":"235888edd8f0b6239afd7e8af12765d5eb86f4e4d79e7143cd6f42c7eeb77612","session":"6d1e1127","journal":{"from":1,"to":16}}
+{"roots":["fixed"],"receipt":"0048-refused.md","receiptSha256":"5a66a0f82c6ed51954e268e20f121bad1c054b2ce9bcc3209768886c593e8d13","session":"37053b19","journal":{"from":1,"to":21}}
+{"roots":["gen"],"receipt":"0053-refused.md","receiptSha256":"e6fb3d23e135b99cbf2cc530cb59cfd930bf895a0c8d9af2e5a86893b2be94a9","session":"bdc146e6","journal":{"from":1,"to":18}}
+{"roots":["gen"],"receipt":"0054-refused.md","receiptSha256":"2dc48a2cad9d339c27b8ecdbd42a5371efef211a90a4ea91b72d4c75f20df23e","session":"bdc146e6","journal":{"from":1,"to":151}}

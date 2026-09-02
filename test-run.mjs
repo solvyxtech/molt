@@ -21,12 +21,21 @@ const files = readdirSync("dist-test/test")
 // Coverage on every run, so `diff-covered` always has something to read. It
 // costs a little wall clock and it is the difference between "a file changed"
 // and "the change is executed by anything".
+//
+// In SOURCE coordinates. Without `--enable-source-maps` the report names
+// `dist-test/src/bar.js` with compiled line numbers, while the ledger names
+// `src/bar.ts` with source line numbers — and `coverageFor` matches by path
+// suffix, so `bar.js` never matches `bar.ts`. Every `work-proven` row this
+// project ever issued read "0 changed file(s) executed by the tests · N not
+// in the coverage report" and passed: a check that verified nothing, in
+// green, on fifteen receipts. tsconfig.test.json emits the maps this reads.
 mkdirSync("coverage", { recursive: true });
 const r = spawnSync(
   "node",
   [
     "--test",
     "--experimental-test-coverage",
+    "--enable-source-maps",
     "--test-reporter=lcov",
     "--test-reporter-destination=coverage/lcov.info",
     "--test-reporter=spec",

@@ -138,6 +138,16 @@ export type Check = Advisory &
          * green, which is how receipt 0025 was issued for no work at all.
          */
         commentOnly?: "allow";
+        /** `spec-intact` only: this turn is allowed to delete an assertion. */
+        removals?: "allow";
+        /**
+         * `tree-accounted` only: files may change outside the tools.
+         *
+         * Off by default. A project whose task is running a generator or an
+         * install can say so here; everywhere else a change on disk that no
+         * tool call wrote is a change nothing can prove or judge.
+         */
+        outside?: "allow";
         /**
          * Where to read lcov from, for `diff-covered`.
          *
@@ -159,6 +169,26 @@ export type BuiltinCheck =
   | "files-changed"
   | "record-intact"
   | "claims-grounded"
+  /**
+   * No assertion was deleted from a test file.
+   *
+   * A turn may add tests freely. Taking one away is a change to what the
+   * project promises, and a model that does it while fixing a bug has usually
+   * rewritten the specification to agree with its own change rather than the
+   * other way round. Set `removals: allow` on the check when a test really is
+   * obsolete — deliberately awkward, because that should be a decision
+   * somebody makes on purpose.
+   */
+  | "spec-intact"
+  /**
+   * Every file that changed on disk this turn was written through a tool.
+   *
+   * The ledger sees the tools; this sees the disk. A script the model wrote
+   * and ran, `sed -i`, `cp /dev/null` — none has a ledger entry, and every
+   * ledger-reading check was blind to them. Compares a snapshot of the tree
+   * taken when the turn began against the tree when the claim is made.
+   */
+  | "tree-accounted"
   /**
    * Every line this turn added is executed by the tests, and every branch on
    * those lines is taken.
@@ -213,6 +243,15 @@ export type CheckResult = {
 export type BarResult = {
   /** True when every check that can block a completion passed. */
   ok: boolean;
+  /**
+   * True when the run was aborted before every check had answered.
+   *
+   * A check killed by ctrl+C exits non-zero, and that used to read as the
+   * suite being red: a refused receipt, the failure sent back to the model,
+   * another request, and the killed result cached as a failure until a
+   * watched file moved. None of that is a verdict on the work.
+   */
+  cancelled?: boolean;
   /** Advisory checks that failed. Reported, never blocking. */
   warnings?: CheckResult[];
   results: CheckResult[];
@@ -225,6 +264,15 @@ export type BarResult = {
  */
 export type LedgerEntry = {
   path: string;
+  /**
+   * Assertions this write deleted from a test file.
+   *
+   * Read by `spec-intact`. Present only when a test file lost an assertion,
+   * which is rare and always worth a person's attention: it is the difference
+   * between fixing code so it meets its specification and editing the
+   * specification so it meets the code.
+   */
+  specRemoved?: string[];
   /** sha256 before the write, or null if the file did not exist. */
   before: string | null;
   /** sha256 molt observed immediately after writing. */
@@ -428,6 +476,13 @@ export type EngineEvent =
  */
 export type JobOutcome =
   | "verified"
+  /**
+   * A question that was answered. The bar ran advisory, because a turn that
+   * wrote nothing cannot have broken anything, so no check could refuse it —
+   * and an answer no check could refuse is not "verified". Five of this
+   * project's sixteen "verified changes" were questions before this existed.
+   */
+  | "answered"
   | "unverified"
   | "not proven"
   | "cancelled"

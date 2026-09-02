@@ -23,7 +23,7 @@
  *     open, with the level on screen while it works.
  */
 import { existsSync, realpathSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export type Autonomy = "low" | "medium" | "high";
 
@@ -277,6 +277,43 @@ export function isReadOnlyCommand(command: string): boolean {
   });
 }
 
+/**
+ * Does this command do nothing except delete paths molt created this session?
+ *
+ * The narrow exception to "a delete always asks". A file that did not exist
+ * when the turn started cannot be someone's work, and removing it destroys
+ * nothing that was not molt's own doing — so at high autonomy, tidying up
+ * after itself is not a decision a person needs to be woken for. A local 30B
+ * hit the other side of this rule: it wrote a scratch script, tried to remove
+ * it, was refused, and told its own receipt "I don't have permission to remove
+ * it". A gate that blocks the remedy for its own complaint is a trap.
+ *
+ * Deliberately literal-minded. Any shell metacharacter, any glob, any second
+ * command, any path molt did not create, anything that is not `rm` — and the
+ * exception does not apply and the prompt happens as before. A carve-out in a
+ * safety gate has to be one that can be read at a glance and be obviously
+ * true, not one that is clever.
+ */
+export function deletesOnlyCreated(
+  command: string,
+  created: ReadonlySet<string>,
+  cwd: string,
+): boolean {
+  const trimmed = command.trim();
+  // Chaining, substitution, redirection, globbing: not worth reasoning about
+  // at a gate whose job is to decide whether a delete is safe.
+  if (/[;&|`$><*?()\[\]{}]/.test(trimmed) || /\bcd\b/.test(trimmed)) return false;
+  const parts = trimmed.split(/\s+/).filter(Boolean);
+  if (parts[0] !== "rm") return false;
+  const paths = parts.slice(1).filter((p) => p !== "--" && !p.startsWith("-"));
+  if (!paths.length) return false;
+  for (const p of paths) {
+    if (!insideProject(cwd, p)) return false;
+    if (!created.has(relative(cwd, resolve(cwd, p)))) return false;
+  }
+  return true;
+}
+
 /** Would this command do something no later step could undo? */
 export function isIrreversible(command: string): boolean {
   // A discard is not a write, so it must not read as one here either.
@@ -364,7 +401,13 @@ export type Decision = {
  */
 export function gate(
   level: Autonomy,
-  call: { name: string; args: Record<string, unknown>; cwd: string },
+  call: {
+    name: string;
+    args: Record<string, unknown>;
+    cwd: string;
+    /** Project-relative paths this session created, for the delete exception. */
+    created?: ReadonlySet<string>;
+  },
 ): Decision {
   const { name, args, cwd } = call;
   const command = typeof args.command === "string" ? args.command : "";
@@ -396,6 +439,11 @@ export function gate(
 
   if (level === "high") {
     if (name === "bash" && isIrreversible(command)) {
+      // Removing only what this session created undoes molt's own work and
+      // nobody else's, so at this level it does not need a person.
+      if (call.created?.size && deletesOnlyCreated(command, call.created, cwd)) {
+        return { ask: false };
+      }
       return { ask: true, why: "this cannot be undone" };
     }
     return { ask: false };

@@ -24,7 +24,7 @@
  */
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createElement } from "react";
 import { describe, it } from "node:test";
@@ -1809,5 +1809,109 @@ describe("/model shows the machine you connected to", () => {
     } finally {
       t.cleanup();
     }
+  });
+});
+
+describe("/interview asks before work", { concurrency: true }, () => {
+  function interviewFetch(): typeof fetch {
+    const work = provider();
+    let rounds = 0;
+    return (async (...args: Parameters<typeof fetch>) => {
+      const [, init] = args;
+      const body = typeof init?.body === "string" ? init.body : "";
+      if (body.includes("You interview a person")) {
+        rounds += 1;
+        const content =
+          rounds === 1
+            ? JSON.stringify({
+                questions: [
+                  {
+                    id: "q1",
+                    prompt: "Which failure mode?",
+                    options: ["timeout", "wrong result"],
+                  },
+                ],
+              })
+            : JSON.stringify({
+                proposal: {
+                  checks: [{ name: "lint", run: "npm test" }],
+                  notes: ["the picker lists the second server"],
+                },
+              });
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => "application/json" },
+          json: async () => ({ choices: [{ message: { content } }] }),
+          text: async () => "",
+        } as unknown as Response;
+      }
+      return work(...args);
+    }) as unknown as typeof fetch;
+  }
+
+  it("is a command, not an unknown slash", async () => {
+    const t = await mount();
+    try {
+      await submit(t.stdin, "/interview");
+      assert.match(t.stdout.text, /usage: \/interview/);
+      assert.ok(!/unknown command/.test(t.stdout.text), "/interview was treated as unknown");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("shows a question card, then seals into the next turn", async () => {
+    const t = await mount({ fetchFn: interviewFetch() });
+    try {
+      await submit(t.stdin, "/interview fix the picker");
+      await tick(200);
+      assert.match(t.stdout.lastFrame, /Which failure mode\?/, "never drew the question");
+      assert.match(t.stdout.lastFrame, /timeout/);
+      t.stdin.press("\r");
+      await tick(400);
+      assert.match(t.stdout.text, /interview proposed 1 check/, "never reached a proposal");
+      assert.match(t.stdout.lastFrame, /check lint: npm test/);
+      t.stdin.press("\r");
+      await tick(200);
+      assert.match(t.stdout.text, /sealed 1 check\(s\)/);
+      assert.match(t.stdout.lastFrame, /fix the picker/, "the task was not waiting on the prompt");
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("drops a sealed interview on /clear so the next prompt is not judged by it", async () => {
+    const t = await mount({ fetchFn: interviewFetch() });
+    try {
+      await submit(t.stdin, "/interview fix the picker");
+      await tick(200);
+      t.stdin.press("\r");
+      await tick(400);
+      t.stdin.press("\r");
+      await tick(200);
+      assert.match(t.stdout.text, /sealed 1 check\(s\)/);
+      // Seal left the task on the prompt. Kill it, then /clear — otherwise
+      // the letters append and "/clear" never runs.
+      t.stdin.press(String.fromCharCode(21));
+      await tick(40);
+      await submit(t.stdin, "/clear");
+      await tick(120);
+      assert.ok(
+        !/fix the picker/.test(t.stdout.lastFrame),
+        "the sealed task was still sitting on the prompt after /clear",
+      );
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("nulls pendingCriteria and the composer inside /clear", () => {
+    const src = readFileSync(join(process.cwd(), "src/app.tsx"), "utf8");
+    const clear = src.slice(src.indexOf('case "/clear"'));
+    const body = clear.slice(0, clear.indexOf("case \"/bom\""));
+    assert.match(body, /pendingCriteria\.current = null/, "sealed checks would survive a reset");
+    assert.match(body, /interviewSeq\.current \+= 1/, "a late interview reply could reopen the cards");
+    assert.match(body, /setInput\(""\)/, "the sealed task would still fire on Enter");
   });
 });

@@ -16,7 +16,7 @@ import { renderMarkdown } from "./markdown.js";
 import { playSplash } from "./splash.js";
 import { fmtCost } from "../src/format.js";
 import { matchCommands } from "../src/commands.js";
-import { JOURNAL_RENDER_CAP, STREAM_CAP, newest, trimOldest } from "./bounds.js";
+import { JOURNAL_RENDER_CAP, STREAM_CAP, contextCap, contextFill, newest, trimOldest } from "./bounds.js";
 import { holdAfterAutoDraft, taskForRun } from "./criteria-hold.js";
 
 // ── the bridge ───────────────────────────────────────────────────────────────
@@ -61,15 +61,40 @@ type MoltBridge = {
     { ok: true; draft: { checks: { name: string; run: string }[]; notes: string[] } }
     | { ok: false; error: string }
   >;
+  interview(opts: {
+    task: string;
+    round: number;
+    history: { questions: { id: string; prompt: string; options: string[]; allowOther: boolean }[]; answers: { id: string; choice: string }[] }[];
+  }): Promise<
+    | { kind: "ask"; questions: { id: string; prompt: string; options: string[]; allowOther: boolean }[]; round: number }
+    | { kind: "propose"; proposal: { barAdds: { name: string; run: string }[]; checks: { name: string; run: string }[]; notes: string[] } }
+    | { kind: "error"; error: string }
+  >;
+  applyBar(adds: { name: string; run: string }[]): Promise<{ ok: boolean; error?: string; state?: AppState }>;
   cancel(): void;
   answerConfirm(id: string, ok: boolean): void;
   receipts(): Promise<ReceiptRow[]>;
   receipt(file: string): Promise<string | null>;
   journal(): Promise<Record<string, unknown>[]>;
   stats(): Promise<Stats | null>;
+  verify(): Promise<VerifyResult | null>;
   onEvent(fn: (ev: Ev) => void): () => void;
   onConfirm(fn: (r: ConfirmReq) => void): () => void;
   onIdle(fn: () => void): () => void;
+};
+
+type VerifyResult = {
+  ok: boolean;
+  established: boolean;
+  records: number;
+  brokenAt: number | null;
+  reason: string | null;
+  drift: { kind: string; file: string; bound: string }[];
+  unbound: { kind: string; file: string }[];
+  /** Every session log's own chain, recomputed — half of what `molt verify` checks. */
+  journals?: { file: string; ok: boolean; entries: number; reason: string | null }[];
+  root: string | null;
+  generatedAt: string;
 };
 
 type AppState = {
@@ -113,8 +138,12 @@ type Stats = {
   tokens: number;
   cached: number;
   costUsd: number | null;
+  costEstimated?: boolean;
   shedBatches: number;
   hasBar: boolean;
+  requestEst: number;
+  window: number;
+  budget: number | null;
 };
 
 /** Loose on purpose: the engine's event union is the authority, not this. */
@@ -182,12 +211,14 @@ let pendingReceipt: string | null = null;
 
 // ── tabs ─────────────────────────────────────────────────────────────────────
 
+const TABS = ["session", "view", "receipts", "log", "settings"] as const;
+
 function showTab(name: string): void {
   for (const t of document.querySelectorAll<HTMLElement>(".tab")) {
     const on = t.dataset.tab === name;
     t.classList.toggle("active", on);
     // The strip already said role="tab" and never said which one was chosen,
-    // so a screen reader announced six tabs and no selection. Roving tabindex
+    // so a screen reader announced five tabs and no selection. Roving tabindex
     // with it: a tablist is one stop, and the arrows move inside it.
     t.setAttribute("aria-selected", String(on));
     t.tabIndex = on ? 0 : -1;
@@ -207,16 +238,15 @@ function showTab(name: string): void {
   }
   if (name === "receipts") void loadReceipts();
   if (name === "log") void loadJournal();
-  if (name === "checks") clearBadge("checks");
   if (name === "receipts") clearBadge("receipts");
 }
 
-function badge(which: "checks" | "receipts", text: string, kind?: "ok" | "fail"): void {
+function badge(which: "receipts", text: string, kind?: "ok" | "fail"): void {
   const b = $(`badge-${which}`);
   b.textContent = text;
   b.className = `badge${kind ? " " + kind : ""}`;
 }
-function clearBadge(which: "checks" | "receipts"): void {
+function clearBadge(which: "receipts"): void {
   $(`badge-${which}`).className = "badge hidden";
 }
 
@@ -257,6 +287,7 @@ function atBottom(): boolean {
 }
 function follow(was: boolean): void {
   if (was) $("panel-session").scrollTop = $("panel-session").scrollHeight;
+  updateJump();
 }
 
 function append(node: HTMLElement): void {
@@ -269,6 +300,23 @@ function append(node: HTMLElement): void {
   trimOldest(stream(), STREAM_CAP);
   follow(was);
 }
+
+function jumpLive(): void {
+  const p = $("panel-session");
+  p.scrollTop = p.scrollHeight;
+  updateJump();
+}
+
+function updateJump(): void {
+  $("jump").classList.toggle("hidden", atBottom() || !busy);
+}
+
+$("panel-session").addEventListener(
+  "scroll",
+  () => updateJump(),
+  { passive: true },
+);
+$("jump").addEventListener("click", jumpLive);
 
 /**
  * The row that says molt is alive.
@@ -375,22 +423,12 @@ function toolRow(ev: Ev, running: boolean): HTMLElement {
 function sealedBlock(c: { checks: { name: string; run: string }[]; notes: string[] }): HTMLElement {
   const box = el("div", "sealed");
   box.appendChild(
-    el("div", "s-head", `sealed for this task — ${c.checks.length} check(s), ${c.notes.length} note(s)`),
+    el(
+      "div",
+      "s-head",
+      `sealed ${c.checks.length} check(s) · ${c.notes.length} note(s)`,
+    ),
   );
-  const ul = el("ul");
-  for (const k of c.checks) {
-    const li = el("li");
-    li.appendChild(el("span", "c", "check "));
-    li.appendChild(document.createTextNode(`${k.name}: ${k.run}`));
-    ul.appendChild(li);
-  }
-  for (const n of c.notes) {
-    const li = el("li");
-    li.appendChild(el("span", "n", "note "));
-    li.appendChild(document.createTextNode(`${n} (recorded, not verified)`));
-    ul.appendChild(li);
-  }
-  box.appendChild(ul);
   return box;
 }
 
@@ -479,62 +517,114 @@ function wire(kind: string, dir: "in" | "out", text: string): void {
 
 $("view-clear").addEventListener("click", () => ($("wire").textContent = ""));
 
-// ── checks tab ───────────────────────────────────────────────────────────────
+// ── spine ────────────────────────────────────────────────────────────────────
 
-function renderChecks(result?: Ev): void {
-  const box = $("checks");
-  box.textContent = "";
+/**
+ * The last proof, kept so the spine can paint without asking the engine
+ * again. Name, pass/fail, duration — stdout lives on the receipt.
+ */
+let lastProof: Ev | undefined;
+
+type SpineRow = {
+  name: string;
+  ok?: boolean;
+  running?: boolean;
+  skipped?: boolean;
+  durationMs?: number;
+};
+
+function spineRows(result?: Ev): SpineRow[] {
   const defined = state?.checks ?? [];
   const results: any[] = result?.result?.results ?? [];
-
-  if (!defined.length && !results.length) {
-    $("checks-sub").textContent = state?.open
-      ? "No .molt/done.yml in this workspace — completions here are unverified, and molt will say so."
-      : "No workspace open.";
-    return;
-  }
-  $("checks-sub").textContent = results.length
-    ? `Last run: ${results.filter((r) => r.ok).length} of ${results.length} passed.`
-    : `${defined.length} check(s) defined. They run when the model claims to be done.`;
-
   const seen = new Set<string>();
+  const rows: SpineRow[] = [];
   for (const r of results) {
     seen.add(r.name);
-    const card = el("div", `check-card ${r.ok ? "pass" : "fail"}`);
-    const top = el("div", "top");
-    top.appendChild(el("span", "nm", r.name));
-    top.appendChild(el("span", "tag", r.kind ?? ""));
-    top.appendChild(el("span", "spacer"));
-    // The stream's proof block times every check and this screen — the one
-    // headed "the bar" — did not, so the slow check was only ever findable by
-    // scrolling back into the session. Left of the verdict, which stays the
-    // rightmost thing on every row so the column of them reads straight down.
-    if (r.durationMs) top.appendChild(el("span", "ms", fmtMs(r.durationMs)));
-    top.appendChild(
-      el("span", r.ok ? "verdict pass" : "verdict fail", r.ok ? "pass" : "FAIL"),
-    );
-    card.appendChild(top);
-    if (r.output) card.appendChild(el("pre", undefined, r.output));
-    box.appendChild(card);
+    rows.push({
+      name: r.name,
+      ok: r.ok === true,
+      durationMs: r.durationMs,
+    });
   }
   for (const c of defined) {
     if (seen.has(c.name)) continue;
-    const card = el("div", "check-card");
-    const top = el("div", "top");
-    top.appendChild(el("span", "nm", c.name));
-    top.appendChild(el("span", "tag", c.kind));
-    for (const t of c.tags ?? []) top.appendChild(el("span", "tag", t));
-    // Only meaningful once something has run: before that every check is
-    // unrun, and labelling them all would be noise. After a run, a check with
-    // no verdict is a fact — it was skipped — and a blank right-hand side left
-    // that indistinguishable from a check that passed quietly.
-    if (results.length) {
-      top.appendChild(el("span", "spacer"));
-      top.appendChild(el("span", "verdict skipped", "not run"));
-    }
-    card.appendChild(top);
-    box.appendChild(card);
+    rows.push({
+      name: c.name,
+      running: result === undefined && busy && $("state-dot").classList.contains("proving"),
+      skipped: !!results.length,
+    });
   }
+  return rows;
+}
+
+function paintSpine(result?: Ev): void {
+  const list = $("spine-list");
+  const sub = $("spine-sub");
+  const rows = spineRows(result);
+  if (!state?.open) {
+    sub.textContent = "What \"done\" means. Stays on screen while the model works.";
+    list.textContent = "";
+    list.appendChild(
+      el("li", "empty", "Open a workspace — checks from .molt/done.yml land here."),
+    );
+    return;
+  }
+  if (!rows.length) {
+    sub.textContent = "No bar — completions here are unverified.";
+    list.textContent = "";
+    list.appendChild(
+      el("li", "empty", "No .molt/done.yml. /init writes one. Until then, claims are unverified."),
+    );
+    return;
+  }
+  const ran = rows.filter((r) => r.ok !== undefined);
+  const passed = ran.filter((r) => r.ok).length;
+  sub.textContent = ran.length
+    ? `${passed} of ${ran.length} last run`
+    : `${rows.length} check(s) · run when it claims done`;
+
+  // Rebuild only when the set of names changes. Verdicts update in place so
+  // a proving pass does not throw away the list the eye is already on.
+  const existing = [...list.querySelectorAll<HTMLElement>("li[data-name]")];
+  const same =
+    existing.length === rows.length &&
+    existing.every((n, i) => n.dataset.name === rows[i]!.name);
+  if (!same) {
+    list.textContent = "";
+    for (const r of rows) {
+      const li = el("li");
+      li.dataset.name = r.name;
+      const mark = el("span", "spine-mark", "·");
+      li.appendChild(mark);
+      li.appendChild(el("span", "spine-nm", r.name));
+      li.appendChild(el("span", "spine-ms"));
+      list.appendChild(li);
+    }
+  }
+  const items = list.querySelectorAll<HTMLElement>("li[data-name]");
+  rows.forEach((r, i) => {
+    const li = items[i];
+    if (!li) return;
+    li.className = r.running
+      ? "run"
+      : r.ok === true
+        ? "pass"
+        : r.ok === false
+          ? "fail"
+          : r.skipped
+            ? "skip"
+            : "";
+    const mark = li.querySelector(".spine-mark");
+    if (mark)
+      mark.textContent = r.running ? "▸" : r.ok === true ? "●" : r.ok === false ? "✕" : r.skipped ? "○" : "·";
+    const ms = li.querySelector(".spine-ms");
+    if (ms) ms.textContent = r.durationMs ? fmtMs(r.durationMs) : "";
+  });
+}
+
+function renderChecks(result?: Ev): void {
+  if (result) lastProof = result;
+  paintSpine(result ?? lastProof);
 }
 
 // ── receipts tab ─────────────────────────────────────────────────────────────
@@ -570,6 +660,78 @@ async function openReceipt(file: string): Promise<void> {
   renderMarkdown(md, doc);
   for (const b of $("receipt-list").querySelectorAll("button")) b.classList.remove("active");
   void loadReceipts();
+}
+
+// ── verify the evidence chain ─────────────────────────────────────────────────
+
+/**
+ * Run the full integrity check on the open workspace: the journals' own
+ * chains plus the project-level ledger binding journals, receipts and exuviae
+ * together. Show the verdict, any drift, and the root of trust. This is the
+ * window's answer to `molt verify` — the same check, on this surface.
+ */
+async function runVerify(): Promise<void> {
+  const out = $("verify-result");
+  const ev = await molt.verify();
+  out.classList.remove("hidden");
+
+  if (ev === null) {
+    out.textContent = "No workspace is open — open one to verify its evidence chain.";
+    out.className = "verify warn";
+    return;
+  }
+
+  if (!ev.established) {
+    // No records, nothing bound. "Intact" here would be a green light for a
+    // chain that covers none of the evidence sitting beside it.
+    out.className = "verify warn";
+    out.textContent = "";
+    out.appendChild(el("div", undefined, "No evidence chain yet — nothing has been bound."));
+    out.appendChild(
+      el(
+        "div",
+        undefined,
+        ev.unbound.length
+          ? `${ev.unbound.length} receipt(s) and shed(s) here predate the ledger. A root of trust appears once a session binds its first receipt.`
+          : "A root of trust appears once a session binds its first receipt.",
+      ),
+    );
+    return;
+  }
+
+  const badLogs = (ev.journals ?? []).filter((j) => !j.ok);
+  const head = el(
+    "div",
+    undefined,
+    ev.ok
+      ? `Evidence chain intact · ${ev.records} record(s) binding journal, receipts and exuviae · ` +
+        `${(ev.journals ?? []).length} session log(s) recompute.`
+      : badLogs.length
+        ? `Evidence chain BROKEN · ${badLogs.length} session log(s) do not recompute.`
+        : `Evidence chain ${ev.brokenAt !== null ? "BROKEN" : "DRIFTED"} at record ${ev.brokenAt ?? "—"}.`,
+  );
+  // A stale verdict's colour must not outlive it.
+  out.className = "verify";
+  out.textContent = "";
+  out.appendChild(head);
+  if (ev.root) out.appendChild(el("div", "verify-root", `root of trust: ${ev.root}`));
+
+  if (ev.reason) {
+    out.appendChild(el("div", undefined, ev.reason));
+  }
+  for (const d of ev.drift) {
+    out.appendChild(el("div", undefined, `${d.kind} ${d.file} no longer matches its bound hash (${d.bound})`));
+  }
+  for (const j of badLogs) {
+    out.appendChild(el("div", undefined, `journal ${j.file}: ${j.reason ?? "chain broken"}`));
+  }
+  // What the chain does not reach, said plainly beside what it does.
+  if (ev.unbound.length) {
+    out.appendChild(
+      el("div", undefined, `${ev.unbound.length} artifact(s) on disk are not bound by this chain.`),
+    );
+  }
+  out.classList.add(ev.ok ? "ok" : "fail");
 }
 
 // ── journal tab ──────────────────────────────────────────────────────────────
@@ -611,12 +773,15 @@ function drawJournal(): void {
 
 $("log-filter").addEventListener("input", drawJournal);
 $("log-refresh").addEventListener("click", () => void loadJournal());
+$("receipt-verify").addEventListener("click", () => void runVerify());
 
 // ── engine events ────────────────────────────────────────────────────────────
 
 function setState(kind: "idle" | "busy" | "proving" | "ok" | "fail", text: string): void {
   $("state-dot").className = `dot ${kind === "idle" ? "" : kind}`.trim();
   $("state-text").textContent = text;
+  if (kind === "idle") paintSpine(lastProof);
+  updateJump();
 }
 
 molt.onEvent((ev) => {
@@ -696,7 +861,20 @@ molt.onEvent((ev) => {
     case "job_start":
       setState("busy", "thinking");
       startActivity("thinking");
-      wire("request", "out", `step ${ev.step ?? ""} · ${ev.messages ?? "?"} messages`);
+      break;
+
+    // The request as the engine states it, before the answer exists. This
+    // frame used to be faked from job_start, which carries no step and no
+    // message count, so every session's wire view read "step · ? messages"
+    // beside a journal that had both numbers — and the real request events
+    // were never rendered at all.
+    case "request":
+      wire(
+        "request",
+        "out",
+        `step ${ev.step + 1} · ${ev.messages} messages · ~${ev.estTokens} tokens → ${ev.model}` +
+          (ev.stream ? " · streaming" : ""),
+      );
       break;
 
     case "usage":
@@ -714,8 +892,7 @@ molt.onEvent((ev) => {
       // said which check was taking the time.
       setPhase(`proving · ${ev.checks} check(s)`);
       bumpActivity();
-      badge("checks", "…");
-      showTabHint();
+      paintSpine();
       break;
 
     case "proof_result":
@@ -730,7 +907,6 @@ molt.onEvent((ev) => {
       }
       renderChecks(ev);
       const ok = ev.result?.ok === true;
-      badge("checks", ok ? "pass" : "fail", ok ? "ok" : "fail");
       setState(ok ? "ok" : "fail", ok ? "bar met" : "bar not met");
       break;
     }
@@ -775,13 +951,6 @@ molt.onEvent((ev) => {
   }
 });
 
-/** Nudge the eye to the Checks tab the first time a proof runs. */
-let hinted = false;
-function showTabHint(): void {
-  if (hinted) return;
-  hinted = true;
-}
-
 /**
  * What opening something over the page costs you.
  *
@@ -805,6 +974,37 @@ function closeModal(id: string): void {
 }
 
 document.addEventListener("keydown", (e) => {
+  if (e.isComposing) return;
+  const chord = state?.platform === "darwin" ? e.metaKey : e.ctrlKey;
+  if (chord && !e.altKey && $("confirm").classList.contains("hidden")) {
+    const n = e.code.startsWith("Digit") ? Number(e.code.slice(5)) : 0;
+    if (n >= 1 && n <= TABS.length) {
+      e.preventDefault();
+      showTab(TABS[n - 1]!);
+      return;
+    }
+    if (e.key === "k" || e.key === "K") {
+      e.preventDefault();
+      showTab("session");
+      const box = $("prompt") as HTMLTextAreaElement;
+      if (!box.value.startsWith("/")) box.value = "/";
+      box.focus();
+      autogrow();
+      refreshPalette();
+      return;
+    }
+    if (e.key === ".") {
+      e.preventDefault();
+      showTab("session");
+      jumpLive();
+      return;
+    }
+    if (e.key === "b" || e.key === "B") {
+      e.preventDefault();
+      setSpineOpen(!spineOpen);
+      return;
+    }
+  }
   if (e.key !== "Escape") return;
   // Innermost surface first, one per press.
   if (!$("confirm").classList.contains("hidden")) {
@@ -816,6 +1016,11 @@ document.addEventListener("keydown", (e) => {
   if (!$("picker").classList.contains("hidden")) {
     e.preventDefault();
     closeModal("picker");
+    return;
+  }
+  if (!$("interview-panel").classList.contains("hidden")) {
+    e.preventDefault();
+    closeInterview();
     return;
   }
   if (!$("criteria").classList.contains("hidden")) {
@@ -856,6 +1061,7 @@ molt.onIdle(() => {
   if (!$("confirm").classList.contains("hidden")) closeModal("confirm");
   if (!$("state-dot").classList.contains("ok") && !$("state-dot").classList.contains("fail"))
     setState("idle", "idle");
+  updateJump();
   void refreshStats();
 });
 
@@ -914,7 +1120,9 @@ promptBox.addEventListener("keydown", (e) => {
   }
 });
 
-const ask0 = (): boolean => ($("ask") as HTMLInputElement).checked;
+/** Ask-only is `?` at the start of a line, or `/ask`. Not a checkbox. */
+let askNext = false;
+const ask0 = (): boolean => askNext;
 
 /** Reset each time the engine goes idle, so the hint is once per turn. */
 let hintedBusy = false;
@@ -966,7 +1174,7 @@ async function send(): Promise<void> {
 
   // "? question" is the terminal's shorthand for ask-only.
   if (text.startsWith("?")) {
-    ($("ask") as HTMLInputElement).checked = true;
+    askNext = true;
     promptBox.value = text.slice(1).trim();
     return void send();
   }
@@ -979,49 +1187,50 @@ async function send(): Promise<void> {
   const auto = ($("ck-auto") as HTMLInputElement).checked;
   const hadRows = rows.length > 0;
 
-  // Drafted from what you just typed, unless you already wrote some yourself.
-  // Announced rather than silent: criteria decide whether the turn can be
-  // called done, and finding out afterwards that something was added on your
-  // behalf is the wrong way to learn it.
-  //
-  // A drafted `run` is a process (`shell: true` at proof time), not a
-  // stricter boolean. Filling the panel and starting the turn in one press
-  // is how a model-chosen command runs with no extra click. Hold instead:
-  // the first press drafts, the second seals what is still in the panel.
-  if (auto && !hadRows && !ask) {
+  // Run while questions are still up means "skip the rest", not "start
+  // coding". Spec-first does not let the model work on a guess you have
+  // not seen.
+  if (!$("interview-panel").classList.contains("hidden")) {
+    await interviewRound(true);
+    return;
+  }
+
+  // Spec first: the first Run writes a spec and holds. The second seals
+  // what is still in the panel and starts work. Ask-only, a panel you
+  // already filled, and a resume after that hold skip it.
+  if (
+    holdAfterAutoDraft({
+      auto,
+      hadRows,
+      ask,
+      resuming,
+    })
+  ) {
     busy = true;
     $("send").classList.add("hidden");
     $("stop").classList.remove("hidden");
-    setState("busy", "drafting");
-    startActivity("drafting criteria");
-    await draftInto(text, true);
-    const drafted = criteriaPayload();
-    if (
-      holdAfterAutoDraft({
-        auto,
-        hadRows,
-        ask,
-        drafted: !!(drafted.checks.length || drafted.notes.length),
-      })
-    ) {
-      // Taken out of the composer and echoed, so the screen shows a message
-      // that was received and a turn that is waiting on you — not a Run that
-      // did nothing.
-      pendingTask = text;
-      promptBox.value = "";
-      autogrow();
-      if (!resuming) say("you", text, "user");
-      $("criteria").classList.remove("hidden");
-      drawCriteria();
-      $("ck-state").textContent = "review the draft, then Run again to seal it";
-      say("", "drafted criteria — review them, then Run to start the turn", "info");
-      stopActivity();
-      busy = false;
-      $("send").classList.remove("hidden");
-      $("stop").classList.add("hidden");
-      setState("idle", "review criteria");
-      return;
+    setState("busy", "spec");
+    startActivity("writing a spec");
+    pendingTask = text;
+    promptBox.value = "";
+    autogrow();
+    if (!resuming) say("you", text, "user");
+    await startInterview(text);
+    const stillAsking = !$("interview-panel").classList.contains("hidden");
+    $("criteria").classList.remove("hidden");
+    drawCriteria();
+    $("ck-state").textContent = stillAsking
+      ? "answer, then Run again — or skip remaining"
+      : "review the spec, then Run again to start";
+    if (!stillAsking) {
+      say("", "spec first — review it, then Run to start the turn", "info");
     }
+    stopActivity();
+    busy = false;
+    $("send").classList.remove("hidden");
+    $("stop").classList.add("hidden");
+    setState("idle", stillAsking ? "interview" : "review spec");
+    return;
   }
 
   promptBox.value = "";
@@ -1043,6 +1252,7 @@ async function send(): Promise<void> {
     bumpActivity();
   }
   const r = await molt.run(text, ask, criteria);
+  askNext = false;
   if (!r.ok && r.error) say("error", r.error, "error");
   // One task, one set. Carrying them into the next turn would quietly apply
   // yesterday's criteria to today's work.
@@ -1097,7 +1307,7 @@ function renderAutonomy(): void {
   $("au-name").title = state.autonomyLevels[at]?.means ?? "";
 }
 
-async function chooseAutonomy(level: string, means: string): Promise<void> {
+async function chooseAutonomy(level: string, _means: string): Promise<void> {
   const r = await molt.setAutonomy(level);
   if (!r.ok) {
     say("error", r.error ?? "could not change autonomy", "error");
@@ -1105,10 +1315,6 @@ async function chooseAutonomy(level: string, means: string): Promise<void> {
   }
   state = r.state!;
   renderAutonomy();
-  // Said out loud in the stream, because it changes what the next turn may do
-  // to this machine without asking, and a silent change to that is the kind
-  // nobody remembers making.
-  if (state.open) say("", `autonomy: ${level} — ${means}`, "info");
   localStorage.setItem("molt.autonomy", level);
 }
 
@@ -1194,9 +1400,6 @@ function updateCriteriaState(): void {
   const c = rows.filter((r) => r.kind === "check" && r.text.trim()).length;
   const n = rows.filter((r) => r.kind === "note" && r.text.trim()).length;
   $("ck-state").textContent = c || n ? `${c} check(s), ${n} note(s)` : "";
-  // The button by the prompt carries the count, so the panel can stay shut
-  // without the criteria being out of sight and out of mind.
-  $("ck-open").textContent = c || n ? `criteria · ${c + n}` : "criteria";
 }
 
 /** What gets sent, cleaned of half-typed rows. */
@@ -1208,10 +1411,6 @@ function criteriaPayload(): { checks: { name: string; run: string }[]; notes: st
   return { checks, notes };
 }
 
-$("ck-open").addEventListener("click", () => {
-  $("criteria").classList.toggle("hidden");
-  if (!$("criteria").classList.contains("hidden")) drawCriteria();
-});
 $("ck-hide").addEventListener("click", () => $("criteria").classList.add("hidden"));
 $("ck-add").addEventListener("click", () => {
   rows.push({ kind: "check", name: "", text: "" });
@@ -1394,13 +1593,17 @@ async function runCommand(name: string, arg: string): Promise<void> {
     }
     case "/ask":
     case "/q":
-      ($("ask") as HTMLInputElement).checked = true;
+      askNext = true;
       if (arg) {
         promptBox.value = arg;
         await send();
       } else {
         say("", "ask only is on — the next turn is a question", "info");
       }
+      return;
+    case "/interview":
+    case "/spec":
+      await startInterview(arg);
       return;
     case "/verbose":
     case "/detail":
@@ -1426,6 +1629,18 @@ async function runCommand(name: string, arg: string): Promise<void> {
         return;
       }
       stream().textContent = "";
+      // A held spec-first task, a drafted panel, and an interview still on
+      // screen are yesterday's work. Resetting the engine and leaving them
+      // would start the next Run against a task nobody can see.
+      pendingTask = null;
+      pendingBarAdds = [];
+      rows = [];
+      drawCriteria();
+      $("criteria").classList.add("hidden");
+      $("ck-seal").classList.add("hidden");
+      closeInterview();
+      lastProof = undefined;
+      askNext = false;
       state = r.state ?? state;
       applyState();
       say("", "session reset — context cleared, the record on disk is untouched", "info");
@@ -1449,8 +1664,7 @@ async function runCommand(name: string, arg: string): Promise<void> {
   switch (out.kind) {
     case "info":
       say("", out.text, "info");
-      // /bar and /wire are about a surface that has its own tab; land there.
-      if (name === "/bar") showTab("checks");
+      if (name === "/bar") setSpineOpen(true);
       if (name === "/wire") showTab("view");
       return;
     case "error":
@@ -1459,6 +1673,7 @@ async function runCommand(name: string, arg: string): Promise<void> {
     case "bar":
       append(proofBlock({ kind: "proof_result", result: out.result }));
       renderChecks({ kind: "proof_result", result: out.result });
+      setSpineOpen(true);
       return;
     case "unhandled":
       say("error", `unknown command: ${name} — /help lists them`, "error");
@@ -1502,6 +1717,9 @@ $("set-open").addEventListener("click", async () => {
     return;
   }
   await molt.saveEndpoint(baseUrl, model);
+  // A leftover proof from the previous workspace would light the spine for
+  // checks this project does not have.
+  lastProof = undefined;
   state = r.state!;
   applyState();
   $("set-status").textContent = "Open.";
@@ -1736,6 +1954,159 @@ $("set-refresh").addEventListener("click", () => {
   void fillModelSelect(true).then(() => ($("set-status").textContent = "Models refreshed."));
 });
 
+
+// ── spine collapse ───────────────────────────────────────────────────────────
+
+/**
+ * Fully hidden, no leftover strip. Default expanded so first launch still
+ * shows the unique surface. `/bar` and Cmd/Ctrl+B are how you get it back.
+ */
+let spineOpen = true;
+
+function setSpineOpen(open: boolean): void {
+  spineOpen = open;
+  $("stage").classList.toggle("no-spine", !open);
+  $("spine-toggle").setAttribute("aria-pressed", String(open));
+  localStorage.setItem("molt.spine", open ? "on" : "off");
+}
+
+$("spine-toggle").addEventListener("click", () => setSpineOpen(!spineOpen));
+$("spine-hide").addEventListener("click", () => setSpineOpen(false));
+
+// ── interview ────────────────────────────────────────────────────────────────
+
+type IvQ = { id: string; prompt: string; options: string[]; allowOther: boolean };
+type IvA = { id: string; choice: string };
+
+let ivTask = "";
+let ivRound = 1;
+let ivHistory: { questions: IvQ[]; answers: IvA[] }[] = [];
+let ivCurrent: IvQ[] = [];
+const ivPicks = new Map<string, string>();
+let pendingBarAdds: { name: string; run: string }[] = [];
+
+function closeInterview(): void {
+  $("interview-panel").classList.add("hidden");
+}
+
+function drawInterview(): void {
+  const box = $("iv-qs");
+  box.textContent = "";
+  for (const q of ivCurrent) {
+    const card = el("div", "iv-q");
+    card.appendChild(el("div", "prompt", q.prompt));
+    const opts = el("div", "iv-opts");
+    for (const opt of q.options) {
+      const b = el("button", ivPicks.get(q.id) === opt ? "on" : "") as HTMLButtonElement;
+      b.type = "button";
+      b.textContent = opt;
+      b.addEventListener("click", () => {
+        ivPicks.set(q.id, opt);
+        drawInterview();
+      });
+      opts.appendChild(b);
+    }
+    card.appendChild(opts);
+    if (q.allowOther) {
+      const other = el("input", "iv-other") as HTMLInputElement;
+      other.type = "text";
+      other.placeholder = "or say it in your own words";
+      const cur = ivPicks.get(q.id);
+      if (cur && !q.options.includes(cur)) other.value = cur;
+      other.addEventListener("input", () => {
+        if (other.value.trim()) ivPicks.set(q.id, other.value.trim());
+      });
+      card.appendChild(other);
+    }
+    box.appendChild(card);
+  }
+}
+
+function collectAnswers(): IvA[] {
+  return ivCurrent
+    .map((q) => ({ id: q.id, choice: (ivPicks.get(q.id) ?? "").trim() }))
+    .filter((a) => a.choice.length > 0);
+}
+
+async function startInterview(task = ""): Promise<void> {
+  // Criteria is the review surface even when nothing is open — self-check
+  // clicks Interview with no workspace and still has to tell a check from
+  // a note. The model round waits until a session exists.
+  $("criteria").classList.remove("hidden");
+  if (!state?.open) {
+    showTab("settings");
+    $("set-status").textContent = "Open a workspace first.";
+    $("ck-state").textContent = "open a workspace to interview; add checks here in the meantime";
+    return;
+  }
+  ivTask = task.trim() || promptBox.value.trim();
+  ivRound = 1;
+  ivHistory = [];
+  ivCurrent = [];
+  ivPicks.clear();
+  pendingBarAdds = [];
+  $("interview-panel").classList.remove("hidden");
+  $("iv-state").textContent = "asking…";
+  await interviewRound();
+}
+
+async function interviewRound(skip = false): Promise<void> {
+  if (ivCurrent.length) {
+    ivHistory.push({ questions: ivCurrent, answers: skip ? [] : collectAnswers() });
+  }
+  $("iv-state").textContent = skip ? "proposing from what you answered…" : "asking…";
+  const r = await molt.interview({
+    task: ivTask,
+    round: ivRound,
+    history: ivHistory,
+  });
+  if (r.kind === "error") {
+    $("iv-state").textContent = r.error;
+    say("error", r.error, "error");
+    return;
+  }
+  if (r.kind === "ask") {
+    ivRound = r.round + 1;
+    ivCurrent = r.questions;
+    ivPicks.clear();
+    $("iv-state").textContent = `round ${r.round} — answer, then continue`;
+    drawInterview();
+    return;
+  }
+  closeInterview();
+  pendingBarAdds = r.proposal.barAdds;
+  for (const c of r.proposal.checks) rows.push({ kind: "check", name: c.name, text: c.run });
+  for (const n of r.proposal.notes) rows.push({ kind: "note", name: "", text: n });
+  $("criteria").classList.remove("hidden");
+  drawCriteria();
+  $("ck-seal").classList.toggle("hidden", pendingBarAdds.length === 0);
+  $("ck-state").textContent = pendingBarAdds.length
+    ? "review, then Seal into bar — or Run to use as this-task criteria"
+    : "review the draft, then Run to seal it for this task";
+  say("", "interview proposed criteria — review them before they mean anything", "info");
+}
+
+$("interview").addEventListener("click", () => void startInterview());
+$("iv-hide").addEventListener("click", closeInterview);
+$("iv-next").addEventListener("click", () => void interviewRound(false));
+$("iv-skip").addEventListener("click", () => void interviewRound(true));
+$("ck-seal").addEventListener("click", async () => {
+  if (!pendingBarAdds.length) return;
+  const r = await molt.applyBar(pendingBarAdds);
+  if (!r.ok) {
+    say("error", r.error ?? "could not write the bar", "error");
+    return;
+  }
+  if (r.state) {
+    state = r.state;
+    applyState();
+  }
+  pendingBarAdds = [];
+  $("ck-seal").classList.add("hidden");
+  $("ck-state").textContent = "wrote into .molt/done.yml — task criteria still need Run to seal";
+  setSpineOpen(true);
+});
+
 // ── chrome ───────────────────────────────────────────────────────────────────
 
 function applyState(): void {
@@ -1754,10 +2125,10 @@ function applyState(): void {
   // className wholesale here would quietly strip the affordance that says so.
   $("crumb-model").classList.toggle("muted", !state.model);
   $("crumb-local").classList.toggle("hidden", !state.selfHosted);
-  $("st-bar").textContent = state.checks.length
-    ? `bar: ${state.checks.length} check(s)`
-    : "no bar — unverified";
-  $("st-session").textContent = state.sessionId ? `session ${state.sessionId}` : "";
+  if (state.sessionId) {
+    $("set-status").dataset.session = state.sessionId;
+    if (!$("set-status").textContent) $("set-status").textContent = `session ${state.sessionId}`;
+  }
   // Settings is where you go to see what is open, and its workspace box was
   // filled from nothing — a session could be running against a directory while
   // the field that names it sat empty behind a placeholder. Never while it has
@@ -1773,21 +2144,55 @@ function applyState(): void {
     say("bar", `done.yml could not be read: ${state.barError}`, "error");
   }
   renderChecks();
+  void refreshStats();
+}
+
+/**
+ * OpenCode's rail is a context meter plus a todo list. The meter is worth
+ * taking; the list is not. molt's todo is the bar — what "done" means — and
+ * a second checklist of the model's own tasks would be a copy.
+ */
+function paintContext(s: Stats | null): void {
+  const pct = $("ctx-pct");
+  const line = $("ctx-line");
+  const cost = $("ctx-cost");
+  const fill = $("ctx-fill");
+  const bar = fill.parentElement!;
+  if (!s) {
+    pct.textContent = "";
+    line.textContent = "no session";
+    cost.textContent = "";
+    fill.style.width = "0%";
+    bar.className = "ctx-bar";
+    return;
+  }
+  const cap = contextCap(s.window, s.budget);
+  const used = s.requestEst;
+  const ratio = contextFill(used, cap);
+  const pctN = Math.round(ratio * 100);
+  fill.style.width = `${pctN}%`;
+  bar.className = ratio >= 0.92 ? "ctx-bar full" : ratio >= 0.75 ? "ctx-bar hot" : "ctx-bar";
+  if (cap > 0) {
+    pct.textContent = `${pctN}%`;
+    line.textContent =
+      s.window > 0
+        ? `${fmtInt(used)} of ${fmtInt(cap)}`
+        : `${fmtInt(used)} of ${fmtInt(cap)} budget`;
+  } else {
+    // No window named, no budget set. A percentage of a number we invented
+    // is how this would lie, so the fill stays empty and the count stands.
+    pct.textContent = "";
+    line.textContent = used > 0 ? `${fmtInt(used)} in the next request` : "empty";
+  }
+  const money =
+    s.costUsd === null ? "" : s.costEstimated ? `~${fmtCost(s.costUsd)}` : fmtCost(s.costUsd);
+  cost.textContent = [money, s.cached > 0 ? `${fmtInt(s.cached)} cached` : "", s.shedBatches > 0 ? `${s.shedBatches} shed` : ""]
+    .filter(Boolean)
+    .join(" · ");
 }
 
 async function refreshStats(): Promise<void> {
-  const s = await molt.stats();
-  if (!s) return;
-  // One string rather than three fields with separators between them: an
-  // empty session showed "— · — · —", which reads as broken rather than idle.
-  const parts = [`${fmtInt(s.tokens)} tokens`];
-  if (s.cached > 0) parts.push(`${fmtInt(s.cached)} cached`);
-  // The terminal's rule, not a second one: always dollars, three decimals at
-  // most, "<$0.001" below that. `toFixed(4)` printed "$0.0001" as a run of
-  // zeros to count, and read differently from the same session in the CLI.
-  if (s.costUsd !== null) parts.push(fmtCost(s.costUsd));
-  if (s.shedBatches > 0) parts.push(`${s.shedBatches} shed`);
-  $("st-usage").textContent = s.tokens > 0 ? parts.join("  ·  ") : "";
+  paintContext(await molt.stats());
 }
 
 async function boot(): Promise<void> {
@@ -1815,7 +2220,10 @@ async function boot(): Promise<void> {
   // The frame differs by platform, and the padding that compensates for
   // macOS's traffic lights is a hole anywhere else.
   document.documentElement.dataset.platform = state.platform;
+  const mod = state.platform === "darwin" ? "⌘" : "Ctrl";
+  for (const k of document.querySelectorAll("[data-mod]")) k.textContent = mod;
 
+  setSpineOpen(localStorage.getItem("molt.spine") !== "off");
   applyState();
   // Discovery is a network call per endpoint; it must not hold the window
   // shut, so it fills in behind the first paint.

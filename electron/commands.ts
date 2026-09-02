@@ -13,6 +13,16 @@
  * and never reach here.
  */
 import { loadBar, BarError } from "../src/bar.js";
+import {
+  cmdAttempts,
+  cmdAutoShed,
+  cmdCommit,
+  cmdFor,
+  cmdMap,
+  cmdRead,
+  cmdRevert,
+  cmdUndo,
+} from "../src/session-commands.js";
 import type { Engine } from "../src/engine.js";
 import type { BarResult } from "../src/types.js";
 
@@ -107,12 +117,13 @@ export async function runEngineCommand(
       return {
         kind: "info",
         text:
-          `${st.attempts} attempts · ${st.accepted} accepted · ` +
-          `false-claim rate ${(st.falseClaimRate * 100).toFixed(1)}% · ` +
+          `${st.attempts} attempts · ${st.accepted} accepted · ${st.verifiedChanges} verified change(s)` +
+          (st.answered ? ` · ${st.answered} answered question(s), not counted` : "") +
+          ` · false-claim rate ${(st.falseClaimRate * 100).toFixed(1)}% · ` +
           `${st.tokensPerVerifiedChange ?? "—"} tokens per verified change` +
           (st.usdPerVerifiedChange === undefined
             ? ""
-            : ` · ${usd(st.usdPerVerifiedChange)} per verified change`),
+            : ` · ${st.costEstimated ? "~" : ""}${usd(st.usdPerVerifiedChange)} per verified change (priced sessions)`),
       };
     }
 
@@ -190,6 +201,33 @@ export async function runEngineCommand(
       if (!result) return { kind: "info", text: "no bar to check — /init to create one" };
       return { kind: "bar", result };
     }
+
+    // One implementation, two surfaces. These are the first commands in the
+    // program that are not written twice, which is why they are the first
+    // that cannot drift apart.
+    case "/commit":
+      return cmdCommit(engine, arg);
+
+    case "/revert":
+      return cmdRevert(engine, arg);
+
+    case "/undo":
+      return cmdUndo(engine);
+
+    case "/for":
+      return cmdFor(engine, arg);
+
+    case "/attempts":
+      return cmdAttempts(engine, arg);
+
+    case "/autoshed":
+      return cmdAutoShed(engine, arg);
+
+    case "/map":
+      return cmdMap(engine, arg);
+
+    case "/read":
+      return cmdRead(engine, arg);
 
     default:
       return { kind: "unhandled" };
