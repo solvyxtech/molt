@@ -2,6 +2,9 @@
 
 **A coding agent that can't say "done" without proving it.**
 
+[![check](https://github.com/solvyxtech/molt/actions/workflows/check.yml/badge.svg)](https://github.com/solvyxtech/molt/actions/workflows/check.yml)
+[![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
+
 molt runs any OpenAI-compatible model (and Anthropic's native API) as a coding
 agent, then refuses to accept "done" until every check in your project's
 `.molt/done.yml` passes against the real state on disk. A completion is a
@@ -200,4 +203,4 @@ explicit about the list.
 
 ## Status
 
-Private and unpublished. The macOS build is unsigned. MIT licence.
+Early and moving. The macOS build is unsigned. MIT licence.
