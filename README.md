@@ -11,13 +11,13 @@ agent, then refuses to accept "done" until every check in your project's
 claim; molt checks the claim and writes a receipt either way.
 
 <p align="center">
-  <img src="docs/images/refused.png" alt="molt refusing its own fix: 10 of 11 checks pass, the mutation check fails" width="900">
+  <img src="docs/images/accepted.png" alt="molt fixing a defect in its own source and passing all eleven checks" width="900">
 </p>
 
-<p align="center"><em>molt, working on molt. It found the failing test, fixed the
-cause, and said the existing test covered it — so molt broke the line it had
-just written and showed that nothing noticed. Refused twice for the same
-reason, it stopped rather than spend more.</em></p>
+<p align="center"><em>molt, working on molt: a real defect in its own source,
+fixed, with a test added to pin the boundary — then eleven checks run against
+the disk, including one that breaks each changed line to confirm a test
+notices. This claim took two attempts; the refused one is on file beside it.</em></p>
 
 ## What it does
 
@@ -115,8 +115,16 @@ as `task:<name>`. Editing `done.yml` mid-session is itself a failing check.
 
 ## What a refusal looks like
 
-The run above, in the terminal. The model had fixed the failing test and said
-so; `work-checked` broke the line it had just written and nothing noticed:
+The same task, an earlier run. The model fixed the failing test and said the
+existing test already covered it, so `work-checked` broke the line it had just
+written and showed that nothing noticed. Ten of eleven, refused — twice the
+same way, after which molt stopped rather than spend more:
+
+<p align="center">
+  <img src="docs/images/refused.png" alt="molt refusing an attempt: ten of eleven checks pass, the mutation check fails" width="900">
+</p>
+
+The same refusal in the terminal:
 
 ```
 bar not met — 10 of 11 checks
@@ -177,13 +185,6 @@ tokens and cost. `molt stats` reports the false-claim rate and cost per
 verified change over all of them, and says what it does not count.
 
 ## The desktop
-
-<p align="center">
-  <img src="docs/images/accepted.png" alt="The same defect, fixed and accepted: 11 of 11 checks" width="900">
-</p>
-
-<p align="center"><em>The same task again, told to add the test the mutation
-check asked for. Eleven of eleven, and a receipt.</em></p>
 
 <p align="center">
   <img src="docs/images/receipts.png" alt="Receipts tab" width="440">
