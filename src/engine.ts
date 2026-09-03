@@ -24,6 +24,7 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { basename, dirname, resolve, relative, isAbsolute, join } from "node:path";
 import type { ArchiveLike } from "./archive.js";
 import { CheckCache, barFingerprint, clipEnds, formatBarFailure, runBar, type BarContext } from "./bar.js";
+import { preflightCriteria } from "./criteria.js";
 import {
   AUTONOMY_SUMMARY,
   DEFAULT_AUTONOMY,
@@ -930,6 +931,26 @@ function isGenerated(rel: string): boolean {
   return rel
     .split(/[\\/]/)
     .some((seg) => seg === "dist" || seg === "dist-test" || SKIP_DIRS.has(seg));
+}
+
+/**
+ * The checks that failed because they never ran.
+ *
+ * When every unmet check is one of these, another attempt is not a second
+ * chance — it is spending a model's tokens on a command that does not exist.
+ * A real session did exactly that: a sealed criterion grepped a file that was
+ * not there, grep exited 2, and the model spent its attempts trying to make
+ * the error go away by creating the file. Nothing was verified, and the run
+ * ended having taught the model to satisfy a typo.
+ */
+function brokenChecks(result: BarResult): string[] {
+  return result.results.filter((r) => !r.ok && !r.advisory && r.didNotRun).map((r) => r.name);
+}
+
+/** True when the bar is unmet and every unmet check is broken rather than failing. */
+function onlyBrokenChecks(result: BarResult): boolean {
+  const failed = result.results.filter((r) => !r.ok && !r.advisory);
+  return failed.length > 0 && failed.every((r) => r.didNotRun === true);
 }
 
 function failedOnlyWriteChecks(result: BarResult): string | null {
@@ -3121,6 +3142,44 @@ export class Engine {
           `${taskChecks.length} task check(s) and ${taskNotes.length} note(s) sealed for this ` +
           `turn (${taskSeal.slice(0, 12)}). They cannot change while it runs.`,
       };
+      // Try them once, now, before a single token is spent. A criterion is
+      // meant to fail before the work; it is not meant to be unrunnable, and
+      // the difference is cheap to establish here and expensive to discover
+      // at the end of a turn.
+      if (taskChecks.length) {
+        // Through `running`, so ctrl+C at the very start of a turn kills the
+        // preflight rather than waiting it out.
+        this.running = new AbortController();
+        let broken: Awaited<ReturnType<typeof preflightCriteria>> = [];
+        try {
+          broken = await preflightCriteria(taskChecks, {
+            cwd: this.cwd,
+            signal: this.running.signal,
+          });
+        } finally {
+          this.running = undefined;
+        }
+        if (broken.length) {
+          log?.append("note", {
+            text: "sealed criteria that did not run when tried before the work",
+            checks: broken.map((b) => b.name),
+          });
+          yield {
+            kind: "info",
+            text:
+              broken
+                .map(
+                  (b) =>
+                    `criterion \`${b.name}\` did not run when tried before the work: ` +
+                    `\`${b.run}\` — ${b.why}.`,
+                )
+                .join(" ") +
+              ` A criterion is supposed to fail until the work is done, but this one cannot ` +
+              `report either way. If the work is what makes it runnable, carry on; otherwise ` +
+              `stop and repair it, because no work will satisfy it.`,
+          };
+        }
+      }
     }
 
     this.transcript.push({ role: "user", content: userText });
@@ -4327,7 +4386,11 @@ export class Engine {
         ? result.results.filter((r) => !r.ok).map((r) => r.name)
         : [];
       lastFailure = signature;
-      const exhausted = !result.ok && (stuck || proofAttempts >= maxAttempts);
+      // A broken check ends the turn now rather than at the attempt limit.
+      // There is no work that satisfies a command which did not run, so every
+      // further attempt is spend with no possible outcome.
+      const allBroken = onlyBrokenChecks(result);
+      const exhausted = !result.ok && (stuck || allBroken || proofAttempts >= maxAttempts);
       const verdict = result.ok ? "accepted" : exhausted ? "exhausted" : "refused";
 
       // A stuck bar is its own fact, worth a separate journal entry: the run
@@ -4408,6 +4471,19 @@ export class Engine {
         log?.append("session_end", { reason: "bar not met", attempts: proofAttempts });
         yield { kind: "proof_exhausted", result, attempts: proofAttempts };
         const onlyWrites = failedOnlyWriteChecks(result);
+        if (allBroken) {
+          const names = brokenChecks(result).map((n) => `\`${n}\``).join(", ");
+          yield {
+            kind: "error",
+            text:
+              `the bar was not met, but nothing failed: ${names} did not run. ` +
+              `The command was not found or could not be executed, so no verdict was ` +
+              `reached either way, and no change to the work could produce one. ` +
+              `Repair the check in .molt/done.yml — molt will not spend more attempts on it.`,
+          };
+          yield* this.settleFailed(log);
+          return;
+        }
         if (stuck) {
           yield {
             kind: "info",

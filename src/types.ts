@@ -229,6 +229,15 @@ export type CheckResult = {
   cached?: boolean;
   /** True when a failure here reports rather than refuses. */
   advisory?: boolean;
+  /**
+   * True when the command never ran: not found, or not executable.
+   *
+   * It still counts as unmet — a check nobody can run is not a licence to
+   * accept the claim — but it is described as a broken check rather than as
+   * failing work, because sending a model to satisfy a command that does not
+   * exist is how a gate teaches a model to invent the wrong change.
+   */
+  didNotRun?: boolean;
   tags?: string[];
   kind: "command" | "builtin";
   /** The command run, or the builtin's identifier. */
