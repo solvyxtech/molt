@@ -112,6 +112,8 @@ options
   --provider <name>  label shown in the status line
   --cwd <dir>        project directory (default: current)
   --budget <n>       hard token ceiling for the session
+  --max-tokens <n>   most tokens the model may write in one reply (default
+                     32768, or the model's own maximum if it is lower)
   --auto-shed <n>    shed once history exceeds n tokens (default 60000, 0 off)
   --attempts <n>     completion attempts before molt reports failure (default 4)
   --for <5m>         wall-clock ceiling for one turn; then the bar runs on
@@ -170,6 +172,7 @@ type Args = {
   verbose: boolean;
   budget?: number;
   autoShed?: number;
+  maxTokens?: number;
   attempts?: number;
   /** Wall-clock ceiling for one turn, in ms. `--for 5m`. */
   forMs?: number;
@@ -328,6 +331,9 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         break;
       case "--auto-shed":
         out.autoShed = positiveInt("--auto-shed", next());
+        break;
+      case "--max-tokens":
+        out.maxTokens = positiveInt("--max-tokens", next());
         break;
       case "--attempts":
         out.attempts = positiveInt("--attempts", next());
@@ -511,6 +517,7 @@ function buildEngine(args: Args, session = false): Engine {
     // things a person expects to be in charge of.
     git: { commitOnPass: args.commit === true, restoreOnFail: args.revert === true },
     autoShedAtTokens: args.autoShed,
+    maxTokens: args.maxTokens,
     captureDir: args.capture ?? process.env.MOLT_CAPTURE_DIR,
     stream: args.stream,
     // --yes predates autonomy and means the same thing as its top level.

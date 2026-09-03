@@ -59,6 +59,8 @@ import {
   toRequest,
   usageFor,
   finishReasonFor,
+  outputCeiling,
+  DEFAULT_MAX_TOKENS,
 } from "./anthropic.js";
 import { breakpoints, withCaching, refusedCaching, type CacheStyle, cacheStyle } from "./cache.js";
 import { Journal } from "./journal.js";
@@ -426,6 +428,17 @@ export const MAX_PROOF_ATTEMPTS = 4;
  * what molt used to assume the first one meant.
  */
 export const EMPTY_TURN_RETRIES = 2;
+
+/**
+ * How many times a reply cut off at the output ceiling is asked to continue
+ * before molt reads it as the answer.
+ *
+ * The same shape as EMPTY_TURN_RETRIES and for the same reason: a truncated
+ * reply is not a decision to stop, so asking again is worth one request — but
+ * a model that keeps running out of room must not loop for ever, and what it
+ * has written by then is what there is.
+ */
+export const TRUNCATED_TURN_RETRIES = 2;
 /**
  * Consecutive dry steps before molt says so IN THE TRANSCRIPT rather than only
  * on screen.
@@ -1212,6 +1225,22 @@ export class Engine {
   /** True once an endpoint has refused `cache_control`. Sticky per session. */
   private cachingUnsupported = false;
   /**
+   * A model's own output maximum, once it has told molt what it is.
+   *
+   * Held apart from `cfg.maxTokens` rather than overwriting it: what the user
+   * asked for and what this model will accept are two different facts, and
+   * folding them together loses the request the moment the model changes.
+   * Sticky within a model, so a low ceiling costs one retry per session
+   * rather than one per step.
+   */
+  private modelMaxTokens?: number;
+
+  /** What to send as `max_tokens`: what was asked for, bounded by what fits. */
+  private maxTokensFor(): number {
+    const asked = this.cfg.maxTokens ?? DEFAULT_MAX_TOKENS;
+    return this.modelMaxTokens ? Math.min(asked, this.modelMaxTokens) : asked;
+  }
+  /**
    * These three are derived from the endpoint, and the endpoint moves.
    *
    * They were fields, computed once in the constructor. `/model` then switched
@@ -1422,6 +1451,11 @@ export class Engine {
   }
 
   setModel(m: string): void {
+    if (m !== this.cfg.model) {
+      // Output maximums are per-model, and the last one's says nothing
+      // about this one. Discovered again on the next refusal if it matters.
+      this.modelMaxTokens = undefined;
+    }
     this.cfg.model = m;
   }
   setApiKey(k?: string): void {
@@ -1469,6 +1503,9 @@ export class Engine {
     // Whatever the last endpoint would not accept says nothing about this one.
     this.cachingUnsupported = false;
     this.streamUsageUnsupported = false;
+    // Not `modelMaxTokens`: changing the endpoint clears the model above, and
+    // the `setModel` that has to follow is what forgets its ceiling. Clearing
+    // it here as well would be a second copy of that rule.
     this.cacheWasWorking = false;
     this.warnedCacheLost = false;
     this.reset();
@@ -2263,7 +2300,7 @@ export class Engine {
           this.native
             ? toRequest(wire, TOOLS, {
                 model: this.cfg.model,
-                maxTokens: this.cfg.maxTokens,
+                maxTokens: this.maxTokensFor(),
                 toolChoice: "none",
                 // A fork must reuse the parent's prefix exactly or it reads
                 // none of the cache the turn has been building.
@@ -2909,7 +2946,7 @@ export class Engine {
    * events to its own consumer and reads the outcome off the return.
    */
   private async *invokeTool(
-    call: { id: string; name: string; rawArgs: string },
+    call: { id: string; name: string; rawArgs: string; truncated?: boolean },
     ctx: ToolContext,
   ): AsyncGenerator<EngineEvent, ToolOutcome> {
     /** Whether this call told the model something it had already been told. */
@@ -2958,9 +2995,21 @@ export class Engine {
         preview: raw,
         auto: true,
       };
-      const complaint =
-        `[molt: the arguments for ${name} were not valid JSON, so nothing ran. ` +
-        `Send them again as a JSON object. What arrived was: ${raw}]`;
+      // Which fact this is matters more than it looks.
+      //
+      // "Send them again" is right for a model that produced bad JSON and
+      // wrong for one that produced good JSON and had it cut off at the
+      // output ceiling: sending the same call again produces the same
+      // truncation, and molt asked for it every time. A `write_file` of a
+      // large file looped exactly that way. The stop reason already says
+      // which happened, so it is said.
+      const complaint = call.truncated
+        ? `[molt: your reply hit the output ceiling of ${this.maxTokensFor()} tokens and was cut ` +
+          `off part-way through the arguments for ${name}, so nothing ran. Sending the same call ` +
+          `again will be cut off in the same place. Write less in one go — a smaller file, or one ` +
+          `part of it at a time — or ask for the ceiling to be raised with --max-tokens.]`
+        : `[molt: the arguments for ${name} were not valid JSON, so nothing ran. ` +
+          `Send them again as a JSON object. What arrived was: ${raw}]`;
       this.transcript.push({ role: "tool", tool_call_id: callId, content: complaint });
       return { name, result: complaint, auto: true, repeated: false };
     }
@@ -3243,6 +3292,8 @@ export class Engine {
     let dryStreak = 0;
     /** Consecutive assistant turns that arrived with nothing in them. */
     let emptyTurns = 0;
+    /** Consecutive replies that stopped at the output ceiling. */
+    let truncatedTurns = 0;
     /** The dry streak molt has already written into the transcript. */
     let nudgedAtStreak = 0;
 
@@ -3533,7 +3584,7 @@ export class Engine {
           const body = this.native
             ? toRequest(wire, TOOLS, {
                 model: this.cfg.model,
-                maxTokens: this.cfg.maxTokens,
+                maxTokens: this.maxTokensFor(),
                 stream,
                 toolChoice: "auto",
                 cacheAt: marks,
@@ -3647,6 +3698,31 @@ export class Engine {
               }
               res = retry;
               body = res.ok ? "" : (await res.text().catch(() => ""));
+            }
+
+            // A model whose own output maximum is below molt's default says
+            // so, and says what the maximum is. Same shape as the two
+            // fallbacks above: retry once, and only believe the ceiling was
+            // the problem if that works.
+            if (!res.ok && res.status === 400 && this.native && this.modelMaxTokens === undefined) {
+              const cap = outputCeiling(body);
+              if (cap && cap < this.maxTokensFor()) {
+                const was = this.maxTokensFor();
+                this.modelMaxTokens = cap;
+                const retry = await send(askForUsage && !this.streamUsageUnsupported);
+                if (retry.ok) {
+                  log?.append("note", {
+                    text: `${this.cfg.model} accepts ${cap} output tokens, not ${was} — using its maximum`,
+                  });
+                } else {
+                  // Not the ceiling after all. Forget it rather than spending
+                  // the rest of the session on a smaller answer for a reason
+                  // that turned out to be wrong.
+                  this.modelMaxTokens = undefined;
+                }
+                res = retry;
+                body = res.ok ? "" : (await res.text().catch(() => ""));
+              }
             }
 
             if (!res.ok) {
@@ -4125,7 +4201,7 @@ export class Engine {
         billed: typeof billedUsd === "number",
       };
       /** Close out the step with what it did and what it cost. */
-      const summary = (tools: string[], outcome: "tools" | "claim" | "empty"): EngineEvent => ({
+      const summary = (tools: string[], outcome: "tools" | "claim" | "empty" | "truncated"): EngineEvent => ({
         kind: "step_summary",
         job,
         step,
@@ -4196,12 +4272,14 @@ export class Engine {
         const called: string[] = [];
         let autoRan = 0;
         let repeated = 0;
-        for (const call of msg.tool_calls) {
+        for (const [i, call] of msg.tool_calls.entries()) {
           const outcome = yield* this.invokeTool(
             {
               id: call.id,
               name: call.function?.name ?? "unknown",
               rawArgs: call.function?.arguments ?? "",
+              // Only the last one can be the one that ran out of room.
+              truncated: finishReason === "length" && i === msg.tool_calls.length - 1,
             },
             { step, userText, confirm, log, shown, answered },
           );
@@ -4286,6 +4364,40 @@ export class Engine {
           nudgedAtStreak = 0;
         }
         continue; // let the model see tool results
+      }
+
+      // ---- A sentence that stopped mid-word is not a claim of completion. ----
+      //
+      // With no tool call, the next thing molt does is treat this message as
+      // "I am finished" and spend the whole bar deciding whether it is true.
+      // A message cut off at the output ceiling did not decide to stop; it ran
+      // out of room. Asking it to carry on costs one step. Running the bar on
+      // it costs the suite, and produces a receipt whose claim is half a
+      // sentence.
+      if (finishReason === "length" && truncatedTurns < TRUNCATED_TURN_RETRIES) {
+        truncatedTurns += 1;
+        log?.append("note", {
+          text: `reply cut off at the ${this.maxTokensFor()}-token output ceiling`,
+          step,
+          attempt: truncatedTurns,
+        });
+        this.transcript.push({
+          role: "user",
+          content:
+            `[molt: that reply hit the output ceiling of ${this.maxTokensFor()} tokens and stopped ` +
+            `part-way through, so it is not being read as a finished answer. Continue from where ` +
+            `it stops, and keep what remains short.]`,
+          molt: { nudge: true },
+        });
+        yield summary([], "truncated");
+        yield {
+          kind: "info",
+          text:
+            `the reply was cut off at the ${this.maxTokensFor()}-token output ceiling — asking it ` +
+            `to continue rather than running the bar on half a sentence` +
+            (this.cfg.maxTokens === undefined ? " (raise it with --max-tokens)" : ""),
+        };
+        continue;
       }
 
       yield summary([], "claim");

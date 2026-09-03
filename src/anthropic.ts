@@ -32,8 +32,44 @@
 import type { Msg, ToolCall } from "./types.js";
 import { SseParser, type StreamResult, type Usage } from "./stream.js";
 
-/** Anthropic requires this; there is no "unset". Generous, not a target. */
-export const DEFAULT_MAX_TOKENS = 8192;
+/**
+ * The output ceiling sent when nothing else says otherwise.
+ *
+ * Anthropic requires the field; there is no "unset". It reserves nothing and
+ * costs nothing — billing is on tokens actually produced — so the only thing
+ * a low number buys is a truncated answer, and a truncated answer on this
+ * loop is worse than an expensive one: a `write_file` cut off mid-JSON came
+ * back as "your arguments were not valid JSON, send them again", and the
+ * model sent the same too-long call again, and again.
+ *
+ * 8192 was the old ceiling and is now the floor of what current models will
+ * do; several serve 64k. Set high enough that a large file lands in one
+ * piece, with `outputCeiling()` below to climb back down for a model whose
+ * own maximum is lower. Override per session with `--max-tokens`.
+ */
+export const DEFAULT_MAX_TOKENS = 32_768;
+
+/**
+ * The maximum a model will accept, read out of its own refusal.
+ *
+ * "max_tokens: 32768 > 8192, which is the maximum allowed number of output
+ * tokens for claude-3-5-sonnet-20241022" says exactly what to send instead,
+ * so an older model costs one retry rather than a turn. Deliberately narrow,
+ * like `refusedCaching`: a 400 that says nothing about output tokens is a
+ * real 400 and must not be quietly reinterpreted.
+ */
+export function outputCeiling(body: string): number | null {
+  // Each pattern carries its own narrowness — every one of them requires the
+  // words "max_tokens" or "output tokens" to be in the refusal. A separate
+  // guard saying the same thing is a second place for it to drift.
+  const m =
+    /max_tokens:\s*\d+\s*>\s*(\d+)/i.exec(body) ??
+    /maximum allowed number of output tokens[^\d]{0,40}(\d+)/i.exec(body) ??
+    /max_tokens\D{0,40}(?:less than or equal to|at most|maximum of)\D{0,10}(\d+)/i.exec(body);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
 
 type TextBlock = { type: "text"; text: string; cache_control?: { type: "ephemeral" } };
 type ToolUseBlock = { type: "tool_use"; id: string; name: string; input: unknown };

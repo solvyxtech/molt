@@ -459,11 +459,12 @@ export type EngineEvent =
       sessionCostUsd?: number;
       durationMs: number;
       /**
-       * What the model did with the step: called tools, claimed done, or
-       * returned nothing at all. `empty` is its own outcome because it is
-       * not a claim — see the empty-turn guard in engine.ts.
+       * What the model did with the step: called tools, claimed done,
+       * returned nothing at all, or ran out of room mid-sentence. `empty` and
+       * `truncated` are their own outcomes because neither is a claim — see
+       * the empty-turn and truncated-turn guards in engine.ts.
        */
-      outcome: "tools" | "claim" | "empty";
+      outcome: "tools" | "claim" | "empty" | "truncated";
       /** Provider-reported stop reason, when one was given. */
       finishReason?: string;
     }
