@@ -62,6 +62,13 @@ less than promised, crash.
 `planShed`/`commitShed` cannot be shown to preserve the full record and produce
 a provider-valid payload, it does not land.
 
+## Licensing
+
+molt is Apache 2.0. Contributions are accepted under the same terms —
+section 5 of the licence says so, so there is no separate agreement to sign.
+If you paste in code you did not write, say where it came from and under what
+licence, in the pull request rather than in a comment.
+
 ## Style
 
 TypeScript, strict, ESM. Comments explain *why*, not *what* — if a line needs a
