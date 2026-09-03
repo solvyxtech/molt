@@ -21,6 +21,74 @@ pins the 1000ms boundary and adds the assertion, then eleven checks run
 against the disk — including one that breaks each changed line to confirm a
 test notices. Bar met, receipt written. (<a href="docs/images/demo.mp4">mp4</a>)</em></p>
 
+<details>
+<summary><strong>The receipt that turn wrote</strong> — unedited, and the whole
+thing is <a href="docs/examples/receipt-from-the-demo.md">in this repository</a></summary>
+
+```
+# molt receipt 0000 — accepted
+
+molt accepted this claim: every check that can block a completion passed.
+
+## What the model claimed
+
+> Fixed `fmtDuration` so sub-second values stay in milliseconds (`1` → `"1ms"`).
+> Added `fmtDuration(1000) === "1s"` so the `< 1000` boundary cannot survive a
+> `<=` mutation.
+
+## What this task had to satisfy
+
+Set before the work began and sealed as `feff7a18877439a6`. The seal is written
+to the session journal before the first request, so these can be shown to
+predate the work rather than to claim they did.
+
+**Machine-checked.** These ran with the bar and could refuse the claim:
+
+- task-gate: node -e "…if (m.fmtDuration(1) !== '1ms') process.exit(1)…"
+
+## What the model changed
+
+| file                       | before         | after          |
+| `src/session-commands.ts`  | `a074ca7e1d0f` | `87767c16fa80` |
+| `test/loop-close.test.ts`  | `4d5e5b567018` | `df490ce46062` |
+
+Hashes are SHA-256, taken immediately before and after molt wrote the file.
+`work-landed` re-reads each path and fails if what is there now does not match.
+
+## What was checked, and what it established
+
+| check          | verdict | what it established                                           |
+| types          | pass    | `npm run typecheck` exited 0 in 1741ms                        |
+| tests          | pass    | `npm test` exited 0 in 24161ms                                |
+| app-boots      | pass    | `npm run self-check` exited 0 in 8474ms                       |
+| app-drives     | pass    | `npm run e2e` exited 0 in 6255ms                              |
+| work-landed    | pass    | 2 file(s) modified and verified byte-for-byte on disk         |
+| record-intact  | pass    | No context has been shed; nothing to audit.                   |
+| work-accounted | pass    | 2 file(s) changed on disk, every one written through a tool   |
+| spec-intact    | pass    | 1 test file(s) changed, no assertion removed                  |
+| work-proven    | pass    | 1 changed file(s) executed by the tests                       |
+| work-checked   | pass    | 1 mutation(s) broke a test, as they should                    |
+| task:task-gate | pass    | the sealed criterion exited 0 in 33ms                         |
+
+## Session
+
+- when: 2026-09-03T17:42:19.808Z
+- attempt: 1
+- provider: xai
+- model: grok-4.6
+- session tokens: 208927
+- session cost: $0.2733
+- bar duration: 64627ms
+
+Every check passed. This is the evidence behind that claim.
+```
+
+Below the table the full receipt carries every check's own output — the
+compiler's, the suite's, the mutation report — followed by the thirty tool
+calls the turn made, in order. Nothing in it is written by a model.
+
+</details>
+
 ## What it does
 
 | | |
@@ -164,27 +232,21 @@ bar NOT met
 molt: bar not met after 1 attempts. molt is reporting failure rather than success.
 ```
 
-## What a receipt looks like
+## What a receipt is for
 
-`.molt/receipts/0050-accepted.md`, from a run with one task criterion:
+One is written for every completion attempt, refusals included, and
+[the one from the demo](docs/examples/receipt-from-the-demo.md) is in this
+repository to read in full.
 
-```
-# molt receipt 0050 — accepted
+The right-hand column is the point. "pass" is a header; *what it established*
+is the reason to believe the header, and molt used to compute that sentence and
+show it only when a check failed — which is backwards, since a failure explains
+itself and a pass is the one that has to earn belief.
 
-molt accepted this claim: every check that can block a completion passed.
-
-| check                 | verdict | what it established                                              |
-| tests                 | pass    | `npm test` exited 0 in 23312ms                                   |
-| work-landed           | pass    | 2 file(s) modified and verified byte-for-byte on disk            |
-| work-accounted        | pass    | 2 file(s) changed on disk this turn, every one written through a tool |
-| spec-intact           | pass    | no test file was changed                                         |
-| work-proven           | pass    | 1 changed file(s) executed by the tests                          |
-| task:fmtbytes-checked | pass    | `node -e "…fmtBytes(12)…"` exited 0 in 28ms                       |
-```
-
-Below the table, every check's full output; below that, provider, model,
-tokens and cost. `molt stats` reports the false-claim rate and cost per
-verified change over all of them, and says what it does not count.
+Refusals are kept for the same reason. A record containing only successes has
+the same shape as a record that was curated, and is worth exactly as much.
+`molt stats` reports the false-claim rate and the cost per verified change over
+all of them, and says plainly what it does not count.
 
 ## The desktop
 
