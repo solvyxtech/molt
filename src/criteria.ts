@@ -22,6 +22,8 @@
  *    A sentence dressed as a check is worse than no check.
  */
 import { authHeaders } from "./providers.js";
+import { runCommand } from "./run.js";
+import { diagnoseFailure } from "./bar.js";
 
 export type DraftedCheck = { name: string; run: string };
 export type Draft = { checks: DraftedCheck[]; notes: string[] };
@@ -96,6 +98,60 @@ export function taskChecksFrom(raw: unknown): {
     })),
     taskNotes: drafted.notes,
   };
+}
+
+/**
+ * Try each drafted criterion once, before the work, and report the ones that
+ * cannot run at all.
+ *
+ * The prompt above already tells the model not to invent a command. A local
+ * 8B model did anyway: it sealed a criterion grepping a file that did not
+ * exist, and the run ended with the model dutifully trying to create the file
+ * so the grep would stop erroring. An instruction is the weakest place to put
+ * a rule that a command can settle, so this settles it.
+ *
+ * Two deliberate limits:
+ *
+ *  - A criterion is EXPECTED to fail here. Failing before the work is the
+ *    entire point of one. Only "did not run" is reported — the shell could
+ *    not find or execute the command.
+ *  - It reports; it does not veto. A criterion can be legitimately unrunnable
+ *    beforehand and runnable after, if the work is what installs the tool it
+ *    names. Blocking on that would refuse a correct criterion, and the bar
+ *    still has the final say when the work claims to be finished.
+ *
+ * Short timeout, because this runs before every turn that seals criteria and
+ * a criterion that is still running after a few seconds has plainly run.
+ */
+export type BrokenCriterion = { name: string; run: string; why: string };
+
+export async function preflightCriteria(
+  checks: readonly { name: string; kind?: string; run?: string }[],
+  opts: { cwd: string; timeoutMs?: number; signal?: AbortSignal },
+): Promise<BrokenCriterion[]> {
+  const broken: BrokenCriterion[] = [];
+  for (const c of checks) {
+    if (c.kind && c.kind !== "command") continue;
+    if (!c.run) continue;
+    try {
+      const r = await runCommand(c.run, {
+        cwd: opts.cwd,
+        timeoutMs: opts.timeoutMs ?? 5_000,
+        maxBuffer: 1024 * 1024,
+        signal: opts.signal,
+      });
+      // One decision point, shared with the bar. A command that outlived the
+      // timeout plainly ran, and a timeout's exit code is never one of the
+      // shell's "could not execute that" codes, so it needs no separate case
+      // here — a second copy of this judgement is a second place to drift.
+      const d = diagnoseFailure(r.code ?? 0, r.stdout, r.stderr);
+      if (d.didNotRun) broken.push({ name: c.name, run: c.run, why: d.hint ?? "did not run" });
+    } catch {
+      // Failing to spawn it here is molt's problem, not the criterion's.
+      // Reporting it as broken would block work for the wrong reason.
+    }
+  }
+  return broken;
 }
 
 const SYSTEM = [

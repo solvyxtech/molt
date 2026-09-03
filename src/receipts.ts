@@ -302,7 +302,17 @@ export class Receipts {
       // The finding, not the label. "pass" is a header; "2 files modified and
       // verified byte-for-byte on disk" is the reason to believe it.
       const finding = r.output.trim().split("\n")[0]?.slice(0, 90) ?? "";
-      const verdict = r.ok ? "pass" : r.advisory ? "warn" : "**FAIL**";
+      // "did not run" is not a softer FAIL, it is a different fact: the
+      // command was never executed, so this row is evidence of nothing. A
+      // receipt that prints it as a failure invites the reader to believe
+      // something was tried and found wanting.
+      const verdict = r.ok
+        ? "pass"
+        : r.didNotRun
+          ? "**did not run**"
+          : r.advisory
+            ? "warn"
+            : "**FAIL**";
       return (
         `| ${r.name} | ${verdict}${r.cached ? " (reused)" : ""} | ` +
         `${finding.replace(/\|/g, "\\|") || "—"} | ${r.durationMs} |`
@@ -314,13 +324,13 @@ export class Receipts {
       // Plain key: value lines so a stranger can `rg "exit:" .molt/receipts`
       // and reconstruct the claim without parsing a markdown table.
       detail.push(
-        `### ${r.name} — ${r.ok ? "pass" : "FAIL"}`,
+        `### ${r.name} — ${r.ok ? "pass" : r.didNotRun ? "did not run" : "FAIL"}`,
         "",
         `check: ${r.name}`,
         `kind: ${r.kind}`,
         `command: ${r.detail}`,
         `exit: ${r.exitCode ?? "n/a"}`,
-        `result: ${r.ok ? "pass" : "fail"}`,
+        `result: ${r.ok ? "pass" : r.didNotRun ? "did-not-run" : "fail"}`,
         // Evidence of a different kind, and the receipt is the document handed
         // to someone who was not there to watch it run.
         `ran: ${r.cached ? "no — reused, nothing it watches had changed" : "yes"}`,

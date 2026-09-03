@@ -474,6 +474,65 @@ function truncate(s: string, n = OUTPUT_MAX): string {
   return clipEnds(s, n);
 }
 
+/**
+ * Did this command fail, or did it never run?
+ *
+ * They are not the same fact and molt reported them identically. A real
+ * session sealed a criterion that grepped a file which did not exist; grep
+ * exited 2 with `No such file or directory`, the bar said FAIL, and the model
+ * read that as work to do and set about creating the file to satisfy the
+ * check. A gate that demands a change teaches a model to invent one, and a
+ * gate that is simply broken teaches it to invent the wrong one.
+ *
+ * Two levels of confidence, kept apart on purpose:
+ *
+ *  - 127 and 126 are the shell's own answer: the command was not found, or
+ *    could not be executed. Nothing ran. This is certain.
+ *  - Anything else that produced no stdout and wrote a recognisable "could not
+ *    open that" line to stderr is a strong hint and nothing more, because a
+ *    suite can legitimately print those words while genuinely failing. So it
+ *    stays a failure and gains a sentence pointing at the command.
+ *
+ * The line it must not cross: a broken check still blocks the completion. A
+ * check nobody can satisfy is not a reason to accept a claim.
+ */
+export type CommandDiagnosis = { didNotRun: boolean; hint?: string };
+
+const CANNOT_RUN = /(command not found|not found|No such file or directory|Permission denied|cannot open|cannot find the path)/i;
+
+export function diagnoseFailure(
+  exitCode: number,
+  stdout: string,
+  stderr: string,
+): CommandDiagnosis {
+  if (exitCode === 127) {
+    return {
+      didNotRun: true,
+      hint: "the command was not found, so nothing ran and nothing was established",
+    };
+  }
+  if (exitCode === 126) {
+    return {
+      didNotRun: true,
+      hint: "the command could not be executed (permissions, or it is not a program)",
+    };
+  }
+  // Only when the command said nothing on stdout: a suite that printed a
+  // thousand lines and then mentioned a missing file did run, and its failure
+  // is about the work.
+  if (stdout.trim() === "" && CANNOT_RUN.test(stderr)) {
+    const first = stderr.trim().split("\n")[0]?.slice(0, 200) ?? "";
+    return {
+      didNotRun: false,
+      hint:
+        `this reads as the command failing rather than the work: ${first}. ` +
+        `If the check itself is wrong, fix the check — satisfying it by making its ` +
+        `error go away is not the task.`,
+    };
+  }
+  return { didNotRun: false };
+}
+
 /** sha256 of a file, or "" if it cannot be read. Used to verify a restore. */
 function sha256Of(abs: string): string {
   try {
@@ -1478,6 +1537,7 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
 
   let exitCode = 0;
   let output = "";
+  let diagnosis: CommandDiagnosis = { didNotRun: false };
   try {
     // Not execSync: a bar check is the longest thing molt runs (`npm test`,
     // two minutes by default) and running it synchronously froze the terminal
@@ -1493,15 +1553,21 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
     if (r.timedOut) {
       output = `timed out after ${check.timeoutMs}ms\n` + output;
       exitCode = 124;
+    } else if (exitCode !== check.expectExit) {
+      diagnosis = diagnoseFailure(exitCode, r.stdout, r.stderr);
     }
   } catch (e) {
     exitCode = 1;
     output = String(e);
   }
   const passed = exitCode === check.expectExit;
+  if (!passed && diagnosis.hint) {
+    output = `[molt] ${diagnosis.hint}\n\n${output}`;
+  }
   return {
     name: check.name,
     ...(check.advisory ? { advisory: true } : {}),
+    ...(diagnosis.didNotRun ? { didNotRun: true } : {}),
     tags: check.tags,
     kind: "command",
     detail: check.run,
@@ -1648,11 +1714,15 @@ export function formatBarFailure(result: BarResult, attempt: number, maxAttempts
   // the session. When both fail, the first is the one to act on, so it goes
   // first and says so.
   const all = result.results.filter((r) => !r.ok && !r.advisory);
-  const commands = all.filter((r) => r.kind === "command");
-  const builtins = all.filter((r) => r.kind !== "command");
+  // A check that never ran is not work to do. Kept out of the ordered list
+  // below and reported at the end as what it is: a broken gate, for a human.
+  const broken = all.filter((r) => r.didNotRun);
+  const actionable = all.filter((r) => !r.didNotRun);
+  const commands = actionable.filter((r) => r.kind === "command");
+  const builtins = actionable.filter((r) => r.kind !== "command");
   const failed = [...commands, ...builtins];
   const lines = [
-    `[molt] You indicated the task is complete, but ${failed.length} of ${result.results.length} ` +
+    `[molt] You indicated the task is complete, but ${all.length} of ${result.results.length} ` +
       `checks in .molt/done.yml did not pass. This is attempt ${attempt} of ${maxAttempts}.`,
     "",
     "Do not claim completion again until these pass. Fix the underlying problem;",
@@ -1671,6 +1741,21 @@ export function formatBarFailure(result: BarResult, attempt: number, maxAttempts
     if (r.exitCode !== undefined) lines.push(`exit code: ${r.exitCode}`);
     lines.push(r.output.trim() || "(no output)");
     lines.push("");
+  }
+  if (broken.length) {
+    lines.push(
+      `--- ${broken.length} check${broken.length === 1 ? "" : "s"} did not run. ` +
+        `${broken.length === 1 ? "It is" : "They are"} broken, not unmet — nothing was established ` +
+        `either way, and there is no change you can make to satisfy ${broken.length === 1 ? "it" : "them"}. ` +
+        `Do not try. A human has to repair the check.`,
+      "",
+    );
+    for (const r of broken) {
+      lines.push(`--- DID NOT RUN: ${r.name} (${r.detail})`);
+      if (r.exitCode !== undefined) lines.push(`exit code: ${r.exitCode}`);
+      lines.push(r.output.trim() || "(no output)");
+      lines.push("");
+    }
   }
   return lines.join("\n");
 }

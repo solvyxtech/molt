@@ -319,6 +319,56 @@ model too — it just is not blocked by them.
 Everything else about the check is unchanged: it is selected by tag, it appears
 in the receipt, and it cannot be edited by the work being judged against it.
 
+## Broken checks
+
+A check that failed and a check that never ran are different facts, and molt
+reports them differently.
+
+```
+--- FAILED: suite (npm test)
+exit code: 1
+1 failing — expected 2 to equal 3
+
+--- 1 check did not run. It is broken, not unmet — nothing was established
+either way, and there is no change you can make to satisfy it. Do not try.
+A human has to repair the check.
+
+--- DID NOT RUN: task:db (grep -q database .molt/done.yml)
+exit code: 127
+```
+
+The shell settles this for two exit codes and only two. `127` means the command
+was not found; `126` means it could not be executed. Nothing ran, so nothing was
+learned about the work, and there is no edit that changes the outcome.
+
+For anything else, molt does not guess. A command that produced no output and
+wrote something like `No such file or directory` to stderr gets one added
+sentence pointing at the command rather than the work — and is still a failure,
+because exit codes below 126 are the program's own and some suites use them
+legitimately.
+
+Two things follow:
+
+- **A broken check still blocks.** "Nobody can run this check" is never a reason
+  to accept a claim. The bar is not met, the receipt records `did not run`, and
+  the completion is refused.
+- **A turn whose only unmet checks are broken stops immediately**, rather than
+  spending every attempt. No further attempt could change the result, so
+  continuing would only spend tokens.
+
+This exists because of a real run. A model drafted `grep -q "database"
+.molt/done.yml` for a project with no such file, grep exited 2, the bar said
+FAIL, and the model — correctly reading FAIL as "there is work to do" — set
+about creating the file so the error would stop. It spent the whole turn
+satisfying a typo, and the run looked exactly like one that had checked
+something and found it wanting.
+
+Task criteria are also tried once at the moment they are sealed, before the
+first request. A criterion that cannot run is reported there, which is the
+cheapest possible place to learn it. It is a warning, not a veto: a criterion is
+*supposed* to fail before the work, and one that names a tool the work itself
+installs is legitimate. The bar keeps the final say.
+
 ## Tamper detection
 
 molt fingerprints `done.yml` when the session starts and compares before every
