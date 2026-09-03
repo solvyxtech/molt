@@ -2,7 +2,7 @@
   "name": "molt-desktop",
   "version": "0.2.0",
   "description": "molt, with a window. A coding agent that can't say \"done\" without proving it.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/solvyxtech/molt.git"
@@ -30,7 +30,8 @@
     "dist",
     "examples",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node -e \"require('fs').chmodSync('dist/cli.js', 0o755)\"",
