@@ -424,24 +424,32 @@ describe("a cache that stops working", () => {
     // the session total keeps the early hits and looks healthy while every new
     // step pays full price. Seen on a real run — two good steps, then 128
     // tokens reused against a prompt growing to 50,000, in silence.
+    //
+    // Three low steps, not one: a provider serving a cached prefix from behind
+    // a load balancer answers erratically, and a warning that fires on the
+    // first dip tells the reader to abandon a session that is working. See
+    // test/cache-cost.test.ts for that half.
     const events = await run([0.9, 0.9, 0.006, 0.006, 0.006]);
     const said = events.find(
-      (e) => e.kind === "info" && /caching stopped/.test(e.text),
+      (e) => e.kind === "info" && /caching has not recovered/.test(e.text),
     ) as { text: string } | undefined;
     assert.ok(said, "a cache that collapsed mid-session was never mentioned");
-    assert.match(said.text, /re-bills the whole context/);
+    assert.match(said.text, /billed for the whole context/);
+    assert.match(said.text, /steps in a row/);
   });
 
   it("says it once, not on every step after", async () => {
     const events = await run([0.9, 0.006, 0.006, 0.006, 0.006]);
-    const times = events.filter((e) => e.kind === "info" && /caching stopped/.test(e.text)).length;
+    const times = events.filter(
+      (e) => e.kind === "info" && /caching has not recovered/.test(e.text),
+    ).length;
     assert.equal(times, 1, `warned ${times} times about the same thing`);
   });
 
   it("stays quiet when the cache is working", async () => {
     const events = await run([0.9, 0.9, 0.9, 0.9]);
     assert.ok(
-      !events.some((e) => e.kind === "info" && /caching stopped/.test(e.text)),
+      !events.some((e) => e.kind === "info" && /caching has not recovered/.test(e.text)),
       "warned about a cache that was doing its job",
     );
   });
@@ -450,7 +458,7 @@ describe("a cache that stops working", () => {
     // Nothing to have lost. Reporting a collapse here would send someone
     // looking for a regression that never happened.
     const events = await run([0.006, 0.006, 0.006, 0.006]);
-    assert.ok(!events.some((e) => e.kind === "info" && /caching stopped/.test(e.text)));
+    assert.ok(!events.some((e) => e.kind === "info" && /caching has not recovered/.test(e.text)));
   });
 });
 
