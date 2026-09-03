@@ -454,6 +454,16 @@ export const DEFAULT_BASH_TIMEOUT_MS = 60_000;
  */
 export const CACHE_WATCH_TOKENS = 10_000;
 
+/**
+ * Consecutive low-hit steps before molt says the cache has gone.
+ *
+ * Three, because one is noise: a real session read 67%, 4%, 0%, 0%, 51%, 0%,
+ * 0%, 80% with an append-only prefix and nothing molt did in between. A
+ * warning that fires on the first dip tells the reader to abandon a session
+ * that is working.
+ */
+export const CACHE_LOST_STREAK = 3;
+
 export const NETWORK_RETRIES = 3;
 export const NETWORK_BACKOFF_MS = [500, 2_000, 5_000];
 
@@ -1225,6 +1235,8 @@ export class Engine {
   private cacheWasWorking = false;
   /** Said once: a cache that was working has stopped. */
   private warnedCacheLost = false;
+  /** Consecutive steps that reused almost nothing. Reset by any real hit. */
+  private lowCacheStreak = 0;
   /**
    * Every path the model read this session.
    *
@@ -3356,17 +3368,31 @@ export class Engine {
        * would archive into exuviae a context that was never in flight —
        * evidence of a conversation molt did not have.
        */
-      // Cheap, mechanical, and strictly a subset of shedding: prune tool
-      // results that later work has made irrelevant before considering the
-      // much heavier option of shedding.
+      // Mechanical, and a smaller move than shedding: prune tool results that
+      // later work has made irrelevant before considering the much heavier
+      // option of shedding. Not free, though — see below.
       if (!this.claudeCode && this.cfg.elideSuperseded !== false) {
-        const pruned = this.transcript.elideSupersededReads();
+        // Protect the prefix once this endpoint has shown it caches. Eliding
+        // rewrites a message in the middle of the conversation, so everything
+        // after it is a cache miss on the next request — measured at 0% on the
+        // step after each elision in a real session. Where nothing has ever
+        // been served from cache there is nothing to protect and elision runs
+        // as it always did.
+        const pruned = this.transcript.elideSupersededReads({
+          protectCache: this.sessionCached > 0,
+        });
         if (pruned.elided > 0) {
-          log?.append("elide", { elided: pruned.elided, tokensSaved: pruned.tokensSaved });
+          log?.append("elide", {
+            elided: pruned.elided,
+            tokensSaved: pruned.tokensSaved,
+            deferred: pruned.deferred,
+          });
           yield {
             kind: "info",
             text: `pruned ${pruned.elided} superseded tool result(s) · ${pruned.tokensSaved} tokens freed`,
           };
+        } else if (pruned.deferred > 0) {
+          log?.append("elide", { elided: 0, tokensSaved: 0, deferred: pruned.deferred });
         }
       }
 
@@ -3999,20 +4025,35 @@ export class Engine {
       //
       // Judged per step rather than cumulatively, and only once the prompt is
       // large enough for the difference to be real money.
+      // One low step is not a state. A provider serving a cached prefix from
+      // behind a load balancer answers erratically — 67%, then 4%, then 0%,
+      // then 51%, then 80%, with nothing on molt's side changing between them
+      // — and the first version of this warning latched on that single 4% and
+      // announced that "every step from here re-bills the whole context",
+      // which the next step disproved. It is a streak or it is noise.
       if (reportedUsage && pTok > CACHE_WATCH_TOKENS) {
         const hit = cachedTok / pTok;
-        if (hit >= 0.25) this.cacheWasWorking = true;
-        else if (this.cacheWasWorking && !this.warnedCacheLost) {
-          this.warnedCacheLost = true;
-          yield {
-            kind: "info",
-            text:
-              `prompt caching stopped: this step reused ${cachedTok} of ${pTok} tokens ` +
-              `(${Math.round(hit * 100)}%) after earlier steps were reusing most of the ` +
-              `conversation. Every step from here re-bills the whole context. If it does ` +
-              `not recover, a fresh session re-establishes the cache more cheaply than ` +
-              `continuing this one.`,
-          };
+        if (hit >= 0.25) {
+          this.cacheWasWorking = true;
+          this.lowCacheStreak = 0;
+        } else {
+          this.lowCacheStreak += 1;
+          if (
+            this.cacheWasWorking &&
+            !this.warnedCacheLost &&
+            this.lowCacheStreak >= CACHE_LOST_STREAK
+          ) {
+            this.warnedCacheLost = true;
+            yield {
+              kind: "info",
+              text:
+                `prompt caching has not recovered: ${this.lowCacheStreak} steps in a row reused ` +
+                `almost none of the conversation, the last of them ${cachedTok} of ${pTok} tokens ` +
+                `(${Math.round(hit * 100)}%), after earlier steps were reusing most of it. While ` +
+                `it stays this way each step is billed for the whole context. If it does not come ` +
+                `back, a fresh session re-establishes the cache more cheaply than continuing.`,
+            };
+          }
         }
       }
 

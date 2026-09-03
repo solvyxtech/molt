@@ -24,6 +24,17 @@ import { estTokens, type Bom, type Msg } from "./types.js";
 export const STALE_FAILURE_PREFIX = "[molt: superseded]";
 export const ELIDED_PREFIX = "[molt: superseded tool result —";
 
+/**
+ * How many steps an elision has to pay for itself in, when a cache is working.
+ *
+ * Eliding saves its tokens on every later request and costs the stranded
+ * prefix once. Three is deliberately conservative: a turn that has already
+ * read enough to need pruning nearly always has three steps left, and being
+ * wrong this way keeps a working cache rather than shaving a few hundred
+ * tokens off one request.
+ */
+export const ELISION_PAYBACK_STEPS = 3;
+
 export const DIGEST_HEADER =
   "[molt digest of shed context — mechanical, verbatim excerpts, not a summary]";
 
@@ -346,7 +357,25 @@ export class Transcript {
     return { trimmed, tokensSaved };
   }
 
-  elideSupersededReads(): { elided: number; tokensSaved: number } {
+  /**
+   * Prune tool results later work made irrelevant.
+   *
+   * `protectCache` is the option this needed and did not have. Eliding
+   * rewrites a message IN PLACE, in the middle of the conversation — see
+   * `m.content = marker` below — and providers cache on exact prefix match,
+   * so every token after the edit becomes a cache miss on the next request.
+   * The docs claimed this "costs nothing" and "does not rewrite the context
+   * prefix"; one real session measured the truth, with the step after each
+   * elision reading 0% cached against a 20,000-token prompt.
+   *
+   * So when a cache is known to be working, a candidate is only worth eliding
+   * if what it saves pays back what it strands within a few steps. When no
+   * cache has been observed there is nothing to lose and everything is
+   * elided, which is what a self-hosted endpoint sees.
+   */
+  elideSupersededReads(
+    opts: { protectCache?: boolean } = {},
+  ): { elided: number; tokensSaved: number; deferred: number } {
     const supersededBy = new Map<number, string>();
     /**
      * Reads still worth keeping, keyed by the exact window they returned.
@@ -401,6 +430,7 @@ export class Transcript {
 
     let elided = 0;
     let tokensSaved = 0;
+    let deferred = 0;
     for (const [callIdx, reason] of supersededBy) {
       // The tool result follows its assistant turn.
       for (let j = callIdx + 1; j < this.working.length; j++) {
@@ -419,12 +449,26 @@ export class Transcript {
         // Eliding it would drop content AND grow the context — which is how
         // the meter came to report "−-17 tokens" saved.
         if (estTokens(marker) >= before) continue;
+        const saving = before - estTokens(marker);
+        // What this edit strands: everything after it shares a prefix that is
+        // about to change, so the next request pays full price for all of it.
+        // Elide only if the saving earns that back inside ELISION_PAYBACK_STEPS.
+        if (opts.protectCache) {
+          let stranded = 0;
+          for (let k = j + 1; k < this.working.length; k++) {
+            stranded += estTokens(this.working[k].content ?? "");
+          }
+          if (saving * ELISION_PAYBACK_STEPS < stranded) {
+            deferred++;
+            continue;
+          }
+        }
         m.content = marker;
-        tokensSaved += before - estTokens(marker);
+        tokensSaved += saving;
         elided++;
       }
     }
-    return { elided, tokensSaved };
+    return { elided, tokensSaved, deferred };
   }
 }
 

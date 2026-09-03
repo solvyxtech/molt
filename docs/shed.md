@@ -127,14 +127,27 @@ expectation. molt keeps three, in increasing durability:
 The archive is per project, not per session. Reopening a project that has
 shed before is normal; the archive holding *less* than was put there is not.
 
-## Cheaper than shedding: elision
+## Smaller than shedding: elision
 
 Before considering a shed, molt prunes tool results that later work made
 irrelevant — a file read and then written, or a path read twice. Those
 results are replaced with a one-line marker naming what superseded them.
 
-This runs every step, costs nothing, and is strictly less disruptive than
-shedding, because it does not rewrite the context prefix.
+This runs every step and moves less than a shed does. It is not free, and the
+earlier version of this page said it was.
+
+Elision replaces a tool result **in place**, in the middle of the
+conversation. Providers cache on exact prefix match, so every token after the
+edit is a miss on the next request. One real session measured it: the step
+after each elision reused 0% of a 20,000-token prompt, while neighbouring
+steps reused 51% and 80%.
+
+So molt only elides when it pays. Once an endpoint has served anything from
+cache, a candidate is pruned only if the tokens it saves earn back the tokens
+it strands within `ELISION_PAYBACK_STEPS` (three) requests; otherwise it is
+deferred and counted in the `elide` journal entry. Where nothing has ever come
+back cached — a self-hosted server, a provider that does not cache — there is
+nothing to protect and everything is elided as before.
 
 ## A tension worth knowing about
 
