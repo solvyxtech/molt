@@ -171,6 +171,30 @@ async function mount(
   };
 }
 
+/**
+ * Wait until the frame says something, or fail saying what it said instead.
+ *
+ * A fixed sleep before a keypress is a race, and CI is where it is lost:
+ * `takes shift+A while the turn is running` pressed the key 80ms after submit
+ * and asserted the level had cycled. On a loaded runner the turn had not
+ * started, so the key hit an idle empty line — where shift+A opens the chooser
+ * and deliberately changes nothing until enter — and the test read `low`
+ * instead of `medium`. The product was behaving exactly as documented; the
+ * test was guessing at the clock.
+ */
+async function until(
+  t: { stdout: { lastFrame: string } },
+  want: RegExp,
+  ms = 5_000,
+): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (want.test(t.stdout.lastFrame)) return;
+    await tick(20);
+  }
+  assert.fail(`waited ${ms}ms for ${want} · last frame was:\n${t.stdout.lastFrame.slice(-400)}`);
+}
+
 /** Type a line and submit it. */
 async function submit(stdin: FakeStdin, text: string): Promise<void> {
   for (const ch of text) stdin.press(ch);
@@ -628,9 +652,12 @@ describe("the transparency view", { concurrency: true }, () => {
     const t = await mount({ fetchFn: slowProvider(150) });
     try {
       void submit(t.stdin, "read the seed");
-      await tick(80);
+      // Mid-turn is the whole point of this test, so wait for the turn rather
+      // than for the clock: at an idle prompt the same key opens the chooser
+      // and changes nothing, which is what a fixed sleep flakily measured.
+      await until(t, /thinking|working|responding/);
       t.stdin.press("A"); // empty line, so it is the autonomy key
-      await tick(600);
+      await until(t, /auto medium|autonomy medium/, 2_000);
       assert.equal(t.engine.autonomy, "medium");
     } finally {
       t.cleanup();
