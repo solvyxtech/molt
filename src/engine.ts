@@ -199,25 +199,25 @@ export function systemPromptFor(cwd: string, extra?: string): string {
  * a dollar". `/budget` raises or removes it, and the message says so.
  */
 /**
- * What one turn may spend before molt stops it, unless told otherwise.
+ * There is no default spending ceiling. There was, and it was wrong.
  *
- * Denominated in money, because tokens are the wrong unit for this and it took
- * a user pointing at the arithmetic to see it. A token ceiling scales with
- * context size, so the same limit buys forty steps on a small project and four
- * on a large one — it punishes depth rather than waste. And it ignores
- * caching: 228,000 cumulative prompt tokens with 75% cache hits costs about
- * $0.22, while the token count says $0.68. Charging a budget for tokens the
- * provider is discounting is charging for work nobody did.
+ * A turn used to stop at $1.00, or at 500,000 tokens where no price was known,
+ * unless someone had said otherwise. Nobody chose either number — the same
+ * fault as the 8,192-token response cap this project removed for the same
+ * reason, and it fails the same way: a limit nobody set interrupts real work
+ * in the middle, which is the most expensive place to stop, and the person it
+ * interrupts has no idea why that number and not another.
  *
- * Waste is caught by the guards that can actually recognise it — repeats,
- * drifting re-reads, steps that learn nothing. This is only the backstop for
- * a turn that is genuinely, expensively going somewhere it should not.
+ * A ceiling is a real control and it still exists. `/budget 4000000` sets one
+ * in tokens, `/budget $5` in money, `--budget` before a run, and once set it
+ * warns on the way up and asks before it gives up. It binds because someone
+ * decided it should, which is the only way a limit means anything.
  *
- * The token fallback applies when no price is known, and is deliberately
- * generous: without a price, molt cannot tell an expensive turn from a long one.
+ * What is left in its place is not nothing. Spend is reported on every step
+ * and on every receipt; the guards that can recognise waste rather than merely
+ * measure it — repeats, drifting re-reads, empty turns, the step ceiling —
+ * are unchanged and were always the part that caught real problems.
  */
-export const DEFAULT_TURN_USD = 1.0;
-export const DEFAULT_TURN_TOKENS = 500_000;
 
 /** Fractions of the ceiling at which molt says something, once each. */
 const CEILING_WARNINGS = [0.5, 0.8];
@@ -3575,15 +3575,11 @@ export class Engine {
       const spentThisTurn = this.sessionTokens - turnStartTokens;
       const usdThisTurn =
         turnStartCost === undefined ? undefined : (this.costUsd() ?? 0) - turnStartCost;
-      // No default ceiling on your own hardware. A spending ceiling exists to
-      // stop a bill, and a model running on a box you own does not send one —
-      // so the default stops work that costs nothing but electricity, and stops
-      // it in the middle, which is the most expensive way to spend nothing.
-      // A ceiling you set yourself still binds: this removes the default, not
-      // the control.
-      const free = isSelfHosted(this.cfg.baseUrl);
-      const usdCeiling = this.cfg.maxTurnUsd ?? (free ? 0 : DEFAULT_TURN_USD);
-      const tokenCeiling = this.cfg.maxTurnTokens ?? (free ? 0 : DEFAULT_TURN_TOKENS);
+      // Zero unless someone set one. The self-hosted exception that used to
+      // live here — no default ceiling on hardware you own — is gone with the
+      // default itself: there is nothing left to make an exception to.
+      const usdCeiling = this.cfg.maxTurnUsd ?? 0;
+      const tokenCeiling = this.cfg.maxTurnTokens ?? 0;
       const priced = usdThisTurn !== undefined && usdCeiling > 0;
       const used = priced ? usdThisTurn : spentThisTurn;
       const ceiling = priced ? usdCeiling : tokenCeiling;

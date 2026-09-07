@@ -667,7 +667,17 @@ describe("the step guard asks too", () => {
   });
 });
 
-describe("no ceiling on hardware you own", () => {
+/**
+ * This suite used to be "no ceiling on hardware you own": a remote endpoint
+ * got a $1.00 turn ceiling nobody had asked for, and self-hosted was carved
+ * out of it because a box you own sends no bill. The carve-out is gone with
+ * the default it made an exception to — no endpoint gets a ceiling now unless
+ * someone sets one, so local and remote are simply the same case.
+ *
+ * What survives is the half that was always the point: a ceiling set by hand
+ * binds wherever it is set.
+ */
+describe("a ceiling binds only where someone set one", () => {
   /** Never stops on its own, so only a ceiling or the guard can end it. */
   function endless() {
     let n = 0;
@@ -725,7 +735,14 @@ describe("no ceiling on hardware you own", () => {
     }
   });
 
-  it("still stops a remote one", async () => {
+  /**
+   * This asserted the opposite until the default was removed: a billable
+   * endpoint was stopped at $1.00 by a limit nobody chose. The endpoint being
+   * billable is a reason to *report* spend, which molt does on every step and
+   * every receipt; it is not a reason to invent a number and stop in the
+   * middle of real work at it.
+   */
+  it("does not invent one for a remote endpoint either", async () => {
     const ws = workspace();
     try {
       const engine = engineWith(ws.dir, {
@@ -736,7 +753,14 @@ describe("no ceiling on hardware you own", () => {
       });
       const events = await drain(engine.run("grind", allowAll));
       const err = events.find((e) => e.kind === "error") as { text: string } | undefined;
-      assert.match(err?.text ?? "", /ceiling for a single turn/, "a billable endpoint ran uncapped");
+      assert.doesNotMatch(
+        err?.text ?? "",
+        /ceiling for a single turn/,
+        "a ceiling nobody set stopped a turn",
+      );
+      // The step guard still ends it — that one is about loops, not money, and
+      // it is the backstop that remains.
+      assert.match(err?.text ?? "", /loop guard/, "nothing stopped it at all");
     } finally {
       ws.cleanup();
     }
@@ -1154,5 +1178,118 @@ describe("a result too large for the window it has to fit in", () => {
     const before = t.historyTokens();
     t.trimOversized(250);
     assert.ok(t.historyTokens() <= before, "trimming must never enlarge the context");
+  });
+});
+
+/**
+ * A limit nobody chose is not a limit, it is a surprise.
+ *
+ * A turn used to stop at $1.00, or 500,000 tokens where no price was known,
+ * without anyone having asked for either. Same fault as the 8,192-token
+ * response cap this project removed for the same reason: it interrupts real
+ * work in the middle — the most expensive place to stop — and the person it
+ * interrupts cannot say why that number and not another.
+ */
+describe("no ceiling exists until someone sets one", () => {
+  /** Spends far past both of the numbers that used to be the defaults. */
+  function spendy(steps: number, perStep: number) {
+    let n = 0;
+    const fetchFn = (async () => {
+      n += 1;
+      const done = n >= steps;
+      return new Response(
+        JSON.stringify({
+          choices: [
+            done
+              ? { message: { role: "assistant", content: "done" }, finish_reason: "stop" }
+              : {
+                  message: {
+                    role: "assistant",
+                    tool_calls: [
+                      {
+                        id: `c${n}`,
+                        type: "function",
+                        function: { name: "list_dir", arguments: JSON.stringify({ path: "." }) },
+                      },
+                    ],
+                  },
+                  finish_reason: "tool_calls",
+                },
+          ],
+          usage: { prompt_tokens: perStep, completion_tokens: 10 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+    return { fetchFn, steps: () => n };
+  }
+
+  function run(cfg: Record<string, unknown>) {
+    const ws = workspace();
+    const s = spendy(9, 120_000);
+    const engine = new Engine({
+      baseUrl: "https://api.openai.com/v1",
+      model: "m",
+      provider: "mock",
+      cwd: ws.dir,
+      fetchFn: s.fetchFn,
+      bar: null,
+      autonomy: "high",
+      ...cfg,
+    });
+    return { engine, ws, spent: s };
+  }
+
+  it("runs past what used to be the default and never mentions a ceiling", async () => {
+    const { engine, ws, spent } = run({ priceInPerMtok: undefined, priceOutPerMtok: undefined });
+    try {
+      const said: string[] = [];
+      for await (const ev of engine.run("grind", allowAll)) {
+        if (ev.kind === "info" || ev.kind === "error") said.push(ev.text);
+      }
+      // Well past the old 500,000-token default.
+      assert.ok(spent.steps() >= 9, `stopped after ${spent.steps()} steps`);
+      assert.ok(
+        !said.some((t) => /of the ceiling|spending ceiling/.test(t)),
+        `a ceiling nobody set spoke: ${said.filter((t) => /ceiling/.test(t)).join(" | ")}`,
+      );
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("is not resurrected by a known price", async () => {
+    // The old default was denominated in money, so a priced endpoint was
+    // exactly where it used to bite hardest.
+    const { engine, ws } = run({ priceInPerMtok: 3, priceOutPerMtok: 15 });
+    try {
+      const said: string[] = [];
+      for await (const ev of engine.run("grind", allowAll)) {
+        if (ev.kind === "info" || ev.kind === "error") said.push(ev.text);
+      }
+      assert.ok(!said.some((t) => /of the ceiling/.test(t)), said.join(" | "));
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("still binds the moment someone asks for one", async () => {
+    const { engine, ws } = run({
+      maxTurnTokens: 200_000,
+      priceInPerMtok: undefined,
+      priceOutPerMtok: undefined,
+    });
+    try {
+      const said: string[] = [];
+      for await (const ev of engine.run("grind", allowAll)) {
+        if (ev.kind === "info" || ev.kind === "error") said.push(ev.text);
+      }
+      assert.ok(
+        said.some((t) => /of the ceiling/.test(t)),
+        "a ceiling that was set must still speak",
+      );
+    } finally {
+      ws.cleanup();
+    }
   });
 });
