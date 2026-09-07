@@ -288,3 +288,52 @@ describe("an endpoint molt cannot use is refused, not retried", () => {
     assert.equal(endpointProblem(CLAUDE_CODE_URL), null);
   });
 });
+
+/**
+ * An artifact this machine does not build is not this machine's failure.
+ *
+ * The output that catches the failure `build-current` was written for is an
+ * *installed* copy, and nothing in a bar rebuilds one. Failing when it is
+ * absent would fail every contributor who has never installed the app — and a
+ * check that fails for everyone but the author is one people learn to skip,
+ * which is why this project disarmed it once already.
+ */
+describe("build-current judges what this machine actually builds", () => {
+  const BAR = (outputs: string) =>
+    parseBar(
+      `version: 1\ncheckly: x\n`.replace("checkly: x\n", "") +
+        `checks:\n  - name: shipped\n    builtin: build-current\n    outputs: ${outputs}\n`,
+    );
+
+  it("skips an absent output that lives outside the project", async () => {
+    const dir = ws();
+    writeFileSync(join(dir, "src.ts"), "export const x = 1;\n");
+    mkdirSync(join(dir, "out"), { recursive: true });
+    writeFileSync(join(dir, "out/app.js"), "built\n");
+    const ctx = ctxIn(dir, [wrote("src.ts")]);
+    const [r] = (
+      await runBar(BAR("out/app.js, /nowhere/that/exists/app.js"), ctx)
+    ).results;
+    assert.equal(r?.ok, true, r?.output);
+    assert.match(r?.output ?? "", /not on this machine/);
+    assert.match(r?.output ?? "", /nowhere\/that\/exists/, "and names what it skipped");
+  });
+
+  it("still fails an absent output the project is supposed to build", async () => {
+    const dir = ws();
+    writeFileSync(join(dir, "src.ts"), "export const x = 1;\n");
+    const ctx = ctxIn(dir, [wrote("src.ts")]);
+    const [r] = (await runBar(BAR("out/never-built.js"), ctx)).results;
+    assert.equal(r?.ok, false, "an output inside the project that was never built is a failure");
+    assert.match(r?.output ?? "", /do not exist/);
+  });
+
+  it("establishes nothing when every declared output is elsewhere and absent", async () => {
+    const dir = ws();
+    writeFileSync(join(dir, "src.ts"), "export const x = 1;\n");
+    const ctx = ctxIn(dir, [wrote("src.ts")]);
+    const [r] = (await runBar(BAR("/nowhere/a.js, /nowhere/b.js"), ctx)).results;
+    assert.equal(r?.ok, true);
+    assert.equal(r?.established, false, "nothing was compared, so nothing is claimed");
+  });
+});

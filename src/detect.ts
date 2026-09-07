@@ -223,6 +223,13 @@ export function proposeBar(cwd: string): { yaml: string; detected: Detected[] } 
     "    builtin: tree-accounted",
     "    tags: [session]",
     "",
+    "  # Nothing committed may depend on a file that was not committed. A commit",
+    "  # that stages a module's dependents but not the module builds perfectly on",
+    "  # the machine that made it and nowhere else, and a suite that reads the",
+    "  # working tree cannot see it. No session needed: `molt prove` runs it too.",
+    "  - name: work-complete",
+    "    builtin: imports-tracked",
+    "",
   ];
 
   return { yaml: [...head, ...body, ...tail].join("\n"), detected };

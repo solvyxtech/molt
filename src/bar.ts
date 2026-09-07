@@ -1038,13 +1038,31 @@ function buildCurrent(
 
   const stale: string[] = [];
   const missing: string[] = [];
+  const elsewhere: string[] = [];
   const fresh: string[] = [];
+  /** Inside the project is something this checkout builds. Outside is not. */
+  const ours = (out: string) => {
+    const abs = resolve(ctx.cwd, out);
+    return abs === ctx.cwd || abs.startsWith(ctx.cwd + sep);
+  };
   for (const out of outputs) {
     let at: number;
     try {
       at = statSync(resolve(ctx.cwd, out)).mtimeMs;
     } catch {
-      missing.push(out);
+      /**
+       * An artifact this checkout does not build is not this checkout's fault.
+       *
+       * The output that catches the failure this check was written for is an
+       * *installed* copy — /Applications/molt.app here — and nothing in a bar
+       * rebuilds that. Failing when it is absent would fail every contributor
+       * who has never installed the app, and a check that fails for everyone
+       * but the author is one people learn to skip. So it is listed and
+       * skipped where it does not exist, and enforced where it does, which is
+       * exactly the machine that is about to hand the thing over.
+       */
+      if (ours(out)) missing.push(out);
+      else elsewhere.push(out);
       continue;
     }
     if (at < newest.at) {
@@ -1055,12 +1073,20 @@ function buildCurrent(
     } else fresh.push(out);
   }
 
+  const note = elsewhere.length
+    ? ` · ${elsewhere.length} not on this machine, so nothing is claimed about ${elsewhere.join(", ")}`
+    : "";
   if (missing.length === 0 && stale.length === 0) {
     return {
       ok: true,
+      // Nothing was actually compared: every declared output lives somewhere
+      // this machine does not have. A pass here establishes nothing.
+      ...(fresh.length === 0 ? { established: false } : {}),
       output:
-        `${fresh.length} built output(s) newer than the ${sources.length} source file(s) ` +
-        `this turn changed (by mtime; newest was ${newest.path}).`,
+        fresh.length === 0
+          ? `None of the ${outputs.length} declared output(s) exist on this machine${note}.`
+          : `${fresh.length} built output(s) newer than the ${sources.length} source file(s) ` +
+            `this turn changed (by mtime; newest was ${newest.path})${note}.`,
     };
   }
   return {
@@ -1068,6 +1094,10 @@ function buildCurrent(
     output:
       (missing.length
         ? `${missing.length} declared output(s) do not exist:\n${missing.map((m) => `  ${m}`).join("\n")}\n\n`
+        : "") +
+      (elsewhere.length
+        ? `${elsewhere.length} declared output(s) are not on this machine and were skipped: ` +
+          `${elsewhere.join(", ")}\n\n`
         : "") +
       (stale.length ? `${stale.length} built output(s) are older than this turn's work:\n${stale.join("\n")}\n\n` : "") +
       `The source is fixed and the thing people run is not. Build and install before ` +
