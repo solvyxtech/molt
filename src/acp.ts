@@ -72,7 +72,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -730,20 +730,32 @@ export class Channel<T> {
  * never sees — the exact silence this file exists to avoid, so it is caught
  * here where it can still name itself.
  */
-export function bridgePath(): string {
+export function shippedScript(name: string): string {
+  /**
+   * `MOLT_MCP_BRIDGE` names the *directory* the scripts sit in when it points
+   * at one; it was a file path first, and both are honoured so the packaged
+   * app's existing setting keeps working.
+   */
   const override = process.env.MOLT_MCP_BRIDGE?.trim();
+  const candidates: string[] = [];
+  if (override) {
+    candidates.push(override.endsWith(".js") ? join(dirname(override), name) : join(override, name));
+  }
   const here = (import.meta as { url?: string }).url;
-  const guess =
-    override ||
-    (typeof here === "string" ? fileURLToPath(new URL("./mcp-bridge.js", here)) : "");
-  if (!guess || !existsSync(guess)) {
+  if (typeof here === "string") candidates.push(fileURLToPath(new URL(`./${name}`, here)));
+  const found = candidates.find((c) => existsSync(c));
+  if (!found) {
     throw new Error(
-      "molt cannot find mcp-bridge.js" +
-        (guess ? ` at ${guess}` : "") +
-        " — set MOLT_MCP_BRIDGE to its path",
+      `molt cannot find ${name}` +
+        (candidates.length ? ` (looked in ${candidates.join(", ")})` : "") +
+        " — set MOLT_MCP_BRIDGE to the directory holding it",
     );
   }
-  return guess;
+  return found;
+}
+
+export function bridgePath(): string {
+  return shippedScript("mcp-bridge.js");
 }
 
 export function mcpEntry(

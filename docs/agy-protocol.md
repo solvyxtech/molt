@@ -132,14 +132,41 @@ the MCP servers your Antigravity IDE registers are in scope for a molt run.
 Deny-by-default covers it — they are unusable without allow-rules of their own,
 which molt does not write.
 
+## Bringing no tools: the `PreToolUse` gate
+
+The permission system alone is not equivalent to Claude Code's `tools: []`,
+because **a denied tool ends the turn**. Molt's first step was spent on
+Antigravity trying its own `read_file`, being refused, and stopping with
+nothing said; the work landed on step two.
+
+Hooks close it. `PreToolUse` returns a `reason` that is shown to the *agent*,
+so it is told mid-turn that molt runs every tool and which ones to call:
+
+```json
+{ "molt-tool-gate": { "PreToolUse": [ { "matcher": "*",
+  "hooks": [ { "type": "command", "command": "… agy-hook.js", "timeout": 15 } ] } ] } }
+```
+
+The gate allows `call_mcp_tool` plus a few bookkeeping tools (`finish`,
+`todo_write`, `manage_task`, `wait`, `ask_*`) and denies the rest with a reason
+naming molt's tools. Allow-list, not denylist: a pattern would quietly admit
+whatever Antigravity adds next.
+
+Measured on the same task, with a bar of `files-changed` + `tree-accounted`:
+
+| | steps | result |
+|---|---|---|
+| without the hook | 2 | first step wasted on a denied builtin |
+| with the hook | **1** | `bar met · job verified`, every write in the ledger |
+
+Hooks live in `~/.gemini/config/hooks.json`, which applies to **every** session
+on the machine — so the gate's first act is to look for `MOLT_MCP_URL` and exit
+silently when it is absent. Sessions you start yourself are untouched.
+
 ## What molt still cannot see
 
-Less than first assumed. `read_file` is gated as well as writes: a live run had
-Antigravity's own read auto-denied, and it fell back to molt's `read_file` —
-correct, at the cost of one empty step. Safe shell commands (`echo hi`) are the
-ones observed to run unasked.
-
-Whatever does get through cannot change the tree, so `tree-accounted` is
-unharmed — but molt's ledger may not be a complete record of what the model
-*read*. `AgySession.unaccountedTools()` reports those and the session names
-them on screen.
+With the gate installed, nothing: every tool call is either molt's or refused,
+and the refusal is visible. Without it, `read_file` is gated too — only safe
+shell commands (`echo hi`) were seen to run unasked. Whatever gets through
+cannot change the tree, so `tree-accounted` is unharmed;
+`AgySession.unaccountedTools()` reports it either way.

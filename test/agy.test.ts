@@ -15,6 +15,9 @@ import { after, describe, it } from "node:test";
 import {
   AGY_URL,
   agyAsk,
+  agyHooksPath,
+  ensureAgyHook,
+  moltHookEntry,
   agyAllowRules,
   agyEnv,
   agyHealth,
@@ -160,6 +163,48 @@ describe("the permission rules molt writes", () => {
     };
     assert.equal(new Set(after.permissions.allow).size, after.permissions.allow.length, "no duplicates");
     assert.deepEqual(agySetupState(tools, path).missingRules, []);
+  });
+
+  /**
+   * The gate that makes this backend cost one step instead of two.
+   *
+   * Without it Antigravity spends the first step trying its own `read_file`,
+   * being refused by the permission system, and stopping with nothing said —
+   * a denial ends the turn. The hook's `reason` reaches the model instead, so
+   * it corrects in the same turn. Measured: two steps became one.
+   */
+  it("gates every tool but molt's, and says what to use instead", () => {
+    const entry = moltHookEntry("/opt/molt/agy-hook.js", "/usr/bin/node") as {
+      PreToolUse: { matcher: string; hooks: { command: string }[] }[];
+    };
+    assert.equal(entry.PreToolUse[0]?.matcher, "*", "every tool, not a guessed list");
+    const cmd = entry.PreToolUse[0]?.hooks[0]?.command ?? "";
+    assert.match(cmd, /ELECTRON_RUN_AS_NODE=1/u, "execPath is Electron in the packaged app");
+    assert.match(cmd, /agy-hook\.js/u);
+  });
+
+  /**
+   * The hooks file is global — it applies to sessions molt did not start — so
+   * molt writes exactly its own key and leaves the rest alone.
+   */
+  it("adds its hook beside yours without touching them", () => {
+    const path = join(ws(), "hooks.json");
+    writeFileSync(path, JSON.stringify({ "lint-checker": { PostToolUse: [{ matcher: "x" }] } }), "utf8");
+    assert.equal(ensureAgyHook(path, "/opt/molt/agy-hook.js"), true);
+
+    const after = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    assert.ok(after["lint-checker"], "a hook molt did not write must survive");
+    assert.ok(after["molt-tool-gate"], "and molt's must be there");
+
+    // Idempotent: the same command written twice changes nothing.
+    assert.equal(ensureAgyHook(path, "/opt/molt/agy-hook.js"), false);
+    // But a moved script is rewritten — a hook pointing at a file that is gone
+    // fails on every tool call.
+    assert.equal(ensureAgyHook(path, "/elsewhere/agy-hook.js"), true);
+  });
+
+  it("puts the hook where agy actually reads global customisations", () => {
+    assert.equal(agyHooksPath("/home/x"), "/home/x/.gemini/config/hooks.json");
   });
 
   /**
