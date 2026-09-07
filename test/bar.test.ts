@@ -368,7 +368,7 @@ describe("builtin: record-intact", () => {
 });
 
 describe("tamper detection", () => {
-  it("fails the bar when the agent edits done.yml mid-session", async () => {
+  it("fails the bar when done.yml is edited through a tool call mid-session", async () => {
     const dir = ws();
     mkdirSync(join(dir, ".molt"), { recursive: true });
     writeFileSync(
@@ -411,7 +411,81 @@ describe("tamper detection", () => {
     assert.ok(exhausted, "expected the attempt to be rejected");
     const tamper = exhausted.result.results.find((r) => r.name === "bar-unmodified");
     assert.ok(tamper, "tamper check must be present");
-    assert.match(tamper.output, /cannot be edited by the work being judged/);
+    /**
+     * Here molt is not guessing. A tool call that writes `.molt/done.yml`
+     * leaves a ledger entry naming it, like any other write — so this is the
+     * one case where the check knows who moved the bar, and it is also the
+     * case the check exists for: a model editing its own passing conditions.
+     * The last place to be vague.
+     *
+     * This assertion pinned the hedge until the ledger was consulted. Hedging
+     * everywhere was an over-correction for blaming everywhere; both threw
+     * away evidence molt had.
+     */
+    assert.match(tamper.output, /This turn wrote \.molt\/done\.yml/);
+    assert.match(tamper.output, /always passes/, "say why it is refused, not just that it is");
+    assert.doesNotMatch(
+      tamper.output,
+      /molt cannot tell/,
+      "the ledger names the writer; there is nothing to be uncertain about",
+    );
+  });
+
+  it("still refuses, without blaming the turn, when done.yml changes by a route the turn never touched", async () => {
+    // 2026-09-07: done.yml changed mid-session by another writer entirely —
+    // no tool call in the turn ever named the file — and the turn was told
+    // to "revert the file", a claim about work it had not done, on every
+    // attempt until it was exhausted. The bar cannot tell who changed the
+    // file, so it must say only what it knows (the fingerprint moved) and
+    // that retrying will not help, rather than accusing the turn.
+    const dir = ws();
+    mkdirSync(join(dir, ".molt"), { recursive: true });
+    writeFileSync(
+      join(dir, ".molt", "done.yml"),
+      "version: 1\nchecks:\n  - name: suite\n    run: exit 0\n",
+    );
+
+    const provider = scriptedProvider([
+      { calls: [{ name: "write_file", args: { path: "real.txt", content: "work\n" } }] },
+      { text: "Done." },
+    ]);
+
+    const engine = new Engine({
+      baseUrl: "http://mock/v1",
+      model: "m",
+      cwd: dir,
+      fetchFn: provider.fetchFn,
+      bar: loadBar(dir),
+      archive: new Archive(dir),
+      receipts: new Receipts(dir),
+      maxProofAttempts: 1,
+    });
+
+    // Simulate a writer outside this turn entirely: the file moves after the
+    // engine has taken its fingerprint (in the constructor) and before the
+    // bar is ever run — no tool call in the transcript ever names the file.
+    writeFileSync(
+      join(dir, ".molt", "done.yml"),
+      "version: 1\nchecks:\n  - name: suite\n    run: exit 1\n",
+    );
+
+    const events = await drain(engine.run("do the work", allowAll));
+    const exhausted = events.find((e) => e.kind === "proof_exhausted") as
+      | { result: { results: { name: string; output: string }[] } }
+      | undefined;
+    assert.ok(exhausted, "expected the attempt to be rejected");
+    const tamper = exhausted.result.results.find((r) => r.name === "bar-unmodified");
+    assert.ok(tamper, "tamper check must be present");
+    assert.match(tamper.output, /no longer matches the fingerprint/);
+    assert.doesNotMatch(tamper.output, /[Rr]evert the file/);
+    assert.match(tamper.output, /[Rr]etrying will not clear this/);
+    assert.match(tamper.output, /settle \.molt\/done\.yml/);
+    // Regression pin: the old wording asserted the turn's own work edited the
+    // file outright, with no hedge at all — that sentence must never come back.
+    assert.doesNotMatch(
+      tamper.output,
+      /^\.molt\/done\.yml changed during this session\. The definition of done cannot be/,
+    );
   });
 
   it("does not cry tamper when done.yml is untouched", async () => {

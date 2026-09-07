@@ -23,7 +23,15 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { basename, dirname, resolve, relative, isAbsolute, join } from "node:path";
 import type { ArchiveLike } from "./archive.js";
-import { CheckCache, barFingerprint, clipEnds, formatBarFailure, runBar, type BarContext } from "./bar.js";
+import {
+  BAR_FILENAME,
+  CheckCache,
+  barFingerprint,
+  clipEnds,
+  formatBarFailure,
+  runBar,
+  type BarContext,
+} from "./bar.js";
 import { preflightCriteria } from "./criteria.js";
 import {
   AUTONOMY_SUMMARY,
@@ -2227,9 +2235,20 @@ export class Engine {
   }
 
   /**
-   * Run the bar, with tamper detection in front of it. A bar the agent
-   * rewrote mid-task is not a bar, so the edit is reported as a failure
-   * rather than quietly honoured.
+   * Run the bar, with tamper detection in front of it.
+   *
+   * All this check can see is that the fingerprint of .molt/done.yml no
+   * longer matches the one taken when the turn began — not who changed it.
+   * The wording used to say "the work being judged against it" edited the
+   * file, which is a claim about the agent. On 2026-09-07 the file changed
+   * mid-session by another route entirely, and a turn that had never touched
+   * it was refused for it and told to revert a change it did not make, on
+   * every attempt until it was exhausted.
+   *
+   * The finding still stands as a refusal — a bar that moved mid-session
+   * cannot judge the claim either way, by anyone's hand — but it no longer
+   * says who moved it, and it says plainly that retrying will not clear it:
+   * that is a decision for the person, not another attempt.
    */
   /**
    * Refuse to act outside the project.
@@ -2263,15 +2282,51 @@ export class Engine {
   private async runBarInner(bar: Bar, claim: string | undefined, t0: number): Promise<BarResult> {
     const now = barFingerprint(this.cwd);
     if (this.barHash !== null && now !== this.barHash) {
+      /**
+       * Who moved the bar — said plainly where molt knows, hedged where it does not.
+       *
+       * The fingerprint moving is all this check measures, and for a while the
+       * wording claimed more than that: "the definition of done cannot be
+       * edited by the work being judged against it" is an accusation, and on
+       * 2026-09-07 it was aimed at a turn that had never touched the file
+       * while a person armed a check in another window. It was then softened
+       * to hedge in every case, which gave away something molt actually has.
+       *
+       * A tool call that writes `.molt/done.yml` leaves a ledger entry naming
+       * it, exactly like any other write. Where that entry exists there is no
+       * uncertainty to be humble about — and this is the case the check was
+       * built for, a model editing its own passing conditions, which is the
+       * last place to be vague. Where it does not exist, molt genuinely cannot
+       * tell an editor from another session from a person, and says so.
+       *
+       * The refusal is the same either way: a bar that moved mid-session
+       * cannot judge the claim, by anyone's hand. Only the sentence changes,
+       * and with it what the model is told to do about it.
+       */
+      /** As the ledger spells it: project-relative, always this. */
+      const BAR_PATH = `.molt/${BAR_FILENAME}`;
+      const editedHere = this.sessionLedger()
+        .filter((e) => this.turnCalls.has(e.callId))
+        .some((e) => e.path === BAR_PATH || e.path.endsWith(`/${BAR_FILENAME}`));
       const tamper: CheckResult = {
         name: "bar-unmodified",
         kind: "builtin",
         detail: "done.yml fingerprint",
         ok: false,
-        output:
-          ".molt/done.yml changed during this session. The definition of done cannot be " +
-          "edited by the work being judged against it. Revert the file and satisfy the " +
-          "original checks, or stop and tell the user why the bar is wrong.",
+        output: editedHere
+          ? `This turn wrote ${BAR_PATH}, and its fingerprint no longer matches the one taken ` +
+            "when the turn began. The definition of done cannot be edited by the work being " +
+            "judged against it — a model that sets its own passing conditions always passes. " +
+            "Revert it and satisfy the original checks, or stop and tell the user why the bar " +
+            "is wrong; changing it is their decision, not yours."
+          : `${BAR_PATH} no longer matches the fingerprint taken when this turn began, and no ` +
+            "tool call in this turn wrote it. molt cannot tell from here whether another " +
+            "session did, an editor did, or a person arming a check did — only that the bar " +
+            "moved while it was being judged against, and a bar that moved mid-session cannot " +
+            "judge this claim either way. Retrying will not clear this: no amount of further " +
+            "work fixes a bar that moved out from under it, and reverting a change this turn " +
+            `did not make is not something to guess at. Say that it changed and stop — the ` +
+            `person needs to settle ${BAR_PATH} before this can be judged again.`,
         durationMs: Date.now() - t0,
       };
       const rest = await runBar(bar, this.barContext(claim));

@@ -24,7 +24,9 @@ import { after, describe, it } from "node:test";
 import { parseBar, runBar, type BarContext } from "../src/bar.js";
 import { snapshotTree } from "../src/files.js";
 import type { LedgerEntry } from "../src/types.js";
-import { workspace } from "./helpers.js";
+import { Engine } from "../src/engine.js";
+import type { EngineEvent } from "../src/types.js";
+import { allowAll, scriptedProvider, workspace } from "./helpers.js";
 
 const cleanups: (() => void)[] = [];
 after(() => cleanups.forEach((c) => c()));
@@ -126,5 +128,86 @@ describe("spec-intact says which route the removal took", () => {
     assert.match(out, /since this turn began/);
     assert.match(out, /changed on disk, not through a tool/, "the route stays on the line");
     assert.match(out, /working harder cannot clear a change this turn did not make/i);
+  });
+});
+
+/**
+ * The bar moving, and whether molt knows who moved it.
+ *
+ * Three wordings in one day, which is itself the lesson. It began as an
+ * accusation — "the definition of done cannot be edited by the work being
+ * judged against it" — aimed on 2026-09-07 at a turn that had never touched
+ * the file while a person armed a check in another window. It was then
+ * softened to hedge in every case, which threw away something molt has: a
+ * tool call that writes `.molt/done.yml` leaves a ledger entry naming it.
+ *
+ * Blaming everywhere and hedging everywhere are the same mistake. The check
+ * refuses either way — a bar that moved mid-session cannot judge the claim, by
+ * anyone's hand — and only the sentence changes.
+ */
+describe("bar-unmodified says only what the ledger supports", () => {
+  const BAR = "version: 1\nchecks:\n  - name: suite\n    run: exit 0\n";
+
+  async function tamperOutput(edit: "tool" | "outside"): Promise<string> {
+    const dir = ws();
+    mkdirSync(join(dir, ".molt"), { recursive: true });
+    writeFileSync(join(dir, ".molt", "done.yml"), BAR);
+    const provider = scriptedProvider([
+      edit === "tool"
+        ? {
+            calls: [
+              {
+                name: "write_file",
+                args: { path: ".molt/done.yml", content: BAR + "  - name: extra\n    run: exit 0\n" },
+              },
+            ],
+          }
+        : { calls: [{ name: "write_file", args: { path: "real.txt", content: "work\n" } }] },
+      { text: "Done." },
+    ]);
+    const engine = new Engine({
+      baseUrl: "http://mock/v1",
+      model: "m",
+      provider: "mock",
+      cwd: dir,
+      fetchFn: provider.fetchFn,
+      bar: parseBar(BAR),
+      autonomy: "high",
+      maxProofAttempts: 1,
+    });
+    const events: EngineEvent[] = [];
+    for await (const ev of engine.run("go", allowAll)) {
+      events.push(ev);
+      // The other writer: after the turn's first write, change the bar by a
+      // route no tool call of this turn took.
+      if (edit === "outside" && ev.kind === "tool") {
+        writeFileSync(join(dir, ".molt", "done.yml"), BAR + "  - name: theirs\n    run: exit 0\n");
+      }
+    }
+    const end = events.find(
+      (e) => e.kind === "proof_refused" || e.kind === "proof_exhausted",
+    ) as { result: { results: { name: string; output: string }[] } } | undefined;
+    assert.ok(end, "the moved bar should have refused the claim");
+    const tamper = end.result.results.find((r) => r.name === "bar-unmodified");
+    assert.ok(tamper, "bar-unmodified should be present");
+    return tamper.output;
+  }
+
+  it("names the turn when a tool call of this turn wrote the bar", async () => {
+    const out = await tamperOutput("tool");
+    assert.match(out, /This turn wrote \.molt\/done\.yml/);
+    assert.match(out, /always passes/, "and why that is refused");
+    assert.doesNotMatch(out, /molt cannot tell/, "there is nothing here to be uncertain about");
+  });
+
+  it("does not name the turn when no tool call of this turn wrote it", async () => {
+    const out = await tamperOutput("outside");
+    assert.match(out, /no tool call in this turn wrote it/);
+    assert.match(out, /Retrying will not clear this/);
+    assert.doesNotMatch(
+      out,
+      /This turn wrote/,
+      "molt did not see this turn write the bar, so it must not say it did",
+    );
   });
 });
