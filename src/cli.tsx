@@ -21,14 +21,15 @@ import { buildRepoMap, DEFAULT_MAP_TOKENS } from "./repomap.js";
 import { parseDuration } from "./session-commands.js";
 import { taskChecksFrom } from "./criteria.js";
 import {
+  endpointProblem,
   fetchPricing,
+  isSelfHosted,
+  keyForUrl,
   needsPriceLookup,
   providerName,
   savePricing,
   storedEndpoint,
   type StoredEndpoint,
-  keyForUrl,
-  isSelfHosted,
 } from "./providers.js";
 import { Receipts } from "./receipts.js";
 import type { BarResult, EngineEvent } from "./types.js";
@@ -304,6 +305,19 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
          * to get it wrong. The full form still works and is what gets stored.
          */
         out.url = given === "claude-code" ? CLAUDE_CODE_URL : given;
+        /**
+         * Refused here, not four retries later.
+         *
+         * `--url claude-code` typed at a build without the shorthand became
+         * `claude-code/chat/completions`, which `fetch` rejects as an invalid
+         * URL and molt read as the network being down. The flag is the first
+         * place that knows, so it is the place that says so.
+         */
+        const wrong = endpointProblem(out.url);
+        if (wrong) {
+          process.stderr.write(`molt: ${wrong}\n`);
+          process.exit(2);
+        }
         break;
       }
       case "--model":

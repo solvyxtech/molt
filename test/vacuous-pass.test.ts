@@ -27,6 +27,8 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { BUILTINS, mutationVerdict, parseBar, runBar, type BarContext } from "../src/bar.js";
 import type { LedgerEntry } from "../src/types.js";
+import { CLAUDE_CODE_URL } from "../src/claude-code.js";
+import { endpointProblem } from "../src/providers.js";
 import { workspace } from "./helpers.js";
 
 const cleanups: (() => void)[] = [];
@@ -247,5 +249,42 @@ describe("build-current: what you ship, against what you changed", () => {
 
   it("is a builtin the bar will name", () => {
     assert.ok(BUILTINS.includes("build-current"));
+  });
+});
+
+/**
+ * An endpoint that is not an address is not a network outage.
+ *
+ * Reported live: `molt run --url claude-code` typed at a build without the
+ * shorthand became `claude-code/chat/completions`, which `fetch` rejects as an
+ * invalid URL. molt retried it four times over seven and a half seconds and
+ * reported "network: TypeError". Nothing was down, and the second attempt was
+ * never going to differ from the first.
+ */
+describe("an endpoint molt cannot use is refused, not retried", () => {
+  it("names what is wrong with a string that is not a URL", () => {
+    const why = endpointProblem("claude-code");
+    assert.ok(why, "a bare word is not an endpoint");
+    assert.match(why, /not an endpoint/);
+    // The message has to carry the two spellings that do work, or it is a
+    // refusal with nowhere to go.
+    assert.match(why, /https:\/\//);
+    assert.match(why, /claude-code/);
+  });
+
+  it("refuses a scheme molt does not speak", () => {
+    const why = endpointProblem("ftp://example.com/v1");
+    assert.ok(why);
+    assert.match(why, /ftp/);
+  });
+
+  it("says so when no endpoint is set at all", () => {
+    assert.match(endpointProblem("") ?? "", /no endpoint is set/);
+  });
+
+  it("accepts the shapes that actually work", () => {
+    assert.equal(endpointProblem("https://api.openai.com/v1"), null);
+    assert.equal(endpointProblem("http://localhost:11434/v1"), null);
+    assert.equal(endpointProblem(CLAUDE_CODE_URL), null);
   });
 });

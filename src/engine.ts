@@ -76,7 +76,11 @@ import {
   type LedgerLike,
 } from "./git.js";
 import { Integrity } from "./integrity.js";
-import { authHeaders, isSelfHosted } from "./providers.js";
+import {
+  authHeaders,
+  endpointProblem,
+  isSelfHosted,
+} from "./providers.js";
 import { Receipts } from "./receipts.js";
 import { readStream, type StreamAccumulator, type Usage } from "./stream.js";
 import { Fragments, SafeStream } from "./live.js";
@@ -4125,11 +4129,28 @@ export class Engine {
               yield { kind: "cancelled", filesWritten: wrote };
               return;
             }
-            failure = {
-              text: `network: ${errorText(e)}`,
-              why: "The connection to the provider failed and could not be re-established.",
-              retryable: true,
-            };
+            /**
+             * An endpoint that is not an address is not a network problem.
+             *
+             * `fetch` reports both as a TypeError, so molt retried
+             * `--url claude-code` — the shorthand, typed at a build too old to
+             * expand it — four times over seven seconds and then called it a
+             * network failure. Nothing was down. Asked before the generic case,
+             * because this policy's own rule is that what cannot improve on a
+             * second attempt is not retried.
+             */
+            const badEndpoint = endpointProblem(this.cfg.baseUrl);
+            failure = badEndpoint
+              ? {
+                  text: badEndpoint,
+                  why: "The endpoint molt was pointed at is not a usable address.",
+                  retryable: false,
+                }
+              : {
+                  text: `network: ${errorText(e)}`,
+                  why: "The connection to the provider failed and could not be re-established.",
+                  retryable: true,
+                };
           }
 
           if (!failure) break;

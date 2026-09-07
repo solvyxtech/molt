@@ -426,6 +426,42 @@ export function keyForUrl(
   return auth[providerName(baseUrl)];
 }
 
+/**
+ * Why this endpoint cannot be used, or null when it can.
+ *
+ * `fetch` is the only thing that ever judged this, and it judges late and
+ * badly: `--url claude-code` (the shorthand, typed at a build that did not
+ * have it) produced `TypeError: Failed to parse URL from
+ * claude-code/chat/completions`, which molt classified as a network fault and
+ * retried four times over seven seconds before giving up. A string that is not
+ * an address does not become one on the second attempt.
+ *
+ * Kept pure and here rather than in the CLI because three callers need the
+ * same answer: the flag parser, the engine before it retries, and the doctor.
+ */
+export function endpointProblem(baseUrl: string): string | null {
+  const url = (baseUrl ?? "").trim();
+  if (!url) return "no endpoint is set — pass --url, or run /login to pick a provider";
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return (
+      `'${url}' is not an endpoint. Give a full base URL like ` +
+      `https://api.openai.com/v1 or http://localhost:11434/v1, a provider name to ` +
+      `/login, or 'claude-code' to run your own logged-in Claude Code.`
+    );
+  }
+  const allowed = ["http:", "https:", "claude-code:"];
+  if (!allowed.includes(parsed.protocol)) {
+    return (
+      `'${url}' uses the scheme '${parsed.protocol.replace(":", "")}', which molt cannot ` +
+      `speak. Endpoints are http or https; 'claude-code' runs the CLI instead.`
+    );
+  }
+  return null;
+}
+
 export function isSelfHosted(baseUrl: string): boolean {
   /**
    * Somebody else's computer, on somebody else's plan.
