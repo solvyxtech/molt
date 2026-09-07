@@ -207,6 +207,13 @@ export type BuiltinCheck =
    * matters, which is nobody having rebuilt at all.
    */
   | "build-current"
+  /**
+   * Nothing committed depends on a file that was not committed.
+   *
+   * A commit that stages a module's dependents but not the module builds
+   * perfectly on the machine that made it and not anywhere else.
+   */
+  | "imports-tracked"
   | "files-changed"
   | "record-intact"
   | "claims-grounded"

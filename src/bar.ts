@@ -14,8 +14,9 @@ import { planMutations, applyMutation, type Mutation } from "./mutate.js";
 import { proposeBar, type Detected } from "./detect.js";
 import { assertionsIn, fingerprint, isTestPath, treeChanges, type TreeSnapshot } from "./files.js";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { ArchiveLike } from "./archive.js";
 import type {
@@ -48,6 +49,7 @@ export const BUILTINS: BuiltinCheck[] = [
   "diff-covered",
   "mutation",
   "build-current",
+  "imports-tracked",
 ];
 
 /**
@@ -1398,6 +1400,101 @@ function treeAccounted(ctx: BarContext, allowOutside: boolean): { ok: boolean; o
   return { ok: false, output: parts.join("\n") };
 }
 
+/**
+ * Nothing committed may depend on a file that was not.
+ *
+ * Earned on 2026-09-07 by breaking `main`. A commit staged four source files
+ * and left the two modules they import untracked; a fresh clone failed
+ * typecheck on four files, and `npm run check` had passed at 1,296 tests
+ * moments earlier because it reads the working tree and the working tree had
+ * them. What is committed is a different artifact from what is verified —
+ * the same fault as the stale installed app, one directory up.
+ *
+ * `build-current` asks whether the built thing is behind the source.
+ * This asks whether the source is complete. Between them the question is
+ * "does the thing you are about to hand someone actually work", which no
+ * amount of testing the working tree can answer.
+ *
+ * Deliberately cheap: one `git ls-files`, then a scan of relative imports in
+ * tracked sources. It never clones and never builds. An import that resolves
+ * to nothing at all is left to the typechecker, which says it better.
+ */
+function importsTracked(ctx: BarContext): {
+  ok: boolean;
+  output: string;
+  established?: boolean;
+} {
+  let tracked: Set<string>;
+  try {
+    const out = execFileSync("git", ["ls-files", "-z"], {
+      cwd: ctx.cwd,
+      encoding: "utf8",
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    tracked = new Set(out.split("\0").filter(Boolean));
+  } catch {
+    return {
+      ok: true,
+      established: false,
+      output: "not a git repository, so there is nothing tracked to compare against.",
+    };
+  }
+  if (tracked.size === 0) {
+    return { ok: true, established: false, output: "git tracks nothing here yet." };
+  }
+
+  const sources = [...tracked].filter((p) => /\.(ts|tsx|mts|cts|js|mjs|cjs|jsx)$/u.test(p));
+  const missing: string[] = [];
+  for (const file of sources) {
+    let text: string;
+    try {
+      text = readFileSync(resolve(ctx.cwd, file), "utf8");
+    } catch {
+      continue; // tracked but not on disk: a different problem, and git's.
+    }
+    const dir = dirname(file);
+    for (const m of text.matchAll(/(?:from|import)\s*\(?\s*["'](\.[^"']+)["']/gu)) {
+      const spec = m[1]!;
+      // `./x.js` in TypeScript source means `./x.ts` on disk.
+      const bases = [spec, spec.replace(/\.js$/u, ".ts"), spec.replace(/\.js$/u, ".tsx")];
+      let resolvedTo: string | null = null;
+      let existsSomewhere = false;
+      for (const b of bases) {
+        const rel = join(dir, b).split(sep).join("/");
+        if (!existsSync(resolve(ctx.cwd, rel))) continue;
+        existsSomewhere = true;
+        resolvedTo = rel;
+        if (tracked.has(rel)) {
+          resolvedTo = null;
+          break;
+        }
+      }
+      // On disk, imported by something committed, and git has never seen it.
+      if (existsSomewhere && resolvedTo && !tracked.has(resolvedTo)) {
+        missing.push(`  ${resolvedTo} — imported by ${file}`);
+      }
+    }
+  }
+
+  const found = [...new Set(missing)];
+  if (found.length === 0) {
+    return {
+      ok: true,
+      output: `${sources.length} tracked source file(s) import nothing that git does not have.`,
+    };
+  }
+  return {
+    ok: false,
+    output:
+      `${found.length} file(s) are imported by committed code and are not tracked by git:\n` +
+      found.slice(0, 12).join("\n") +
+      (found.length > 12 ? `\n  … and ${found.length - 12} more` : "") +
+      "\n\nThey exist here, so everything passes on this machine; a clone would not have " +
+      "them and would not build. Add them, or stop importing them. If they are deliberately " +
+      "local, they cannot be imported by anything committed.",
+  };
+}
+
 function runBuiltin(
   builtin: BuiltinCheck,
   ctx: BarContext,
@@ -1409,6 +1506,7 @@ function runBuiltin(
   from: string[] = [],
 ): { ok: boolean; output: string; established?: boolean } {
   if (builtin === "build-current") return buildCurrent(ctx, outputs, from);
+  if (builtin === "imports-tracked") return importsTracked(ctx);
   if (builtin === "diff-covered") return diffCovered(ctx, lcovPath);
   if (builtin === "tree-accounted") return treeAccounted(ctx, allowOutside);
   if (builtin === "files-changed") {

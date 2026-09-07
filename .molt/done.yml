@@ -161,6 +161,23 @@ checks:
     from: src, electron, ui, build.mjs
     tags: [session]
 
+  # Nothing committed may depend on a file that was not committed.
+  #
+  # Added the day it was needed. A commit here staged src/criteria.ts,
+  # src/interview.ts, src/cli.tsx and src/engine.ts and left src/acp.ts and
+  # src/mcp-bridge.ts untracked — the modules all four import. A fresh clone
+  # failed typecheck on four files, minutes after `npm run check` passed at
+  # 1,296 tests. It could not have seen it: it reads the working tree, and the
+  # working tree had them.
+  #
+  # `build-current` asks whether the built thing is behind the source; this
+  # asks whether the source is complete. Together they are the one question no
+  # amount of testing the working tree can answer — does what you are about to
+  # hand someone actually work.
+  - name: work-complete
+    builtin: imports-tracked
+    tags: [session]
+
   - name: work-checked
     builtin: mutation
     run: npm test
