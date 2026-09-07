@@ -492,6 +492,14 @@ export function removedAssertions(before: string, after: string): string[] {
  * snapshot of an unknown subset proves nothing about the rest.
  */
 export type TreeSnapshot = {
+  /**
+   * When the snapshot was taken — the moment the turn began.
+   *
+   * Lets a check say whether a file was modified while the turn was running or
+   * merely differs from it, which is the difference between "the agent wrote
+   * this outside its tools" and "something else is writing to this repository".
+   */
+  takenAt: number;
   /** project-relative path -> sha256 of contents (or size:mtime past the hash cap). */
   files: Map<string, string>;
   /** test path -> its assertions, normalised, at snapshot time. */
@@ -506,7 +514,13 @@ export const TREE_SKIP = new Set([...SKIP_DIRS, ".molt", "dist-test", "release"]
 const TREE_HASH_CAP = 8 * 1024 * 1024;
 
 export function snapshotTree(root: string): TreeSnapshot {
-  const out: TreeSnapshot = { files: new Map(), assertions: new Map(), truncated: false, examined: 0 };
+  const out: TreeSnapshot = {
+    takenAt: Date.now(),
+    files: new Map(),
+    assertions: new Map(),
+    truncated: false,
+    examined: 0,
+  };
   const walked = walk(root, {
     depth: 24,
     limit: 20_000,

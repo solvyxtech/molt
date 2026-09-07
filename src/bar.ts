@@ -1306,26 +1306,96 @@ function treeAccounted(ctx: BarContext, allowOutside: boolean): { ok: boolean; o
           : `${total} file(s) changed on disk this turn, every one written through a tool and in the ledger`,
     };
   }
-  const shown = outside.slice(0, 12);
-  const more = outside.length > shown.length ? `\n  … and ${outside.length - shown.length} more` : "";
   if (allowOutside) {
     return {
       ok: true,
       output: `${outside.length} file(s) changed outside the tools, allowed by \`outside: allow\`: ${outside.join(", ")}`,
     };
   }
-  return {
-    ok: false,
-    output:
-      `${outside.length} file(s) changed on disk this turn that no tool call wrote:\n` +
-      shown.map((s) => `  ${s}`).join("\n") +
-      more +
-      "\n\nA change made through bash — a script, sed, cp, a generator — has no entry in the " +
-      "write ledger, so nothing here can prove what it did or judge it. Make changes with " +
-      "write_file and edit_file. If a command was meant to change these (an install, a build " +
-      "step), say which command and why, and stop: that is a decision for a person, or " +
-      "`outside: allow` on this check in .molt/done.yml.",
+
+  /**
+   * Whose change was it? molt does not know, and stops pretending it does.
+   *
+   * This used to open "N file(s) changed on disk **this turn** that no tool
+   * call wrote", which is a claim about the agent. What the check actually
+   * knows is narrower: the tree differs from its pre-turn snapshot, and no
+   * ledger entry explains the difference. Those are the same sentence only
+   * when one process is writing to the repository.
+   *
+   * On 2026-09-07 three were: a turn in the window, and two other sessions
+   * editing the same checkout. The turn was refused four times and exhausted
+   * for twelve files, eight of which belonged to one of the other writers, and
+   * spent its last message defending itself with file mtimes and a commit
+   * hash. It was right, and it should never have had to — a harness built to
+   * refuse unearned claims had made one about the only party present to blame.
+   *
+   * So the paths are split by the one piece of evidence that discriminates:
+   * whether this session ever opened the file at all. A path the model has
+   * never read and never written is not plausibly its doing, and saying so
+   * costs nothing when it is.
+   */
+  const opened = new Set([...(ctx.read ?? []), ...ctx.ledger.map((e) => e.path)]);
+  const path0 = (entry: string) => entry.replace(/ \((changed|created|deleted)\)$/u, "");
+  const mine = outside.filter((e) => opened.has(path0(e)));
+  const theirs = outside.filter((e) => !opened.has(path0(e)));
+
+  /** When it was last written, where that is knowable and inside the turn. */
+  const when = (entry: string): string => {
+    const at = ctx.treeBefore?.takenAt;
+    if (at === undefined) return "";
+    try {
+      const m = statSync(resolve(ctx.cwd, path0(entry))).mtimeMs;
+      if (m < at) return "";
+      const secs = Math.round((m - at) / 1000);
+      return ` · written ${secs < 90 ? `${secs}s` : `${Math.round(secs / 60)} min`} into the turn`;
+    } catch {
+      return "";
+    }
   };
+
+  const list = (entries: string[]) =>
+    entries
+      .slice(0, 12)
+      .map((e) => `  ${e}${when(e)}`)
+      .join("\n") + (entries.length > 12 ? `\n  … and ${entries.length - 12} more` : "");
+
+  const parts: string[] = [
+    `${outside.length} file(s) changed on disk since this turn began that no tool call wrote.`,
+  ];
+  if (mine.length) {
+    parts.push(
+      `\nFiles this session has opened — a change here is most likely work done outside the tools:\n` +
+        list(mine),
+    );
+  }
+  if (theirs.length) {
+    parts.push(
+      `\nFiles this session has never read or written — molt cannot attribute these to this turn:\n` +
+        list(theirs),
+    );
+  }
+  parts.push(
+    "\nA change with no ledger entry cannot be proven or judged, whoever made it, so the claim " +
+      "is refused either way.",
+  );
+  if (mine.length) {
+    parts.push(
+      "For the first group: make changes with write_file and edit_file. If a command was meant " +
+        "to change them (an install, a build step), say which command and why, and stop — that " +
+        "is a decision for a person.",
+    );
+  }
+  if (theirs.length) {
+    parts.push(
+      "For the second group: if another session, an editor or a watch process is writing to " +
+        "this checkout, no amount of further work will clear this — nothing can judge a claim " +
+        "against a tree moving underneath it. Say so and stop; the person can quiet the other " +
+        "writer and run again.",
+    );
+  }
+  parts.push("`outside: allow` on this check in .molt/done.yml turns the whole question off.");
+
+  return { ok: false, output: parts.join("\n") };
 }
 
 function runBuiltin(
@@ -1539,15 +1609,37 @@ function runBuiltin(
         (a) => `  ${e.path}: ${a}${e.route === "disk" ? "  (changed on disk, not through a tool)" : ""}`,
       ),
     );
+    /**
+     * "This turn deleted" was a claim about the agent; the removal reaching
+     * disk is the only part this check saw.
+     *
+     * Where the route was a tool call the two are the same and the wording
+     * stands. Where it was not — the file simply differs from its pre-turn
+     * snapshot — another writer on the same checkout produces exactly this,
+     * and on 2026-09-07 one did, three times over, on a turn that had not
+     * touched the file. Each line already carries its route; the sentence
+     * above them now agrees with the lines.
+     */
+    const byTool = rewritten.some((e) => e.route !== "disk");
+    const byDisk = rewritten.some((e) => e.route === "disk");
+    const headline = byTool
+      ? `This turn deleted ${lines.length} assertion(s) from ${rewritten.length} test file(s):`
+      : `${lines.length} assertion(s) are gone from ${rewritten.length} test file(s) since this ` +
+        `turn began, none of them removed through a tool:`;
     return {
       ok: false,
       output:
-        `This turn deleted ${lines.length} assertion(s) from ${rewritten.length} test file(s):\n` +
+        `${headline}\n` +
         `${lines.join("\n")}\n` +
         `A test that contradicts your change is not an obstacle to remove. Either the code ` +
         `is wrong and you fix the code, or the test is wrong — and a test being wrong is a ` +
         `decision for a person, so say which assertion you believe is wrong and why, and ` +
-        `stop. If it really is obsolete, set \`removals: allow\` on this check.`,
+        `stop. If it really is obsolete, set \`removals: allow\` on this check.` +
+        (byDisk && !byTool
+          ? `\n\nNothing here was removed by a tool call, so molt cannot attribute it to this ` +
+            `turn. If another session or editor is writing to this checkout, say so and stop — ` +
+            `working harder cannot clear a change this turn did not make.`
+          : ""),
     };
   }
 
