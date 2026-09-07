@@ -2075,9 +2075,30 @@ async function usePlan(
     return;
   }
   if (!h.ok) {
-    // The fix is a command you type somewhere else, so it is shown verbatim
-    // rather than summarised — "not signed in" without it is a dead end.
-    status.textContent = h.fix ? `${h.detail} — run: ${h.fix}` : h.detail;
+    /**
+     * A refused plan must not leave another backend's address in the box.
+     *
+     * `usePlan` used to report the failure and return, leaving `set-url`
+     * exactly as it was — and what it was is often a different vendor. Press
+     * "Use my Google plan", have it fail, press "Open workspace", and molt
+     * opens whatever was in the field: reported as "in settings when using
+     * use my google plan it links to google cli", which is precisely what the
+     * screen said, because the box still held `gemini-cli://subscription`
+     * from before and nothing had told the person the button had not changed
+     * it.
+     *
+     * So the failure says which endpoint is actually selected. It does not
+     * clear the field — silently emptying a box someone filled is its own
+     * surprise — it just stops the screen implying a switch that did not
+     * happen.
+     */
+    const still = ($("set-url") as HTMLInputElement).value.trim();
+    const unchanged = still
+      ? ` The endpoint is unchanged: ${still}.`
+      : " No endpoint is selected.";
+    status.textContent =
+      (h.fix ? `${h.detail} — run: ${h.fix}` : h.detail) + unchanged;
+    $("set-status").textContent = `${name} was not selected.${unchanged}`;
     return;
   }
   ($("set-url") as HTMLInputElement).value = h.url;

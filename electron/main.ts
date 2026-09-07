@@ -1076,6 +1076,35 @@ ipcMain.handle("app:theme", (_e, name: string) => {
   return { ...t, ...desktopSurfaces(t) };
 });
 
+
+/**
+ * Why this backend cannot be opened, or null.
+ *
+ * Reads the same health the Settings buttons read, so the door and the button
+ * can never disagree about whether a CLI is usable.
+ */
+async function backendRefusal(baseUrl: string): Promise<string | null> {
+  try {
+    if (isClaudeCode(baseUrl)) {
+      const h = await claudeCodeHealth();
+      return h.ok ? null : `${h.detail}${h.fix ? ` — run: ${h.fix}` : ""}`;
+    }
+    if (isAgy(baseUrl)) {
+      const h = await agyHealth();
+      return h.ok ? null : `${h.detail}${h.fix ? ` — run: ${h.fix}` : ""}`;
+    }
+    const spec = acpAgentFor(baseUrl);
+    if (spec) {
+      const h = await acpHealth(spec);
+      return h.ok ? null : `${h.detail}${h.fix ? ` — run: ${h.fix}` : ""}`;
+    }
+  } catch {
+    // A health check that cannot run is not a reason to refuse a workspace.
+    return null;
+  }
+  return null;
+}
+
 ipcMain.handle("workspace:pick", async () => {
   const r = await dialog.showOpenDialog({
     properties: ["openDirectory", "createDirectory"],
@@ -1087,9 +1116,25 @@ ipcMain.handle("workspace:pick", async () => {
 
 ipcMain.handle(
   "session:open",
-  (_e, opts: { cwd: string; model: string; baseUrl: string; apiKey?: string }) => {
+  async (_e, opts: { cwd: string; model: string; baseUrl: string; apiKey?: string }) => {
     const refuse = sessionOpenReject(opts, running !== null);
     if (refuse) return { ok: false, error: refuse };
+    /**
+     * A backend molt already knows is dead is refused at the door.
+     *
+     * molt has a health check for every CLI backend and did not consult it
+     * before opening. So a workspace could be opened on `gemini-cli` — where
+     * `acpHealth` reports, in molt's own words, "This client is no longer
+     * supported for Gemini Code Assist for individuals" — and the person
+     * found out one turn later, having written a prompt and waited, from an
+     * error that reads like the model's rather than the address's.
+     *
+     * Only for the CLI backends, and only when the answer is already known:
+     * an HTTP endpoint is not probed here, because reachability is a network
+     * question and this is a door, not a doctor.
+     */
+    const unhealthy = await backendRefusal(opts.baseUrl);
+    if (unhealthy) return { ok: false, error: unhealthy };
     try {
       session = openSession(opts.cwd, opts.model, opts.baseUrl, opts.apiKey);
       rememberEndpoint(opts.baseUrl, opts.model);
