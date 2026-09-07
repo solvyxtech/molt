@@ -145,3 +145,45 @@ turn wrote — molt's own ledger, attributable per tool call, and narrower than
 `git diff`, which shows the working tree rather than this turn and is worth
 nothing when more than one agent is editing it.
 
+## The tree is not the deliverable
+
+Three failures on 2026-09-07, all of them the same sentence.
+
+1. A turn fixed `src/`, passed ten checks, wrote an accepted receipt — and the
+   person who opened the app got a build from forty minutes earlier.
+2. A commit staged four source files and left the two modules they import
+   untracked. A fresh clone failed typecheck on four files, minutes after
+   `npm run check` passed at 1,296 tests.
+3. Between those, a turn was refused four times and exhausted for twelve files
+   it had not written, because two other agents were editing the same checkout
+   and molt reported their work as the turn's.
+
+The first two are one fault: **molt judges the working tree, and the working
+tree is not what anyone receives.** What is received is a build, a commit, an
+install, a package — each derived from the tree and each able to disagree with
+it. A green bar says the tree is healthy. It has never said the artifact is.
+
+The third is the same fault seen from the other side: the tree is not solely
+the turn's either, so a finding about the tree is not automatically a finding
+about the work.
+
+What follows:
+
+- **Every check names the artifact it judges.** `build-current` judges built
+  output against source. `imports-tracked` judges what git holds against what
+  committed code imports. `tree-accounted`, `files-changed` and the rest judge
+  the tree, and say so.
+- **A check that judges an artifact this machine does not build says nothing
+  about it rather than failing.** The installed app is listed in this
+  project's own bar and skipped where it is absent — enforced on the machine
+  that is about to hand it over, silent on the machine that is not.
+- **When a commit moves modules, verify a clone rather than the tree.** No
+  suite that reads the working tree can see a file missing from the commit.
+- **A finding about the tree is attributed only as far as the ledger reaches.**
+  Name the turn where a tool call is on record; say what changed and stop
+  guessing where none is.
+
+The general form, for whatever the fourth instance turns out to be: *before
+adding a check, say which artifact it judges — and if the answer is "the
+working tree", ask what is actually being handed over.*
+

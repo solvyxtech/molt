@@ -148,16 +148,19 @@ checks:
   # check had been truthful; none of them was about the artifact.
   #
   # `out/` is what `npm run bundle` writes and what the app runs. The installed
-  # copy is deliberately NOT listed: a contributor who has never run
-  # `app:push` has no /Applications/molt.app, and a check that fails for
-  # everyone but the author is a check people learn to skip. Add it locally if
-  # you are the one shipping.
+  # copy IS listed, because the failure this check exists for was an installed
+  # app forty minutes behind its source and nothing in the bar rebuilds
+  # /Applications. An output that does not exist and lives outside the project
+  # is skipped rather than failed, so a contributor who has never run
+  # `app:push` is not blocked by an artifact they do not have — and whoever is
+  # about to hand the app over is.
   #
   # mtime, so a build that genuinely ran satisfies it and a `touch` defeats it.
   # It is aimed at the case that actually happens: nobody rebuilt.
   - name: build-current
     builtin: build-current
-    outputs: out/main.cjs, out/preload.cjs, out/ui/app.js
+    outputs: out/main.cjs, out/preload.cjs, out/ui/app.js,
+      /Applications/molt.app/Contents/Resources/app/out/main.cjs
     from: src, electron, ui, build.mjs
     tags: [session]
 
@@ -176,7 +179,6 @@ checks:
   # hand someone actually work.
   - name: work-complete
     builtin: imports-tracked
-    tags: [session]
 
   - name: work-checked
     builtin: mutation

@@ -129,3 +129,36 @@ describe("imports-tracked", () => {
     );
   });
 });
+
+/**
+ * The adaptation, not the patch.
+ *
+ * Two of the three failures on 2026-09-07 were one fault — molt judges the
+ * working tree, and the tree is not what anyone receives — so the lesson has
+ * to live where new projects get it, not only in this repository's own bar.
+ */
+describe("what molt proposes to a project it has never seen", () => {
+  it("includes the completeness check, with no configuration to get wrong", async () => {
+    const { proposeBar } = await import("../src/detect.js");
+    const w = workspace();
+    cleanups.push(w.cleanup);
+    const { yaml } = proposeBar(w.dir);
+    assert.match(yaml, /builtin: imports-tracked/, "every git project wants this one");
+    // It reads no ledger, so it must not be tagged session — `molt prove`
+    // standalone should still be able to answer it.
+    const after = yaml.slice(yaml.indexOf("builtin: imports-tracked"));
+    assert.doesNotMatch(
+      after.slice(0, 80),
+      /tags: \[session\]/,
+      "imports-tracked needs no session and must run under `molt prove`",
+    );
+  });
+
+  it("still parses as a bar", async () => {
+    const { proposeBar } = await import("../src/detect.js");
+    const w = workspace();
+    cleanups.push(w.cleanup);
+    const bar = parseBar(proposeBar(w.dir).yaml);
+    assert.ok(bar.checks.some((c) => c.name === "work-complete"));
+  });
+});
