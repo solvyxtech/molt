@@ -212,7 +212,7 @@ describe("a change made outside the tools", () => {
     assert.match(none.output, /no turn/);
     const truncated = await runCheck(check, {
       ...base,
-      treeBefore: { files: new Map(), assertions: new Map(), truncated: true, examined: 20_000 },
+      treeBefore: { takenAt: Date.now(), files: new Map(), assertions: new Map(), truncated: true, examined: 20_000 },
     });
     assert.equal(truncated.ok, false, "an unreadable tree passed as accounted");
     assert.match(truncated.output, /could not be snapshotted in full/);
