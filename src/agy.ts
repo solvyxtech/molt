@@ -22,20 +22,24 @@
  * out of cache where the first read 8,122, so a process per turn would pay for
  * the context again every step.
  *
- * ## Why the ledger is safe here, and why it is safer than on ACP
+ * ## Why the ledger is safe here
  *
  * Antigravity's headless mode **denies by default**. A tool that needs
  * permission and has no matching rule cannot prompt anybody, so it is refused
- * — verified three ways on a live account: `write_to_file` refused,
- * `run_command touch …` refused (the file never appeared), and `call_mcp_tool`
- * refused until a rule allowed it. Only its read-only shell commands run
- * unasked, and those cannot change the tree.
+ * — verified on a live account: `write_to_file` refused, `run_command touch …`
+ * refused with the file never created, `call_mcp_tool` refused until a rule
+ * allowed it, and `read_file` refused too.
  *
- * So molt does not have to take anything away. It adds exactly one thing: an
- * allow-rule per molt tool, `mcp(molt/<name>)`, which is the rule string the
- * CLI itself prints when it refuses one. Everything molt has not named stays
- * refused. That is the opposite of the Grok backend, where molt must strip
- * tools and refuse permissions and still cannot stop an auto-approved read.
+ * So molt does not have to take anything away. It adds an allow-rule per molt
+ * tool, `mcp(molt/<name>)`, which is the rule string the CLI itself prints
+ * when it refuses one. Everything molt has not named stays refused.
+ *
+ * That alone is safe but not usable: **a denied tool ends the turn**, so the
+ * first step went to Antigravity trying its own `read_file`, being refused,
+ * and stopping with nothing said. `agy-hook.ts` is what fixes it — a
+ * `PreToolUse` gate whose `reason` reaches the model, so it is told mid-turn
+ * to use molt's tools instead. Two steps became one, and a bar of
+ * `files-changed` + `tree-accounted` now passes on the first attempt.
  *
  * ## Why it edits the config you already have
  *
@@ -72,12 +76,12 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { homedir } from "node:os";
+import { homedir, tmpdir as _tmpdir } from "node:os";
 import { dirname } from "node:path";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
-import { bridgePath, Channel, McpToolServer } from "./acp.js";
+import { bridgePath, Channel, McpToolServer, shippedScript } from "./acp.js";
 import type { BackendEvent, MoltTool, ToolRunner } from "./claude-code.js";
 import { errorText } from "./format.js";
 
@@ -258,6 +262,60 @@ export function ensureAgyRules(
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify({ ...current, permissions }, null, 2), "utf8");
   return state.missingRules;
+}
+
+/** `~/.gemini/config/hooks.json` — global customisations, all sessions. */
+export function agyHooksPath(home = homedir()): string {
+  return join(home, ".gemini", "config", "hooks.json");
+}
+
+/** The hook entry molt installs, so a test can assert it without a filesystem. */
+export function moltHookEntry(script: string, exe = process.execPath): Record<string, unknown> {
+  return {
+    PreToolUse: [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            // `ELECTRON_RUN_AS_NODE` because in the packaged app `execPath` is
+            // Electron, and without it this starts a second window instead of
+            // a script. The hook runs through `sh -c`, so the assignment works.
+            command: `ELECTRON_RUN_AS_NODE=1 ${JSON.stringify(exe)} ${JSON.stringify(script)}`,
+            timeout: 15,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+/**
+ * Install the `PreToolUse` gate, once, beside whatever hooks you already have.
+ *
+ * Merged by name: molt writes exactly the `molt-tool-gate` key and leaves every
+ * other hook in the file untouched. Rewritten when the command changes — the
+ * path to the script moves when the app is reinstalled, and a hook pointing at
+ * a file that is gone is a hook that fails on every tool call.
+ *
+ * Safe to have installed permanently: the gate has no opinion unless
+ * `MOLT_MCP_URL` is in its environment. See `agy-hook.ts`.
+ */
+export function ensureAgyHook(path = agyHooksPath(), script?: string): boolean {
+  const entry = moltHookEntry(script ?? shippedScript("agy-hook.js"));
+  let current: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      current = parsed as Record<string, unknown>;
+    }
+  } catch {
+    /* no hooks yet, or not ours to read */
+  }
+  if (JSON.stringify(current["molt-tool-gate"]) === JSON.stringify(entry)) return false;
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({ ...current, "molt-tool-gate": entry }, null, 2), "utf8");
+  return true;
 }
 
 /**
@@ -508,7 +566,16 @@ export class AgySession<H> {
     if (this.opts.setup) await this.opts.setup(endpoint);
     else {
       const added = ensureAgyRules(tools);
+      const hooked = ensureAgyHook();
       await ensureAgyServer(bridgePath());
+      if (hooked) {
+        this.events.push({
+          kind: "info",
+          text:
+            `installed molt's tool gate in ${agyHooksPath()} — it has no effect on ` +
+            `Antigravity sessions molt did not start`,
+        });
+      }
       if (added.length) {
         this.events.push({
           kind: "info",

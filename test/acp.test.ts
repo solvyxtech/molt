@@ -27,6 +27,7 @@ import {
   mcpEntry,
   bridgePath,
   permissionsDisarmed,
+  shippedScript,
 } from "../src/acp.js";
 import { Archive } from "../src/archive.js";
 import { parseBar } from "../src/bar.js";
@@ -242,15 +243,19 @@ describe("the stdio bridge to molt's tool server", () => {
 
   /**
    * A path handed to an agent that does not resolve produces a spawn failure
-   * the agent reports as "no tools" and molt never sees. Caught here, where it
-   * can still name itself — and named loudly, because the packaged app's
-   * `import.meta` is an empty object and this is where that lands.
+   * the agent reports as "no tools" and molt never sees. So whatever comes
+   * back must exist — and when nothing does, it says so by name rather than
+   * handing over a guess.
    */
-  it("refuses a bridge path that is not there, rather than handing it over", () => {
+  it("never returns a path that is not there", () => {
     const before = process.env.MOLT_MCP_BRIDGE;
-    process.env.MOLT_MCP_BRIDGE = join(ws(), "not-here.js");
+    process.env.MOLT_MCP_BRIDGE = join(ws(), "nowhere", "mcp-bridge.js");
     try {
-      assert.throws(() => bridgePath(), /MOLT_MCP_BRIDGE|cannot find/u);
+      // A bad override falls back to the copy shipped beside this module
+      // rather than failing: a working script beats an honoured typo.
+      assert.ok(existsSync(bridgePath()), "the resolved bridge must exist on disk");
+      // But a script that exists nowhere at all is named, not guessed at.
+      assert.throws(() => shippedScript("no-such-script.js"), /no-such-script\.js|MOLT_MCP_BRIDGE/u);
     } finally {
       if (before === undefined) delete process.env.MOLT_MCP_BRIDGE;
       else process.env.MOLT_MCP_BRIDGE = before;
