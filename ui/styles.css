@@ -878,6 +878,20 @@ input[type="checkbox"]:checked::after {
   color: var(--dim);
 }
 .activity .spin { color: var(--accent); animation: pulse 1s ease-in-out infinite; }
+
+/* The interview waits on a real round trip — often a minute against a real
+   provider — and used to show only a swapped line of text, which reads as a
+   frozen window. Reported as "it looks frozen then populates after a minute". */
+.iv-wait {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  margin-right: auto;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.iv-wait .spin { color: var(--accent); animation: pulse 1s ease-in-out infinite; }
+.interview.busy .iv-qs { opacity: 0.55; pointer-events: none; }
 .activity .phase { color: var(--text); opacity: 0.75; }
 .activity .clock {
   color: var(--dim);
@@ -1087,7 +1101,7 @@ input[type="checkbox"]:checked::after {
 .ck-auto input { accent-color: var(--dim); }
 
 @media (prefers-reduced-motion: reduce) {
-  .dot.busy, .dot.proving, .activity .spin, .tool.running .glyph, .spine-list li.run .spine-mark {
+  .dot.busy, .dot.proving, .activity .spin, .iv-wait .spin, .tool.running .glyph, .spine-list li.run .spine-mark {
     animation: none;
   }
 }

@@ -177,6 +177,26 @@ Every file is hashed before it is touched and verified after. A failed restore
 is reported as this check failing, whatever the mutations found: a verification
 tool that leaves your source altered has done something worse than miss a bug.
 
+```yaml
+  - name: work-tested
+    builtin: mutation
+    run: npm test
+    empty: allow       # optional — a turn with nothing to mutate is permitted
+```
+
+`empty: allow` is for a project whose turns routinely change only lines with no
+operator to flip. Without it, changed lines that were in scope and none of which
+was mutated is a **failure**: the check exists to establish that your tests
+would notice this code being broken, and it never broke it once, so passing
+would be a claim molt has not earned. With it set, that case passes and says
+plainly that nothing is claimed either way — it does not turn into a pass that
+means the tests are good. It is refused on any other builtin, so a typo is an
+error rather than a setting that quietly does nothing.
+
+A turn where *no* changed line carries an operator this check can flip needs no
+setting at all: that scope is genuinely empty and passes on its own, again
+without claiming anything.
+
 #### `record-intact`
 
 Passes when everything this project shed is still recoverable.
@@ -260,6 +280,47 @@ reference.
 
 It says nothing to ground rather than passing vacuously when the claim
 mentions no files.
+
+#### `build-current`
+
+Passes when what this project ships is newer than the sources this turn
+changed.
+
+Every other builtin reads the record or the source tree. None of them is about
+the artifact. A turn fixed a real defect in `src/`, passed ten checks and wrote
+an accepted receipt — and the person who went to use it opened a build from
+forty minutes earlier and watched the same bug happen. Every check had been
+truthful; none of them was about the thing people run.
+
+```yaml
+  - name: build-current
+    builtin: build-current
+    outputs: out/main.cjs, out/preload.cjs
+    from: src, electron, ui
+```
+
+`outputs` is required — the built file(s) this project ships, comma separated or
+as a list. There is no guessing it: `dist`, `out`, `build`, an installed app
+bundle and a container image are all the same kind of thing and no two projects
+spell it alike, so a check that cannot work says so at parse time rather than on
+the first turn it would have caught something. They are paths, not globs, and
+absolute paths are allowed and are the point: the thing that goes stale is
+usually the installed copy, which lives outside the repository. `outputs` is
+refused on any other builtin.
+
+`from` is optional — the path prefixes that feed those outputs. Omitted, every
+file the turn wrote counts, which makes a docs-only turn demand a rebuild it
+does not need. Anything under `outputs` is never treated as a source.
+
+It compares **modification times**, which is weak evidence and is named as such
+in the output: a `touch` defeats it, and a build that ran but produced nothing
+new looks the same as one that never ran. It catches the case that actually
+occurs, which is that nobody rebuilt at all. An output that does not exist is a
+failure, not a pass — it never passes silently on a missing artifact.
+
+Fails with the names of the outputs that are missing or behind, how far behind,
+and which source they are behind, because "build and install, then say the claim
+again" is a repair the model can carry out.
 
 ## `watch` — what a check reads
 
@@ -368,6 +429,32 @@ first request. A criterion that cannot run is reported there, which is the
 cheapest possible place to learn it. It is a warning, not a veto: a criterion is
 *supposed* to fail before the work, and one that names a tool the work itself
 installs is legitimate. The bar keeps the final say.
+
+## Passes that established nothing
+
+A check that looked and found nothing wrong and a check that had nothing to look
+at are different facts, and a receipt that prints both as `pass` is how a check
+that has never examined anything reads as one that keeps clearing the work.
+
+So a check that passes on an empty scope is reported in the receipt table as
+**`pass (nothing to establish)`**, and its detail block records
+`result: pass-vacuous`. `molt prove` writes the same distinction as `pass·none`
+beside the plain `pass`. It does not block a completion — the bar is still met —
+but nobody reading the receipt can mistake it for evidence.
+
+Where it comes from today:
+
+- `mutation`, when no changed line carries an operator it can flip, or when
+  lines were in scope, none was mutated, and `empty: allow` is set.
+- `diff-covered`, when the turn changed no line coverage could speak about.
+- `build-current`, when the turn changed nothing that feeds a build, or when
+  every source it wrote is gone from disk.
+- `record-intact`, in a project that has never shed context.
+
+This is a report about the scope, not a verdict on the work. It is worth reading
+as a question: if a check keeps saying it had nothing to look at, either that is
+true of the project — and the setting that permits it should be explicit — or
+the check is pointed somewhere the work does not reach.
 
 ## Tamper detection
 
