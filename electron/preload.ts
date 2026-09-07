@@ -26,6 +26,7 @@ contextBridge.exposeInMainWorld("molt", {
     ipcRenderer.invoke("session:open", opts),
 
   saveKey: (provider: string, key: string) => ipcRenderer.invoke("auth:save", provider, key),
+  claudeCodeHealth: () => ipcRenderer.invoke("claudeCode:health"),
   saveEndpoint: (baseUrl: string, model: string) =>
     ipcRenderer.invoke("auth:endpoint", baseUrl, model),
   storedEndpoint: () => ipcRenderer.invoke("auth:stored"),

@@ -22,6 +22,7 @@ import {
   CLAUDE_CODE_URL,
   claudeCodeHealth,
   isClaudeCode,
+  parseCredential,
   zodShape,
 } from "../src/claude-code.js";
 import { Engine } from "../src/engine.js";
@@ -153,6 +154,41 @@ describe("molt's tool schemas, as the SDK wants them", () => {
 
   it("is empty for a schema with no properties", () => {
     assert.deepEqual(zodShape({}, z as never), {});
+  });
+});
+
+describe("whose credential this is, and what molt takes from it", () => {
+  /**
+   * It is the credential of whoever is running molt, read off their own
+   * machine — molt ships none, and there is nowhere for one to be embedded.
+   * What is taken from it is three fields that get rendered. The tokens beside
+   * them are never copied out, so there is nothing to leak rather than a rule
+   * about not leaking it.
+   */
+  it("takes the plan and the expiry, and never the tokens", () => {
+    const cred = parseCredential(
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: "sk-ant-oat01-SECRETVALUE",
+          refreshToken: "sk-ant-ort01-ALSOSECRET",
+          subscriptionType: "max",
+          rateLimitTier: "max_20x",
+          expiresAt: 4102444800000,
+          scopes: ["user:inference"],
+        },
+      }),
+    );
+    assert.deepEqual(cred, {
+      subscriptionType: "max",
+      rateLimitTier: "max_20x",
+      expiresAt: 4102444800000,
+    });
+    assert.doesNotMatch(JSON.stringify(cred), /SECRET/, "no token may survive the parse");
+  });
+
+  it("is nothing at all when there is no credential to read", () => {
+    assert.equal(parseCredential("not json"), null);
+    assert.equal(parseCredential("{}"), null);
   });
 });
 

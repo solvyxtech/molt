@@ -117,8 +117,16 @@ export function renderMarkdown(md: string, into: HTMLElement): void {
       continue;
     }
 
+    // The first line is consumed unconditionally, because it is the line this
+    // pass already refused every other block for. Leaving it to the loop below
+    // meant a line that opens a block form without completing it — `##### h5`
+    // (the header rule stops at four), `#tag`, a `|` row with no separator
+    // beneath it — matched the guard, added nothing to the buffer, and left
+    // `i` where it was: an empty <p> appended forever, in the renderer thread,
+    // on a receipt the model wrote. A paragraph always eats at least its own
+    // first line, and that is what makes this loop terminate.
     const p = el("p");
-    const buf: string[] = [];
+    const buf: string[] = [lines[i++]!];
     while (i < lines.length && lines[i]!.trim() !== "" && !/^(#|>|```|[-*]\s|\|)/.test(lines[i]!))
       buf.push(lines[i++]!);
     inline(p, buf.join(" "));

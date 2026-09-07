@@ -306,8 +306,14 @@ export class Receipts {
       // command was never executed, so this row is evidence of nothing. A
       // receipt that prints it as a failure invites the reader to believe
       // something was tried and found wanting.
+      // A pass that established nothing is not the same fact as a pass that
+      // looked and found nothing wrong, and printing both as "pass" is how a
+      // check that has never examined anything reads as a check that keeps
+      // clearing the work.
       const verdict = r.ok
-        ? "pass"
+        ? r.established === false
+          ? "pass (nothing to establish)"
+          : "pass"
         : r.didNotRun
           ? "**did not run**"
           : r.advisory
@@ -324,13 +330,23 @@ export class Receipts {
       // Plain key: value lines so a stranger can `rg "exit:" .molt/receipts`
       // and reconstruct the claim without parsing a markdown table.
       detail.push(
-        `### ${r.name} — ${r.ok ? "pass" : r.didNotRun ? "did not run" : "FAIL"}`,
+        `### ${r.name} — ${
+          r.ok
+            ? r.established === false
+              ? "pass (nothing to establish)"
+              : "pass"
+            : r.didNotRun
+              ? "did not run"
+              : "FAIL"
+        }`,
         "",
         `check: ${r.name}`,
         `kind: ${r.kind}`,
         `command: ${r.detail}`,
         `exit: ${r.exitCode ?? "n/a"}`,
-        `result: ${r.ok ? "pass" : r.didNotRun ? "did-not-run" : "fail"}`,
+        `result: ${
+          r.ok ? (r.established === false ? "pass-vacuous" : "pass") : r.didNotRun ? "did-not-run" : "fail"
+        }`,
         // Evidence of a different kind, and the receipt is the document handed
         // to someone who was not there to watch it run.
         `ran: ${r.cached ? "no — reused, nothing it watches had changed" : "yes"}`,

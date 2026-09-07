@@ -564,7 +564,15 @@ function printBar(result: BarResult, from: "run" | "prove"): void {
   );
   for (const r of result.results) {
     const tags = r.tags?.length ? `  [${r.tags.join(",")}]` : "";
-    const label = r.ok ? "pass" : r.advisory ? "warn" : "FAIL";
+    // Same three-way distinction the receipt makes: a check that established
+    // nothing is not a check that cleared the work.
+    const label = r.ok
+      ? r.established === false
+        ? "pass·none"
+        : "pass"
+      : r.advisory
+        ? "warn"
+        : "FAIL";
     const evidence = r.ok ? r.output.trim().split("\n")[0] ?? "" : "";
     process.stdout.write(
       `${label}  ${r.name}${r.exitCode !== undefined ? ` (exit ${r.exitCode})` : ""}${tags}` +

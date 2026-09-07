@@ -666,7 +666,9 @@ export function App({
           baseUrl: engine.baseUrl,
           apiKey: engine.apiKey,
           model: engine.model,
+          cwd: engine.cwd,
           fetchFn: engine.cfg.fetchFn,
+          claudeCodeSdk: engine.cfg.claudeCodeSdk,
         });
         if (seq !== interviewSeq.current) return;
         if (r.kind === "error") {

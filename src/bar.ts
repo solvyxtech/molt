@@ -14,7 +14,7 @@ import { planMutations, applyMutation, type Mutation } from "./mutate.js";
 import { proposeBar, type Detected } from "./detect.js";
 import { assertionsIn, fingerprint, isTestPath, treeChanges, type TreeSnapshot } from "./files.js";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { ArchiveLike } from "./archive.js";
@@ -47,6 +47,7 @@ export const BUILTINS: BuiltinCheck[] = [
   "tree-accounted",
   "diff-covered",
   "mutation",
+  "build-current",
 ];
 
 /**
@@ -286,6 +287,21 @@ export function parseBar(source: string): Bar {
         }
       }
       const outside = c["outside"] === "allow" ? { outside: "allow" as const } : {};
+      if (c["empty"] !== undefined) {
+        if (c["empty"] !== "allow" && c["empty"] !== "refuse") {
+          throw new BarError(
+            `done.yml: check "${name}" has \`empty: ${JSON.stringify(c["empty"])}\` ` +
+              `— it takes "allow" or "refuse".`,
+          );
+        }
+        if (c.builtin !== "mutation") {
+          throw new BarError(
+            `done.yml: check "${name}" sets \`empty\`, which only applies to the ` +
+              `mutation builtin.`,
+          );
+        }
+      }
+      const empty = c["empty"] === "allow" ? { empty: "allow" as const } : {};
 
       // diff-covered cannot work without being told where the report is, and
       // a check that cannot work must say so at parse time rather than fail
@@ -318,6 +334,35 @@ export function parseBar(source: string): Bar {
             }
           : {};
       const lcov = typeof c.lcov === "string" ? { lcov: c.lcov.trim() } : {};
+
+      /**
+       * build-current has to be told what this project ships.
+       *
+       * There is no guessing it: `dist`, `out`, `build`, an installed app
+       * bundle and a container image are all the same kind of thing and no
+       * two projects spell it alike. Like diff-covered's `lcov`, a check that
+       * cannot work says so at parse time rather than on the first turn that
+       * would have caught something.
+       */
+      const asPaths = (v: unknown): string[] =>
+        (Array.isArray(v) ? v : typeof v === "string" ? v.split(",") : [])
+          .map((x) => String(x).trim())
+          .filter(Boolean);
+      const outputs = asPaths(c.outputs);
+      const from = asPaths(c.from);
+      if (builtin === "build-current" && outputs.length === 0) {
+        throw new BarError(
+          `done.yml: check "${name}" uses the build-current builtin and needs \`outputs\` — ` +
+            "the built file(s) this project ships, one per line or comma separated.",
+        );
+      }
+      if (c.outputs !== undefined && builtin !== "build-current") {
+        throw new BarError(
+          `done.yml: check "${name}" sets \`outputs\`, which only applies to the ` +
+            "build-current builtin.",
+        );
+      }
+      const built = builtin === "build-current" ? { outputs, ...(from.length ? { from } : {}) } : {};
       return {
         name,
         kind: "builtin",
@@ -325,9 +370,11 @@ export function parseBar(source: string): Bar {
         tags,
         ...advisory,
         ...commentOnly,
+        ...empty,
         ...removals,
         ...outside,
         ...lcov,
+        ...built,
         ...mut,
       };
     }
@@ -768,7 +815,8 @@ async function mutationCheck(
   run: string,
   sample: number,
   timeoutMs: number,
-): Promise<{ ok: boolean; output: string }> {
+  allowEmpty = false,
+): Promise<{ ok: boolean; output: string; established?: boolean }> {
   const files = ctx.ledger
     .filter((e) => e.changedLines && e.changedLines.length > 0)
     .map((e) => {
@@ -783,15 +831,35 @@ async function mutationCheck(
     })
     .filter((f): f is NonNullable<typeof f> => f !== null);
 
-  if (files.length === 0) return { ok: true, output: "No changed lines to mutate." };
+  /**
+   * The two genuinely empty scopes, and the reason they pass.
+   *
+   * This check can only ever examine a line carrying an operator it knows how
+   * to flip. A turn that adds imports, strings or JSX has no such line, and
+   * refusing it would make the check noise that everyone learns to route
+   * around. So both of these pass — and neither claims to have established
+   * anything, which is the part receipt 0052 got wrong: it printed a bare
+   * green `pass` on "no line with an operator to flip", one row under
+   * `work-proven`, and read exactly like a check that had proven the tests
+   * would catch a break.
+   *
+   * Note this is NOT the same as mutations being planned and none applying.
+   * That one means the check tried and could not, and `mutationVerdict`
+   * refuses it.
+   */
+  if (files.length === 0) {
+    return { ok: true, established: false, output: "No changed lines to mutate." };
+  }
 
   const plan = planMutations(files, sample) as (Mutation & { path: string })[];
   if (plan.length === 0) {
     return {
       ok: true,
+      established: false,
       output:
         `${files.length} changed file(s), no line with an operator to flip. ` +
-        "Nothing was mutated, so nothing is claimed.",
+        "Nothing was mutated, so nothing is claimed about whether the tests would notice " +
+        "a break here.",
     };
   }
 
@@ -901,7 +969,7 @@ async function mutationCheck(
   }
 
   const total = files.reduce((n, f) => n + f.changedLines.length, 0);
-  return mutationVerdict({ killed, survived, planned: plan.length, total, sample });
+  return mutationVerdict({ killed, survived, planned: plan.length, total, sample, allowEmpty });
 }
 
 /**
@@ -914,14 +982,109 @@ async function mutationCheck(
  * the mutation check exists to refuse. Being a pure function makes it reachable
  * by a test rather than by an argument that it cannot go wrong.
  */
+/**
+ * Is what this project ships newer than what this turn changed?
+ *
+ * The gap this closes, in full: on 2026-09-07 a turn fixed a real defect in
+ * `src/`, passed ten checks, and wrote an accepted receipt — and the person
+ * who went to use it opened a build from forty minutes earlier and watched the
+ * same bug happen. Every check had been truthful. None of them was about the
+ * artifact.
+ *
+ * Compared by mtime, which is weak evidence and named as such in the output: a
+ * `touch` defeats it, and a build that ran but produced nothing new looks the
+ * same as one that never ran. It catches the case that actually occurs, which
+ * is that nobody rebuilt at all, and it never passes silently on a missing
+ * artifact.
+ */
+function buildCurrent(
+  ctx: BarContext,
+  outputs: string[],
+  from: string[],
+): { ok: boolean; output: string; established?: boolean } {
+  const inScope = (p: string): boolean =>
+    (from.length === 0 || from.some((f) => p === f || p.startsWith(f.replace(/\/*$/, "") + "/"))) &&
+    !outputs.some((o) => p === o || p.startsWith(o.replace(/\/*$/, "") + "/"));
+
+  const sources = [...new Set(ctx.ledger.map((e) => e.path))].filter(inScope);
+  if (sources.length === 0) {
+    return {
+      ok: true,
+      established: false,
+      output:
+        "This turn changed nothing that feeds a build, so there is nothing for the built " +
+        "output to be behind.",
+    };
+  }
+
+  let newest = { path: "", at: 0 };
+  for (const p of sources) {
+    try {
+      const at = statSync(resolve(ctx.cwd, p)).mtimeMs;
+      if (at > newest.at) newest = { path: p, at };
+    } catch {
+      // Written and then removed. `files-changed` owns that question.
+    }
+  }
+  if (newest.at === 0) {
+    return {
+      ok: true,
+      established: false,
+      output: "Every source this turn wrote is gone from disk; there is nothing to compare.",
+    };
+  }
+
+  const stale: string[] = [];
+  const missing: string[] = [];
+  const fresh: string[] = [];
+  for (const out of outputs) {
+    let at: number;
+    try {
+      at = statSync(resolve(ctx.cwd, out)).mtimeMs;
+    } catch {
+      missing.push(out);
+      continue;
+    }
+    if (at < newest.at) {
+      const behind = Math.round((newest.at - at) / 1000);
+      stale.push(
+        `  ${out} — ${behind < 90 ? `${behind}s` : `${Math.round(behind / 60)} min`} older than ${newest.path}`,
+      );
+    } else fresh.push(out);
+  }
+
+  if (missing.length === 0 && stale.length === 0) {
+    return {
+      ok: true,
+      output:
+        `${fresh.length} built output(s) newer than the ${sources.length} source file(s) ` +
+        `this turn changed (by mtime; newest was ${newest.path}).`,
+    };
+  }
+  return {
+    ok: false,
+    output:
+      (missing.length
+        ? `${missing.length} declared output(s) do not exist:\n${missing.map((m) => `  ${m}`).join("\n")}\n\n`
+        : "") +
+      (stale.length ? `${stale.length} built output(s) are older than this turn's work:\n${stale.join("\n")}\n\n` : "") +
+      `The source is fixed and the thing people run is not. Build and install before ` +
+      `claiming this is done — whatever \`npm run\` script or command produces these — then ` +
+      `say the claim again. Compared by modification time, so a build that genuinely ran ` +
+      `satisfies it.`,
+  };
+}
+
 export function mutationVerdict(r: {
   killed: string[];
   survived: string[];
   planned: number;
   total: number;
   sample: number;
-}): { ok: boolean; output: string } {
-  const { killed, survived, planned, total, sample } = r;
+  /** `empty: allow` — this project has turns with nothing to mutate. */
+  allowEmpty?: boolean;
+}): { ok: boolean; output: string; established?: boolean } {
+  const { killed, survived, planned, total, sample, allowEmpty } = r;
   const examined = killed.length + survived.length;
   const unexamined = total - examined;
   const note =
@@ -929,18 +1092,56 @@ export function mutationVerdict(r: {
       ? ` · ${unexamined} changed line(s) not mutated (sample is ${sample}; raise it or accept the bound)`
       : "";
 
-  // Nothing was applied, so nothing was tested. The loop above already refuses
-  // to trust that a planned mutation applied, and this must refuse it too.
-  // Falling through would report "0 mutation(s) broke a test, as they should"
-  // after a single baseline run: a green pass claiming a suite killed
-  // everything when the code was never once broken. Same phrasing as the
-  // empty-plan case, because it is the same claim — that none is being made.
-  if (examined === 0) {
+  /**
+   * Nothing was applied, so nothing was tested.
+   *
+   * This used to pass, and the comment sitting here argued that it should not
+   * — that a green "0 mutation(s) broke a test, as they should" after a single
+   * baseline run claims a suite killed everything when the code was never once
+   * broken. It passed anyway, and receipt 0052 is what that looks like from
+   * outside: `work-checked` green on a turn where nothing was ever mutated,
+   * beside `work-proven`, which fails when *its* input is missing. Same
+   * principle, opposite answers, on the same receipt.
+   *
+   * They answer the same way now. `total === 0` — no changed line this check
+   * could ever have mutated — is the one genuinely empty scope, and it passes
+   * without claiming to have established anything. Anything else means there
+   * was work to examine and none of it was examined, which is a check that
+   * cannot report and therefore must not pass.
+   */
+  if (total === 0) {
     return {
       ok: true,
+      established: false,
       output:
-        `${planned} mutation(s) planned, none applied (every line had moved, or the swap ` +
-        "left the file unchanged). Nothing was mutated, so nothing is claimed.",
+        "No changed line carries an operator this check can flip, so nothing was mutated " +
+        "and nothing is claimed about whether the tests would notice a break.",
+    };
+  }
+  if (examined === 0 && allowEmpty) {
+    return {
+      ok: true,
+      established: false,
+      output:
+        `${total} changed line(s) were in scope and none was mutated. ` +
+        "`empty: allow` is set on this check, so nothing is claimed either way.",
+    };
+  }
+  if (examined === 0) {
+    return {
+      ok: false,
+      output:
+        `${total} changed line(s) were in scope and none was mutated` +
+        (planned > 0
+          ? ` — ${planned} mutation(s) were planned and none applied (every line had moved, ` +
+            `or the swap left the file unchanged).`
+          : ` — no mutation could be planned for any of them.`) +
+        `
+
+This check establishes that your tests would notice this code being broken, ` +
+        `and it did not break it once. Passing would be a claim molt has not earned. Re-run ` +
+        `after the tree settles, raise \`sample\`, or set \`empty: allow\` on this check if a ` +
+        `turn like this legitimately has nothing to mutate.`,
     };
   }
 
@@ -973,12 +1174,16 @@ export function mutationVerdict(r: {
  * nothing when its input is absent is worse than no check, because it is
  * counted as one.
  */
-function diffCovered(ctx: BarContext, lcovPath?: string): { ok: boolean; output: string } {
+function diffCovered(
+  ctx: BarContext,
+  lcovPath?: string,
+): { ok: boolean; output: string; established?: boolean } {
   const judged = ctx.ledger.filter((e) => e.changedLines && e.changedLines.length > 0);
   if (judged.length === 0) {
     // Nothing was written that could be executed. files-changed is the check
-    // that has an opinion about that; this one has nothing to measure.
-    return { ok: true, output: "No changed lines to cover." };
+    // that has an opinion about that; this one has nothing to measure — and
+    // says so, rather than presenting an empty scope as a covered one.
+    return { ok: true, established: false, output: "No changed lines to cover." };
   }
   if (!lcovPath) {
     return { ok: false, output: "diff-covered needs an `lcov` path in done.yml." };
@@ -1130,7 +1335,10 @@ function runBuiltin(
   lcovPath?: string,
   allowRemovals = false,
   allowOutside = false,
-): { ok: boolean; output: string } {
+  outputs: string[] = [],
+  from: string[] = [],
+): { ok: boolean; output: string; established?: boolean } {
+  if (builtin === "build-current") return buildCurrent(ctx, outputs, from);
   if (builtin === "diff-covered") return diffCovered(ctx, lcovPath);
   if (builtin === "tree-accounted") return treeAccounted(ctx, allowOutside);
   if (builtin === "files-changed") {
@@ -1423,7 +1631,7 @@ function runBuiltin(
   if (builtin === "record-intact") {
     if (!ctx.archive) {
       return ctx.archivedBatches === 0 && (ctx.expectedArchiveFiles ?? []).length === 0
-        ? { ok: true, output: "No context has been shed; nothing to audit." }
+        ? { ok: true, established: false, output: "No context has been shed; nothing to audit." }
         : { ok: false, output: "Context was shed but no archive is configured." };
     }
     const entries = ctx.archive.list();
@@ -1497,6 +1705,10 @@ function runBuiltin(
 
     return {
       ok: true,
+      // Zero batches is an empty archive, not a verified one. This check sat
+      // at 0 refusals in 34 runs and nobody could tell from a receipt which
+      // of those runs had actually audited anything.
+      ...(entries.length === 0 ? { established: false } : {}),
       output:
         entries.length === 0
           ? "No context has been shed; nothing to audit."
@@ -1512,9 +1724,15 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
   const t0 = Date.now();
   if (check.kind === "builtin") {
     // The only builtin that runs a command, so the only one that can await.
-    const { ok, output } =
+    const { ok, output, established } =
       check.builtin === "mutation"
-        ? await mutationCheck(ctx, check.run ?? "", check.sample ?? 4, check.timeoutMs ?? 600_000)
+        ? await mutationCheck(
+            ctx,
+            check.run ?? "",
+            check.sample ?? 4,
+            check.timeoutMs ?? 600_000,
+            check.empty === "allow",
+          )
         : runBuiltin(
             check.builtin,
             ctx,
@@ -1522,6 +1740,8 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
             check.lcov,
             check.removals === "allow",
             check.outside === "allow",
+            check.outputs ?? [],
+            check.from ?? [],
           );
     return {
       name: check.name,
@@ -1530,6 +1750,7 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
       kind: "builtin",
       detail: check.builtin,
       ok,
+      ...(established === false ? { established: false } : {}),
       output: truncate(output),
       durationMs: Date.now() - t0,
     };

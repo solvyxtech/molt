@@ -169,6 +169,40 @@ describe("desktop theme surfaces", () => {
   });
 });
 
+describe("logging in to Claude Code from the window", () => {
+  /**
+   * Reported as "in the desktop app it is not possible to login to claude
+   * code". The TUI grew a `/login` row for the backend and the window did
+   * not — the seventh capability to exist on one surface and not the other.
+   *
+   * Settings' only credential control is an API key box, which is the wrong
+   * question here: there is no key, and what the backend needs is a CLI
+   * logged in somewhere else. So this pins the door, the wire behind it, and
+   * the fact that it never asks for a key.
+   */
+  it("has a control, a bridge and a handler, all three", () => {
+    const html = readFileSync(path.join(repoRoot(), "ui", "index.html"), "utf8");
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    const preload = readFileSync(path.join(repoRoot(), "electron", "preload.ts"), "utf8");
+    const main = readFileSync(path.join(repoRoot(), "electron", "main.ts"), "utf8");
+
+    assert.match(html, /id="set-claude-code"/, "Settings needs a way in");
+    assert.match(ui, /\$\("set-claude-code"\)\.addEventListener/, "the button must be wired");
+    assert.match(preload, /claudeCodeHealth/, "the renderer cannot reach main without a bridge");
+    assert.match(main, /ipcMain\.handle\("claudeCode:health"/, "and main must answer it");
+  });
+
+  /**
+   * A button that reports "ok" without looking is worse than no button: the
+   * failure then arrives mid-turn, dressed as the model's fault.
+   */
+  it("reports the fix rather than assuming it worked", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    assert.match(ui, /if \(!h\.ok\)/, "the unhealthy case must be handled");
+    assert.match(ui, /h\.fix/, "and it must say what to run");
+  });
+});
+
 describe("title bar padding", () => {
   it("does not reserve 86px for traffic lights on every platform", () => {
     // Walked up to, not guessed at: this file runs from dist-test/test/ once
@@ -652,6 +686,89 @@ describe("receipt markdown is text, never HTML", () => {
       assert.match(into.textContent ?? "", /<script>y<\/script>/);
       assert.equal(created.some((c) => c.tag === "table"), true);
       assert.equal(created.some((c) => c.tag === "blockquote"), true);
+    } finally {
+      restore();
+    }
+  });
+
+  /**
+   * A node sink that accepts exactly the blocks the document is made of.
+   *
+   * The failure being reproduced is a hang, not a wrong string, and a test
+   * that reproduces a hang by hanging stops the suite instead of reporting.
+   * So the sink turns "not making progress" into an ordinary thrown failure
+   * on the very first block too many.
+   *
+   * `expected` is the exact block count, not slack: every test below also
+   * asserts that count, so the ceiling is pinned from both sides. One too low
+   * and the legitimate last block throws; one too high and the block-count
+   * assertion catches it.
+   */
+  function sink(expected: number): HTMLElement {
+    const n = stub();
+    const push = n.appendChild.bind(n);
+    let count = 0;
+    (n as unknown as { appendChild: (c: HTMLElement) => HTMLElement }).appendChild = (c) => {
+      count += 1;
+      if (count > expected) {
+        throw new Error(`renderMarkdown appended block ${count}; the document holds ${expected}`);
+      }
+      return push(c);
+    };
+    return n;
+  }
+
+  it("advances past a heading deeper than the header rule matches", () => {
+    install();
+    try {
+      const into = sink(1);
+      renderMarkdown("##### five hashes", into);
+      assert.equal(into.children.length, 1);
+      assert.equal(created.filter((c) => c.tag === "p").length, 1);
+      assert.match(into.textContent ?? "", /five hashes/);
+      assert.equal(into.textContent, "##### five hashes");
+    } finally {
+      restore();
+    }
+  });
+
+  it("advances past a hash with no space after it", () => {
+    install();
+    try {
+      const into = sink(2);
+      renderMarkdown("#hashtag\n\ndone", into);
+      assert.equal(into.children.length, 2);
+      assert.match(into.textContent ?? "", /#hashtag/);
+      assert.match(into.textContent ?? "", /done/);
+      assert.equal(into.textContent, "#hashtagdone");
+    } finally {
+      restore();
+    }
+  });
+
+  it("advances past a pipe row with no separator beneath it", () => {
+    install();
+    try {
+      const into = sink(3);
+      renderMarkdown("| a | b |\n| no separator |\n\nafter", into);
+      assert.equal(created.some((c) => c.tag === "table"), false, "that was not a table");
+      assert.equal(into.children.length, 3);
+      assert.match(into.textContent ?? "", /after/);
+      assert.equal(into.textContent, "| a | b || no separator |after");
+    } finally {
+      restore();
+    }
+  });
+
+  it("still joins the continuation lines of an ordinary paragraph", () => {
+    install();
+    try {
+      const into = sink(1);
+      renderMarkdown("one two\nthree four", into);
+      assert.equal(into.children.length, 1);
+      assert.equal(created.filter((c) => c.tag === "p").length, 1);
+      assert.match(into.textContent ?? "", /one two three four/);
+      assert.equal(into.textContent, "one two three four");
     } finally {
       restore();
     }

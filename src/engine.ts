@@ -32,6 +32,7 @@ import {
   insideProject,
   type Autonomy,
 } from "./autonomy.js";
+import { errorText } from "./format.js";
 import { redact } from "./redact.js";
 import {
   SKIP_DIRS,
@@ -1192,6 +1193,16 @@ export class Engine {
   private ccForwarded = new WeakSet<Msg>();
   /** The turn's tool context, read by the MCP handlers as each call arrives. */
   private ccCtx?: ToolContext;
+  /**
+   * Tools are shut for the rest of this turn.
+   *
+   * The HTTP salvage says `tool_choice: "none"` in a request body. There is
+   * no request body here, so the promise the salvage prompt makes — "you
+   * cannot call any more tools" — is kept at the seam every tool call on this
+   * backend already passes through, and a model that tries anyway is told no
+   * rather than quietly allowed to go on spending a stopped turn.
+   */
+  private ccNoTools = false;
 
   /**
    * The context window this endpoint serves, once it has said so.
@@ -2273,6 +2284,21 @@ export class Engine {
         `already found: what you learned, and — just as importantly — what you did not get ` +
         `to and cannot vouch for. Do not claim anything you did not verify.`,
     });
+    /**
+     * This backend has no endpoint to post to.
+     *
+     * `salvage` was the last path still speaking HTTP on it. The base URL is
+     * `claude-code://subscription`, which `fetch` refuses outright, so every
+     * ceiling in this loop — the deadline, the budget, the spending ceiling,
+     * the step limit, a provider that gave up — ended with the safety net
+     * throwing into the journal and nothing at all reaching the reader. The
+     * one request whose entire job is to rescue a stopped turn cannot be the
+     * one request that goes a way this backend cannot go.
+     */
+    if (this.claudeCode) {
+      yield* this.claudeCodeSalvage(reason, log);
+      return;
+    }
     // Cancellable, like every other request. It was not, and that made molt
     // unquittable at the worst moment: hitting the budget runs a salvage, and
     // a salvage that cannot be aborted holds the turn open with no way out —
@@ -2358,11 +2384,119 @@ export class Engine {
         log?.append("cancelled", { reason: "salvage cancelled" });
         yield { kind: "info", text: "cancelled — no closing summary was written" };
       } else {
-        log?.append("error", { text: `salvage failed: ${String(e)}` });
+        log?.append("error", { text: `salvage failed: ${errorText(e)}` });
       }
     } finally {
       this.inFlight = undefined;
     }
+  }
+
+  /**
+   * The same last word, asked the way this backend is asked.
+   *
+   * Everything the HTTP salvage does, minus the request: one message, no
+   * tools, the answer labelled as notes rather than as a completion, and the
+   * tokens counted against the session so the meter still adds up. What it
+   * cannot do is stream — the HTTP salvage does not either, and yielding the
+   * deltas as well as the text below is how the closing answer would print
+   * twice.
+   */
+  private async *claudeCodeSalvage(
+    reason: string,
+    log?: Journal,
+  ): AsyncGenerator<EngineEvent> {
+    let cc: ClaudeCodeSession<EngineEvent>;
+    try {
+      cc = await this.claudeCodeSession();
+    } catch (e) {
+      log?.append("error", { text: `salvage failed: ${errorText(e)}` });
+      yield {
+        kind: "info",
+        text: "could not write a closing summary — the work above is all there is",
+      };
+      return;
+    }
+
+    /**
+     * Everything molt has said that Claude Code has not been told yet.
+     *
+     * The salvage prompt, and whatever a ceiling pushed just before it. Same
+     * rule `claudeCodeStep` uses, so the two conversations do not drift apart
+     * on the last message of the turn.
+     */
+    const pending = this.transcript
+      .all()
+      .filter((m) => m.role === "user" && !this.ccForwarded.has(m));
+    for (const m of pending) this.ccForwarded.add(m);
+    const texts = pending.map((m) => m.content ?? "").filter((t) => t.trim().length > 0);
+    if (!texts.length) return;
+
+    let done:
+      | { text: string; promptTokens: number; completionTokens: number; error?: string }
+      | undefined;
+    /** The last answer that called nothing, in case `done` carries no text. */
+    let last = "";
+    this.ccNoTools = true;
+    try {
+      for await (const ev of cc.send([texts.join("\n\n")])) {
+        if (ev.kind === "done") done = ev;
+        else if (ev.kind === "assistant" && !ev.toolCalls.length && ev.text) last = ev.text;
+      }
+    } catch (e) {
+      // A courtesy that failed must not mask the real stop. The session is
+      // started lazily inside `send`, so a missing optional dependency throws
+      // here rather than above — and an exception escaping a salvage would
+      // take down the turn it exists to close.
+      log?.append("error", { text: `salvage failed: ${errorText(e)}` });
+      yield {
+        kind: "info",
+        text: "could not write a closing summary — the work above is all there is",
+      };
+      return;
+    } finally {
+      this.ccNoTools = false;
+    }
+
+    if (!done || done.error) {
+      // A session that vanished mid-salvage was cancelled, not broken:
+      // `cancel()` ends it, because ending it is the only way to stop the
+      // subprocess. Reporting that as a failure would blame molt for doing
+      // what it was told.
+      const cancelled = !this.cc;
+      log?.append(cancelled ? "cancelled" : "error", {
+        text: cancelled
+          ? "salvage cancelled"
+          : `salvage failed: ${done?.error ?? "the Claude Code session ended without answering"}`,
+      });
+      yield {
+        kind: "info",
+        text: cancelled
+          ? "cancelled — no closing summary was written"
+          : "could not write a closing summary — the work above is all there is",
+      };
+      return;
+    }
+
+    this.sessionPrompt += done.promptTokens;
+    this.sessionCompletion += done.completionTokens;
+    // A subscription run is not metered, so this is unbilled like every other
+    // step on this backend. Counted, so `billed` cannot come out true.
+    this.unbilledSteps += 1;
+    const text = (done.text || last).trim();
+    log?.append("salvage", {
+      reason,
+      promptTokens: done.promptTokens,
+      completionTokens: done.completionTokens,
+      chars: text.length,
+    });
+    if (!text) return;
+    yield {
+      kind: "info",
+      text:
+        "the answer below was written after molt stopped the turn. It was NOT checked " +
+        "against the bar — treat it as notes, not as a completed task.",
+    };
+    yield { kind: "assistant_text", text: redact(text, this.secrets()) };
   }
 
   /**
@@ -2738,6 +2872,9 @@ export class Engine {
         runTool: async (name, args, callId, emit) => {
           const ctx = this.ccCtx;
           if (!ctx) return "[molt: no turn is running]";
+          if (this.ccNoTools) {
+            return "[molt: the turn is over. No more tools — answer with what you already have.]";
+          }
           const calls = this.invokeTool(
             { id: callId, name, rawArgs: JSON.stringify(args) },
             ctx,
@@ -2776,8 +2913,9 @@ export class Engine {
     try {
       cc = await this.claudeCodeSession();
     } catch (e) {
-      ctx.log?.append("error", { text: String(e) });
-      yield { kind: "error", text: String(e) };
+      const text = errorText(e);
+      ctx.log?.append("error", { text });
+      yield { kind: "error", text };
       return null;
     }
 
@@ -3988,7 +4126,7 @@ export class Engine {
               return;
             }
             failure = {
-              text: `network: ${String(e)}`,
+              text: `network: ${errorText(e)}`,
               why: "The connection to the provider failed and could not be re-established.",
               retryable: true,
             };

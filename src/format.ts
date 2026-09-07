@@ -66,3 +66,22 @@ export function fmtDuration(ms: number): string {
   const m = Math.floor(s / 60);
   return `${m}m ${String(Math.floor(s % 60)).padStart(2, "0")}s`;
 }
+
+/**
+ * An error, with the reason it is actually carrying.
+ *
+ * `String(e)` on a failed `fetch` is six words — "TypeError: fetch failed" —
+ * and undici puts the reason in `cause`: a refused connection, a DNS miss, a
+ * TLS failure, a scheme it does not speak. Nothing here read it, so every
+ * network failure printed the same sentence and a dead local server could not
+ * be told apart from a URL that was never fetchable in the first place.
+ *
+ * One level deep. A cause's own cause is the library's business.
+ */
+export function errorText(e: unknown): string {
+  const head = String(e);
+  const cause = (e as { cause?: unknown } | null | undefined)?.cause;
+  if (cause === undefined || cause === null) return head;
+  const tail = String(cause);
+  return tail && tail !== head ? `${head} (${tail})` : head;
+}

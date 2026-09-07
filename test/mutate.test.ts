@@ -250,13 +250,30 @@ describe("the mutation check", () => {
 describe("the mutation verdict", () => {
   const base = { killed: [], survived: [], planned: 0, total: 0, sample: 4 };
 
-  it("claims nothing when nothing was applied", () => {
-    // The dangerous fall-through. Without this the same counts render as
-    // "0 mutation(s) broke a test, as they should" — a pass asserting the
-    // suite killed everything, after breaking the code exactly zero times.
+  /**
+   * This test pinned `ok: true` until 2026-09-07, and pinning it was the bug.
+   *
+   * The comment beside the code always argued the other way — that a check
+   * which never broke the code must not report that the suite killed
+   * everything — and then it returned a pass anyway. Receipt 0052 is what that
+   * looked like from outside: `work-checked` green on a turn where nothing was
+   * mutated, printed one row under `work-proven`, which fails when *its* input
+   * is missing. The owner of the project chose consistency: work in scope that
+   * was never examined is a refusal.
+   */
+  it("refuses when lines were in scope and nothing was applied", () => {
     const r = mutationVerdict({ ...base, planned: 3, total: 3 });
-    assert.equal(r.ok, true);
-    assert.match(r.output, /3 mutation\(s\) planned, none applied/);
+    assert.equal(r.ok, false);
+    assert.match(r.output, /none was mutated/);
+    assert.doesNotMatch(r.output, /as they should/);
+    // A refusal with no way out is a wall. `empty: allow` is the way out.
+    assert.match(r.output, /empty: allow/);
+  });
+
+  it("claims nothing, and passes, when there was never a line to mutate", () => {
+    const r = mutationVerdict({ ...base, planned: 0, total: 0 });
+    assert.equal(r.ok, true, "a docs-only turn is not a failing turn");
+    assert.equal(r.established, false, "…but it establishes nothing, and says so");
     assert.match(r.output, /nothing is claimed/);
     assert.doesNotMatch(r.output, /as they should/);
   });

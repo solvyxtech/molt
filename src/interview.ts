@@ -12,6 +12,8 @@
 import { stringify } from "yaml";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { claudeCodeAsk, isClaudeCode, type Sdk } from "./claude-code.js";
+import { errorText } from "./format.js";
 import { authHeaders } from "./providers.js";
 import { loadBar, parseBar, barPath } from "./bar.js";
 import type { Bar, Check } from "./types.js";
@@ -266,7 +268,10 @@ export async function interviewTurn(opts: {
   baseUrl: string;
   apiKey?: string;
   model: string;
+  /** Where the interview runs. Only the Claude Code transport reads it. */
+  cwd?: string;
   fetchFn?: typeof fetch;
+  claudeCodeSdk?: Sdk;
 }): Promise<InterviewTurn> {
   const f = opts.fetchFn ?? fetch;
   const base = opts.baseUrl.replace(/\/$/, "");
@@ -291,6 +296,28 @@ export async function interviewTurn(opts: {
       : "Ask only if a real decision is still missing. Otherwise propose.",
   ].join("\n");
 
+  /**
+   * The Claude Code backend has no endpoint, so it is asked through the CLI.
+   *
+   * This used to refuse — "the interview needs an HTTP endpoint" — which was
+   * true of the transport and false of the backend: molt already runs a model
+   * here, and spec-first calls this on Run, so every first Run on a
+   * subscription ended in an apology and started no turn. `claudeCodeAsk`
+   * gives it a model with no tools; everything after the reply is unchanged,
+   * including that nothing is written until a person seals it.
+   */
+  if (isClaudeCode(opts.baseUrl)) {
+    const asked = await claudeCodeAsk({
+      model: opts.model,
+      systemPrompt: SYSTEM,
+      prompt: context,
+      cwd: opts.cwd,
+      sdk: opts.claudeCodeSdk,
+    });
+    if (!asked.ok) return { kind: "error", error: asked.error };
+    return parseInterviewReply(asked.text, opts.round);
+  }
+
   try {
     const res = await f(`${base}/chat/completions`, {
       method: "POST",
@@ -308,12 +335,19 @@ export async function interviewTurn(opts: {
     if (!res.ok) return { kind: "error", error: `HTTP ${res.status} interviewing` };
     const json = (await res.json()) as { choices?: { message?: { content?: string } }[] };
     const text = json.choices?.[0]?.message?.content ?? "";
-    const parsed = parseInterviewReply(text, opts.round);
-    if (parsed.kind === "ask" && last) {
-      return { kind: "error", error: "interview kept asking after the last round" };
-    }
-    return parsed;
+    /**
+     * No last-round guard here, because there is nothing left to guard.
+     *
+     * This used to end the turn with "interview kept asking after the last
+     * round" when the reply held questions and the round was the last one.
+     * `parseInterviewReply` already decides that: questions are only returned
+     * as `ask` while `round < INTERVIEW_MAX_ROUNDS`, so the two conditions
+     * were mutually exclusive and the branch could not be reached. A line no
+     * input can trip is not a safety net, it is something a reader has to
+     * account for — and molt's own mutation check is what pointed at it.
+     */
+    return parseInterviewReply(text, opts.round);
   } catch (e) {
-    return { kind: "error", error: String(e) };
+    return { kind: "error", error: errorText(e) };
   }
 }
