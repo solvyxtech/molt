@@ -891,6 +891,9 @@ input[type="checkbox"]:checked::after {
   font-variant-numeric: tabular-nums;
 }
 .iv-wait .spin { color: var(--accent); animation: pulse 1s ease-in-out infinite; }
+.iv-wait .iv-dot { opacity: 0.5; }
+/* Fixed width so a changing word does not shove the clock along the row. */
+#iv-word { min-width: 15ch; }
 .interview.busy .iv-qs { opacity: 0.55; pointer-events: none; }
 .activity .phase { color: var(--text); opacity: 0.75; }
 .activity .clock {
