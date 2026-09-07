@@ -45,6 +45,22 @@ import {
 import { parseBar } from "../src/bar.js";
 
 /** The nearest ancestor holding a package.json. */
+/**
+ * The body of one IPC handler, bounded by the next one.
+ *
+ * Tests used to take the first 900 characters after the handler's name and
+ * assert against that, which measures how much prose sits between the name and
+ * the code as much as it measures the code: adding a doc comment to
+ * `session:open` failed two unrelated assertions that were still perfectly
+ * true. Bound it by the next handler instead — that boundary is real.
+ */
+function handlerBody(src: string, name: string): string {
+  const at = src.indexOf(`"${name}"`);
+  if (at < 0) return "";
+  const next = src.indexOf("ipcMain.handle(", at + 1);
+  return src.slice(at, next < 0 ? undefined : next);
+}
+
 function repoRoot(): string {
   let dir = path.dirname(new URL(import.meta.url).pathname);
   for (let i = 0; i < 8; i++) {
@@ -613,8 +629,11 @@ describe("the meter shows money, not just tokens", () => {
     // money beside them. Anthropic hid it: its rates ship in providers.ts, so
     // Claude found a price and grok — which publishes one — found none.
     assert.match(src, /fetchPricing\(/, "the desktop never asks for a price");
-    const open = src.slice(src.indexOf('"session:open"'));
-    assert.match(open.slice(0, 900), /refreshPricing\(/, "no price lookup when a workspace opens");
+    assert.match(
+      handlerBody(src, "session:open"),
+      /refreshPricing\(/,
+      "no price lookup when a workspace opens",
+    );
     const model = src.slice(src.indexOf('"session:model"'));
     assert.match(model.slice(0, 1200), /refreshPricing\(/, "no price lookup when the model changes");
   });
@@ -1655,5 +1674,52 @@ describe("the spine's default state", () => {
     // The other half of the round trip: what the toggle stores is what this
     // reads back, so "off" is the only string that can ever suppress it.
     assert.match(ui, /localStorage\.setItem\("molt\.spine", open \? "on" : "off"\)/);
+  });
+});
+
+describe("a backend molt knows is dead is refused at the door", () => {
+  /**
+   * Reported as "in settings when using use my google plan it links to google
+   * cli". Two faults met there.
+   *
+   * `usePlan` reported a failure and returned, leaving `set-url` exactly as it
+   * was — often a different vendor's address — so the screen implied a switch
+   * that had not happened and "Open workspace" then used whatever was in the
+   * box.
+   *
+   * And the door never asked. molt has a health check for every CLI backend
+   * and did not consult it before opening, so a workspace could open on
+   * `gemini-cli`, where molt's own health reports Google's withdrawal of the
+   * product, and the person found out a turn later from an error that reads
+   * like the model's rather than the address's.
+   */
+  it("says which endpoint is still selected when a plan is refused", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    const plan = ui.slice(ui.indexOf("async function usePlan"));
+    const refused = plan.slice(0, plan.indexOf("($(\"set-url\") as HTMLInputElement).value = h.url"));
+    assert.match(refused, /The endpoint is unchanged/, "a refusal must not imply a switch");
+    assert.match(refused, /No endpoint is selected/, "…including when the box is empty");
+  });
+
+  it("consults the same health the buttons do before opening a session", () => {
+    const main = readFileSync(path.join(repoRoot(), "electron", "main.ts"), "utf8");
+    assert.match(main, /async function backendRefusal/, "the door needs an opinion");
+    assert.match(
+      handlerBody(main, "session:open"),
+      /await backendRefusal\(opts\.baseUrl\)/,
+      "session:open must ask before it opens",
+    );
+    // The three CLI backends, so door and button can never disagree.
+    const fn = main.slice(main.indexOf("async function backendRefusal"));
+    for (const probe of ["claudeCodeHealth", "agyHealth", "acpHealth"]) {
+      assert.match(fn.slice(0, 900), new RegExp(probe), `${probe} is not consulted`);
+    }
+  });
+
+  /** A health check that cannot run is not a reason to refuse a workspace. */
+  it("does not refuse when the health check itself fails", () => {
+    const main = readFileSync(path.join(repoRoot(), "electron", "main.ts"), "utf8");
+    const fn = main.slice(main.indexOf("async function backendRefusal"));
+    assert.match(fn.slice(0, 1200), /catch\s*\{/, "a thrown probe must not close the door");
   });
 });
