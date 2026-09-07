@@ -8,6 +8,7 @@
  * successes, which is exactly the shape of evidence nobody should trust.
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { MIN_SECRET_CHARS, redact } from "./redact.js";
 import type { BarResult } from "./types.js";
@@ -147,6 +148,102 @@ export type Stats = {
   byModel: Record<string, { attempts: number; accepted: number; refused: number }>;
 };
 
+/** The same digest the ledger records, so the two can be compared. */
+function sha256(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+/** No receipt is worth reading if you have to scroll a thousand lines to it. */
+const WROTE_MAX_LINES = 120;
+const WROTE_MAX_PER_FILE = 40;
+
+/**
+ * The lines this turn actually wrote, on the receipt.
+ *
+ * A receipt used to prove a change happened — two hashes and a path — and then
+ * say "read the diff". The diff it meant was `git diff`, which is the wrong
+ * instrument twice over: it shows the working tree, not this turn, and on
+ * 2026-09-07 this repository had three agents writing to it at once, so what
+ * git showed was not attributable to anybody.
+ *
+ * molt has what git cannot supply here. The ledger records which lines each
+ * tool call wrote, so the receipt can show this turn's work and nobody else's.
+ *
+ * It exists because of a specific miss. A turn was accepted at 11 of 11 checks
+ * having quietly made a message less specific than the evidence allowed —
+ * every check passed, and no check could have seen it. That class is only ever
+ * caught by a person reading the change, so the reading is what got cheaper.
+ * This does not judge the work; it puts it where it can be judged.
+ */
+function wroteSection(
+  cwd: string,
+  changed: { path: string; after: string; lines?: number[] }[],
+): string[] {
+  const withLines = changed.filter((c) => (c.lines?.length ?? 0) > 0);
+  if (withLines.length === 0) return [];
+
+  const out: string[] = ["## What the model wrote", ""];
+  let budget = WROTE_MAX_LINES;
+  let elided = 0;
+  for (const c of withLines) {
+    if (budget <= 0) {
+      elided += 1;
+      continue;
+    }
+    let text: string;
+    try {
+      text = readFileSync(join(cwd, c.path), "utf8");
+    } catch {
+      out.push(`\`${c.path}\` — gone from disk; nothing to show.`, "");
+      continue;
+    }
+    /**
+     * Only where the file still is what molt wrote.
+     *
+     * Line numbers are indices into the file as it stood at the write. If
+     * something has changed it since — a later tool call, another session,
+     * a formatter — those indices point at text this turn did not write, and
+     * printing it under "what the model wrote" would be a fabrication of
+     * exactly the kind this file exists to prevent.
+     */
+    if (sha256(text) !== c.after) {
+      out.push(
+        `\`${c.path}\` — changed since molt wrote it, so its lines are not shown; the hashes ` +
+          "above are what can still be proven.",
+        "",
+      );
+      continue;
+    }
+    const all = text.split("\n");
+    const want = [...new Set(c.lines ?? [])].sort((a, b) => a - b);
+    const show = want.slice(0, Math.min(WROTE_MAX_PER_FILE, budget));
+    budget -= show.length;
+    const width = String(show.at(-1) ?? 0).length;
+    out.push(`\`${c.path}\``, "", "```");
+    let prev = 0;
+    for (const n of show) {
+      // A gap in the numbers is a gap in the file; say so rather than letting
+      // two distant edits read as adjacent lines.
+      if (prev && n > prev + 1) out.push("…");
+      out.push(`${String(n).padStart(width)} │ ${all[n - 1] ?? ""}`);
+      prev = n;
+    }
+    out.push("```");
+    const rest = want.length - show.length;
+    out.push(rest > 0 ? `… and ${rest} more changed line(s) in this file.` : "", "");
+  }
+  if (elided > 0) {
+    out.push(`… and ${elided} more changed file(s), not shown.`, "");
+  }
+  out.push(
+    "Substantive lines only — blank and comment-only lines are not listed. These are the",
+    "lines molt's own tools wrote this turn, which is narrower than `git diff` and is the",
+    "only view that stays attributable when more than one thing is editing the tree.",
+    "",
+  );
+  return out;
+}
+
 export class Receipts {
   readonly dir: string;
   private indexPath: string;
@@ -190,8 +287,13 @@ export class Receipts {
     costEstimated?: boolean;
     /** True for a question: the bar ran advisory and could not refuse. */
     ask?: boolean;
-    /** Every file the turn changed, with the hashes that prove it. */
-    changed?: { path: string; before: string | null; after: string }[];
+    /**
+     * Every file the turn changed, with the hashes that prove it — and which
+     * lines it wrote, so the receipt can show the work rather than describe it.
+     */
+    changed?: { path: string; before: string | null; after: string; lines?: number[] }[];
+    /** Where those paths are rooted. Needed to read the lines back. */
+    cwd?: string;
     /**
      * This task's own criteria, and the seal taken before work began.
      *
@@ -272,6 +374,7 @@ export class Receipts {
         "`work-landed` re-reads each path and fails if what is there now does not match.",
         "",
       );
+      work.push(...wroteSection(args.cwd ?? process.cwd(), changed));
     }
 
     const did = args.did ?? [];

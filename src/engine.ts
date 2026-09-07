@@ -4816,7 +4816,13 @@ export class Engine {
           // A question the bar could not refuse is recorded as one, so stats
           // never count an answer as a verified change.
           ask: opts.ask === true && this.sessionLedger().length === 0,
-          changed: this.sessionLedger().map((e) => ({ path: e.path, before: e.before, after: e.after })),
+          changed: this.sessionLedger().map((e) => ({
+            path: e.path,
+            before: e.before,
+            after: e.after,
+            ...(e.changedLines?.length ? { lines: e.changedLines } : {}),
+          })),
+          cwd: this.cwd,
           did: [...this.did],
           task: taskSeal
             ? {

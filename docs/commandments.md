@@ -114,3 +114,34 @@ finding nothing.
   and they are sealed before the work starts so the model cannot write its own
   exam. Reachable from both surfaces: the window's criteria panel, and
   `molt run --criterion name=command --note "..."` headlessly.
+
+## The fourth tier: what no check can reach
+
+The three tiers above are refusal at the tool boundary, judgement at the bar,
+and instruction in the prompt. There is a fourth thing, and pretending
+otherwise is its own dishonesty.
+
+On 2026-09-07 a turn was accepted at 11 of 11 checks. Types clean, suite green,
+window boots, window drives, every write ledgered, no assertion removed,
+changed lines covered, mutants killed, the shipped build current. The change
+was still worse than it looked: asked to stop a check blaming the wrong party,
+it hedged in *every* case, including the one where the ledger names the writer
+and molt has proof. It gave away evidence molt had.
+
+No check saw it, and none could have. "This discards information that was
+available" is not a property of the tree, the tests, the coverage or the
+diff — it is a judgement about whether the change was the right shape, and the
+bar does not make judgements. It establishes facts.
+
+So the rule for this tier is not a check. It is:
+
+> **An accepted receipt means every check passed. It does not mean the work is
+> good, and molt must never be written as though it did.**
+
+What follows from that is a duty on the receipt rather than on the model: if
+the only thing that catches this class is a person reading the change, then
+reading the change has to be cheap. That is why a receipt carries the lines the
+turn wrote — molt's own ledger, attributable per tool call, and narrower than
+`git diff`, which shows the working tree rather than this turn and is worth
+nothing when more than one agent is editing it.
+
