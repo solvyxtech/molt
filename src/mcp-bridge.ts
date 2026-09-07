@@ -27,11 +27,19 @@ function emit(msg: unknown): void {
 }
 
 async function main(): Promise<void> {
+  /**
+   * No molt session is holding the other end, so there are no tools to offer.
+   *
+   * This used to exit(2), which is right for a bridge molt spawned and wrong
+   * for this one: the Antigravity backend registers it permanently in your own
+   * `agy` config, so it is also started every time *you* run `agy` yourself.
+   * Failing then would put a broken server in your editor's tool list for the
+   * sake of a session that is not running. An empty tool list is the honest
+   * answer — the server is there, and right now it has nothing to offer.
+   */
   if (!url || !token) {
-    // Nothing can be done without them, and exiting silently would look to the
-    // agent like a server that started and then had no tools.
-    process.stderr.write("molt mcp bridge: MOLT_MCP_URL and MOLT_MCP_TOKEN are required\n");
-    process.exit(2);
+    await serveEmpty();
+    return;
   }
   let buf = "";
   process.stdin.setEncoding("utf8");
@@ -75,6 +83,43 @@ async function main(): Promise<void> {
           });
         }
       }
+    }
+  }
+}
+
+/** initialize + an empty tools list, and nothing else. */
+async function serveEmpty(): Promise<void> {
+  let buf = "";
+  process.stdin.setEncoding("utf8");
+  for await (const chunk of process.stdin) {
+    buf += chunk;
+    for (;;) {
+      const i = buf.indexOf("\n");
+      if (i < 0) break;
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      if (!line) continue;
+      let msg: { id?: unknown; method?: string };
+      try {
+        msg = JSON.parse(line) as { id?: unknown; method?: string };
+      } catch {
+        continue;
+      }
+      if (msg.id === undefined) continue;
+      emit({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result:
+          msg.method === "initialize"
+            ? {
+                protocolVersion: "2025-06-18",
+                capabilities: { tools: {} },
+                serverInfo: { name: "molt", version: "1.0.0" },
+              }
+            : msg.method === "tools/list"
+              ? { tools: [] }
+              : {},
+      });
     }
   }
 }

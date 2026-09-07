@@ -7,7 +7,8 @@
  * bar is not met, so molt can sit in CI, in a script, or in a benchmark
  * harness without a human watching.
  */
-import { ACP_AGENTS, acpAgentFor } from "./acp.js";
+import { acpAgentFor } from "./acp.js";
+import { isAgy } from "./agy.js";
 import { isClaudeCode } from "./claude-code.js";
 import { expandEndpointShorthand } from "./endpoint.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -310,14 +311,7 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
          * `endpointProblem`, so the engine and the window expand the same word
          * this flag does rather than each learning it separately.
          */
-        const expanded = expandEndpointShorthand(given);
-        out.url =
-          expanded !== given
-            ? expanded
-            : // Same shorthand for the ACP CLIs: `--url grok-build`, not
-              // `grok-build://subscription`. A sentinel nobody can spell is a
-              // sentinel nobody uses.
-              (ACP_AGENTS.find((a) => a.name === given)?.url ?? given);
+        out.url = expandEndpointShorthand(given);
         /**
          * Refused here, not four retries later.
          *
@@ -921,9 +915,11 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
             // molt's knowledge. It is not one: nothing was charged.
             isClaudeCode(engine.cfg.baseUrl)
             ? " · your Claude plan, not metered"
-            : acpAgentFor(engine.cfg.baseUrl)
-              ? ` · your ${acpAgentFor(engine.cfg.baseUrl)!.label} plan, not metered`
-              : " · no price for this model"
+            : isAgy(engine.cfg.baseUrl)
+              ? " · your Google AI plan, not metered"
+              : acpAgentFor(engine.cfg.baseUrl)
+                ? ` · your ${acpAgentFor(engine.cfg.baseUrl)!.label} plan, not metered`
+                : " · no price for this model"
           : ` · ${b.costEstimated ? "~" : ""}${fmtCost(b.costUsd)}`) +
         "\n",
     );

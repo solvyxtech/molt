@@ -27,6 +27,7 @@ import {
   isClaudeCode,
 } from "../src/claude-code.js";
 import { ACP_AGENTS, acpAgentFor, acpHealth } from "../src/acp.js";
+import { AGY_URL, agyHealth, agyModels, isAgy } from "../src/agy.js";
 import { keyFor } from "./endpoint-key.js";
 import { draftCriteria, type Draft } from "./criteria.js";
 import {
@@ -355,16 +356,39 @@ function createWindow(): void {
          * one depends on whether the machine running the suite has Claude
          * Code, so neither is asserted; silence is the failure.
          */
-        const ccStatus = await win!.webContents.executeJavaScript(`(async () => {
-          document.getElementById("set-claude-code").click();
-          for (let i = 0; i < 60; i++) {
-            const t = document.getElementById("claude-code-status").textContent || "";
-            if (t && !/Looking for/.test(t)) return t;
-            await new Promise((r) => setTimeout(r, 100));
-          }
-          return "";
-        })()`);
+        const askPlan = async (id: string): Promise<string> =>
+          (await win!.webContents.executeJavaScript(`(async () => {
+            document.getElementById(${JSON.stringify(id)}).click();
+            for (let i = 0; i < 60; i++) {
+              const t = document.getElementById("claude-code-status").textContent || "";
+              if (t && !/Looking for/.test(t)) return t;
+              await new Promise((r) => setTimeout(r, 100));
+            }
+            return "";
+          })()`)) as string;
+
+        /**
+         * Every plan button, clicked for real.
+         *
+         * What each one answers depends on which CLIs the machine running the
+         * suite has, so no wording is asserted — silence is the failure. A
+         * button whose handler throws looks identical to one that is missing,
+         * and that is the bug this whole check exists for.
+         */
+        const ccStatus = await askPlan("set-claude-code");
         console.log(`[e2e] claude-code ${ccStatus || "NO ANSWER"}`);
+        for (const [id, name] of [
+          ["set-agy", "antigravity"],
+          ["set-grok", "grok-build"],
+        ] as const) {
+          const answer = await askPlan(id);
+          console.log(`[e2e] ${name} ${answer || "NO ANSWER"}`);
+          if (!answer) {
+            console.error(`[e2e] the ${name} button answered nothing`);
+            app.exit(1);
+            return;
+          }
+        }
         if (!ccStatus) {
           console.error("[e2e] the Claude Code button answered nothing");
           app.exit(1);
@@ -772,7 +796,7 @@ function createWindow(): void {
       void win!.webContents
         .executeJavaScript(
           `(async () => {
-             const need = ["tabs","panels","stream","wire","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","set-claude-code","claude-code-status","autonomy","interview","criteria","ck-rows","ck-draft","ck-auto","spine","spine-list","jump","ctx","ctx-fill","ctx-line"];
+             const need = ["tabs","panels","stream","wire","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","set-claude-code","set-agy","set-grok","claude-code-status","autonomy","interview","criteria","ck-rows","ck-draft","ck-auto","spine","spine-list","jump","ctx","ctx-fill","ctx-line"];
              const missing = need.filter((id) => !document.getElementById(id));
              const tabs = [...document.querySelectorAll(".tab")].map((t) => t.dataset.tab);
              const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
@@ -784,6 +808,15 @@ function createWindow(): void {
                claudeCode:
                  typeof window.molt.claudeCodeHealth === "function" &&
                  !!document.getElementById("set-claude-code"),
+               // Same two halves for the other two plans. A button whose
+               // bridge method does not exist looks identical to one that
+               // works until somebody clicks it.
+               agy:
+                 typeof window.molt.agyHealth === "function" &&
+                 !!document.getElementById("set-agy"),
+               grok:
+                 typeof window.molt.acpHealth === "function" &&
+                 !!document.getElementById("set-grok"),
                missing,
                tabs,
                accent,
@@ -887,6 +920,8 @@ function createWindow(): void {
             (r.criteriaRows as { distinct: boolean; converted: boolean }).distinct === true &&
             (r.criteriaRows as { distinct: boolean; converted: boolean }).converted === true &&
             r.claudeCode === true &&
+            r.agy === true &&
+            r.grok === true &&
             Number(r.paletteRows) >= 15 &&
             (r.csp as { script?: boolean; connect?: boolean } | undefined)?.script === true &&
             (r.csp as { script?: boolean; connect?: boolean } | undefined)?.connect === true;
@@ -901,7 +936,11 @@ function createWindow(): void {
               `, click sticks: ${r.autonomySticks}`,
           );
           console.log(`[self-check] palette     ${r.paletteRows} command(s) on "/"`);
-          console.log(`[self-check] claude code ${r.claudeCode ? "button + bridge ok" : "NOT WIRED"}`);
+          console.log(
+            `[self-check] plan buttons claude ${r.claudeCode ? "ok" : "NOT WIRED"}` +
+              `, google ${r.agy ? "ok" : "NOT WIRED"}` +
+              `, grok ${r.grok ? "ok" : "NOT WIRED"}`,
+          );
           const ck = r.criteriaRows as { distinct: boolean; converted: boolean };
           console.log(
             `[self-check] criteria    check/note distinct: ${ck.distinct}, convertible: ${ck.converted}` +
@@ -1117,7 +1156,11 @@ async function refreshPricing(s: Session, announce: boolean): Promise<void> {
    * publishes no rate reads as a gap in molt's knowledge rather than the
    * absence of a charge. Same correction the terminal footer got.
    */
-  const plan = isClaudeCode(s.baseUrl) ? "Claude" : acpAgentFor(s.baseUrl)?.label;
+  const plan = isClaudeCode(s.baseUrl)
+    ? "Claude"
+    : isAgy(s.baseUrl)
+      ? "Google AI"
+      : acpAgentFor(s.baseUrl)?.label;
   if (plan) {
     if (announce)
       send("engine:event", {
@@ -1474,6 +1517,14 @@ ipcMain.handle("claudeCode:health", async () => ({
  * discovered as a spawn failure with no tools behind it.
  */
 process.env.MOLT_MCP_BRIDGE ??= join(__dirname, "mcp-bridge.js");
+
+ipcMain.handle("agy:health", async () => ({
+  ...(await agyHealth()),
+  name: "antigravity",
+  label: "Antigravity",
+  url: AGY_URL,
+  models: await agyModels(),
+}));
 
 ipcMain.handle("acp:health", async () =>
   Promise.all(

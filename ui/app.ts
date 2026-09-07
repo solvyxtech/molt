@@ -35,18 +35,9 @@ type MoltBridge = {
     apiKey?: string;
   }): Promise<{ ok: boolean; error?: string; state?: AppState }>;
   saveKey(provider: string, key: string): Promise<boolean>;
-  claudeCodeHealth(): Promise<{
-    ok: boolean;
-    installed: boolean;
-    authenticated: boolean;
-    sdk: boolean;
-    version?: string;
-    plan?: string;
-    detail: string;
-    fix?: string;
-    url: string;
-    models: string[];
-  }>;
+  claudeCodeHealth(): Promise<PlanHealth>;
+  agyHealth(): Promise<PlanHealth>;
+  acpHealth(): Promise<PlanHealth[]>;
   saveEndpoint(baseUrl: string, model: string): Promise<boolean>;
   storedEndpoint(): Promise<{ baseUrl?: string; model?: string }>;
   listModels(current?: { url: string; key?: string }): Promise<ModelSource[]>;
@@ -2039,34 +2030,87 @@ $("set-model-pick").addEventListener("change", () => {
 });
 
 /**
- * Point molt at the Claude Code you already logged in.
+ * What every "use my plan" button gets back.
  *
- * Not a key box, because there is no key: what this needs is a CLI installed
- * and logged in somewhere else, so the button's job is to go and look, then
- * say what is missing in the words you would type to fix it. On success it
- * fills the endpoint and a model, which is the same thing choosing one from
- * the picker does — this is just the door people actually look for.
+ * The three backends answer in the same shape on purpose: whichever CLI it is,
+ * the question is the same one — is it installed, is it signed in, and what
+ * should the endpoint and model become.
  */
-$("set-claude-code").addEventListener("click", async () => {
+type PlanHealth = {
+  ok: boolean;
+  installed?: boolean;
+  authenticated?: boolean;
+  version?: string;
+  plan?: string;
+  label?: string;
+  detail: string;
+  fix?: string;
+  url: string;
+  models: string[];
+};
+
+/**
+ * Point molt at a CLI you already logged in.
+ *
+ * Not a key box, because there is no key: what these need is a CLI installed
+ * and signed in somewhere else, so the button's job is to go and look, then say
+ * what is missing in the words you would type to fix it. On success it fills
+ * the endpoint and a model, which is the same thing choosing one from the
+ * picker does — this is just the door people actually look for.
+ *
+ * One function for all three, because the difference between them is a name
+ * and a preferred model. Three copies of this drifted apart once already on
+ * every other pair of surfaces in this repo.
+ */
+async function usePlan(
+  name: string,
+  look: () => Promise<PlanHealth | undefined>,
+  prefer: string[],
+): Promise<void> {
   const status = $("claude-code-status");
-  status.textContent = "Looking for Claude Code…";
-  const h = await molt.claudeCodeHealth();
+  status.textContent = `Looking for ${name}…`;
+  const h = await look();
+  if (!h) {
+    status.textContent = `${name} is not one of the backends this build knows.`;
+    return;
+  }
   if (!h.ok) {
+    // The fix is a command you type somewhere else, so it is shown verbatim
+    // rather than summarised — "not signed in" without it is a dead end.
     status.textContent = h.fix ? `${h.detail} — run: ${h.fix}` : h.detail;
     return;
   }
   ($("set-url") as HTMLInputElement).value = h.url;
   const model = ($("set-model") as HTMLInputElement).value.trim();
-  // Keep a Claude model that is already chosen; otherwise pick the middle one
-  // rather than leaving a model id from another vendor pointed at this.
+  // Keep a model this backend actually has; otherwise take the first preferred
+  // one it offers, rather than leaving a model id from another vendor pointed
+  // at it — which reads as molt being broken when the first turn is refused.
   if (!h.models.includes(model)) {
-    ($("set-model") as HTMLInputElement).value = h.models.includes("sonnet")
-      ? "sonnet"
-      : (h.models[0] ?? "sonnet");
+    const pick = prefer.find((m) => h.models.includes(m)) ?? h.models[0] ?? "";
+    ($("set-model") as HTMLInputElement).value = pick;
   }
   syncModelPick(($("set-model") as HTMLInputElement).value);
   status.textContent = `${h.detail} — open the workspace to use it`;
-  $("set-status").textContent = "Claude Code selected. No API key needed.";
+  $("set-status").textContent = `${name} selected. No API key needed.`;
+}
+
+$("set-claude-code").addEventListener("click", () => {
+  void usePlan("Claude Code", () => molt.claudeCodeHealth(), ["sonnet", "opus"]);
+});
+
+$("set-agy").addEventListener("click", () => {
+  void usePlan("Antigravity", () => molt.agyHealth(), [
+    "gemini-3.1-pro-high",
+    "gemini-3.1-pro-low",
+  ]);
+});
+
+$("set-grok").addEventListener("click", () => {
+  void usePlan(
+    "Grok Build",
+    async () => (await molt.acpHealth()).find((a) => a.label === "Grok Build"),
+    ["grok-4.6"],
+  );
 });
 
 $("set-refresh").addEventListener("click", () => {

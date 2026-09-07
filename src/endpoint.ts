@@ -22,6 +22,21 @@
 const CLAUDE_CODE_SCHEME = "claude-code://";
 
 /**
+ * The other CLIs molt spawns, written down once for the same reason.
+ *
+ * Each is a name for "a subscription is doing the work", not an address:
+ * `grok agent stdio` and `agy` are processes, and `fetch` refuses the scheme
+ * with six words that read as the network being down. Kept here beside
+ * `CLAUDE_CODE_SCHEME` because `endpointProblem` has to know all of them and a
+ * scheme it has not been told about is one it rejects — which is exactly how
+ * `--url grok-build` came back as "molt cannot speak 'grok-build'" from a
+ * build whose Grok backend was finished and working.
+ */
+const GROK_BUILD_SCHEME = "grok-build://";
+const GEMINI_CLI_SCHEME = "gemini-cli://";
+const ANTIGRAVITY_SCHEME = "antigravity://";
+
+/**
  * The endpoint molt stores for the Claude Code backend.
  *
  * Lives here, not in `claude-code.ts`, for the same reason `endpointProblem`
@@ -32,6 +47,26 @@ const CLAUDE_CODE_SCHEME = "claude-code://";
  * apart from each other.
  */
 export const CLAUDE_CODE_URL = `${CLAUDE_CODE_SCHEME}subscription`;
+export const GROK_BUILD_URL = `${GROK_BUILD_SCHEME}subscription`;
+export const GEMINI_CLI_URL = `${GEMINI_CLI_SCHEME}subscription`;
+export const AGY_URL = `${ANTIGRAVITY_SCHEME}subscription`;
+
+/**
+ * What someone types, and the sentinel it stands for.
+ *
+ * One table rather than a chain of comparisons in the flag parser, because
+ * the flag parser is not the only caller — the window expands the same words,
+ * and the two drifting apart is the bug this file was created to end.
+ */
+const SHORTHAND: Readonly<Record<string, string>> = {
+  "claude-code": CLAUDE_CODE_URL,
+  claude: CLAUDE_CODE_URL,
+  "grok-build": GROK_BUILD_URL,
+  grok: GROK_BUILD_URL,
+  "gemini-cli": GEMINI_CLI_URL,
+  antigravity: AGY_URL,
+  agy: AGY_URL,
+};
 
 /** Is this endpoint the Claude Code backend rather than an HTTP API? */
 export function isClaudeCode(baseUrl: string | undefined): boolean {
@@ -56,7 +91,7 @@ export function isClaudeCode(baseUrl: string | undefined): boolean {
  */
 export function expandEndpointShorthand(value: string): string {
   const v = (value ?? "").trim();
-  return v === "claude-code" ? CLAUDE_CODE_URL : v;
+  return SHORTHAND[v.toLowerCase()] ?? v;
 }
 
 /**
@@ -94,11 +129,20 @@ export function endpointProblem(baseUrl: string): string | null {
       `/login, or 'claude-code' to run your own logged-in Claude Code.`
     );
   }
-  const allowed = ["http:", "https:", CLAUDE_CODE_SCHEME.replace(/\/\/$/, "")];
+  const allowed = [
+    "http:",
+    "https:",
+    ...[CLAUDE_CODE_SCHEME, GROK_BUILD_SCHEME, GEMINI_CLI_SCHEME, ANTIGRAVITY_SCHEME].map((s) =>
+      s.replace(/\/\/$/u, ""),
+    ),
+  ];
   if (!allowed.includes(parsed.protocol)) {
     return (
       `'${url}' uses the scheme '${parsed.protocol.replace(":", "")}', which molt cannot ` +
-      `speak. Endpoints are http or https; 'claude-code' runs the CLI instead.`
+      `speak. Endpoints are http or https; ${Object.keys(SHORTHAND)
+        .filter((k) => k !== "claude")
+        .map((k) => `'${k}'`)
+        .join(", ")} run a CLI instead.`
     );
   }
   return null;

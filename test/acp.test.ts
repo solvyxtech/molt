@@ -14,7 +14,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import {
@@ -26,6 +26,7 @@ import {
   McpToolServer,
   mcpEntry,
   bridgePath,
+  permissionsDisarmed,
 } from "../src/acp.js";
 import { Archive } from "../src/archive.js";
 import { parseBar } from "../src/bar.js";
@@ -499,6 +500,7 @@ describe("health", () => {
     const out = await acpHealth(GROK, {
       run: async () => ({ stdout: "1.0.13 (abc)\n" }),
       probe: async () => ({ authenticated: false, detail: "not signed in" }),
+      disarmed: null,
     });
     assert.equal(out.installed, true);
     assert.equal(out.version, "1.0.13");
@@ -509,9 +511,59 @@ describe("health", () => {
     const ok = await acpHealth(GROK, {
       run: async () => ({ stdout: "1.0.13\n" }),
       probe: async () => ({ authenticated: true }),
+      // Pinned, not read off the machine running the suite: without this the
+      // developer's own `permission_mode = "always-approve"` made this fail,
+      // which is a test that depends on whose laptop it is.
+      disarmed: null,
     });
     assert.equal(ok.ok, true);
     assert.equal(ok.fix, undefined);
+  });
+
+  /**
+   * The gate molt relies on can be switched off by a line in the CLI's own
+   * config, and a backend that is signed in but ungated writes outside the
+   * ledger on every turn. Found the hard way: the first real turn edited a
+   * file with `search_replace` and molt was never asked.
+   */
+  it("refuses an agent whose own config disarms the permission gate", async () => {
+    const home = ws();
+    mkdirSync(join(home, ".grok"), { recursive: true });
+    writeFileSync(
+      join(home, ".grok", "config.toml"),
+      '[ui]\npermission_mode = "always-approve"\n',
+      "utf8",
+    );
+    assert.equal(permissionsDisarmed(home), "always-approve");
+
+    const health = await acpHealth(GROK, {
+      run: async () => ({ stdout: "grok 1.0.13 (abc) [stable]\n" }),
+      probe: async () => ({ authenticated: true }),
+      disarmed: "always-approve",
+    });
+    assert.equal(health.authenticated, true, "it is signed in");
+    assert.equal(health.ok, false, "but it cannot be used: molt cannot gate its tools");
+    assert.match(health.detail, /permission_mode/u);
+    assert.match(health.fix ?? "", /config\.toml/u);
+  });
+
+  it("reads the version out of a line that starts with the binary's name", async () => {
+    // `grok --version` prints "grok 1.0.13 (5e9a58…) [stable]"; taking the
+    // first word reported the version as "grok".
+    const h = await acpHealth(GROK, {
+      run: async () => ({ stdout: "grok 1.0.13 (5e9a58528b76) [stable]\n" }),
+      probe: async () => ({ authenticated: true }),
+      disarmed: null,
+    });
+    assert.equal(h.version, "1.0.13");
+  });
+
+  it("is content when the config asks, or says nothing at all", () => {
+    const home = ws();
+    assert.equal(permissionsDisarmed(home), null, "no config means the default, which asks");
+    mkdirSync(join(home, ".grok"), { recursive: true });
+    writeFileSync(join(home, ".grok", "config.toml"), '[ui]\npermission_mode = "default"\n', "utf8");
+    assert.equal(permissionsDisarmed(home), null);
   });
 
   /**
