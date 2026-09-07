@@ -13,8 +13,10 @@
  */
 
 import { renderMarkdown } from "./markdown.js";
+import { nextWaitWord } from "./wait-words.js";
 import { playSplash } from "./splash.js";
 import { fmtCost } from "../src/format.js";
+import { endpointProblem } from "../src/endpoint.js";
 import { matchCommands } from "../src/commands.js";
 import { JOURNAL_RENDER_CAP, STREAM_CAP, contextCap, contextFill, newest, trimOldest } from "./bounds.js";
 import { holdAfterAutoDraft, taskForRun } from "./criteria-hold.js";
@@ -1723,12 +1725,41 @@ $("set-savekey").addEventListener("click", async () => {
     : "Could not write the key file.";
 });
 
+/**
+ * Why the endpoint box cannot be used as typed, or null.
+ *
+ * The same judgement the flag parser and the engine make, in the same words —
+ * `endpointProblem` is shared source, not a second copy that drifts. The
+ * window had none of it: Settings took any string and handed it to the engine,
+ * so `localhost:11434/v1` (no scheme) opened a session that then failed four
+ * retries deep as if the network were down.
+ *
+ * Never called on keystrokes. Every URL is invalid halfway through being
+ * typed, and a field that argues with you at "h" is a field you fight. It runs
+ * on save and on open, and it does not touch the text: the value stays in the
+ * box so a typo can be corrected rather than retyped.
+ *
+ * Empty is not this function's business here — "endpoint is required" is said
+ * once, alongside workspace and model, by the caller below.
+ */
+function endpointFieldProblem(): string | null {
+  const typed = ($("set-url") as HTMLInputElement).value.trim();
+  return typed ? endpointProblem(typed) : null;
+}
+
 $("set-open").addEventListener("click", async () => {
   const cwd = ($("set-cwd") as HTMLInputElement).value.trim();
   const model = ($("set-model") as HTMLInputElement).value.trim();
   const baseUrl = ($("set-url") as HTMLInputElement).value.trim();
   if (!cwd || !model || !baseUrl) {
     $("set-status").textContent = "Workspace, model and endpoint are all required.";
+    return;
+  }
+  const wrong = endpointFieldProblem();
+  if (wrong) {
+    // Refused here, not four retries later, and refused before saveEndpoint
+    // can write the bad address into the config for next launch to inherit.
+    $("set-status").textContent = wrong;
     return;
   }
   const key = ($("set-key") as HTMLInputElement).value.trim() || undefined;
@@ -2126,8 +2157,15 @@ function ivWaiting(on: boolean): void {
   // An elapsed count, because "waiting" and "hung" look identical without one.
   const started = Date.now();
   $("iv-clock").textContent = "0s";
+  $("iv-word").textContent = nextWaitWord("");
   ivTimer = setInterval(() => {
-    $("iv-clock").textContent = `${Math.round((Date.now() - started) / 1000)}s`;
+    const secs = Math.round((Date.now() - started) / 1000);
+    $("iv-clock").textContent = `${secs}s`;
+    // Slow enough to read, often enough that the row is never the same twice
+    // in the time it takes to look away and back.
+    if (secs > 0 && secs % 4 === 0) {
+      $("iv-word").textContent = nextWaitWord($("iv-word").textContent ?? "");
+    }
   }, 1000);
 }
 
@@ -2318,6 +2356,12 @@ async function boot(): Promise<void> {
   const stored = await molt.storedEndpoint();
   if (stored.baseUrl) ($("set-url") as HTMLInputElement).value = stored.baseUrl;
   if (stored.model) ($("set-model") as HTMLInputElement).value = stored.model;
+  // A config written by an older build, or by hand, can hold an address this
+  // window will refuse. Said on open rather than at the first click: the box
+  // is already filled with it, and a value that is going to be rejected should
+  // not look accepted until you try to use it.
+  const storedWrong = endpointFieldProblem();
+  if (storedWrong) $("set-status").textContent = storedWrong;
 
   const savedAutonomy = localStorage.getItem("molt.autonomy");
   if (savedAutonomy && savedAutonomy !== state.autonomy) {
@@ -2336,7 +2380,12 @@ async function boot(): Promise<void> {
   // Discovery is a network call per endpoint; it must not hold the window
   // shut, so it fills in behind the first paint.
   void fillModelSelect().catch(() => {
-    $("set-status").textContent = "Could not reach any endpoint to list models.";
+    // Discovery failing is the lesser complaint. If the stored endpoint is
+    // itself unusable, that message is the one to leave on screen — it is the
+    // reason nothing answered, and it is the one you can act on.
+    if (!endpointFieldProblem()) {
+      $("set-status").textContent = "Could not reach any endpoint to list models.";
+    }
   });
   showTab(state.open ? "session" : "settings");
   if (!state.open) $("composer").classList.add("hidden");

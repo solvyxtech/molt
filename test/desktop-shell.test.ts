@@ -5,6 +5,7 @@
  * the parts that have never been run on two of the three platforms they ship
  * to, and that a green engine suite cannot see.
  */
+import { nextWaitWord } from "../ui/wait-words.js";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -33,7 +34,8 @@ import { keyFor } from "../electron/endpoint-key.js";
 import { mutatesSession } from "../electron/limits.js";
 import { fmtCost } from "../src/format.js";
 import { COMMANDS, matchCommands } from "../src/commands.js";
-import { providerName } from "../src/providers.js";
+import { providerName, endpointProblem as fromProviders } from "../src/providers.js";
+import { endpointProblem } from "../src/endpoint.js";
 import {
   INTERVIEW_MAX_ROUNDS,
   applyBarAdds,
@@ -206,6 +208,51 @@ describe("the interview says it is working", () => {
     const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
     const round = ui.slice(ui.indexOf("async function interviewRound"));
     assert.match(round.slice(0, 900), /finally \{\s*ivWaiting\(false\);/);
+  });
+});
+
+describe("what the interview says while it waits", () => {
+  /**
+   * Asked for after watching a real round: the clock is honest but a minute of
+   * a motionless panel is dull, and dull reads as broken.
+   */
+  it("rotates rather than sitting on one word", () => {
+    let n = 0;
+    const cycle = [0, 0.3, 0.6, 0.9];
+    const seen = new Set<string>();
+    let word = "";
+    for (let i = 0; i < 8; i++) {
+      const next = nextWaitWord(word, () => cycle[n++ % cycle.length]!);
+      assert.notEqual(next, word, "the label must never repeat itself in place");
+      seen.add(next);
+      word = next;
+    }
+    assert.ok(seen.size > 2, `expected variety, saw ${[...seen].join(", ")}`);
+  });
+
+  /**
+   * The one joke this tool cannot make. A label reading "verifying" or
+   * "proving" while a question is still out would claim exactly the thing molt
+   * refuses to claim without evidence — and it would say it in the calmest
+   * possible voice, which is worse.
+   */
+  it("never claims to have established anything", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "wait-words.ts"), "utf8");
+    const list = ui.slice(ui.indexOf("const IV_WORDS"), ui.indexOf("] as const;"));
+    assert.ok(list.length > 0, "the word list must exist");
+    for (const claim of ["verif", "proven", "proving", "confirmed", "validated", "done"]) {
+      assert.doesNotMatch(
+        list,
+        new RegExp(claim, "i"),
+        `a waiting label must not say "${claim}" — nothing is established yet`,
+      );
+    }
+  });
+
+  it("keeps the clock beside it, since that is the honest part", () => {
+    const html = readFileSync(path.join(repoRoot(), "ui", "index.html"), "utf8");
+    assert.match(html, /id="iv-word"/);
+    assert.match(html, /id="iv-clock"/);
   });
 });
 
@@ -1293,5 +1340,92 @@ describe("/clear drops a held spec, not just the stream", () => {
     assert.match(body, /rows = \[\]/, "drafted checks would apply to the next Run");
     assert.match(body, /closeInterview\(\)/, "the interview panel stayed on screen");
     assert.match(body, /lastProof = undefined/, "the spine would keep lighting yesterday's bar");
+  });
+});
+
+/**
+ * The window judges an endpoint by the same rule the terminal does.
+ *
+ * `endpointProblem()` guarded the `--url` flag and the engine's retry loop
+ * from the day it was written, and Settings — the one surface where a base URL
+ * is typed by hand, with no shell history to copy it from — called neither.
+ * `localhost:11434/v1` with the scheme left off was accepted, stored by
+ * `saveEndpoint`, and then failed four retries deep looking like a dead
+ * network. The judgement now lives in `src/endpoint.ts`, free of `node:fs`, so
+ * the renderer imports the rule rather than growing a second one.
+ */
+describe("a bad endpoint is refused where it is typed", () => {
+  it("asks the shared rule instead of reimplementing it", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    assert.match(
+      ui,
+      /import \{ endpointProblem \} from "\.\.\/src\/endpoint\.js"/,
+      "the window must import the rule the CLI and engine use",
+    );
+    assert.match(ui, /function endpointFieldProblem\(\)/, "one place reads the box");
+  });
+
+  it("refuses on save, before the session opens or the address is stored", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    const open = ui.slice(ui.indexOf('$("set-open").addEventListener'));
+    const body = open.slice(0, open.indexOf('$("set-theme")'));
+    const guard = body.indexOf("endpointFieldProblem()");
+    const session = body.indexOf("molt.openSession(");
+    const save = body.indexOf("molt.saveEndpoint(");
+    assert.ok(guard > 0, "the save path never asks");
+    assert.ok(guard < session, "a bad endpoint reached openSession");
+    assert.ok(guard < save, "a bad endpoint was written to the config");
+    // The message shown is the rule's own words, not a second phrasing that
+    // drifts from the one the terminal prints for the same string.
+    assert.match(body, /\$\("set-status"\)\.textContent = wrong;/);
+  });
+
+  it("leaves the typed text alone so it can be corrected", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    const open = ui.slice(ui.indexOf('$("set-open").addEventListener'));
+    const body = open.slice(0, open.indexOf('$("set-theme")'));
+    assert.doesNotMatch(
+      body,
+      /\$\("set-url"\) as HTMLInputElement\)\.value = /,
+      "the refusal cleared or rewrote the field the person must edit",
+    );
+    // Judged on save, never on keystrokes: every URL is invalid halfway
+    // through being typed.
+    assert.doesNotMatch(
+      ui,
+      /\$\("set-url"\)\.addEventListener\(\s*"input"/,
+      "typing in the endpoint box must stay free of judgement",
+    );
+  });
+
+  it("surfaces a stored endpoint it would refuse as soon as the window opens", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    const boot = ui.slice(ui.indexOf("async function boot()"));
+    const stored = boot.indexOf("molt.storedEndpoint()");
+    const check = boot.indexOf("endpointFieldProblem()");
+    assert.ok(stored > 0 && check > stored, "a config full of nonsense looks fine until you click");
+    assert.match(boot, /if \(storedWrong\) \$\("set-status"\)\.textContent = storedWrong;/);
+  });
+
+  it("says the same thing about the same string, wherever it is said", () => {
+    // The empty case used to end "pass --url", which is advice you cannot take
+    // in a window: it is printed beside the very box it is telling you to pass.
+    const empty = endpointProblem("") ?? "";
+    assert.doesNotMatch(empty, /--url/, "a flag name leaked into a message the window shows");
+    assert.doesNotMatch(empty, /\/login/, "a slash command leaked into it too");
+    assert.match(empty, /no endpoint is set/);
+    // Still one function, still the same verdicts.
+    // The mistake people actually make: the scheme left off. `new URL` parses
+    // it — as the scheme "localhost" — so it is the scheme branch that catches
+    // it, and that is the sentence the window shows.
+    assert.match(endpointProblem("localhost:11434/v1") ?? "", /scheme 'localhost'/);
+    assert.match(endpointProblem("just some words") ?? "", /is not an endpoint/);
+    assert.match(endpointProblem("ftp://example.com/v1") ?? "", /scheme 'ftp'/);
+    assert.equal(endpointProblem("http://localhost:11434/v1"), null);
+    assert.equal(endpointProblem("  https://api.openai.com/v1  "), null);
+  });
+
+  it("is still reachable through providers.ts, which the engine and CLI ask", () => {
+    assert.equal(fromProviders, endpointProblem, "the re-export drifted into a copy");
   });
 });
