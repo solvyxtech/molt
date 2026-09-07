@@ -40,10 +40,23 @@
  *      `--always-approve`: the prompt *is* the enforcement point, and molt is
  *      the one answering it.
  *
- * Layer 3 is the one that matters, because it is the only one molt can verify
- * rather than request. A flag the CLI silently stopped honouring in a point
- * release looks exactly like a flag that works, right up until a receipt
- * claims a ledger is complete and it is not.
+ * Layer 3 was meant to be the one that matters, because it is the only one
+ * molt could verify rather than request. **It has never been observed to
+ * fire.** Two real turns against a live Grok on 2026-09-07 used its own
+ * `search_replace` to edit a file and molt was never asked — zero
+ * `session/request_permission` requests arrived in either run, with
+ * `permission_mode` left at its default. Layers 1 and 2 did not stop it
+ * either: `agentProfile.tools: ""` is evidently not how that CLI is told to
+ * bring no tools.
+ *
+ * So on this backend the ledger is **not** guaranteed complete, and the honest
+ * backstop is the one molt already had: `tree-accounted` refuses a claim when
+ * the tree holds a change no tool call explains, and it did — the turn was
+ * refused rather than passed. Safe, but a bar that fails on a correct edit is
+ * not a usable backend, and it should not be described as one.
+ *
+ * What is still unexplored: Grok's own docs say `deny` rules and hooks apply
+ * even under always-approve, which is a lever this file does not pull yet.
  *
  * ### What this still does not catch, said out loud
  *
@@ -56,8 +69,10 @@
  * surfaces it as an `info` event rather than discovering it in a receipt.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -65,6 +80,7 @@ import { promisify } from "node:util";
 
 import { errorText } from "./format.js";
 import type { BackendEvent, MoltTool, ToolRunner } from "./claude-code.js";
+import { GEMINI_CLI_URL, GROK_BUILD_URL } from "./endpoint.js";
 import { estTokens } from "./types.js";
 
 const exec = promisify(execFile);
@@ -119,7 +135,7 @@ export const ACP_AGENTS: readonly AcpAgentSpec[] = [
   {
     name: "grok-build",
     label: "Grok Build",
-    url: "grok-build://subscription",
+    url: GROK_BUILD_URL,
     bin: "grok",
     // No `--always-approve`. See the header: the permission request is how
     // molt refuses a builtin, and approving everything throws that away.
@@ -137,7 +153,7 @@ export const ACP_AGENTS: readonly AcpAgentSpec[] = [
   {
     name: "gemini-cli",
     label: "Gemini CLI",
-    url: "gemini-cli://subscription",
+    url: GEMINI_CLI_URL,
     bin: "gemini",
     // `--experimental-acp` was renamed to `--acp` during 2026. Both are
     // passed: the older builds ignore an unknown long flag rather than
@@ -171,6 +187,39 @@ export function acpModels(baseUrl: string | undefined): string[] {
   return [...(acpAgentFor(baseUrl)?.models ?? [])];
 }
 
+/**
+ * Does this agent's own config disarm the gate molt relies on?
+ *
+ * Layer 3 of the lockdown in this file's header — refuse every permission
+ * request that is not one of molt's tools — is the only layer molt can verify.
+ * It is also the only one that a line in *your* config can switch off:
+ * `permission_mode = "always-approve"` in `~/.grok/config.toml` short-circuits
+ * the permission pipeline, so `session/request_permission` is never sent and
+ * molt never gets to say no.
+ *
+ * This is not hypothetical. The first real turn this backend ever ran did
+ * exactly that: Grok used its own `search_replace` to edit a file, molt was
+ * never asked, and the write landed with no ledger entry behind it. `tree-
+ * accounted` would have refused the claim — the bar is the backstop and it
+ * held — but a backend that fails every bar is not a working backend, and
+ * discovering why in a receipt is far too late.
+ *
+ * Read, never written. What to change is yours to decide; molt's job is to say
+ * so before the turn rather than after it.
+ */
+export function permissionsDisarmed(home = homedir()): string | null {
+  let text: string;
+  try {
+    text = readFileSync(join(home, ".grok", "config.toml"), "utf8");
+  } catch {
+    // No config is the default, and the default asks.
+    return null;
+  }
+  const mode = /^\s*permission_mode\s*=\s*"([^"]+)"/mu.exec(text)?.[1];
+  if (!mode || mode === "default" || mode === "ask") return null;
+  return mode;
+}
+
 // ---------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------
@@ -202,13 +251,24 @@ export async function acpHealth(
   deps: {
     run?: (cmd: string, args: string[]) => Promise<{ stdout: string }>;
     probe?: (spec: AcpAgentSpec) => Promise<{ authenticated: boolean; detail?: string }>;
+    /** Injected in tests; real callers read the CLI's own config. */
+    disarmed?: string | null;
   } = {},
 ): Promise<AcpHealth> {
   const run = deps.run ?? ((c: string, a: string[]) => exec(c, a));
   let version: string | undefined;
   try {
     const { stdout } = await run(spec.bin, ["--version"]);
-    version = stdout.trim().split(/\s+/u)[0];
+    /**
+     * The first thing that looks like a version, not the first word.
+     *
+     * `claude --version` prints "2.1.263 (Claude Code)" and taking field zero
+     * works; `grok --version` prints "grok 1.0.13 (5e9a58…) [stable]" and the
+     * same rule reported the version as "grok", which reached the endpoint
+     * picker as "grok grok · signed in".
+     */
+    version =
+      /\b(\d+\.\d+(?:\.\d+)?)\b/u.exec(stdout)?.[1] ?? stdout.trim().split(/\s+/u)[0];
   } catch {
     return {
       ok: false,
@@ -220,14 +280,37 @@ export async function acpHealth(
   }
   const probe = deps.probe ?? probeAuth;
   const { authenticated, detail } = await probe(spec);
+  /**
+   * `??` is wrong here and was: `null` is the *answer* "the gate is armed",
+   * not the absence of one, so `deps.disarmed ?? permissionsDisarmed()` fell
+   * through to the real config every time a test pinned it to null — and the
+   * test then failed or passed depending on whose `~/.grok/config.toml` it ran
+   * on. Presence of the key is the question.
+   */
+  const disarmed =
+    spec.name === "grok-build"
+      ? "disarmed" in deps
+        ? deps.disarmed
+        : permissionsDisarmed()
+      : null;
   return {
-    ok: authenticated,
+    // Signed in but ungated is not "ok": every write would land outside the
+    // ledger and every bar would refuse the claim that followed.
+    ok: authenticated && !disarmed,
     installed: true,
     version,
     authenticated,
     detail:
-      `${spec.bin} ${version} · ` + (authenticated ? "signed in" : (detail ?? "not signed in")),
-    ...(authenticated ? {} : { fix: spec.loginHint }),
+      `${spec.bin} ${version} · ` +
+      (authenticated ? "signed in" : (detail ?? "not signed in")) +
+      (disarmed ? ` · ⚠ permission_mode = "${disarmed}" — molt cannot gate its tools` : ""),
+    ...(authenticated
+      ? disarmed
+        ? {
+            fix: `remove permission_mode = "${disarmed}" from ~/.grok/config.toml (molt needs to be asked)`,
+          }
+        : {}
+      : { fix: spec.loginHint }),
   };
 }
 
@@ -591,7 +674,7 @@ export class McpToolServer<H> {
  * a generator that only pulled between notifications would hold a `tool_start`
  * until after the tool it announces had finished.
  */
-class Channel<T> {
+export class Channel<T> {
   private queue: T[] = [];
   private waiting: ((r: IteratorResult<T>) => void)[] = [];
   private done = false;

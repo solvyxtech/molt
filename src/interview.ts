@@ -13,6 +13,7 @@ import { stringify } from "yaml";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { acpAgentFor, acpAsk } from "./acp.js";
+import { isAgy } from "./agy.js";
 import { claudeCodeAsk, isClaudeCode, type Sdk } from "./claude-code.js";
 import { errorText } from "./format.js";
 import { authHeaders } from "./providers.js";
@@ -317,6 +318,20 @@ export async function interviewTurn(opts: {
    * looking for "what happens when there is no URL" should find both cases
    * together rather than one here and one three screens down.
    */
+  /**
+   * Antigravity has no endpoint either, and no tool-free one-shot path.
+   *
+   * `agy` always brings its 57 tools; there is no `--tools ""`. molt could run
+   * the question through a full session, but a proposal drafted by something
+   * that can read the repo is a different thing from the one every other
+   * backend produces, and quietly making it a different thing is worse than
+   * saying so. Refused in words a reader can act on, rather than as
+   * "TypeError: fetch failed" from a scheme `fetch` will not take.
+   */
+  if (isAgy(opts.baseUrl)) {
+    return { kind: "error", error: "Antigravity cannot run the interview yet — start the run without it, or switch endpoint for this step." };
+  }
+
   const acp = acpAgentFor(opts.baseUrl);
   if (acp) {
     const asked = await acpAsk({

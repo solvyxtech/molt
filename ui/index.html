@@ -161,11 +161,21 @@
             </div>
             <div class="row">
               <button class="btn ghost" id="set-claude-code">Use my Claude plan</button>
+              <button class="btn ghost" id="set-agy">Use my Google plan</button>
+              <button class="btn ghost" id="set-grok">Use my Grok plan</button>
+            </div>
+            <div class="row">
+              <!--
+                One status line for the row. The id is historical — the
+                self-check looks for it by name — and it now carries whichever
+                plan you last asked about.
+              -->
               <span class="muted" id="claude-code-status"></span>
             </div>
             <p class="hint">
-              Runs the Claude Code you already logged in — a Pro or Max plan pays
-              for the turn, and molt never sees the credential.
+              Runs the CLI you already logged in — Claude Code, Antigravity or
+              Grok Build. The plan pays for the turn, and molt never sees the
+              credential.
             </p>
             <p class="hint" id="local-hint"></p>
           </fieldset>

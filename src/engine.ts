@@ -94,6 +94,7 @@ import { readStream, type StreamAccumulator, type Usage } from "./stream.js";
 import { Fragments, SafeStream } from "./live.js";
 import { Transcript, toolDetail } from "./transcript.js";
 import { acpAgentFor, acpHealth, acpModels, AcpSession, isAcp } from "./acp.js";
+import { AGY_MODELS, AgySession, agyHealth, agyModels, isAgy } from "./agy.js";
 import {
   type BackendSession,
   CLAUDE_CODE_MODELS,
@@ -833,6 +834,13 @@ export type EngineConfig = {
    */
   acpSpawn?: typeof import("node:child_process").spawn;
   /**
+   * How the Antigravity config home is prepared, injected.
+   *
+   * Tests supply one so no real settings file is edited and no `agy mcp add`
+   * runs against the machine running the suite.
+   */
+  agySetup?: (endpoint: { url: string; headers: { name: string; value: string }[] }) => Promise<void>;
+  /**
    * Response ceiling for protocols that demand one. Anthropic's Messages API
    * requires `max_tokens`; the OpenAI shape treats it as optional.
    */
@@ -1313,11 +1321,12 @@ export class Engine {
    */
   /** The CLI's name, for a message a person reads. */
   private get backendLabel(): string {
+    if (isAgy(this.cfg.baseUrl)) return "Antigravity";
     return acpAgentFor(this.cfg.baseUrl)?.label ?? "Claude Code";
   }
 
   private get subprocess(): boolean {
-    return isClaudeCode(this.cfg.baseUrl) || isAcp(this.cfg.baseUrl);
+    return isClaudeCode(this.cfg.baseUrl) || isAcp(this.cfg.baseUrl) || isAgy(this.cfg.baseUrl);
   }
 
   /** Where a completion request goes, which differs between the two APIs. */
@@ -2960,7 +2969,17 @@ export class Engine {
         }
       };
       const spec = acpAgentFor(this.cfg.baseUrl);
-      this.cc = spec
+      this.cc = isAgy(this.cfg.baseUrl)
+        ? new AgySession<EngineEvent>({
+            model: this.cfg.model,
+            cwd: this.cwd,
+            systemPrompt: system,
+            tools: TOOLS,
+            runTool,
+            ...(this.cfg.acpSpawn ? { spawnFn: this.cfg.acpSpawn } : {}),
+            ...(this.cfg.agySetup ? { setup: this.cfg.agySetup } : {}),
+          })
+        : spec
         ? new AcpSession<EngineEvent>({
             spec,
             model: this.cfg.model,
@@ -4958,13 +4977,20 @@ export class Engine {
      */
     if (this.subprocess) {
       const spec = acpAgentFor(this.cfg.baseUrl);
-      const health = spec ? await acpHealth(spec) : await claudeCodeHealth();
-      const ids: string[] = spec ? acpModels(this.cfg.baseUrl) : [...CLAUDE_CODE_MODELS];
+      const agy = isAgy(this.cfg.baseUrl);
+      const health = agy ? await agyHealth() : spec ? await acpHealth(spec) : await claudeCodeHealth();
+      const ids: string[] = agy
+        ? await agyModels()
+        : spec
+          ? acpModels(this.cfg.baseUrl)
+          : [...CLAUDE_CODE_MODELS];
       // An alias the CLI resolves itself is not in the list and is still
       // valid; refusing it would be molt overruling the only party that knows.
-      const has = spec
-        ? ids.includes(this.cfg.model) || this.cfg.model.startsWith(spec.bin)
-        : ids.includes(this.cfg.model) || this.cfg.model.startsWith("claude-");
+      const has = agy
+        ? ids.length === 0 || ids.includes(this.cfg.model)
+        : spec
+          ? ids.includes(this.cfg.model) || this.cfg.model.startsWith(spec.bin)
+          : ids.includes(this.cfg.model) || this.cfg.model.startsWith("claude-");
       return {
         ok: health.ok && has,
         reachable: health.installed,
@@ -4975,7 +5001,7 @@ export class Engine {
           (health.fix ? ` · run \`${health.fix}\`` : "") +
           (has
             ? ""
-            : ` · ⚠ '${this.cfg.model}' is not a ${spec?.label ?? "Claude"} model (try: ${ids.join(", ")})`),
+            : ` · ⚠ '${this.cfg.model}' is not a ${this.backendLabel} model (try: ${ids.slice(0, 3).join(", ")})`),
       };
     }
     /**
@@ -5038,6 +5064,9 @@ export class Engine {
     // up. See CLAUDE_CODE_MODELS.
     if (isClaudeCode(baseUrl)) return { ok: true, ids: [...CLAUDE_CODE_MODELS] };
     if (isAcp(baseUrl)) return { ok: true, ids: acpModels(baseUrl) };
+    // The constant, not the live list: `/model` asks every provider it knows,
+    // and a picker keystroke must not spawn a CLI. See AGY_MODELS.
+    if (isAgy(baseUrl)) return { ok: true, ids: [...AGY_MODELS] };
     try {
       const res = await fetchFn(`${base}/models`, { headers: authHeaders(base, apiKey) });
       if (!res.ok) return { ok: false, error: `HTTP ${res.status} from ${base}/models` };

@@ -12,11 +12,15 @@
  * into one.
  */
 import { ACP_AGENTS, isAcp } from "./acp.js";
+import { AGY_URL, isAgy } from "./agy.js";
 import { CLAUDE_CODE_URL, isClaudeCode } from "./claude-code.js";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { windowAround } from "./commands.js";
+import { defaultConfigDir } from "./config-dir.js";
+
+/** Re-exported: it lived here first, and callers import it from here. */
+export { defaultConfigDir };
 
 export type Provider = {
   url: string;
@@ -52,6 +56,16 @@ export const PROVIDERS: Record<string, Provider> = {
    * there is no key to hold and `needsKey` is false for something that is
    * anything but free. See acp.ts.
    */
+  /**
+   * Antigravity speaks its own stream rather than ACP, so it is a row here
+   * rather than one in `ACP_AGENTS`. Same bargain: molt runs the CLI you
+   * signed in, and the plan pays.
+   */
+  antigravity: {
+    url: AGY_URL,
+    needsKey: false,
+    hint: "runs your own logged-in Antigravity CLI — a Google AI plan pays for it, not a key",
+  },
   ...Object.fromEntries(
     ACP_AGENTS.map((a) => [
       a.name,
@@ -94,19 +108,6 @@ export function authHeaders(baseUrl: string, apiKey?: string): Record<string, st
     headers["anthropic-version"] = "2023-06-01";
   }
   return headers;
-}
-
-export function defaultConfigDir(): string {
-  // `MOLT_CONFIG_DIR` relocates the whole of molt's config: keys, endpoint,
-  // prices. It exists because without it the test suite writes to the real
-  // one — a TUI test that mounts the app triggers a pricing refresh, and
-  // `savePricing` had nowhere else to go, so running `npm test` rewrote the
-  // developer's stored endpoint and left `priceModel: "test-model"` behind.
-  // A test that edits the machine it runs on is not a test you can trust
-  // twice, and this was doing it on every run.
-  const override = process.env.MOLT_CONFIG_DIR?.trim();
-  if (override) return override;
-  return join(homedir(), ".config", "molt");
 }
 
 function readJson(dir: string, file: string): Record<string, string> {
@@ -461,7 +462,7 @@ export function isSelfHosted(baseUrl: string): boolean {
    * wrong for a frontier model: with the map it won 3 of 3 paired runs and
    * cost 23% less. Said first, before the address is parsed at all.
    */
-  if (isClaudeCode(baseUrl) || isAcp(baseUrl)) return false;
+  if (isClaudeCode(baseUrl) || isAcp(baseUrl) || isAgy(baseUrl)) return false;
   let host = "";
   try {
     host = new URL(baseUrl).hostname.toLowerCase();
