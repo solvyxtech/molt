@@ -211,6 +211,48 @@ describe("the interview says it is working", () => {
   });
 });
 
+describe("the window says when it is waiting on the model", () => {
+  /**
+   * Reported from a long turn: after the spending-ceiling warning "the model
+   * keeps working, it looks dead after this and you can't tell if the model is
+   * done or still going".
+   *
+   * The ceiling notice was incidental. The waiting row was started once per
+   * turn, on `job_start`, and removed on the first token — right, because
+   * streaming text is its own proof of life. Nothing started it again, so
+   * every silence after the first one showed nothing: a model thinking between
+   * steps looked identical to a finished turn.
+   */
+  it("starts the waiting row on every request, not just the first", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    const at = ui.indexOf('case "request":');
+    assert.ok(at > 0, "the request event must be handled");
+    const block = ui.slice(at, ui.indexOf("break;", at));
+    assert.match(block, /setPhase\(/, "a request out means the model is being waited on");
+    assert.match(block, /bumpActivity\(/, "…and the row belongs below what just arrived");
+  });
+
+  /**
+   * The counterpart, and the reason the bug was invisible in the code: the
+   * only thing that removes the row mid-turn is the first token, which is
+   * correct. It just has to be put back.
+   */
+  it("still clears the row the moment tokens arrive", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    const at = ui.indexOf('case "delta":');
+    const block = ui.slice(at, ui.indexOf("break;", at));
+    assert.match(block, /stopActivity\(\)/);
+  });
+
+  it("keeps a notice from stranding the spinner above it", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    // `say` bumps the row to the bottom, which is what makes an info line
+    // arriving mid-wait leave the spinner where it can still be seen.
+    const sayFn = ui.slice(ui.indexOf("function say("), ui.indexOf("function say(") + 400);
+    assert.match(sayFn, /bumpActivity\(\)/);
+  });
+});
+
 describe("what the interview says while it waits", () => {
   /**
    * Asked for after watching a real round: the clock is honest but a minute of
@@ -1427,5 +1469,70 @@ describe("a bad endpoint is refused where it is typed", () => {
 
   it("is still reachable through providers.ts, which the engine and CLI ask", () => {
     assert.equal(fromProviders, endpointProblem, "the re-export drifted into a copy");
+  });
+
+  /**
+   * `storedEndpoint()` answers `{}` when nothing has been saved, so the window
+   * asks about `stored.baseUrl` — which is `undefined`, not "". The guard that
+   * absorbs it is the reason a first launch says "no endpoint is set" instead
+   * of throwing on `.trim()` of undefined.
+   */
+  it("treats a missing endpoint as an empty one rather than throwing", () => {
+    const missing = (undefined as unknown as string);
+    assert.match(endpointProblem(missing) ?? "", /no endpoint is set/);
+    assert.match(endpointProblem(null as unknown as string) ?? "", /no endpoint is set/);
+  });
+
+  it("refuses before it spends a round trip on an address it cannot speak to", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    const refresh = ui.slice(ui.indexOf('$("set-refresh").addEventListener'));
+    const body = refresh.slice(0, 600);
+    const guard = body.indexOf("endpointFieldProblem()");
+    const ask = body.indexOf("fillModelSelect(true)");
+    assert.ok(guard > 0 && guard < ask, '"Models refreshed." over an endpoint molt refuses');
+  });
+
+  /**
+   * The window's half of this is driven by `--self-drive`, which `npm test`
+   * cannot execute — so the conditions that decide whether the refusal was
+   * correct are pinned as source. Without this, `&&` becomes `||` in the
+   * harness and every one of the three requirements below is satisfied by any
+   * one of them: a window that refused nothing but stayed on the Settings tab
+   * would pass.
+   */
+  it("makes the e2e verdict require all three things it claims to check", () => {
+    const main = readFileSync(path.join(repoRoot(), "electron", "main.ts"), "utf8");
+    const verdict = main.slice(main.indexOf("const refusedOk ="));
+    const expr = verdict.slice(0, verdict.indexOf(";") + 1);
+    assert.match(expr, /uses the scheme 'localhost'/, "the message is not checked");
+    assert.match(expr, /refused\.left === badUrl/, "the typed text is not checked");
+    assert.match(expr, /refused\.tab === "settings"/, "the session opening is not checked");
+    assert.equal((expr.match(/&&/g) ?? []).length, 3, "the conjuncts must all be required");
+    assert.doesNotMatch(expr, /\|\|/, "any one of them would satisfy the whole verdict");
+    // And the harness must act on it, rather than printing a verdict it ignores.
+    assert.match(verdict.slice(0, 900), /if \(!refusedOk\)[\s\S]{0,300}app\.exit\(1\)/);
+  });
+});
+
+/**
+ * The spine is hidden only when it was explicitly put away.
+ *
+ * Flagged by the mutation check on a line nothing asserted: flipping `!==` to
+ * `===` starts every window with the one surface that is unique to molt
+ * collapsed, and no test noticed. `npm test` cannot execute the renderer, so
+ * the default is pinned where the window's other renderer rules are — as the
+ * source it ships.
+ */
+describe("the spine's default state", () => {
+  it("opens unless localStorage says off", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    assert.match(
+      ui,
+      /setSpineOpen\(localStorage\.getItem\("molt\.spine"\) !== "off"\)/,
+      "a missing or unknown value must open the spine, not hide it",
+    );
+    // The other half of the round trip: what the toggle stores is what this
+    // reads back, so "off" is the only string that can ever suppress it.
+    assert.match(ui, /localStorage\.setItem\("molt\.spine", open \? "on" : "off"\)/);
   });
 });

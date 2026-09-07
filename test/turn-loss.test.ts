@@ -394,6 +394,113 @@ describe("the ceiling asks before it gives up", () => {
     return { fetchFn, steps: () => n };
   }
 
+  describe("what the ceiling notice actually says", () => {
+    /**
+     * Reported from a real turn: "this turn: 1589524 of 2000000 tokens — 50% of
+     * the ceiling". 1,589,524 of 2,000,000 is 79%. The line printed the mark
+     * that had been crossed while the numbers beside it were current, and a step
+     * can cross a mark and land well past it.
+     */
+    it("states the percentage it reached, not the mark it crossed", async () => {
+      const ws = workspace();
+      try {
+        const g = grinder(12, 30_000);
+        const engine = new Engine({
+          baseUrl: "http://mock/v1",
+          model: "m",
+          provider: "mock",
+          cwd: ws.dir,
+          fetchFn: g.fetchFn,
+          bar: null,
+          autonomy: "high",
+          maxTurnTokens: 60_000,
+          priceInPerMtok: undefined,
+          priceOutPerMtok: undefined,
+        });
+        const notices: string[] = [];
+        for await (const ev of engine.run("grind", allowAll)) {
+          if (ev.kind === "info" && /% of the ceiling/.test(ev.text)) notices.push(ev.text);
+        }
+        assert.ok(notices.length > 0, "the ceiling should have spoken");
+        for (const n of notices) {
+          const m = /([\d,]+) of ([\d,]+) tokens — (\d+)% of the ceiling/.exec(n);
+          assert.ok(m, `unreadable notice: ${n}`);
+          const used = Number(m[1]!.replace(/,/g, ""));
+          const cap = Number(m[2]!.replace(/,/g, ""));
+          const said = Number(m[3]);
+          const real = Math.round((used / cap) * 100);
+          assert.equal(said, real, `said ${said}% of ${cap} for ${used} — the arithmetic is ${real}%`);
+        }
+      } finally {
+        ws.cleanup();
+      }
+    });
+  
+    /**
+     * `/budget $5` was the advice whatever the unit. Where no price is known —
+     * every Claude Code turn, since a subscription run has no dollar figure —
+     * the money ceiling is not what stopped anything, so that command changes a
+     * number nothing reads and the turn hits the same wall.
+     */
+    it("offers the knob that is actually binding", async () => {
+      const ws = workspace();
+      try {
+        const g = grinder(12, 30_000);
+        const engine = new Engine({
+          baseUrl: "http://mock/v1",
+          model: "m",
+          provider: "mock",
+          cwd: ws.dir,
+          fetchFn: g.fetchFn,
+          bar: null,
+          autonomy: "high",
+          maxTurnTokens: 60_000,
+          priceInPerMtok: undefined,
+          priceOutPerMtok: undefined,
+        });
+        const notices: string[] = [];
+        for await (const ev of engine.run("grind", allowAll)) {
+          if (ev.kind === "info" && /% of the ceiling/.test(ev.text)) notices.push(ev.text);
+        }
+        assert.ok(notices.length > 0);
+        for (const n of notices) {
+          assert.doesNotMatch(n, /\/budget \$/, "a token ceiling is not raised with dollars");
+          assert.match(n, /\/budget \d+ raises it/, "…it is raised with a number");
+        }
+      } finally {
+        ws.cleanup();
+      }
+    });
+  
+    /** One step can cross two marks. It should say so once. */
+    it("does not repeat itself for every mark one step blew past", async () => {
+      const ws = workspace();
+      try {
+        // A single step far larger than the gap between marks.
+        const g = grinder(6, 90_000);
+        const engine = new Engine({
+          baseUrl: "http://mock/v1",
+          model: "m",
+          provider: "mock",
+          cwd: ws.dir,
+          fetchFn: g.fetchFn,
+          bar: null,
+          autonomy: "high",
+          maxTurnTokens: 100_000,
+          priceInPerMtok: undefined,
+          priceOutPerMtok: undefined,
+        });
+        const notices: string[] = [];
+        for await (const ev of engine.run("grind", allowAll)) {
+          if (ev.kind === "info" && /% of the ceiling/.test(ev.text)) notices.push(ev.text);
+        }
+        assert.equal(new Set(notices).size, notices.length, `duplicated: ${notices.join(" | ")}`);
+      } finally {
+        ws.cleanup();
+      }
+    });
+  });
+
   const engineFor = (dir: string, g: { fetchFn: typeof fetch }) =>
     engineWith(dir, {
       fetchFn: g.fetchFn,

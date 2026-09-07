@@ -85,10 +85,13 @@ import { Receipts } from "./receipts.js";
 import { readStream, type StreamAccumulator, type Usage } from "./stream.js";
 import { Fragments, SafeStream } from "./live.js";
 import { Transcript, toolDetail } from "./transcript.js";
+import { acpAgentFor, acpHealth, acpModels, AcpSession, isAcp } from "./acp.js";
 import {
+  type BackendSession,
   CLAUDE_CODE_MODELS,
   ClaudeCodeSession,
   claudeCodeHealth,
+  type ToolRunner,
   isClaudeCode,
   type Sdk,
 } from "./claude-code.js";
@@ -813,6 +816,15 @@ export type EngineConfig = {
    */
   claudeCodeSdk?: Sdk;
   /**
+   * How an ACP agent's process is started, injected.
+   *
+   * Only tests pass one, for the same reason `claudeCodeSdk` exists: left out,
+   * `AcpSession` spawns the real `grok` or `gemini`, which is the only way a
+   * test could spend a real subscription's quota. Every test that drives the
+   * backend supplies a scripted agent here instead.
+   */
+  acpSpawn?: typeof import("node:child_process").spawn;
+  /**
    * Response ceiling for protocols that demand one. Anthropic's Messages API
    * requires `max_tokens`; the OpenAI shape treats it as optional.
    */
@@ -1185,7 +1197,7 @@ export class Engine {
    * streaming session read 2,200 tokens out of cache where the first wrote
    * 958 fresh ones, and a session per turn pays that back every time.
    */
-  private cc?: ClaudeCodeSession<EngineEvent>;
+  private cc?: BackendSession<EngineEvent>;
   /** The system prompt the live session was started with. */
   private ccSystem = "";
   /**
@@ -1279,13 +1291,25 @@ export class Engine {
   }
 
   /**
-   * Is the work being done by Claude Code rather than by an HTTP endpoint?
+   * Is the work being done by a CLI molt spawned, rather than by an HTTP
+   * endpoint it posts to?
    *
    * Read off the endpoint, so it survives `/endpoint` switching mid-session
    * and cannot disagree with what the receipt records.
+   *
+   * One predicate for three backends, because everything downstream of it
+   * asks the same question: there is no request body to put `tool_choice` in,
+   * no `/models` to fetch, no token price to apply, and the context belongs to
+   * the subprocess rather than to molt's transcript. Which CLI it is only
+   * matters where the session is constructed and where health is reported.
    */
-  private get claudeCode(): boolean {
-    return isClaudeCode(this.cfg.baseUrl);
+  /** The CLI's name, for a message a person reads. */
+  private get backendLabel(): string {
+    return acpAgentFor(this.cfg.baseUrl)?.label ?? "Claude Code";
+  }
+
+  private get subprocess(): boolean {
+    return isClaudeCode(this.cfg.baseUrl) || isAcp(this.cfg.baseUrl);
   }
 
   /** Where a completion request goes, which differs between the two APIs. */
@@ -1744,7 +1768,7 @@ export class Engine {
      * `anthropicPricing` would happily match the model alias and do it. The
      * token ceiling still applies; `/budget` in dollars has nothing to bound.
      */
-    if (this.claudeCode) return undefined;
+    if (this.subprocess) return undefined;
     if (this.costBilled) return this.sessionBilled;
     const { priceInPerMtok: pin, priceOutPerMtok: pout, priceCachedInPerMtok: pcache } = this.cfg;
     if (pin === undefined || pout === undefined) return undefined;
@@ -2299,8 +2323,8 @@ export class Engine {
      * one request whose entire job is to rescue a stopped turn cannot be the
      * one request that goes a way this backend cannot go.
      */
-    if (this.claudeCode) {
-      yield* this.claudeCodeSalvage(reason, log);
+    if (this.subprocess) {
+      yield* this.subprocessSalvage(reason, log);
       return;
     }
     // Cancellable, like every other request. It was not, and that made molt
@@ -2405,13 +2429,13 @@ export class Engine {
    * deltas as well as the text below is how the closing answer would print
    * twice.
    */
-  private async *claudeCodeSalvage(
+  private async *subprocessSalvage(
     reason: string,
     log?: Journal,
   ): AsyncGenerator<EngineEvent> {
-    let cc: ClaudeCodeSession<EngineEvent>;
+    let cc: BackendSession<EngineEvent>;
     try {
-      cc = await this.claudeCodeSession();
+      cc = await this.subprocessSession();
     } catch (e) {
       log?.append("error", { text: `salvage failed: ${errorText(e)}` });
       yield {
@@ -2470,7 +2494,7 @@ export class Engine {
       log?.append(cancelled ? "cancelled" : "error", {
         text: cancelled
           ? "salvage cancelled"
-          : `salvage failed: ${done?.error ?? "the Claude Code session ended without answering"}`,
+          : `salvage failed: ${done?.error ?? `the ${this.backendLabel} session ended without answering`}`,
       });
       yield {
         kind: "info",
@@ -2850,7 +2874,7 @@ export class Engine {
    * is working from instructions molt no longer holds. Rebuilding costs the
    * cached prefix, which is the same trade `setSystem` already documents.
    */
-  private async claudeCodeSession(): Promise<ClaudeCodeSession<EngineEvent>> {
+  private async subprocessSession(): Promise<BackendSession<EngineEvent>> {
     const system = this.transcript.systemText;
     if (this.cc && this.ccSystem !== system) {
       await this.cc.close();
@@ -2859,37 +2883,52 @@ export class Engine {
     if (!this.cc) {
       this.ccSystem = system;
       this.ccForwarded = new WeakSet<Msg>();
-      this.cc = new ClaudeCodeSession<EngineEvent>({
-        model: this.cfg.model,
-        cwd: this.cwd,
-        systemPrompt: system,
-        tools: TOOLS,
-        sdk: this.cfg.claudeCodeSdk,
-        /**
-         * Every tool call Claude Code makes runs here, through the same
-         * method the step loop uses: the same autonomy gate, the same ledger
-         * entry, the same journal lines, the same events on screen. Claude
-         * Code has no tools of its own, so this is the only way anything
-         * reaches the disk — which is what lets `tree-accounted` mean
-         * something on this backend.
-         */
-        runTool: async (name, args, callId, emit) => {
-          const ctx = this.ccCtx;
-          if (!ctx) return "[molt: no turn is running]";
-          if (this.ccNoTools) {
-            return "[molt: the turn is over. No more tools — answer with what you already have.]";
-          }
-          const calls = this.invokeTool(
-            { id: callId, name, rawArgs: JSON.stringify(args) },
-            ctx,
-          );
-          for (;;) {
-            const next = await calls.next();
-            if (next.done) return next.value.result;
-            emit(next.value);
-          }
-        },
-      });
+      /**
+       * The one tool path, whichever CLI is on the other end.
+       *
+       * Claude Code reaches it through the Agent SDK's in-process MCP server
+       * and the ACP agents reach it over a loopback HTTP one, and neither
+       * difference is visible here: the same autonomy gate, the same ledger
+       * entry, the same journal lines, the same events on screen.
+       */
+      const runTool: ToolRunner<EngineEvent> = async (name, args, callId, emit) => {
+        const ctx = this.ccCtx;
+        if (!ctx) return "[molt: no turn is running]";
+        if (this.ccNoTools) {
+          return "[molt: the turn is over. No more tools — answer with what you already have.]";
+        }
+        const calls = this.invokeTool({ id: callId, name, rawArgs: JSON.stringify(args) }, ctx);
+        for (;;) {
+          const next = await calls.next();
+          if (next.done) return next.value.result;
+          emit(next.value);
+        }
+      };
+      const spec = acpAgentFor(this.cfg.baseUrl);
+      this.cc = spec
+        ? new AcpSession<EngineEvent>({
+            spec,
+            model: this.cfg.model,
+            cwd: this.cwd,
+            systemPrompt: system,
+            tools: TOOLS,
+            runTool,
+            ...(this.cfg.acpSpawn ? { spawnFn: this.cfg.acpSpawn } : {}),
+          })
+        : /**
+           * Claude Code has no tools of its own, so `runTool` is the only way
+           * anything reaches the disk — which is what lets `tree-accounted`
+           * mean something on this backend. `acp.ts` buys the same guarantee
+           * a harder way; see its header.
+           */
+          new ClaudeCodeSession<EngineEvent>({
+            model: this.cfg.model,
+            cwd: this.cwd,
+            systemPrompt: system,
+            tools: TOOLS,
+            sdk: this.cfg.claudeCodeSdk,
+            runTool,
+          });
     }
     return this.cc;
   }
@@ -2905,7 +2944,7 @@ export class Engine {
    *
    * Returns null when the turn cannot continue; it has already said why.
    */
-  private async *claudeCodeStep(
+  private async *subprocessStep(
     step: number,
     ctx: ToolContext,
   ): AsyncGenerator<
@@ -2913,9 +2952,9 @@ export class Engine {
     { msg: Msg; usage: Usage; finishReason?: string; streamed: boolean } | null
   > {
     this.ccCtx = ctx;
-    let cc: ClaudeCodeSession<EngineEvent>;
+    let cc: BackendSession<EngineEvent>;
     try {
-      cc = await this.claudeCodeSession();
+      cc = await this.subprocessSession();
     } catch (e) {
       const text = errorText(e);
       ctx.log?.append("error", { text });
@@ -3021,7 +3060,7 @@ export class Engine {
     }
 
     if (!done) {
-      yield { kind: "error", text: "the Claude Code session ended without answering" };
+      yield { kind: "error", text: `the ${this.backendLabel} session ended without answering` };
       await this.dropClaudeCode();
       return null;
     }
@@ -3030,7 +3069,7 @@ export class Engine {
       yield {
         kind: "error",
         text:
-          `Claude Code: ${done.error}. Nothing was verified. The work above still ` +
+          `${this.backendLabel}: ${done.error}. Nothing was verified. The work above still ` +
           `happened; what follows is a report on it, not a completion.`,
       };
       // The session cannot be trusted to continue after it has failed, and a
@@ -3046,11 +3085,21 @@ export class Engine {
      * compare a plan against a bill, and it is exactly the number that must
      * not turn up in `costUsd()` as though it had been charged.
      */
-    ctx.log?.append("note", {
-      text: `claude-code: ${done.cumulativeCostUsd.toFixed(4)} USD would have been billed on the API`,
-      costEstimateUsd: done.cumulativeCostUsd,
-      subscription: true,
-    });
+    /**
+     * Only when the backend actually reported one.
+     *
+     * Claude Code's SDK reports what the same turn would have cost on the API,
+     * which is worth recording. ACP reports nothing, and a note reading
+     * "0.0000 USD would have been billed" is not a cheap turn — it is a
+     * missing number wearing a measurement's clothes.
+     */
+    if (done.cumulativeCostUsd > 0) {
+      ctx.log?.append("note", {
+        text: `${this.cfg.provider ?? "subscription"}: ${done.cumulativeCostUsd.toFixed(4)} USD would have been billed on the API`,
+        costEstimateUsd: done.cumulativeCostUsd,
+        subscription: true,
+      });
+    }
 
     return {
       msg: { role: "assistant", content: done.text || deferred || "" },
@@ -3548,18 +3597,42 @@ export class Engine {
       // Said on the way up, not only on arrival. A limit that speaks for the
       // first time when it stops you is a limit that feels like a surprise
       // bill, whatever the number on it.
-      while (
+      if (
         ceiling > 0 &&
         warned < CEILING_WARNINGS.length &&
         used >= ceiling * CEILING_WARNINGS[warned]!
       ) {
-        const pct = Math.round(CEILING_WARNINGS[warned]! * 100);
-        warned += 1;
+        // Every mark this step blew past, in one notice. The loop used to
+        // yield one line per mark, so a step that jumped from 40% to 79%
+        // printed the same sentence twice.
+        while (warned < CEILING_WARNINGS.length && used >= ceiling * CEILING_WARNINGS[warned]!) {
+          warned += 1;
+        }
+        /**
+         * The percentage actually reached, not the mark that was crossed.
+         *
+         * This printed the threshold: "1589524 of 2000000 tokens — 50% of the
+         * ceiling", which is 79%. A step can cross a mark and land well past
+         * it, and a meter that misstates its own arithmetic is the one kind of
+         * error this tool cannot afford anywhere.
+         */
+        const pct = Math.round((used / ceiling) * 100);
+        /**
+         * Advice in the unit that is actually binding.
+         *
+         * It said `/budget $5` unconditionally. Where no price is known —
+         * every Claude Code run, since a subscription turn has no dollar
+         * figure at all — the money ceiling is not what stopped anything, so
+         * that command would change a number nothing reads and the turn would
+         * hit the same wall. A bare number sets the token ceiling; `$` sets
+         * the money one.
+         */
+        const raise = priced ? `/budget ${fmtUsd(usdCeiling * 2)}` : `/budget ${ceiling * 2}`;
         yield {
           kind: "info",
           text:
-            `this turn: ${ceilingLine} — ${pct}% of the ceiling. Type /budget $5 now to raise ` +
-            `it and the turn carries on; /budget off removes it entirely.`,
+            `this turn: ${ceilingLine} — ${pct}% of the ceiling. ${raise} raises it and the ` +
+            `turn carries on; /budget off removes it entirely.`,
         };
       }
 
@@ -3623,7 +3696,7 @@ export class Engine {
       // Mechanical, and a smaller move than shedding: prune tool results that
       // later work has made irrelevant before considering the much heavier
       // option of shedding. Not free, though — see below.
-      if (!this.claudeCode && this.cfg.elideSuperseded !== false) {
+      if (!this.subprocess && this.cfg.elideSuperseded !== false) {
         // Protect the prefix once this endpoint has shown it caches. Eliding
         // rewrites a message in the middle of the conversation, so everything
         // after it is a cache miss on the next request — measured at 0% on the
@@ -3648,7 +3721,7 @@ export class Engine {
         }
       }
 
-      const auto = this.claudeCode ? 0 : this.cfg.autoShedAtTokens ?? DEFAULT_AUTO_SHED_TOKENS;
+      const auto = this.subprocess ? 0 : this.cfg.autoShedAtTokens ?? DEFAULT_AUTO_SHED_TOKENS;
       if (auto > 0 && this.transcript.historyTokens() > auto) {
         const shed = this.shed();
         if (shed) {
@@ -3673,12 +3746,12 @@ export class Engine {
       /** Whether this step's text already went out as deltas. */
       let streamedContent = false;
 
-      if (this.claudeCode) {
+      if (this.subprocess) {
         // Claude Code runs the model, the tool calls and its own context. What
         // comes back is the same three things the HTTP path produces — a final
         // message, what it cost in tokens, and why it stopped — so everything
         // below this branch is shared.
-        const got = yield* this.claudeCodeStep(step, {
+        const got = yield* this.subprocessStep(step, {
           step,
           userText,
           confirm,
@@ -4826,10 +4899,15 @@ export class Engine {
      * `claude-code://subscription/models` would fail in a way that reads as a
      * network problem and sends someone to check their wifi.
      */
-    if (this.claudeCode) {
-      const health = await claudeCodeHealth();
-      const ids: string[] = [...CLAUDE_CODE_MODELS];
-      const has = ids.includes(this.cfg.model) || this.cfg.model.startsWith("claude-");
+    if (this.subprocess) {
+      const spec = acpAgentFor(this.cfg.baseUrl);
+      const health = spec ? await acpHealth(spec) : await claudeCodeHealth();
+      const ids: string[] = spec ? acpModels(this.cfg.baseUrl) : [...CLAUDE_CODE_MODELS];
+      // An alias the CLI resolves itself is not in the list and is still
+      // valid; refusing it would be molt overruling the only party that knows.
+      const has = spec
+        ? ids.includes(this.cfg.model) || this.cfg.model.startsWith(spec.bin)
+        : ids.includes(this.cfg.model) || this.cfg.model.startsWith("claude-");
       return {
         ok: health.ok && has,
         reachable: health.installed,
@@ -4838,7 +4916,9 @@ export class Engine {
         detail:
           health.detail +
           (health.fix ? ` · run \`${health.fix}\`` : "") +
-          (has ? "" : ` · ⚠ '${this.cfg.model}' is not a Claude model (try: ${ids.join(", ")})`),
+          (has
+            ? ""
+            : ` · ⚠ '${this.cfg.model}' is not a ${spec?.label ?? "Claude"} model (try: ${ids.join(", ")})`),
       };
     }
     try {
@@ -4888,6 +4968,7 @@ export class Engine {
     // reach; a list fetched from an endpoint molt never contacts would be made
     // up. See CLAUDE_CODE_MODELS.
     if (isClaudeCode(baseUrl)) return { ok: true, ids: [...CLAUDE_CODE_MODELS] };
+    if (isAcp(baseUrl)) return { ok: true, ids: acpModels(baseUrl) };
     try {
       const res = await fetchFn(`${base}/models`, { headers: authHeaders(base, apiKey) });
       if (!res.ok) return { ok: false, error: `HTTP ${res.status} from ${base}/models` };

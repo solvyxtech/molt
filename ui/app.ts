@@ -895,6 +895,23 @@ molt.onEvent((ev) => {
         `step ${ev.step + 1} · ${ev.messages} messages · ~${ev.estTokens} tokens → ${ev.model}` +
           (ev.stream ? " · streaming" : ""),
       );
+      /**
+       * A request is out and nothing has come back. Say so.
+       *
+       * The waiting row used to be started once, on `job_start`, and removed
+       * on the first token — correctly, because streaming text is its own
+       * proof of life. Nothing ever started it again, so every silence after
+       * the first one showed nothing at all: the model thinking for a minute
+       * between steps looked exactly like a finished turn.
+       *
+       * Noticed after a spending-ceiling warning, which is simply the moment a
+       * long silence is most likely to follow: "the model keeps working, it
+       * looks dead after this and you can't tell if the model is done or still
+       * going". `setPhase` starts the row when there is none and relabels it
+       * when there is, so this is also correct on the first step.
+       */
+      setPhase("thinking");
+      bumpActivity();
       break;
 
     case "usage":
@@ -947,6 +964,8 @@ molt.onEvent((ev) => {
 
     case "info":
       endMessage();
+      // `say` bumps the waiting row below the line it just added, so a notice
+      // arriving mid-wait does not leave the spinner stranded above it.
       say("", ev.text, "info");
       break;
 
@@ -2033,6 +2052,14 @@ $("set-claude-code").addEventListener("click", async () => {
 });
 
 $("set-refresh").addEventListener("click", () => {
+  // Same rule, same words, one more place it matters: asking an address molt
+  // cannot speak to is a round trip that can only fail, and "Models refreshed."
+  // over a refused endpoint reads as if the address were fine.
+  const wrong = endpointFieldProblem();
+  if (wrong) {
+    $("set-status").textContent = wrong;
+    return;
+  }
   $("set-status").textContent = "Asking endpoints…";
   void fillModelSelect(true).then(() => ($("set-status").textContent = "Models refreshed."));
 });
