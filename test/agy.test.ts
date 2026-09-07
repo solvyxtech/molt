@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import {
   AGY_URL,
+  agyAsk,
   agyAllowRules,
   agyEnv,
   agyHealth,
@@ -25,6 +26,7 @@ import { Archive } from "../src/archive.js";
 import { parseBar } from "../src/bar.js";
 import { CLAUDE_CODE_URL } from "../src/claude-code.js";
 import { draftCriteria } from "../src/criteria.js";
+import { interviewTurn } from "../src/interview.js";
 import { Engine } from "../src/engine.js";
 import { isSelfHosted, PROVIDERS, providerName } from "../src/providers.js";
 import { Receipts } from "../src/receipts.js";
@@ -302,10 +304,15 @@ describe("nothing on the Antigravity endpoint reaches for HTTP", () => {
   });
 
   /**
-   * Refused in words rather than by a failed fetch. `agy` brings its 57 tools
-   * whatever you ask of it, so there is no tool-free one-shot to draft with.
+   * Drafted through the CLI, not over HTTP — and not refused.
+   *
+   * This used to answer "Antigravity cannot draft criteria yet", which the
+   * window turns into an apology on every first Run because it drafts
+   * automatically. `interview.ts` already carried that lesson from the Claude
+   * Code backend; this repeated it anyway, and a user hit it.
    */
-  it("says why it cannot draft criteria, instead of failing as a network error", async () => {
+  it("drafts criteria through the CLI instead of over HTTP", async () => {
+    let argv: string[] = [];
     const r = await draftCriteria({
       task: "audit this repo",
       scripts: ["test"],
@@ -313,9 +320,60 @@ describe("nothing on the Antigravity endpoint reaches for HTTP", () => {
       baseUrl: AGY_URL,
       model: "gemini-3.1-pro-low",
       fetchFn: noFetch("draftCriteria"),
+      agyRun: async (_c, args) => {
+        argv = args;
+        return {
+          stdout: JSON.stringify({
+            status: "SUCCESS",
+            response: '{"checks":[{"name":"suite","run":"npm test"}],"notes":["reads cleanly"]}',
+          }),
+        };
+      },
+    });
+    assert.ok(r.ok, r.ok ? "" : r.error);
+    assert.deepEqual(r.ok ? r.draft.checks.map((c) => c.run) : [], ["npm test"]);
+    // The task reached the model, so this is its answer and not a canned one.
+    assert.ok(
+      argv.some((a) => a.includes("audit this repo")),
+      `the task must be in the prompt: ${JSON.stringify(argv)}`,
+    );
+    // And no MCP server is on offer for a question: nothing here can write.
+    assert.ok(!argv.some((a) => /mcp/iu.test(a)), JSON.stringify(argv));
+  });
+
+  it("runs the interview through the CLI too", async () => {
+    const r = await interviewTurn({
+      task: "audit this repo",
+      scripts: ["test"],
+      barChecks: ["types"],
+      history: [],
+      round: 1,
+      baseUrl: AGY_URL,
+      model: "gemini-3.1-pro-low",
+      fetchFn: noFetch("interviewTurn"),
+      agyRun: async () => ({
+        stdout: JSON.stringify({
+          status: "SUCCESS",
+          response: JSON.stringify({
+            questions: [{ id: "q1", prompt: "What counts as done?", options: ["tests pass", "a demo"] }],
+          }),
+        }),
+      }),
+    });
+    assert.equal(r.kind, "ask");
+    assert.equal(r.kind === "ask" ? r.questions[0]?.prompt : "", "What counts as done?");
+  });
+
+  /** A refusal from the CLI is reported as itself, not as an empty answer. */
+  it("reports a refusal from the CLI rather than returning nothing", async () => {
+    const r = await agyAsk({
+      model: "gemini-3.1-pro-low",
+      systemPrompt: "S",
+      prompt: "P",
+      run: async () => ({ stdout: JSON.stringify({ status: "ERROR", error: "usage limit" }) }),
     });
     assert.equal(r.ok, false);
-    assert.match(r.ok ? "" : r.error, /Antigravity/u);
+    assert.match(r.ok ? "" : r.error, /usage limit/u);
   });
 });
 
