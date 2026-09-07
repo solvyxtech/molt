@@ -21,6 +21,7 @@
  *  - Anything not mechanically checkable is a note, and is labelled as one.
  *    A sentence dressed as a check is worse than no check.
  */
+import { acpAgentFor, acpAsk } from "./acp.js";
 import { claudeCodeAsk, isClaudeCode, type Sdk } from "./claude-code.js";
 import { errorText } from "./format.js";
 import { authHeaders } from "./providers.js";
@@ -203,6 +204,8 @@ export async function draftCriteria(opts: {
   cwd?: string;
   fetchFn?: typeof fetch;
   claudeCodeSdk?: Sdk;
+  /** How an ACP agent is spawned. Tests only; see `EngineConfig.acpSpawn`. */
+  acpSpawn?: typeof import("node:child_process").spawn;
 }): Promise<{ ok: true; draft: Draft } | { ok: false; error: string }> {
   const f = opts.fetchFn ?? fetch;
   const base = opts.baseUrl.replace(/\/$/, "");
@@ -226,6 +229,28 @@ export async function draftCriteria(opts: {
    * that would have answered is a subprocess away; `claudeCodeAsk` spawns it
    * with no tools, and a draft is still only a proposal a person approves.
    */
+  /**
+   * The ACP backends have no endpoint either, for the same reason.
+   *
+   * Asked first, because `isClaudeCode` and `acpAgentFor` are both false for
+   * an HTTP endpoint and the order between them is arbitrary — but a reader
+   * looking for "what happens when there is no URL" should find both cases
+   * together rather than one here and one three screens down.
+   */
+  const acp = acpAgentFor(opts.baseUrl);
+  if (acp) {
+    const asked = await acpAsk({
+      spec: acp,
+      model: opts.model,
+      systemPrompt: SYSTEM,
+      prompt: context,
+      cwd: opts.cwd,
+      ...(opts.acpSpawn ? { spawnFn: opts.acpSpawn } : {}),
+    });
+    if (!asked.ok) return { ok: false, error: asked.error };
+    return { ok: true, draft: parseDraft(asked.text) };
+  }
+
   if (isClaudeCode(opts.baseUrl)) {
     const asked = await claudeCodeAsk({
       model: opts.model,

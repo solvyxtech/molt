@@ -95,6 +95,29 @@ describe("doctor", () => {
     assert.equal(d.ok, true);
     assert.match(d.detail, /model list unavailable/);
   });
+
+  /**
+   * `endpointProblem`'s own doc comment has always named `molt doctor` as a
+   * caller. It was not one: an unusable `baseUrl` reached `fetchFn`, which
+   * threw, and `doctor` reported it exactly as it reports a dead network —
+   * "cannot reach <url>: TypeError" — the same misdiagnosis the engine's
+   * retry loop exists to avoid, uncaught in the one command whose whole job
+   * is to tell you what is actually wrong.
+   */
+  it("names a bad endpoint instead of reporting it as an unreachable one", async () => {
+    const engine = new Engine({
+      baseUrl: "just some words",
+      model: "anything",
+      cwd: ws(),
+      bar: null,
+      fetchFn: endpoint([]),
+    });
+    const d = await engine.doctor();
+    assert.equal(d.ok, false);
+    assert.equal(d.reachable, false);
+    assert.match(d.detail, /is not an endpoint/);
+    assert.doesNotMatch(d.detail, /cannot reach/, "fetch was asked to judge a string it never should have seen");
+  });
 });
 
 describe("tag selection", () => {

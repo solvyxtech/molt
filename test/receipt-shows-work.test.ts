@@ -121,3 +121,48 @@ describe("a receipt shows the lines the turn wrote", () => {
     assert.ok(shown <= 120, `printed ${shown} lines; a receipt has to stay readable`);
   });
 });
+
+/**
+ * A test that matches source text can pass while the thing it names is broken.
+ *
+ * Receipt 0062 wired the `claude-code` shorthand into the window and pinned it
+ * with assertions like
+ *
+ *     /return typed \? endpointProblem\(endpointFieldValue\(\)\) : null;/
+ *
+ * which still passes if `endpointFieldValue` quietly stops expanding: the line
+ * it matches never changes. It pinned a call site while reading like it pinned
+ * behaviour, and `mutation` cannot catch it, because the assertion runs against
+ * a string read off disk rather than executed code.
+ *
+ * The cure is not a better regex, it is a function a test can call — the same
+ * move that produced ui/markdown.ts, ui/wait-words.ts and src/endpoint.ts. What
+ * stays in app.ts is wiring, and wiring is the one thing a source assertion is
+ * the honest tool for.
+ */
+describe("the endpoint guard is run, not matched", () => {
+  it("answers for every shape the box can hold", async () => {
+    const { typedEndpointProblem } = await import("../src/endpoint.js");
+    assert.equal(typedEndpointProblem("claude-code"), null, "the shorthand is an endpoint");
+    assert.equal(typedEndpointProblem("  claude-code  "), null, "however it is spaced");
+    assert.equal(typedEndpointProblem("https://api.openai.com/v1"), null);
+    assert.equal(typedEndpointProblem("http://localhost:11434/v1"), null);
+    assert.equal(typedEndpointProblem(""), null, "an empty box is not a problem yet");
+    assert.equal(typedEndpointProblem("   "), null, "nor is a box of spaces");
+    assert.match(typedEndpointProblem("claude-cod") ?? "", /is not an endpoint/);
+    assert.match(typedEndpointProblem("ftp://x/v1") ?? "", /ftp/);
+  });
+
+  /**
+   * The mutation this guards against, written out. Break the expansion and the
+   * shorthand stops being an endpoint — which the old source-matching
+   * assertion would not have noticed.
+   */
+  it("fails if the expansion is ever dropped", async () => {
+    const { endpointProblem, expandEndpointShorthand } = await import("../src/endpoint.js");
+    const withExpansion = endpointProblem(expandEndpointShorthand("claude-code"));
+    const without = endpointProblem("claude-code");
+    assert.equal(withExpansion, null);
+    assert.ok(without, "the two paths must not agree, or the test proves nothing");
+  });
+});

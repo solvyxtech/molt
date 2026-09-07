@@ -26,6 +26,7 @@ import {
   claudeCodeHealth,
   isClaudeCode,
 } from "../src/claude-code.js";
+import { ACP_AGENTS, acpAgentFor, acpHealth } from "../src/acp.js";
 import { keyFor } from "./endpoint-key.js";
 import { draftCriteria, type Draft } from "./criteria.js";
 import {
@@ -366,6 +367,45 @@ function createWindow(): void {
         console.log(`[e2e] claude-code ${ccStatus || "NO ANSWER"}`);
         if (!ccStatus) {
           console.error("[e2e] the Claude Code button answered nothing");
+          app.exit(1);
+          return;
+        }
+
+        /**
+         * A bad endpoint, typed into Settings and saved.
+         *
+         * The window used to accept any string here and hand it to the engine,
+         * which then failed four retries deep as if the network were down.
+         * Driven through the real button so what is proven is the refusal a
+         * person meets: the message is the shared rule's own words, no session
+         * opens, and the text they must correct is still in the box.
+         */
+        const badUrl = "localhost:11434/v1";
+        const refused = await win!.webContents.executeJavaScript(`(async () => {
+          document.getElementById("set-cwd").value = ${JSON.stringify(cwd)};
+          document.getElementById("set-model").value = ${JSON.stringify(model)};
+          document.getElementById("set-url").value = ${JSON.stringify(badUrl)};
+          document.getElementById("set-open").click();
+          await new Promise((r) => setTimeout(r, 300));
+          return {
+            status: document.getElementById("set-status").textContent || "",
+            left: document.getElementById("set-url").value,
+            tab: document.querySelector(".tab.active")?.dataset.tab || "",
+          };
+        })()`);
+        console.log(`[e2e] endpoint   refused: ${JSON.stringify(refused.status).slice(0, 120)}`);
+        // The scheme sentence, in full: `localhost:11434/v1` parses as the
+        // scheme "localhost", which is the mistake this is standing in for.
+        const refusedOk =
+          refused.status.includes(`'${badUrl}' uses the scheme 'localhost'`) &&
+          refused.status.includes("which molt cannot speak") &&
+          refused.left === badUrl &&
+          refused.tab === "settings";
+        if (!refusedOk) {
+          console.error(
+            `[e2e] the window accepted a bad endpoint — status=${JSON.stringify(refused.status)} ` +
+              `field=${JSON.stringify(refused.left)} tab=${JSON.stringify(refused.tab)}`,
+          );
           app.exit(1);
           return;
         }
@@ -1077,11 +1117,12 @@ async function refreshPricing(s: Session, announce: boolean): Promise<void> {
    * publishes no rate reads as a gap in molt's knowledge rather than the
    * absence of a charge. Same correction the terminal footer got.
    */
-  if (isClaudeCode(s.baseUrl)) {
+  const plan = isClaudeCode(s.baseUrl) ? "Claude" : acpAgentFor(s.baseUrl)?.label;
+  if (plan) {
     if (announce)
       send("engine:event", {
         kind: "info",
-        text: `your Claude plan is paying for this — the meter shows tokens, not money`,
+        text: `your ${plan} plan is paying for this — the meter shows tokens, not money`,
       });
     return;
   }
@@ -1409,6 +1450,42 @@ ipcMain.handle("claudeCode:health", async () => ({
   url: CLAUDE_CODE_URL,
   models: [...CLAUDE_CODE_MODELS],
 }));
+
+/**
+ * The same question for the other subscriptions molt can drive.
+ *
+ * A separate channel rather than a widened `claudeCode:health`, because the
+ * window asks that one for a single backend and answers it with a single
+ * button; this one answers with a list, and a caller that got an array where
+ * it expected an object would render an empty panel and say nothing.
+ *
+ * Every agent is probed, installed or not: "Grok Build is not on PATH" with
+ * the install command beside it is the answer somebody deciding whether to buy
+ * a subscription actually wants, and hiding the row until it works means the
+ * feature is invisible to everyone who does not already have it.
+ */
+/**
+ * Where the packaged app keeps the MCP stdio bridge.
+ *
+ * `acp.ts` cannot work this out for itself here: esbuild replaces
+ * `import.meta` with an empty object in a CommonJS bundle, and `__dirname` —
+ * which does know — only exists in this file. Set once, at load, so the answer
+ * is already there the first time a Gemini session opens rather than being
+ * discovered as a spawn failure with no tools behind it.
+ */
+process.env.MOLT_MCP_BRIDGE ??= join(__dirname, "mcp-bridge.js");
+
+ipcMain.handle("acp:health", async () =>
+  Promise.all(
+    ACP_AGENTS.map(async (a) => ({
+      ...(await acpHealth(a)),
+      name: a.name,
+      label: a.label,
+      url: a.url,
+      models: [...a.models],
+    })),
+  ),
+);
 
 /** The renderer answering a tool confirmation. */
 ipcMain.on("confirm:reply", (_e, id: string, ok: boolean) => {

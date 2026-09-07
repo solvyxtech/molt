@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { parseArgs } from "../src/cli.js";
+import { CLAUDE_CODE_URL } from "../src/claude-code.js";
 
 describe("parseArgs", () => {
   it("defaults to local Ollama", () => {
@@ -13,6 +14,14 @@ describe("parseArgs", () => {
     assert.equal(a.url, "http://localhost:11434/v1");
     assert.equal(a.cmd, "");
     assert.equal(a.yes, false);
+  });
+
+  it("expands the 'claude-code' shorthand to the sentinel the backend checks for", () => {
+    // The expansion itself moved to src/endpoint.ts, beside endpointProblem,
+    // so this pins that the flag parser still goes through it rather than
+    // having grown a second copy that only this file knows.
+    const a = parseArgs(["run", "x", "--url", "claude-code"]);
+    assert.equal(a.url, CLAUDE_CODE_URL);
   });
 
   it("reads a subcommand and its task", () => {

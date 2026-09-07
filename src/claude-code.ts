@@ -63,8 +63,6 @@ import { promisify } from "node:util";
 
 import { errorText } from "./format.js";
 
-const exec = promisify(execFile);
-
 /**
  * The endpoint molt stores for this backend.
  *
@@ -73,13 +71,17 @@ const exec = promisify(execFile);
  * and a second way to say "where does the model live" is a second thing to
  * keep in step. It is not fetchable, and nothing tries: `isClaudeCode` guards
  * every path that would.
+ *
+ * Defined in `src/endpoint.ts`, not here: it is a plain string, and this file
+ * opens with six `node:` imports that would make it unusable from the window.
+ * Re-exported so every existing importer of `./claude-code.js` still finds it.
+ * `isClaudeCode` moved with it for the same reason: the scheme it compares
+ * against used to be a second copy of the literal in `CLAUDE_CODE_URL`, one
+ * edit away from disagreeing with it.
  */
-export const CLAUDE_CODE_URL = "claude-code://subscription";
+export { CLAUDE_CODE_URL, isClaudeCode } from "./endpoint.js";
 
-/** Is this endpoint the Claude Code backend rather than an HTTP API? */
-export function isClaudeCode(baseUrl: string | undefined): boolean {
-  return (baseUrl ?? "").trim().toLowerCase().startsWith("claude-code://");
-}
+const exec = promisify(execFile);
 
 /**
  * Models this backend offers.
@@ -948,4 +950,28 @@ export class ClaudeCodeSession<H> {
       // A session being torn down has nothing left to report.
     }
   }
+}
+
+/**
+ * What any backend that is a subprocess rather than an endpoint tells molt.
+ *
+ * `ClaudeCodeEvent` was the only such shape when it was written; `acp.ts` now
+ * produces the same one for Grok Build and Gemini CLI. Aliased rather than
+ * renamed because the name is load-bearing in the engine's Claude Code path
+ * and a rename there is a diff that reviews as "everything changed".
+ */
+export type BackendEvent<H> = ClaudeCodeEvent<H>;
+
+/**
+ * The three methods the engine needs from a subprocess backend.
+ *
+ * Structural, so `ClaudeCodeSession` and `AcpSession` satisfy it without
+ * either importing the other — the engine holds one of these and does not ask
+ * which. That is the whole point: a receipt, a bar and a ceiling cannot tell
+ * the backends apart, and neither should the loop.
+ */
+export interface BackendSession<H> {
+  send(messages: readonly string[]): AsyncGenerator<BackendEvent<H>>;
+  close(): Promise<void>;
+  costSoFarUsd(): number;
 }

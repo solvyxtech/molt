@@ -11,6 +11,7 @@
  * tool whose whole pitch is an auditable record never writes a credential
  * into one.
  */
+import { ACP_AGENTS, isAcp } from "./acp.js";
 import { CLAUDE_CODE_URL, isClaudeCode } from "./claude-code.js";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -45,6 +46,22 @@ export const PROVIDERS: Record<string, Provider> = {
     hint: "runs your own logged-in Claude Code — a Pro/Max plan pays for it, not a key",
   },
   groq: { url: "https://api.groq.com/openai/v1", needsKey: true },
+  /**
+   * The other two subscriptions molt can drive, on the same terms as
+   * `claude-code`: molt spawns the CLI you logged in and speaks ACP to it, so
+   * there is no key to hold and `needsKey` is false for something that is
+   * anything but free. See acp.ts.
+   */
+  ...Object.fromEntries(
+    ACP_AGENTS.map((a) => [
+      a.name,
+      {
+        url: a.url,
+        needsKey: false,
+        hint: `runs your own logged-in ${a.label} — a subscription pays for it, not a key`,
+      },
+    ]),
+  ),
 };
 
 /** Providers you can hold a key for, in listing order. */
@@ -427,40 +444,13 @@ export function keyForUrl(
 }
 
 /**
- * Why this endpoint cannot be used, or null when it can.
+ * Re-exported, not defined here.
  *
- * `fetch` is the only thing that ever judged this, and it judges late and
- * badly: `--url claude-code` (the shorthand, typed at a build that did not
- * have it) produced `TypeError: Failed to parse URL from
- * claude-code/chat/completions`, which molt classified as a network fault and
- * retried four times over seven seconds before giving up. A string that is not
- * an address does not become one on the second attempt.
- *
- * Kept pure and here rather than in the CLI because three callers need the
- * same answer: the flag parser, the engine before it retries, and the doctor.
+ * The judgement itself lives in `./endpoint.js` so the renderer can import it:
+ * this file reads and writes auth.json, and a browser bundle cannot carry
+ * `node:fs`. Everything that already asked providers.ts for it still gets it.
  */
-export function endpointProblem(baseUrl: string): string | null {
-  const url = (baseUrl ?? "").trim();
-  if (!url) return "no endpoint is set — pass --url, or run /login to pick a provider";
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return (
-      `'${url}' is not an endpoint. Give a full base URL like ` +
-      `https://api.openai.com/v1 or http://localhost:11434/v1, a provider name to ` +
-      `/login, or 'claude-code' to run your own logged-in Claude Code.`
-    );
-  }
-  const allowed = ["http:", "https:", "claude-code:"];
-  if (!allowed.includes(parsed.protocol)) {
-    return (
-      `'${url}' uses the scheme '${parsed.protocol.replace(":", "")}', which molt cannot ` +
-      `speak. Endpoints are http or https; 'claude-code' runs the CLI instead.`
-    );
-  }
-  return null;
-}
+export { endpointProblem } from "./endpoint.js";
 
 export function isSelfHosted(baseUrl: string): boolean {
   /**
@@ -471,7 +461,7 @@ export function isSelfHosted(baseUrl: string): boolean {
    * wrong for a frontier model: with the map it won 3 of 3 paired runs and
    * cost 23% less. Said first, before the address is parsed at all.
    */
-  if (isClaudeCode(baseUrl)) return false;
+  if (isClaudeCode(baseUrl) || isAcp(baseUrl)) return false;
   let host = "";
   try {
     host = new URL(baseUrl).hostname.toLowerCase();
