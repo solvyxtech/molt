@@ -7,7 +7,9 @@
  * bar is not met, so molt can sit in CI, in a script, or in a benchmark
  * harness without a human watching.
  */
-import { CLAUDE_CODE_URL, isClaudeCode } from "./claude-code.js";
+import { ACP_AGENTS, acpAgentFor } from "./acp.js";
+import { isClaudeCode } from "./claude-code.js";
+import { expandEndpointShorthand } from "./endpoint.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Archive } from "./archive.js";
@@ -303,8 +305,19 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
          * The backend's endpoint is a sentinel, not an address, and asking
          * someone to spell `claude-code://subscription` exactly is asking them
          * to get it wrong. The full form still works and is what gets stored.
+         *
+         * The translation itself lives in `src/endpoint.ts`, beside
+         * `endpointProblem`, so the engine and the window expand the same word
+         * this flag does rather than each learning it separately.
          */
-        out.url = given === "claude-code" ? CLAUDE_CODE_URL : given;
+        const expanded = expandEndpointShorthand(given);
+        out.url =
+          expanded !== given
+            ? expanded
+            : // Same shorthand for the ACP CLIs: `--url grok-build`, not
+              // `grok-build://subscription`. A sentinel nobody can spell is a
+              // sentinel nobody uses.
+              (ACP_AGENTS.find((a) => a.name === given)?.url ?? given);
         /**
          * Refused here, not four retries later.
          *
@@ -908,7 +921,9 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
             // molt's knowledge. It is not one: nothing was charged.
             isClaudeCode(engine.cfg.baseUrl)
             ? " · your Claude plan, not metered"
-            : " · no price for this model"
+            : acpAgentFor(engine.cfg.baseUrl)
+              ? ` · your ${acpAgentFor(engine.cfg.baseUrl)!.label} plan, not metered`
+              : " · no price for this model"
           : ` · ${b.costEstimated ? "~" : ""}${fmtCost(b.costUsd)}`) +
         "\n",
     );

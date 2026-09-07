@@ -35,7 +35,7 @@ import { mutatesSession } from "../electron/limits.js";
 import { fmtCost } from "../src/format.js";
 import { COMMANDS, matchCommands } from "../src/commands.js";
 import { providerName, endpointProblem as fromProviders } from "../src/providers.js";
-import { endpointProblem } from "../src/endpoint.js";
+import { CLAUDE_CODE_URL, endpointProblem, expandEndpointShorthand, typedEndpointProblem } from "../src/endpoint.js";
 import {
   INTERVIEW_MAX_ROUNDS,
   applyBarAdds,
@@ -1397,12 +1397,36 @@ describe("/clear drops a held spec, not just the stream", () => {
  * the renderer imports the rule rather than growing a second one.
  */
 describe("a bad endpoint is refused where it is typed", () => {
+  /**
+   * Everything before `needle`, which has to be there.
+   *
+   * Ordering was written here as `a > 0 && a < b` over `indexOf` results, and
+   * the mutation check found the hole: the only values those expressions can
+   * take are -1 and a real offset, so `>` and `>=` are indistinguishable and
+   * the comparison proved nothing. Asked as a substring question instead,
+   * which is both mutable and stricter — what must follow the guard may not
+   * appear before it at all, rather than merely later than its first mention.
+   */
+  function textBefore(hay: string, needle: string, why: string): string {
+    assert.ok(hay.includes(needle), why);
+    return hay.slice(0, hay.indexOf(needle));
+  }
+
   it("asks the shared rule instead of reimplementing it", () => {
     const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    // The intent, not the spelling: the window asks the shared module. Naming
+    // the exact import list made this fail the moment the shared module grew a
+    // better entry point — a test breaking on a rename it should not care
+    // about, which is the same fault as pinning the body of a function.
     assert.match(
       ui,
-      /import \{ endpointProblem \} from "\.\.\/src\/endpoint\.js"/,
+      /from "\.\.\/src\/endpoint\.js"/,
       "the window must import the rule the CLI and engine use",
+    );
+    assert.doesNotMatch(
+      ui,
+      /function (endpointProblem|expandEndpointShorthand)\b/,
+      "…and must not grow its own copy of it",
     );
     assert.match(ui, /function endpointFieldProblem\(\)/, "one place reads the box");
   });
@@ -1411,12 +1435,17 @@ describe("a bad endpoint is refused where it is typed", () => {
     const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
     const open = ui.slice(ui.indexOf('$("set-open").addEventListener'));
     const body = open.slice(0, open.indexOf('$("set-theme")'));
-    const guard = body.indexOf("endpointFieldProblem()");
-    const session = body.indexOf("molt.openSession(");
-    const save = body.indexOf("molt.saveEndpoint(");
-    assert.ok(guard > 0, "the save path never asks");
-    assert.ok(guard < session, "a bad endpoint reached openSession");
-    assert.ok(guard < save, "a bad endpoint was written to the config");
+    const untilGuard = textBefore(body, "endpointFieldProblem()", "the save path never asks");
+    assert.doesNotMatch(untilGuard, /molt\.openSession\(/, "a bad endpoint reached openSession");
+    assert.doesNotMatch(
+      untilGuard,
+      /molt\.saveEndpoint\(/,
+      "a bad endpoint was written to the config for the next launch to inherit",
+    );
+    // …and both still happen, after it. A guard that passes by having removed
+    // the work is not a guard.
+    assert.match(body, /molt\.openSession\(/, "the save path stopped opening a session");
+    assert.match(body, /molt\.saveEndpoint\(/, "the save path stopped storing the endpoint");
     // The message shown is the rule's own words, not a second phrasing that
     // drifts from the one the terminal prints for the same string.
     assert.match(body, /\$\("set-status"\)\.textContent = wrong;/);
@@ -1443,9 +1472,16 @@ describe("a bad endpoint is refused where it is typed", () => {
   it("surfaces a stored endpoint it would refuse as soon as the window opens", () => {
     const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
     const boot = ui.slice(ui.indexOf("async function boot()"));
-    const stored = boot.indexOf("molt.storedEndpoint()");
-    const check = boot.indexOf("endpointFieldProblem()");
-    assert.ok(stored > 0 && check > stored, "a config full of nonsense looks fine until you click");
+    const untilCheck = textBefore(
+      boot,
+      "endpointFieldProblem()",
+      "a config full of nonsense looks fine until you click",
+    );
+    assert.match(
+      untilCheck,
+      /molt\.storedEndpoint\(\)/,
+      "the stored endpoint is judged before it has been read",
+    );
     assert.match(boot, /if \(storedWrong\) \$\("set-status"\)\.textContent = storedWrong;/);
   });
 
@@ -1483,13 +1519,98 @@ describe("a bad endpoint is refused where it is typed", () => {
     assert.match(endpointProblem(null as unknown as string) ?? "", /no endpoint is set/);
   });
 
+  /**
+   * `--url claude-code` expanded to the sentinel at the flag since the
+   * shorthand was written. Nowhere else that took a base URL knew the word,
+   * so typing it into Settings was refused as "not an endpoint" — the exact
+   * complaint this test would have caught before it shipped.
+   */
+  it("expands the 'claude-code' shorthand the same way everywhere", () => {
+    assert.equal(expandEndpointShorthand("claude-code"), CLAUDE_CODE_URL);
+    assert.equal(expandEndpointShorthand("  claude-code  "), CLAUDE_CODE_URL);
+    // Only the short spelling is rewritten; the long one and anything else
+    // pass through untouched.
+    assert.equal(expandEndpointShorthand(CLAUDE_CODE_URL), CLAUDE_CODE_URL);
+    assert.equal(expandEndpointShorthand("https://api.openai.com/v1"), "https://api.openai.com/v1");
+    assert.equal(expandEndpointShorthand(""), "");
+    // The bug: typed and handed to `endpointProblem` unexpanded, "claude-code"
+    // is not a URL at all.
+    assert.match(endpointProblem("claude-code") ?? "", /is not an endpoint/);
+    // Expanded first, as every caller must, it is accepted.
+    assert.equal(endpointProblem(expandEndpointShorthand("claude-code")), null);
+  });
+
+  it("expands the shorthand in the window before it is judged or used", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    assert.match(
+      ui,
+      /return expandEndpointShorthand\(/,
+      "the window stopped expanding 'claude-code' before using the box",
+    );
+    /**
+     * Judged by running it, not by matching the line that implements it.
+     *
+     * This used to assert the source text of the guard. That assertion still
+     * passes if `endpointFieldValue` quietly stops expanding — the line it
+     * matches never changes — so it pinned a call site while reading like it
+     * pinned behaviour, and `mutation` could not catch it, because it ran
+     * against a string read off disk rather than executed code.
+     */
+    assert.equal(typedEndpointProblem("claude-code"), null, "the shorthand must be accepted");
+    assert.equal(typedEndpointProblem("  claude-code  "), null, "however it is spaced");
+    assert.equal(typedEndpointProblem("https://api.openai.com/v1"), null);
+    assert.equal(typedEndpointProblem(""), null, "an empty box is not a problem yet");
+    assert.match(
+      typedEndpointProblem("just some words") ?? "",
+      /is not an endpoint/,
+      "and text that is not an endpoint is still refused",
+    );
+    // …and opened through it: a session must not be handed the bare word.
+    const open = ui.slice(ui.indexOf('$("set-open").addEventListener'));
+    const body = open.slice(0, open.indexOf('$("set-theme")'));
+    assert.match(
+      body,
+      /const baseUrl = endpointFieldValue\(\);/,
+      "typing 'claude-code' and opening would send the literal word to the engine",
+    );
+  });
+
   it("refuses before it spends a round trip on an address it cannot speak to", () => {
     const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
     const refresh = ui.slice(ui.indexOf('$("set-refresh").addEventListener'));
     const body = refresh.slice(0, 600);
-    const guard = body.indexOf("endpointFieldProblem()");
-    const ask = body.indexOf("fillModelSelect(true)");
-    assert.ok(guard > 0 && guard < ask, '"Models refreshed." over an endpoint molt refuses');
+    const untilGuard = textBefore(body, "endpointFieldProblem()", "the refresh path never asks");
+    assert.doesNotMatch(
+      untilGuard,
+      /fillModelSelect\(true\)/,
+      '"Models refreshed." over an endpoint molt refuses',
+    );
+    assert.match(body, /fillModelSelect\(true\)/, "refresh stopped asking the endpoints at all");
+  });
+
+  /**
+   * The renderer is not executed by `npm test` — it is a browser bundle, and
+   * this suite is Node. So the lines the window's refusal is made of are
+   * pinned as the source that ships. Without this, inverting the ternary or
+   * dropping the `!` changes real behaviour and every check stays green.
+   */
+  it("pins the lines the refusal is actually made of", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    // Wiring is the one thing only the source can answer: does the window ask
+    // at all, and does it hand over what the person typed?
+    assert.match(
+      ui,
+      /return typedEndpointProblem\(\(\$\("set-url"\) as HTMLInputElement\)\.value\)/,
+      "the guard stopped reading the endpoint box",
+    );
+    // Whether the answer is right is a question for the function itself.
+    assert.match(typedEndpointProblem("not a url") ?? "", /is not an endpoint/);
+    assert.equal(typedEndpointProblem("http://localhost:11434/v1"), null);
+    assert.match(
+      ui,
+      /if \(!endpointFieldProblem\(\)\) \{/,
+      "a failed model lookup clobbers the endpoint message again",
+    );
   });
 
   /**

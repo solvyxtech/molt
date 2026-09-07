@@ -4978,6 +4978,18 @@ export class Engine {
             : ` · ⚠ '${this.cfg.model}' is not a ${spec?.label ?? "Claude"} model (try: ${ids.join(", ")})`),
       };
     }
+    /**
+     * The third caller this file's own doc comment names.
+     *
+     * `endpointProblem`'s comment has always said four callers need this
+     * answer, doctor among them, but nothing here ever asked it: a garbage
+     * `baseUrl` reached `fetchFn` and came back a `TypeError`, caught below
+     * and reported as "cannot reach ... TypeError" — the same misdiagnosis
+     * the retry loop above exists to avoid, just uncaught in the one place
+     * `molt doctor` is supposed to be the honest answer.
+     */
+    const badEndpoint = endpointProblem(this.cfg.baseUrl);
+    if (badEndpoint) return { ok: false, reachable: false, detail: badEndpoint };
     try {
       const res = await fetchFn(`${base}/models`, { headers: authHeaders(base, this.cfg.apiKey) });
       if (!res.ok) {

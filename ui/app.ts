@@ -16,7 +16,7 @@ import { renderMarkdown } from "./markdown.js";
 import { nextWaitWord } from "./wait-words.js";
 import { playSplash } from "./splash.js";
 import { fmtCost } from "../src/format.js";
-import { endpointProblem } from "../src/endpoint.js";
+import { expandEndpointShorthand, typedEndpointProblem } from "../src/endpoint.js";
 import { matchCommands } from "../src/commands.js";
 import { JOURNAL_RENDER_CAP, STREAM_CAP, contextCap, contextFill, newest, trimOldest } from "./bounds.js";
 import { holdAfterAutoDraft, taskForRun } from "./criteria-hold.js";
@@ -1745,6 +1745,23 @@ $("set-savekey").addEventListener("click", async () => {
 });
 
 /**
+ * What the endpoint box means, as an address rather than as typed text.
+ *
+ * `--url claude-code` has worked at the flag since the shorthand was written;
+ * the window never got it, because the flag parser was the only place that
+ * translated the word into `claude-code://subscription` — everywhere else
+ * that read a base URL treated `'claude-code'` as a literal address and sent
+ * it to `fetch`, which is the same "not a network problem" mistake
+ * `endpointProblem` exists to catch, just upstream of where it could catch it.
+ * `expandEndpointShorthand` now lives beside `endpointProblem` in
+ * `src/endpoint.ts` for exactly this reason, so this is the one place the
+ * window reads the box rather than a second one that forgot to expand it.
+ */
+function endpointFieldValue(): string {
+  return expandEndpointShorthand(($("set-url") as HTMLInputElement).value.trim());
+}
+
+/**
  * Why the endpoint box cannot be used as typed, or null.
  *
  * The same judgement the flag parser and the engine make, in the same words —
@@ -1762,14 +1779,15 @@ $("set-savekey").addEventListener("click", async () => {
  * once, alongside workspace and model, by the caller below.
  */
 function endpointFieldProblem(): string | null {
-  const typed = ($("set-url") as HTMLInputElement).value.trim();
-  return typed ? endpointProblem(typed) : null;
+  // One line of wiring. The decision lives in src/endpoint.ts, where a test
+  // can run it rather than match the text of this line.
+  return typedEndpointProblem(($("set-url") as HTMLInputElement).value);
 }
 
 $("set-open").addEventListener("click", async () => {
   const cwd = ($("set-cwd") as HTMLInputElement).value.trim();
   const model = ($("set-model") as HTMLInputElement).value.trim();
-  const baseUrl = ($("set-url") as HTMLInputElement).value.trim();
+  const baseUrl = endpointFieldValue();
   if (!cwd || !model || !baseUrl) {
     $("set-status").textContent = "Workspace, model and endpoint are all required.";
     return;
@@ -1827,7 +1845,7 @@ let sourceCache: ModelSource[] | null = null;
 
 async function sources(force = false): Promise<ModelSource[]> {
   if (sourceCache && !force) return sourceCache;
-  const url = ($("set-url") as HTMLInputElement).value.trim() || state?.baseUrl || "";
+  const url = endpointFieldValue() || state?.baseUrl || "";
   const key = ($("set-key") as HTMLInputElement).value.trim() || undefined;
   sourceCache = await molt.listModels(url ? { url, key } : undefined);
   return sourceCache;
