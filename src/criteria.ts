@@ -21,6 +21,8 @@
  *  - Anything not mechanically checkable is a note, and is labelled as one.
  *    A sentence dressed as a check is worse than no check.
  */
+import { claudeCodeAsk, isClaudeCode, type Sdk } from "./claude-code.js";
+import { errorText } from "./format.js";
 import { authHeaders } from "./providers.js";
 import { runCommand } from "./run.js";
 import { diagnoseFailure } from "./bar.js";
@@ -197,7 +199,10 @@ export async function draftCriteria(opts: {
   baseUrl: string;
   apiKey?: string;
   model: string;
+  /** Where the draft is asked for. Only the Claude Code transport reads it. */
+  cwd?: string;
   fetchFn?: typeof fetch;
+  claudeCodeSdk?: Sdk;
 }): Promise<{ ok: true; draft: Draft } | { ok: false; error: string }> {
   const f = opts.fetchFn ?? fetch;
   const base = opts.baseUrl.replace(/\/$/, "");
@@ -210,6 +215,28 @@ export async function draftCriteria(opts: {
     "Do not repeat what the project already checks. Add only what is specific to",
     "this task.",
   ].join("\n");
+
+  /**
+   * There is no endpoint to ask on the Claude Code backend, so ask the CLI.
+   *
+   * `claude-code://subscription` is a name for "the subscription is doing the
+   * work", not a URL: `fetch` refuses the scheme, and the refusal reached the
+   * checks panel as the bare words "TypeError: fetch failed" — which reads as
+   * a network fault and sends whoever saw it to check their wifi. The model
+   * that would have answered is a subprocess away; `claudeCodeAsk` spawns it
+   * with no tools, and a draft is still only a proposal a person approves.
+   */
+  if (isClaudeCode(opts.baseUrl)) {
+    const asked = await claudeCodeAsk({
+      model: opts.model,
+      systemPrompt: SYSTEM,
+      prompt: context,
+      cwd: opts.cwd,
+      sdk: opts.claudeCodeSdk,
+    });
+    if (!asked.ok) return { ok: false, error: asked.error };
+    return { ok: true, draft: parseDraft(asked.text) };
+  }
 
   try {
     const res = await f(`${base}/chat/completions`, {
@@ -231,6 +258,6 @@ export async function draftCriteria(opts: {
     const text = json.choices?.[0]?.message?.content ?? "";
     return { ok: true, draft: parseDraft(text) };
   } catch (e) {
-    return { ok: false, error: String(e) };
+    return { ok: false, error: errorText(e) };
   }
 }

@@ -54,11 +54,14 @@
  * bundler's static analysis deliberately — see the comment there.
  */
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+
+import { errorText } from "./format.js";
 
 const exec = promisify(execFile);
 
@@ -97,6 +100,8 @@ export type ClaudeCodeHealth = {
   version?: string;
   /** A subscription or key the CLI can use. */
   authenticated: boolean;
+  /** Whether this build of molt can load Anthropic's Agent SDK. */
+  sdk: boolean;
   /** "Max 20x", "Pro", … — read from the credential, never sent anywhere. */
   plan?: string;
   account?: string;
@@ -116,8 +121,8 @@ type StoredCredential = {
  * The plan name, from the credential the CLI already stores.
  *
  * Read-only, and only ever rendered — molt shows "Max 20x" beside the endpoint
- * so you can see which account is about to do the work. The token sitting
- * beside it in the same JSON is never read into a variable, let alone sent.
+ * so you can see which account is about to do the work. The tokens sitting
+ * beside it in the same JSON are never copied out of the parse at all.
  */
 function planLabel(cred: StoredCredential): string | undefined {
   const max = /max_(\d+)x/u.exec(cred.rateLimitTier ?? "");
@@ -127,16 +132,59 @@ function planLabel(cred: StoredCredential): string | undefined {
   return sub.charAt(0).toUpperCase() + sub.slice(1);
 }
 
+/**
+ * Three fields, copied out by name. Never the object.
+ *
+ * `claudeAiOauth` also holds `accessToken` and `refreshToken`. Returning it
+ * whole and narrowing it with a TypeScript type would read as safe and be
+ * nothing of the kind: a type annotation removes no field at runtime, and the
+ * token would then be live in molt's memory, one careless `log` or
+ * error-serialisation away from a file. Only what gets rendered is taken, so
+ * there is nothing to leak rather than a rule about not leaking it.
+ *
+ * Exported for the test that pins exactly that.
+ */
+export function parseCredential(raw: string): StoredCredential | null {
+  try {
+    const oauth = (JSON.parse(raw) as { claudeAiOauth?: Record<string, unknown> }).claudeAiOauth;
+    if (!oauth) return null;
+    return {
+      ...(typeof oauth.subscriptionType === "string"
+        ? { subscriptionType: oauth.subscriptionType }
+        : {}),
+      ...(typeof oauth.rateLimitTier === "string" ? { rateLimitTier: oauth.rateLimitTier } : {}),
+      ...(typeof oauth.expiresAt === "number" ? { expiresAt: oauth.expiresAt } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The `claude` this machine has, if it has one.
+ *
+ * molt drives the CLI you installed and logged in, never a copy of its own:
+ * the SDK ships a platform build weighing ~240MB, and the whole argument for
+ * this backend is that your Claude Code is doing the work. Passing the path
+ * explicitly is also what lets molt bundle only the SDK's JavaScript.
+ */
+export async function findClaude(
+  run: (cmd: string, args: string[]) => Promise<{ stdout: string }> = (c, a) => exec(c, a),
+): Promise<string | undefined> {
+  try {
+    // `which` walks PATH, which a Finder-launched app only has because
+    // electron/login-path.ts went and asked the login shell for it.
+    const { stdout } = await run("which", ["claude"]);
+    const path = stdout.trim().split("\n")[0]?.trim();
+    return path && existsSync(path) ? path : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** macOS keeps it in the keychain; Linux in a file. Try both, quietly. */
 async function readCredential(): Promise<StoredCredential | null> {
-  const parse = (raw: string): StoredCredential | null => {
-    try {
-      const json = JSON.parse(raw) as { claudeAiOauth?: StoredCredential };
-      return json.claudeAiOauth ?? null;
-    } catch {
-      return null;
-    }
-  };
+  const parse = parseCredential;
   if (process.platform === "darwin") {
     try {
       const { stdout } = await exec("security", [
@@ -177,8 +225,31 @@ export async function claudeCodeHealth(
       ok: false,
       installed: false,
       authenticated: false,
+      sdk: false,
       detail: "Claude Code is not on PATH",
       fix: "npm install -g @anthropic-ai/claude-code",
+    };
+  }
+  /**
+   * Whether molt can load the SDK is part of "can this run", not a detail.
+   *
+   * The packaged app carries `out/claude-sdk.mjs`; a build made without the
+   * SDK installed does not, and a window that only found out mid-turn would
+   * report it as the model failing.
+   */
+  let sdk = true;
+  try {
+    await loadSdk();
+  } catch (e) {
+    sdk = false;
+    return {
+      ok: false,
+      installed: true,
+      version,
+      authenticated: false,
+      sdk,
+      detail: `claude ${version} · molt cannot load the Agent SDK`,
+      fix: String(e).replace(/^Error: /u, "").replace(/ \(.*\)$/u, ""),
     };
   }
   const cred = await readCredential();
@@ -191,6 +262,7 @@ export async function claudeCodeHealth(
         installed: true,
         version,
         authenticated: true,
+        sdk,
         plan: "API key",
         detail: `claude ${version} · ANTHROPIC_API_KEY (metered)`,
       };
@@ -200,6 +272,7 @@ export async function claudeCodeHealth(
       installed: true,
       version,
       authenticated: false,
+      sdk,
       detail: `claude ${version} · not logged in`,
       fix: "claude /login",
     };
@@ -211,6 +284,7 @@ export async function claudeCodeHealth(
     installed: true,
     version,
     authenticated: !expired,
+    sdk,
     ...(plan ? { plan } : {}),
     detail:
       `claude ${version} · ${plan ?? "logged in"}` + (expired ? " · session expired" : ""),
@@ -437,7 +511,57 @@ async function loadSdk(): Promise<Sdk> {
   try {
     mod = (await import(sdkName)) as Record<string, unknown>;
     zod = (await import(zodName)) as Record<string, unknown>;
-  } catch (first) {
+  } catch (fromNodeModules) {
+    /**
+     * The packaged app has no node_modules, by design.
+     *
+     * `electron-builder.yml` ships `out/` and nothing else, so that what you
+     * audit is what runs — which means a package molt did not bundle cannot
+     * be resolved by name. `build.mjs` bundles the SDK into `out/claude-sdk.mjs`
+     * beside the app's own code, and this finds it there.
+     */
+    const sidecar = await loadSidecar();
+    if (sidecar) return sidecar;
+    return loadGlobal(fromNodeModules);
+  }
+  return check(mod, zod);
+}
+
+/**
+ * Where this module is running from, when that is knowable.
+ *
+ * Only the app needs this, and the app is CJS — `out/main.cjs`, where
+ * `__dirname` is real. The ESM build has `import.meta.url` instead, but
+ * reading it here would be worse than useless: esbuild empties `import.meta`
+ * when it converts to CJS and says so as a warning, and the ESM build does not
+ * need a sidecar anyway — a checkout resolves the SDK by name, and an install
+ * outside one falls through to the global root below.
+ */
+function moduleDir(): string | null {
+  return typeof __dirname === "string" ? __dirname : null;
+}
+
+/** The SDK bundled beside the app, if this build has one. */
+async function loadSidecar(): Promise<Sdk | null> {
+  const here = moduleDir();
+  if (here === null) return null;
+  for (const dir of [here, join(here, "out")]) {
+    const file = join(dir, "claude-sdk.mjs");
+    if (!existsSync(file)) continue;
+    const mod = (await import(pathToFileURL(file).href)) as Record<string, unknown>;
+    return check(mod, mod);
+  }
+  return null;
+}
+
+/** A global install, for anyone running molt's CLI from outside a checkout. */
+async function loadGlobal(first: unknown): Promise<Sdk> {
+  const sdkName = ["@anthropic-ai", "claude-agent-sdk"].join("/");
+  const zodName = "z" + "od";
+  let mod: Record<string, unknown>;
+  let zod: Record<string, unknown>;
+  {
+    try {
     /**
      * The packaged app has no `node_modules` to resolve from.
      *
@@ -448,7 +572,6 @@ async function loadSdk(): Promise<Sdk> {
      * disk anyway. So a global install counts, which is how anyone who
      * already runs Claude Code will have installed things.
      */
-    try {
       const { stdout } = await exec("npm", ["root", "-g"]);
       const root = stdout.trim();
       const url = (name: string) => pathToFileURL(join(root, name, "")).href;
@@ -456,11 +579,16 @@ async function loadSdk(): Promise<Sdk> {
       zod = (await import(url(zodName))) as Record<string, unknown>;
     } catch {
       throw new Error(
-        `the Claude Code backend needs Anthropic's Agent SDK, which molt does not bundle: ` +
-          `npm install -g @anthropic-ai/claude-agent-sdk zod (${String(first)})`,
+        `the Claude Code backend needs Anthropic's Agent SDK, which this build does not ` +
+          `carry: npm install -g @anthropic-ai/claude-agent-sdk zod (${String(first)})`,
       );
     }
   }
+  return check(mod, zod);
+}
+
+/** The three functions molt calls, present and callable, or a plain refusal. */
+function check(mod: Record<string, unknown>, zod: Record<string, unknown>): Sdk {
   const sdk = {
     query: mod.query,
     tool: mod.tool,
@@ -476,6 +604,105 @@ async function loadSdk(): Promise<Sdk> {
     }
   }
   return sdk as Sdk;
+}
+
+/**
+ * One question, one answer, no tools — the pre-turn calls on this backend.
+ *
+ * `interviewTurn` and `draftCriteria` are the two places molt asks a model
+ * something that is not the work: what should be asked before starting, and
+ * what would prove the task done. Both were written against `/chat/completions`
+ * and both were dead ends here, because `claude-code://subscription` is a name
+ * for "the subscription is doing the work" and not a URL. There is still no
+ * endpoint; there is a subprocess, and that is enough to ask a question.
+ *
+ * Deliberately not `ClaudeCodeSession`. That class exists to carry molt's six
+ * tools, its ledger and a conversation that outlives a turn; none of that
+ * applies to a question whose answer is a JSON blob a person then edits. So
+ * this spawns its own short-lived query with `tools: []` and no MCP server at
+ * all — the model here cannot read a file, cannot write one, and cannot touch
+ * the ledger the bar reads. It is a text completion wearing a subprocess.
+ *
+ * The lockdown from the session is kept for the same reasons it exists there:
+ * `settingSources: []` so a CLAUDE.md does not steer what gets proposed, and
+ * `strictMcpConfig` so your own MCP servers stay out of it.
+ */
+export type AskOptions = {
+  model: string;
+  systemPrompt: string;
+  prompt: string;
+  /** Where the model is allowed to think it is. No tool can act on it. */
+  cwd?: string;
+  /** Injected in tests. Real callers leave it out and get the SDK. */
+  sdk?: Sdk;
+  /** How the SDK is found, and how the CLI is. Injected the same way. */
+  load?: () => Promise<Sdk>;
+  find?: () => Promise<string | undefined>;
+};
+
+export type Answer = { ok: true; text: string } | { ok: false; error: string };
+
+export async function claudeCodeAsk(opts: AskOptions): Promise<Answer> {
+  const controller = new AbortController();
+  const answer = await askOnce(controller, opts);
+  // The question is answered, whichever way it went; the subprocess should not
+  // outlive it. Nothing here holds a session open for a second turn.
+  controller.abort();
+  return answer;
+}
+
+async function askOnce(controller: AbortController, opts: AskOptions): Promise<Answer> {
+  const load = opts.load ?? loadSdk;
+  const find = opts.find ?? findClaude;
+  try {
+    const sdk = opts.sdk ?? (await load());
+    // The CLI you logged into, exactly as the session does it. A test that
+    // supplies its own SDK is not spawning anything, so it does not look.
+    const executable = opts.sdk ? undefined : await find();
+    const stream = sdk.query({
+      prompt: oneMessage(opts.prompt),
+      options: {
+        model: opts.model,
+        cwd: opts.cwd ?? process.cwd(),
+        systemPrompt: opts.systemPrompt,
+        tools: [],
+        mcpServers: {},
+        allowedTools: [],
+        strictMcpConfig: true,
+        settingSources: [],
+        // One reply. Nothing here is worth a second round trip, and a model
+        // that decided to keep going would be spending the plan's quota on a
+        // conversation no one is reading.
+        maxTurns: 1,
+        abortController: controller,
+        ...(executable ? { pathToClaudeCodeExecutable: executable } : {}),
+        env: { ...process.env, CLAUDE_AGENT_SDK_CLIENT_APP: "molt/0.1.0" },
+      },
+    });
+    for await (const m of stream) {
+      // Only the result matters. A one-shot question has no partial state
+      // worth keeping, and the SDK puts the final text in `result` — reading
+      // the assistant blocks as well would be a second answer to reconcile.
+      if (m.type !== "result") continue;
+      const r = m as { result?: string; is_error?: boolean; subtype?: string };
+      if (r.is_error === true || r.subtype !== "success") {
+        // `subtype` names the refusal — `error_max_turns`, a usage limit —
+        // and a refusal reported as an empty answer would read as molt's bug.
+        return { ok: false, error: r.result || r.subtype || "the Claude Code session failed" };
+      }
+      const text = (r.result ?? "").trim();
+      return text ? { ok: true, text } : { ok: false, error: "Claude Code returned nothing" };
+    }
+    return { ok: false, error: "Claude Code ended without answering" };
+  } catch (e) {
+    return { ok: false, error: errorText(e) };
+  }
+}
+
+/** The one user message, in the shape the SDK's streaming input wants. */
+async function* oneMessage(text: string): AsyncGenerator<unknown> {
+  const message = { role: "user", content: text };
+  yield { type: "user", message, parent_tool_use_id: null, session_id: "" };
 }
 
 /**
@@ -525,6 +752,10 @@ export class ClaudeCodeSession<H> {
 
   private async start(): Promise<void> {
     const sdk = this.opts.sdk ?? (await loadSdk());
+    // The CLI you logged into, not the SDK's own copy of one. Left undefined
+    // if it is not on PATH, in which case the SDK falls back to whatever it
+    // ships — and `claudeCodeHealth` has already said so.
+    const executable = this.opts.sdk ? undefined : await findClaude();
     const names: string[] = [];
     const tools = this.opts.tools.map((t) => {
       const name = t.function.name;
@@ -543,7 +774,7 @@ export class ClaudeCodeSession<H> {
             // A handler that throws would otherwise fail the MCP call and take
             // the session with it. molt's own tools report their errors as
             // results, and this keeps a bug in one from ending the turn.
-            text = `tool error: ${String(e)}`;
+            text = `tool error: ${errorText(e)}`;
           }
           return { content: [{ type: "text" as const, text }] };
         },
@@ -570,6 +801,7 @@ export class ClaudeCodeSession<H> {
         settingSources: [],
         includePartialMessages: true,
         abortController: this.controller,
+        ...(executable ? { pathToClaudeCodeExecutable: executable } : {}),
         // The subprocess environment REPLACES rather than merges, so the
         // spread is load-bearing: without it a Finder-launched molt hands
         // `claude` an empty PATH. `electron/login-path.ts` has already
@@ -589,7 +821,7 @@ export class ClaudeCodeSession<H> {
           completionTokens: 0,
           cachedTokens: 0,
           cumulativeCostUsd: this.lastCumulativeCost,
-          error: String(e),
+          error: errorText(e),
         });
       }
     })();

@@ -149,6 +149,33 @@ export type Check = Advisory &
          */
         outside?: "allow";
         /**
+         * `mutation` only: a turn with nothing to mutate may still pass.
+         *
+         * Off by default, because "nothing was mutated" is the shape a
+         * broken mutation run takes as well as a legitimately empty one, and
+         * the two are indistinguishable from the counts alone. A project whose
+         * turns routinely change only lines with no operator to flip can say
+         * so here; the check then passes without establishing anything, and
+         * says which it did.
+         */
+        empty?: "allow";
+        /**
+         * `build-current` only: what this project ships, in build order.
+         *
+         * Paths, not globs — each names one built artifact whose mtime is
+         * compared against the source this turn changed. Absolute paths are
+         * allowed and are the point: the thing that goes stale is usually the
+         * installed copy, which lives outside the repository.
+         */
+        outputs?: string[];
+        /**
+         * `build-current` only: which sources feed those outputs.
+         *
+         * Path prefixes. Omitted, every file the turn wrote counts, which
+         * makes a docs-only turn demand a rebuild it does not need.
+         */
+        from?: string[];
+        /**
          * Where to read lcov from, for `diff-covered`.
          *
          * Required, and deliberately not defaulted: a missing file makes the
@@ -166,6 +193,20 @@ export type Check = Advisory &
   );
 
 export type BuiltinCheck =
+  /**
+   * What this project ships is not older than what this turn changed.
+   *
+   * molt judges the working tree, and for five days that was the whole story:
+   * a turn edited `src/`, every check went green, an accepted receipt was
+   * written — and the app the person actually opened was a build from before
+   * the fix, so they saw the bug the receipt said was gone. Nothing in the bar
+   * knew the difference between a repository and a shipped build.
+   *
+   * mtime, and it says so: it is the only signal a built artifact carries
+   * about the source it came from, and it is enough to catch the case that
+   * matters, which is nobody having rebuilt at all.
+   */
+  | "build-current"
   | "files-changed"
   | "record-intact"
   | "claims-grounded"
@@ -238,6 +279,21 @@ export type CheckResult = {
    * exist is how a gate teaches a model to invent the wrong change.
    */
   didNotRun?: boolean;
+  /**
+   * False when the check passed without establishing anything.
+   *
+   * A builtin can pass for two very different reasons: it looked and found
+   * nothing wrong, or there was nothing in scope for it to look at. Both
+   * printed as a bare green `pass`, which is how `record-intact` sat at 0
+   * refusals in 34 runs without anyone being able to tell a verified archive
+   * from an empty one, and how a mutation check that mutated nothing read as
+   * proof the tests would catch a break.
+   *
+   * A vacuous pass still passes — refusing a docs-only turn for having no
+   * operators to flip would be its own kind of lie — but it is never again
+   * displayed as though it had proven something.
+   */
+  established?: boolean;
   tags?: string[];
   kind: "command" | "builtin";
   /** The command run, or the builtin's identifier. */

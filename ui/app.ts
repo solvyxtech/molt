@@ -33,6 +33,18 @@ type MoltBridge = {
     apiKey?: string;
   }): Promise<{ ok: boolean; error?: string; state?: AppState }>;
   saveKey(provider: string, key: string): Promise<boolean>;
+  claudeCodeHealth(): Promise<{
+    ok: boolean;
+    installed: boolean;
+    authenticated: boolean;
+    sdk: boolean;
+    version?: string;
+    plan?: string;
+    detail: string;
+    fix?: string;
+    url: string;
+    models: string[];
+  }>;
   saveEndpoint(baseUrl: string, model: string): Promise<boolean>;
   storedEndpoint(): Promise<{ baseUrl?: string; model?: string }>;
   listModels(current?: { url: string; key?: string }): Promise<ModelSource[]>;
@@ -485,7 +497,13 @@ function proofBlock(ev: Ev): HTMLElement {
 
   for (const c of rows) {
     const row = el("div", "check");
-    const label = c.ok ? "pass" : c.advisory ? "note" : "FAIL";
+    const label = c.ok
+      ? c.established === false
+        ? "pass·none"
+        : "pass"
+      : c.advisory
+        ? "note"
+        : "FAIL";
     const cls = c.ok ? "pass" : c.advisory ? "note" : "fail";
     row.appendChild(el("div", `verdict ${cls}`, label));
     // The name was missing entirely. Four rows reading "PASS" with a blank
@@ -1947,6 +1965,37 @@ $("set-model-pick").addEventListener("change", () => {
   $("row-custom-model").classList.add("hidden");
   ($("set-model") as HTMLInputElement).value = id!;
   if (url) ($("set-url") as HTMLInputElement).value = url;
+});
+
+/**
+ * Point molt at the Claude Code you already logged in.
+ *
+ * Not a key box, because there is no key: what this needs is a CLI installed
+ * and logged in somewhere else, so the button's job is to go and look, then
+ * say what is missing in the words you would type to fix it. On success it
+ * fills the endpoint and a model, which is the same thing choosing one from
+ * the picker does — this is just the door people actually look for.
+ */
+$("set-claude-code").addEventListener("click", async () => {
+  const status = $("claude-code-status");
+  status.textContent = "Looking for Claude Code…";
+  const h = await molt.claudeCodeHealth();
+  if (!h.ok) {
+    status.textContent = h.fix ? `${h.detail} — run: ${h.fix}` : h.detail;
+    return;
+  }
+  ($("set-url") as HTMLInputElement).value = h.url;
+  const model = ($("set-model") as HTMLInputElement).value.trim();
+  // Keep a Claude model that is already chosen; otherwise pick the middle one
+  // rather than leaving a model id from another vendor pointed at this.
+  if (!h.models.includes(model)) {
+    ($("set-model") as HTMLInputElement).value = h.models.includes("sonnet")
+      ? "sonnet"
+      : (h.models[0] ?? "sonnet");
+  }
+  syncModelPick(($("set-model") as HTMLInputElement).value);
+  status.textContent = `${h.detail} — open the workspace to use it`;
+  $("set-status").textContent = "Claude Code selected. No API key needed.";
 });
 
 $("set-refresh").addEventListener("click", () => {

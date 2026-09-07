@@ -139,6 +139,28 @@ checks:
   # suite runs, not `sample` + 1 — about 50s at 3, and it says plainly how
   # many changed lines it did not get to. Raise `sample` to buy more coverage
   # of the diff at ~17s each.
+  # What this project ships, against what this turn changed.
+  #
+  # Added after the miss it names. On 2026-09-07 a turn fixed spec-first for
+  # the Claude Code backend, passed all ten checks above, and wrote an accepted
+  # receipt — and the person who went to use it opened /Applications/molt.app,
+  # a build from forty minutes earlier, and watched the same bug happen. Every
+  # check had been truthful; none of them was about the artifact.
+  #
+  # `out/` is what `npm run bundle` writes and what the app runs. The installed
+  # copy is deliberately NOT listed: a contributor who has never run
+  # `app:push` has no /Applications/molt.app, and a check that fails for
+  # everyone but the author is a check people learn to skip. Add it locally if
+  # you are the one shipping.
+  #
+  # mtime, so a build that genuinely ran satisfies it and a `touch` defeats it.
+  # It is aimed at the case that actually happens: nobody rebuilt.
+  - name: build-current
+    builtin: build-current
+    outputs: out/main.cjs, out/preload.cjs, out/ui/app.js
+    from: src, electron, ui, build.mjs
+    tags: [session]
+
   - name: work-checked
     builtin: mutation
     run: npm test

@@ -20,6 +20,12 @@ import { join } from "node:path";
 
 import { resolveReceipt } from "./receipts-path.js";
 import { sessionOpenReject } from "./session-open.js";
+import {
+  CLAUDE_CODE_MODELS,
+  CLAUDE_CODE_URL,
+  claudeCodeHealth,
+  isClaudeCode,
+} from "../src/claude-code.js";
 import { keyFor } from "./endpoint-key.js";
 import { draftCriteria, type Draft } from "./criteria.js";
 import {
@@ -84,6 +90,28 @@ const here = __dirname;
 
 /** The window, once there is one. Single-window app by design. */
 let win: BrowserWindow | null = null;
+
+/**
+ * Where to photograph this window, and how to frame it.
+ *
+ * Read once and REMOVED from the environment, because a bar check spawns
+ * molt's own end-to-end driver — `npm run e2e` launches a second
+ * `--self-drive` window — and a child that inherits `MOLT_SHOT` writes its
+ * screenshot over its parent's target. Two attempts to photograph a real
+ * turn produced the stub provider's window instead, taken from inside the
+ * bar of the run being photographed. A capture path belongs to the process
+ * that was given it.
+ */
+const SHOT = {
+  path: process.env.MOLT_SHOT,
+  tab: process.env.MOLT_SHOT_TAB,
+  scroll: process.env.MOLT_SHOT_SCROLL,
+  picker: process.env.MOLT_SHOT_PICKER === "1",
+  palette: process.env.MOLT_SHOT_PALETTE === "1",
+};
+for (const k of ["MOLT_SHOT", "MOLT_SHOT_TAB", "MOLT_SHOT_SCROLL", "MOLT_SHOT_PICKER", "MOLT_SHOT_PALETTE"]) {
+  delete process.env[k];
+}
 
 /**
  * Everything a turn needs, rebuilt whenever the workspace or model changes.
@@ -297,6 +325,51 @@ function createWindow(): void {
       const seen: string[] = [];
 
       if (process.env.MOLT_E2E_VIA_UI === "1") {
+        // `did-finish-load` means the page parsed, not that the app booted —
+        // the same trap --self-check documents. boot() awaits several IPC
+        // round trips before it wires the buttons, and against a real provider
+        // one of them lists hundreds of models over the network. Clicking
+        // "open workspace" before that lands does nothing at all: one run sat
+        // with a window open and no session for as long as it was given.
+        let booted = false;
+        for (let i = 0; i < 200; i++) {
+          booted = await win!.webContents.executeJavaScript(
+            `document.querySelectorAll("#autonomy .au").length > 0 && typeof window.molt === "object"`,
+          );
+          if (booted) break;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        if (!booted) {
+          console.error("[self-drive] the app never finished booting (20s)");
+          app.exit(1);
+          return;
+        }
+        /**
+         * Press the Claude Code button for real, before anything else.
+         *
+         * The complaint was that the window offered no way in at all, and a
+         * button whose handler throws looks identical to one that is missing.
+         * This clicks it through the preload bridge and both IPC hops and
+         * requires an answer — either a version, or the command to run. Which
+         * one depends on whether the machine running the suite has Claude
+         * Code, so neither is asserted; silence is the failure.
+         */
+        const ccStatus = await win!.webContents.executeJavaScript(`(async () => {
+          document.getElementById("set-claude-code").click();
+          for (let i = 0; i < 60; i++) {
+            const t = document.getElementById("claude-code-status").textContent || "";
+            if (t && !/Looking for/.test(t)) return t;
+            await new Promise((r) => setTimeout(r, 100));
+          }
+          return "";
+        })()`);
+        console.log(`[e2e] claude-code ${ccStatus || "NO ANSWER"}`);
+        if (!ccStatus) {
+          console.error("[e2e] the Claude Code button answered nothing");
+          app.exit(1);
+          return;
+        }
+
         // Drive the window the way a person does: fill Settings, open the
         // workspace, tick the box, type, click Run. Calling engine.run()
         // directly skips the preload bridge and both IPC hops — which is
@@ -400,6 +473,75 @@ function createWindow(): void {
             return;
           }
           console.log("[self-drive] hold       composer cleared, task echoed");
+          /**
+           * What the hold actually put on screen, not merely that it held.
+           *
+           * The hold check passes on a visible panel, and a panel is visible
+           * whether it filled with questions or with the words "fetch
+           * failed" — so a backend whose drafting was broken looked exactly
+           * like one whose drafting worked. Asked for after a report that
+           * spec-first "didn't work" that this harness had called a pass.
+           */
+          const drafted = await win!.webContents.executeJavaScript(`({
+            interview: !document.getElementById("interview-panel").classList.contains("hidden"),
+            questions: document.querySelectorAll("#iv-qs .iv-q").length,
+            ivState: (document.getElementById("iv-state").textContent || "").trim(),
+            rows: document.querySelectorAll("#ck-rows .ck-row").length,
+            ckState: (document.getElementById("ck-state").textContent || "").trim(),
+          })`);
+          const d = drafted as {
+            interview: boolean;
+            questions: number;
+            ivState: string;
+            rows: number;
+            ckState: string;
+          };
+          console.log(
+            `[self-drive] drafted    ${d.interview ? `interview up, ${d.questions} question(s) — ${d.ivState}` : "no interview"}` +
+              ` · ${d.rows} criteria row(s)${d.ckState ? ` — ${d.ckState}` : ""}`,
+          );
+          // Nothing was proposed and nothing was asked: the draft failed, and
+          // the panel being open is not the same as the panel being useful.
+          if (!d.questions && !d.rows) {
+            console.error("[self-drive] the hold produced neither a question nor a criterion");
+            app.exit(1);
+            return;
+          }
+          /**
+           * Questions on screen mean the next Run skips them, not that it
+           * starts work — which is right for a person and wrong for a driver
+           * that presses Run once and waits for a verdict. Skip, wait for the
+           * proposal that follows, and only then start the turn.
+           */
+          if (d.interview) {
+            let settled = false;
+            try {
+              await win!.webContents.executeJavaScript(`document.getElementById("iv-skip").click()`);
+              // "Skip remaining" is not "propose now": it sends the round with
+              // empty answers, and the model may ask again up to
+              // INTERVIEW_MAX_ROUNDS. Each of those is a real request against a
+              // real provider, so this waits rounds, not seconds.
+              for (let i = 0; i < 1800 && !settled; i++) {
+                settled = await win!.webContents.executeJavaScript(
+                  `document.getElementById("interview-panel").classList.contains("hidden")`,
+                );
+                if (!settled) await new Promise((r) => setTimeout(r, 100));
+              }
+            } catch (e) {
+              // The window went away mid-interview. Said plainly: a driver
+              // that swallows this reports "no verdict" and sends whoever
+              // reads it looking at the engine instead of at the window.
+              console.error(`[self-drive] window died during the interview: ${String(e)}`);
+              app.exit(1);
+              return;
+            }
+            if (!settled) {
+              console.error("[self-drive] the interview never settled into a proposal");
+              app.exit(1);
+              return;
+            }
+            console.log("[self-drive] interview  skipped, proposal accepted");
+          }
           await win!.webContents.executeJavaScript(`document.getElementById("send").click()`);
         }
         // Wait for the turn to finish, seen from the page rather than guessed.
@@ -516,7 +658,7 @@ function createWindow(): void {
                 String(r.proofHead).includes(process.env.MOLT_E2E_WANT_PROOF));
             console.log(ok ? "[self-drive] PASS" : "[self-drive] FAIL");
             if (!ok) console.log(`[self-drive] screen was: ${text.slice(0, 400)}`);
-            const shot = process.env.MOLT_SHOT;
+            const shot = SHOT.path;
             if (shot) {
               // capturePage reads the compositor, not the DOM. A tab switched
               // one statement ago has not been painted yet, and the capture
@@ -528,10 +670,21 @@ function createWindow(): void {
               // README needs the others too.
               // The assertions above opened the model picker to read it;
               // a photograph of the work should not have a dialog over it.
-              const tab = process.env.MOLT_SHOT_TAB;
+              //
+              // MOLT_SHOT_SCROLL takes a selector to bring into view before the
+              // capture — `.proof.fail` for a refusal, `.proof.pass` for the
+              // verdict that followed it. Without one the stream stays where
+              // the turn left it, which is the end.
+              const tab = SHOT.tab;
+              const scrollTo = SHOT.scroll;
               void win!.webContents.executeJavaScript(
                 `(document.getElementById("picker-close")?.click(), ` +
-                  `document.querySelector('.tab[data-tab=${JSON.stringify(tab || "session")}]')?.click(), 0)`,
+                  `document.querySelector('.tab[data-tab=${JSON.stringify(tab || "session")}]')?.click(), ` +
+                  (scrollTo
+                    ? `[...document.querySelectorAll(${JSON.stringify(scrollTo)})].pop()` +
+                      `?.scrollIntoView({ block: "center" }), `
+                    : "") +
+                  `0)`,
               );
               setTimeout(
                 () => {
@@ -579,12 +732,18 @@ function createWindow(): void {
       void win!.webContents
         .executeJavaScript(
           `(async () => {
-             const need = ["tabs","panels","stream","wire","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","autonomy","interview","criteria","ck-rows","ck-draft","ck-auto","spine","spine-list","jump","ctx","ctx-fill","ctx-line"];
+             const need = ["tabs","panels","stream","wire","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","set-claude-code","claude-code-status","autonomy","interview","criteria","ck-rows","ck-draft","ck-auto","spine","spine-list","jump","ctx","ctx-fill","ctx-line"];
              const missing = need.filter((id) => !document.getElementById(id));
              const tabs = [...document.querySelectorAll(".tab")].map((t) => t.dataset.tab);
              const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
              return {
                bridge: typeof window.molt === "object" && typeof window.molt.run === "function",
+               // A button with nothing behind it is the bug this whole check
+               // exists for: the control shipped on one surface, the wire on
+               // neither. Both halves, or it is not wired.
+               claudeCode:
+                 typeof window.molt.claudeCodeHealth === "function" &&
+                 !!document.getElementById("set-claude-code"),
                missing,
                tabs,
                accent,
@@ -687,6 +846,7 @@ function createWindow(): void {
             r.autoCriteriaDefault === true &&
             (r.criteriaRows as { distinct: boolean; converted: boolean }).distinct === true &&
             (r.criteriaRows as { distinct: boolean; converted: boolean }).converted === true &&
+            r.claudeCode === true &&
             Number(r.paletteRows) >= 15 &&
             (r.csp as { script?: boolean; connect?: boolean } | undefined)?.script === true &&
             (r.csp as { script?: boolean; connect?: boolean } | undefined)?.connect === true;
@@ -701,6 +861,7 @@ function createWindow(): void {
               `, click sticks: ${r.autonomySticks}`,
           );
           console.log(`[self-check] palette     ${r.paletteRows} command(s) on "/"`);
+          console.log(`[self-check] claude code ${r.claudeCode ? "button + bridge ok" : "NOT WIRED"}`);
           const ck = r.criteriaRows as { distinct: boolean; converted: boolean };
           console.log(
             `[self-check] criteria    check/note distinct: ${ck.distinct}, convertible: ${ck.converted}` +
@@ -715,14 +876,14 @@ function createWindow(): void {
           // A screenshot on demand, because "PASS" says the page assembled and
           // says nothing about whether it is legible. Support asks for one of
           // these on the first call every time.
-          const shot = process.env.MOLT_SHOT;
+          const shot = SHOT.path;
           if (shot) {
-            if (process.env.MOLT_SHOT_PICKER === "1") {
+            if (SHOT.picker) {
               void win!.webContents.executeJavaScript(
                 `(document.getElementById("crumb-model").click(), 0)`,
               );
             }
-            if (process.env.MOLT_SHOT_PALETTE === "1") {
+            if (SHOT.palette) {
               void win!.webContents.executeJavaScript(
                 `(() => { document.querySelector('.tab[data-tab="session"]').click();
                           const b = document.getElementById("prompt");
@@ -737,7 +898,7 @@ function createWindow(): void {
                   app.exit(ok ? 0 : 1);
                 });
               },
-              process.env.MOLT_SHOT_PICKER === "1" ? 1200 : 120,
+              SHOT.picker ? 1200 : 120,
             );
             return;
           }
@@ -909,6 +1070,21 @@ let noPriceAnnouncedFor: string | null = null;
 async function refreshPricing(s: Session, announce: boolean): Promise<void> {
   const model = s.model;
   if (!model) return;
+  /**
+   * A plan is not a price list, and "publishes no price" is the wrong words.
+   *
+   * On this backend nothing is being billed, so a line saying the provider
+   * publishes no rate reads as a gap in molt's knowledge rather than the
+   * absence of a charge. Same correction the terminal footer got.
+   */
+  if (isClaudeCode(s.baseUrl)) {
+    if (announce)
+      send("engine:event", {
+        kind: "info",
+        text: `your Claude plan is paying for this — the meter shows tokens, not money`,
+      });
+    return;
+  }
   const p = await fetchPricing(s.baseUrl, model, s.engine.apiKey).catch(() => null);
   if (p) {
     s.engine.setPricing({ in: p.in, out: p.out, cached: p.cached, source: p.source });
@@ -1149,6 +1325,7 @@ ipcMain.handle("criteria:draft", async (_e, task: string) => {
     baseUrl: session.baseUrl,
     apiKey: session.engine.apiKey,
     model: session.model,
+    cwd: session.cwd,
   });
 });
 
@@ -1187,6 +1364,9 @@ ipcMain.handle(
       baseUrl: session.baseUrl,
       apiKey: session.engine.apiKey,
       model: session.model,
+      // The workspace, not the app's own directory: on the Claude Code
+      // backend this is where the CLI that answers is run.
+      cwd: session.cwd,
     });
   },
 );
@@ -1214,6 +1394,21 @@ ipcMain.handle("auth:endpoint", (_e, baseUrl: string, model: string) =>
   saveEndpoint(baseUrl, model, configDir()),
 );
 ipcMain.handle("auth:stored", () => storedEndpoint(configDir()));
+/**
+ * Whether this machine can run turns on a Claude subscription, and as whom.
+ *
+ * Settings' only other credential control is "paste an API key", which is the
+ * wrong question for this backend — there is no key, and what it needs is a
+ * command run somewhere else. Reported as "in the desktop app it is not
+ * possible to login to claude code": the TUI grew a `/login` row for it and
+ * the window did not. The seventh thing to exist on one surface and not the
+ * other, and the reason `run-options.ts` and `session-commands.ts` exist.
+ */
+ipcMain.handle("claudeCode:health", async () => ({
+  ...(await claudeCodeHealth()),
+  url: CLAUDE_CODE_URL,
+  models: [...CLAUDE_CODE_MODELS],
+}));
 
 /** The renderer answering a tool confirmation. */
 ipcMain.on("confirm:reply", (_e, id: string, ok: boolean) => {
