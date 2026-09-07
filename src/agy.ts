@@ -70,7 +70,8 @@
  * own, which molt does not write.
  */
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
 import { join } from "node:path";
@@ -350,6 +351,79 @@ export async function agyHealth(
   };
 }
 
+/**
+ * One question, one answer — the pre-turn calls on this backend.
+ *
+ * `interviewTurn` and `draftCriteria` are the two places molt asks a model
+ * something that is not the work. Both were written against
+ * `/chat/completions`, and `antigravity://subscription` is a name rather than
+ * a URL, so both were dead ends here.
+ *
+ * They used to refuse in words, on the grounds that `agy` always brings its 57
+ * tools and a proposal drafted by something that can read the repo is a
+ * different artefact from the one every other backend produces. That was true
+ * and it was the wrong trade: the window drafts criteria automatically on Run,
+ * so the refusal meant every first Run on this backend ended in an apology and
+ * started no turn. `interview.ts` already carries that exact lesson from the
+ * Claude Code backend, and this managed to repeat it anyway.
+ *
+ * What makes it safe without a `tools: []` to ask for:
+ *
+ *   - **No MCP server is registered for this call.** Molt's tools are not on
+ *     offer, so nothing here can reach the ledger.
+ *   - **It runs in an empty temporary directory.** Its read-only tools work
+ *     and find nothing, which is the closest thing to no tools that a CLI
+ *     without a tool switch can be given — and it keeps the proposal a
+ *     function of the prompt, the way the other backends' proposals are.
+ *   - **Everything else is denied by default** in headless mode, which is the
+ *     property this whole backend rests on.
+ *
+ * `--disable-slash-commands` because a task that happens to begin with `/`
+ * is a task, not a command.
+ */
+export type AgyAskOptions = {
+  model: string;
+  systemPrompt: string;
+  prompt: string;
+  /** Injected in tests. Real callers spawn the CLI. */
+  run?: (cmd: string, args: string[], opts: object) => Promise<{ stdout: string }>;
+};
+
+export async function agyAsk(
+  opts: AgyAskOptions,
+): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+  const run = opts.run ?? ((c: string, a: string[], o: object) => exec(c, a, o));
+  const dir = opts.run ? tmpdir() : mkdtempSync(join(tmpdir(), "molt-agy-ask-"));
+  try {
+    const { stdout } = await run(
+      "agy",
+      [
+        `--print=${opts.systemPrompt}\n\n${opts.prompt}`,
+        "--output-format",
+        "json",
+        "--model",
+        opts.model,
+        "--print-timeout",
+        "180s",
+        "--disable-slash-commands",
+      ],
+      { cwd: dir, env: agyEnv(), maxBuffer: 1024 * 1024 * 16 },
+    );
+    const parsed = JSON.parse(stdout) as { status?: string; response?: string; error?: string };
+    if (parsed.status && !/SUCCESS/iu.test(parsed.status)) {
+      // The status names the refusal — a usage limit, a timeout — and a
+      // refusal reported as an empty answer would read as molt's bug.
+      return { ok: false, error: parsed.error || parsed.status };
+    }
+    const text = (parsed.response ?? "").trim();
+    return text ? { ok: true, text } : { ok: false, error: "Antigravity returned nothing" };
+  } catch (e) {
+    return { ok: false, error: errorText(e) };
+  } finally {
+    if (!opts.run) rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The session
 // ---------------------------------------------------------------------------
@@ -548,10 +622,14 @@ export class AgySession<H> {
        *
        * A refusal arrives as ERROR and is the system working — those are not
        * reported as unaccounted, because nothing happened. A DONE is a builtin
-       * that ran: Antigravity's read-only shell commands and file reads are
-       * auto-approved and never reach a permission check, so they are the one
-       * thing molt cannot stop. They cannot change the tree, so the bar is
-       * unharmed; the ledger is simply not a record of what was read.
+       * that ran without molt.
+       *
+       * Less of this happens than first assumed: `read_file` is gated too, not
+       * only writes — a live run had Antigravity's own read auto-denied and
+       * fall back to molt's `read_file`, at the cost of one empty step. Safe
+       * shell commands (`echo`) are the ones seen to pass unasked. Whatever
+       * gets through cannot change the tree, so the bar is unharmed; the
+       * ledger simply may not be a complete record of what was read.
        */
       if (su.state === "DONE" && !this.unaccounted.has(name)) {
         this.unaccounted.add(name);

@@ -134,8 +134,12 @@ which molt does not write.
 
 ## What molt still cannot see
 
-Read-only tools (`view_file`, `grep_search`, `list_dir`, and safe shell
-commands) are auto-approved and never reach a permission check. They cannot
-change the tree, so `tree-accounted` is unharmed — but molt's ledger is not a
-complete record of what the model *read*. `AgySession.unaccountedTools()`
-reports them and the session says so on screen.
+Less than first assumed. `read_file` is gated as well as writes: a live run had
+Antigravity's own read auto-denied, and it fell back to molt's `read_file` —
+correct, at the cost of one empty step. Safe shell commands (`echo hi`) are the
+ones observed to run unasked.
+
+Whatever does get through cannot change the tree, so `tree-accounted` is
+unharmed — but molt's ledger may not be a complete record of what the model
+*read*. `AgySession.unaccountedTools()` reports those and the session names
+them on screen.
