@@ -1044,6 +1044,7 @@ document.addEventListener("keydown", (e) => {
   if (!$("criteria").classList.contains("hidden")) {
     e.preventDefault();
     $("criteria").classList.add("hidden");
+  $("ck-start").classList.add("hidden");
   }
 });
 
@@ -1277,6 +1278,7 @@ async function send(): Promise<void> {
   rows = [];
   drawCriteria();
   $("criteria").classList.add("hidden");
+  $("ck-start").classList.add("hidden");
 }
 
 $("send").addEventListener("click", () => void send());
@@ -1655,6 +1657,7 @@ async function runCommand(name: string, arg: string): Promise<void> {
       rows = [];
       drawCriteria();
       $("criteria").classList.add("hidden");
+  $("ck-start").classList.add("hidden");
       $("ck-seal").classList.add("hidden");
       closeInterview();
       lastProof = undefined;
@@ -2099,16 +2102,54 @@ async function startInterview(task = ""): Promise<void> {
   await interviewRound();
 }
 
+/**
+ * True while a round is in flight.
+ *
+ * Both a guard and a display. A round is a real request — a minute is normal
+ * against a real provider — and the panel used to swap one line of text and
+ * otherwise sit there with its buttons live: it read as a frozen window, and a
+ * second click sent a second round. Reported as "it looks frozen then
+ * populates after a minute or so".
+ */
+let ivBusy = false;
+let ivTimer: ReturnType<typeof setInterval> | null = null;
+
+function ivWaiting(on: boolean): void {
+  ivBusy = on;
+  $("interview-panel").classList.toggle("busy", on);
+  $("iv-wait").classList.toggle("hidden", !on);
+  ($("iv-next") as HTMLButtonElement).disabled = on;
+  ($("iv-skip") as HTMLButtonElement).disabled = on;
+  if (ivTimer) clearInterval(ivTimer);
+  ivTimer = null;
+  if (!on) return;
+  // An elapsed count, because "waiting" and "hung" look identical without one.
+  const started = Date.now();
+  $("iv-clock").textContent = "0s";
+  ivTimer = setInterval(() => {
+    $("iv-clock").textContent = `${Math.round((Date.now() - started) / 1000)}s`;
+  }, 1000);
+}
+
 async function interviewRound(skip = false): Promise<void> {
+  if (ivBusy) return;
   if (ivCurrent.length) {
     ivHistory.push({ questions: ivCurrent, answers: skip ? [] : collectAnswers() });
   }
-  $("iv-state").textContent = skip ? "proposing from what you answered…" : "asking…";
-  const r = await molt.interview({
-    task: ivTask,
-    round: ivRound,
-    history: ivHistory,
-  });
+  $("iv-state").textContent = skip
+    ? "proposing from what you answered…"
+    : "sending your answers to the model…";
+  ivWaiting(true);
+  let r: Awaited<ReturnType<typeof molt.interview>>;
+  try {
+    r = await molt.interview({
+      task: ivTask,
+      round: ivRound,
+      history: ivHistory,
+    });
+  } finally {
+    ivWaiting(false);
+  }
   if (r.kind === "error") {
     $("iv-state").textContent = r.error;
     say("error", r.error, "error");
@@ -2129,14 +2170,32 @@ async function interviewRound(skip = false): Promise<void> {
   $("criteria").classList.remove("hidden");
   drawCriteria();
   $("ck-seal").classList.toggle("hidden", pendingBarAdds.length === 0);
+  /**
+   * The spec is written; starting the work is a separate, deliberate press.
+   *
+   * It stays deliberate — sealing what a person approved is the whole of
+   * spec-first, and a panel that ran itself would be a bar the model wrote.
+   * What was wrong was the affordance: the next action lived in the composer,
+   * spelled "Run", the same button that had just appeared to do nothing.
+   * Reported as "clicking run after the interview feels weird".
+   */
+  $("ck-start").classList.remove("hidden");
   $("ck-state").textContent = pendingBarAdds.length
-    ? "review, then Seal into bar — or Run to use as this-task criteria"
-    : "review the draft, then Run to seal it for this task";
+    ? "review, then Seal into bar — or Start work to use these for this task only"
+    : "review the draft, then Start work";
   say("", "interview proposed criteria — review them before they mean anything", "info");
 }
 
 $("interview").addEventListener("click", () => void startInterview());
 $("iv-hide").addEventListener("click", closeInterview);
+// Deliberately delegates to Run rather than reimplementing it: one path
+// begins a turn, so the two buttons can never drift into meaning different
+// things.
+$("ck-start").addEventListener("click", () => {
+  $("ck-start").classList.add("hidden");
+  $("send").click();
+});
+
 $("iv-next").addEventListener("click", () => void interviewRound(false));
 $("iv-skip").addEventListener("click", () => void interviewRound(true));
 $("ck-seal").addEventListener("click", async () => {

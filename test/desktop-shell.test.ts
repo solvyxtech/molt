@@ -169,6 +169,83 @@ describe("desktop theme surfaces", () => {
   });
 });
 
+describe("the interview says it is working", () => {
+  /**
+   * Reported after a real run: "when you draft answer the questions and click
+   * to send there needs to be a loading or something because it looks frozen
+   * then populates after a minute or so."
+   *
+   * A round is a real request to a real provider. The panel used to swap one
+   * line of text and leave its buttons live, so a minute of waiting was
+   * indistinguishable from a hung window — and a second click sent a second
+   * round.
+   */
+  it("shows a spinner and an elapsed clock while a round is in flight", () => {
+    const html = readFileSync(path.join(repoRoot(), "ui", "index.html"), "utf8");
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    const css = readFileSync(path.join(repoRoot(), "ui", "styles.css"), "utf8");
+
+    assert.match(html, /id="iv-wait"/, "the wait indicator must exist");
+    assert.match(html, /id="iv-clock"/, "…and say how long it has been");
+    assert.match(css, /\.iv-wait \.spin/, "…and animate");
+    assert.match(ui, /function ivWaiting/, "…driven by one place");
+  });
+
+  it("disables the buttons while it waits, so a second click cannot double-send", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    assert.match(ui, /if \(ivBusy\) return;/, "a round in flight refuses another");
+    assert.match(ui, /\("iv-next"\) as HTMLButtonElement\)\.disabled/);
+    assert.match(ui, /\("iv-skip"\) as HTMLButtonElement\)\.disabled/);
+  });
+
+  /**
+   * The indicator has to come down on failure too, or a failed round leaves a
+   * panel that spins for ever — a worse lie than the frozen one it replaced.
+   */
+  it("clears the indicator even when the round throws", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    const round = ui.slice(ui.indexOf("async function interviewRound"));
+    assert.match(round.slice(0, 900), /finally \{\s*ivWaiting\(false\);/);
+  });
+});
+
+describe("starting the work after the interview", () => {
+  /**
+   * Reported as "clicking run after the interview feels weird". The press
+   * stays deliberate — sealing what a person approved is the whole of
+   * spec-first, and a panel that ran itself would be a bar the model wrote —
+   * but the action now sits where the spec is, instead of back in the composer
+   * behind a button that had just appeared to do nothing.
+   */
+  it("offers the action beside the spec it starts", () => {
+    const html = readFileSync(path.join(repoRoot(), "ui", "index.html"), "utf8");
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    assert.match(html, /id="ck-start"/);
+    assert.match(ui, /\$\("ck-start"\)\.classList\.remove\("hidden"\)/, "shown when a proposal lands");
+    // One path begins a turn. A second implementation is how two buttons come
+    // to mean different things.
+    assert.match(ui, /\$\("ck-start"\)\.addEventListener[\s\S]{0,200}\$\("send"\)\.click\(\)/);
+  });
+
+  it("never leaves the action over a panel that has been cleared", () => {
+    const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");
+    const hidePanel = '$("criteria").classList.add("hidden");';
+    const parts = ui.split(hidePanel);
+    assert.ok(parts.length > 1, "the panel is hidden somewhere");
+    // Paired, not merely present: the button is hidden immediately after every
+    // hide of the panel it belongs to. Counting the two separately would pass
+    // on a file that hid the button four times in one branch and never in the
+    // others.
+    for (const after of parts.slice(1)) {
+      assert.match(
+        after.slice(0, 120),
+        /\$\("ck-start"\)\.classList\.add\("hidden"\);/,
+        "a hidden criteria panel must take its Start work button with it",
+      );
+    }
+  });
+});
+
 describe("logging in to Claude Code from the window", () => {
   /**
    * Reported as "in the desktop app it is not possible to login to claude

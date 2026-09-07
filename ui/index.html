@@ -202,6 +202,7 @@
       </div>
       <div class="iv-qs" id="iv-qs"></div>
       <div class="iv-actions">
+        <span class="iv-wait hidden" id="iv-wait"><span class="spin">▪</span><span id="iv-clock">0s</span></span>
         <button class="btn ghost sm" id="iv-skip">Skip remaining</button>
         <button class="btn primary sm" id="iv-next">Answer</button>
       </div>
@@ -214,11 +215,12 @@
         <span class="spacer"></span>
         <button class="btn ghost sm" id="ck-add">+ check</button>
         <button class="btn ghost sm" id="ck-add-note">+ note</button>
-        <label class="ck-auto" title="Ask before work; review the spec, then Run again to start">
+        <label class="ck-auto" title="Ask before work; review the spec, then Start work">
           <input type="checkbox" id="ck-auto" checked /> spec first
         </label>
         <button class="btn ghost sm" id="ck-draft">Draft now</button>
         <button class="btn ghost sm hidden" id="ck-seal">Seal into bar</button>
+        <button class="btn primary sm hidden" id="ck-start">Start work</button>
         <button class="btn ghost sm" id="ck-hide">✕</button>
       </div>
       <div class="ck-rows" id="ck-rows"></div>
