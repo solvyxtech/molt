@@ -223,6 +223,11 @@ export function proposeBar(cwd: string): { yaml: string; detected: Detected[] } 
     "    builtin: tree-accounted",
     "    tags: [session]",
     "",
+    "  # A deleted assertion is a change to what this project promises.",
+    "  - name: spec-intact",
+    "    builtin: spec-intact",
+    "    tags: [session]",
+    "",
     "  # Nothing committed may depend on a file that was not committed. A commit",
     "  # that stages a module's dependents but not the module builds perfectly on",
     "  # the machine that made it and nowhere else, and a suite that reads the",
@@ -231,6 +236,33 @@ export function proposeBar(cwd: string): { yaml: string; detected: Detected[] } 
     "    builtin: imports-tracked",
     "",
   ];
+
+  // Coverage and mutation need a test command. Proposing them without one
+  // writes a bar that cannot parse (mutation requires `run`) or that fails
+  // every turn (diff-covered with no report). The commands above are what
+  // molt found; these two are why those commands are not the whole bar.
+  const tests =
+    detected.find((c) => c.name === "tests") ??
+    detected.find((c) => c.name === "test") ??
+    detected.find((c) => c.name === "check" || c.name === "ci");
+  if (tests) {
+    tail.push(
+      "  # Every added line is executed by the suite. Point `lcov` at whatever",
+      "  # the test command actually writes; this is the conventional path.",
+      "  - name: work-proven",
+      "    builtin: diff-covered",
+      "    lcov: coverage/lcov.info",
+      "    tags: [session]",
+      "",
+      `  # Break a sample of those lines; the suite must go red. ${tests.because}.`,
+      "  - name: work-checked",
+      "    builtin: mutation",
+      `    run: ${tests.run}`,
+      "    sample: 3",
+      "    tags: [session, slow]",
+      "",
+    );
+  }
 
   return { yaml: [...head, ...body, ...tail].join("\n"), detected };
 }

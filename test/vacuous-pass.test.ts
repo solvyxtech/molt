@@ -146,6 +146,63 @@ describe("the mutation check's early exits claim nothing either", () => {
   });
 });
 
+/**
+ * The other half of the 2026-09-07 finding, left open in the audit: mutation
+ * learned to refuse (or to say it established nothing), and `diff-covered`
+ * still passed when every changed file was simply absent from the report.
+ * Fifteen receipts read "0 changed file(s) executed by the tests" and the
+ * bar was met.
+ */
+describe("diff-covered does not pass on a report that never looked", () => {
+  const BAR = parseBar(
+    "version: 1\nchecks:\n  - name: proven\n    builtin: diff-covered\n    lcov: coverage/lcov.info\n",
+  );
+
+  function withReport(dir: string, lcov: string): void {
+    mkdirSync(join(dir, "coverage"), { recursive: true });
+    writeFileSync(join(dir, "coverage/lcov.info"), lcov);
+  }
+
+  it("refuses when every source file is absent from the report", async () => {
+    const dir = ws();
+    withReport(dir, "SF:src/other.ts\nDA:1,1\nend_of_record\n");
+    writeFileSync(join(dir, "src.ts"), "export const x = 1;\n");
+    const [r] = (await runBar(BAR, ctxIn(dir, [wrote("src.ts", [1])]))).results;
+    assert.equal(r?.ok, false, "a report that does not mention the work is not a pass");
+    assert.match(r?.output ?? "", /none of them is in/);
+  });
+
+  it("establishes nothing when the turn changed no file coverage instruments", async () => {
+    const dir = ws();
+    withReport(dir, "SF:src/a.ts\nDA:1,1\nend_of_record\n");
+    writeFileSync(join(dir, "README.md"), "# docs\n");
+    const [r] = (await runBar(BAR, ctxIn(dir, [wrote("README.md", [1])]))).results;
+    assert.equal(r?.ok, true, "a docs turn is not unproven source");
+    assert.equal(r?.established, false);
+    assert.match(r?.output ?? "", /none that coverage instruments/);
+  });
+
+  it("still passes when the changed source ran", async () => {
+    const dir = ws();
+    mkdirSync(join(dir, "src"), { recursive: true });
+    writeFileSync(join(dir, "src/a.ts"), "export const x = 1;\n");
+    withReport(dir, "SF:src/a.ts\nDA:1,4\nend_of_record\n");
+    const [r] = (await runBar(BAR, ctxIn(dir, [wrote("src/a.ts", [1])]))).results;
+    assert.equal(r?.ok, true, r?.output);
+    assert.notEqual(r?.established, false);
+    assert.match(r?.output ?? "", /1 changed file\(s\) executed/);
+  });
+
+  it("still fails a missing report rather than treating absence as empty scope", async () => {
+    const dir = ws();
+    mkdirSync(join(dir, "src"), { recursive: true });
+    writeFileSync(join(dir, "src/a.ts"), "export const x = 1;\n");
+    const [r] = (await runBar(BAR, ctxIn(dir, [wrote("src/a.ts", [1])]))).results;
+    assert.equal(r?.ok, false);
+    assert.match(r?.output ?? "", /No coverage report/);
+  });
+});
+
 describe("record-intact says which kind of pass it is", () => {
   it("establishes nothing when there is no archive to audit", async () => {
     const dir = ws();

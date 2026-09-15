@@ -91,21 +91,24 @@ try {
 }
 
 /**
- * The MCP stdio bridge, as its own file rather than inside the bundle.
+ * The MCP stdio bridge and the PreToolUse gate, as their own files rather
+ * than inside the bundle.
  *
  * `mcpEntry` hands an ACP agent a path to spawn, so this one has to exist on
  * disk beside whatever resolves `./mcp-bridge.js`. Rolled into main.cjs it
  * would be code that is present and unreachable — the agent would spawn a
  * missing file, get no tools, and report nothing about why.
  */
-await build({
-  ...common,
-  entryPoints: ["src/mcp-bridge.ts"],
-  outfile: "out/mcp-bridge.js",
-  platform: "node",
-  format: "esm",
-  target: "node20",
-});
+for (const name of ["mcp-bridge", "agy-hook"]) {
+  await build({
+    ...common,
+    entryPoints: [`src/${name}.ts`],
+    outfile: `out/${name}.js`,
+    platform: "node",
+    format: "esm",
+    target: "node20",
+  });
+}
 
 cpSync("ui/index.html", "out/ui/index.html");
 cpSync("ui/styles.css", "out/ui/styles.css");

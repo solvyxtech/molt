@@ -136,9 +136,17 @@ test command wrote. Node's test runner emits it with
 A missing report **fails**. A check that verifies nothing when its input is
 absent is worse than no check, because it is counted as one.
 
-A changed line absent from the report is not held against anyone — lcov lists
-only what the tool considers executable, so a type or an import simply is not
-there. Silence means "not instrumented", not "not run".
+A changed *file* that coverage would instrument — `.ts`, `.py`, `.go`, and
+the rest — with **none** of those files in the report, also fails. That is
+the same green row as a missing report, reached by a report that does not
+mention the work. Fifteen receipts on this project read "0 changed file(s)
+executed by the tests" and passed, for exactly that reason.
+
+A changed line absent from a file that *is* in the report is not held
+against anyone — lcov lists only what the tool considers executable, so a
+type or an import simply is not there. Silence means "not instrumented",
+not "not run". A turn that only changed markdown, CSS, or yaml establishes
+nothing and says so.
 
 Known limit: it catches the dead branch and not the dead constant. A
 module-level `export const` executes at import, so coverage cannot see that

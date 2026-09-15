@@ -114,6 +114,22 @@ export type Unproven = {
 };
 
 /**
+ * Paths a coverage report can speak about.
+ *
+ * lcov never lists a stylesheet, a markdown file, or a yaml config. Treating
+ * those as "in the report, unexecuted" would refuse a docs-only turn, and
+ * treating a `.ts` file the same way as a stylesheet is how fifteen receipts
+ * read "0 changed file(s) executed" and passed: the source was absent from
+ * the report, the check counted that as not-instrumented, and the bar was
+ * met without having looked.
+ */
+export function coverageCouldSpeak(path: string): boolean {
+  return /\.(?:[cm]?tsx?|[cm]?jsx?|py|go|rs|java|rb|c|cc|cpp|h|hpp|cs|kt|swift)$/i.test(
+    path,
+  );
+}
+
+/**
  * Which of this turn's changed lines nothing executed.
  *
  * A changed line absent from the report is not counted against the model: lcov

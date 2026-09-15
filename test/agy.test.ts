@@ -14,17 +14,23 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import {
   AGY_URL,
+  agyAsk,
+  agyHooksPath,
+  ensureAgyHook,
+  moltHookEntry,
   agyAllowRules,
   agyEnv,
   agyHealth,
   agySetupState,
   ensureAgyRules,
   isAgy,
+  AgySession,
 } from "../src/agy.js";
 import { Archive } from "../src/archive.js";
 import { parseBar } from "../src/bar.js";
 import { CLAUDE_CODE_URL } from "../src/claude-code.js";
 import { draftCriteria } from "../src/criteria.js";
+import { interviewTurn } from "../src/interview.js";
 import { Engine } from "../src/engine.js";
 import { isSelfHosted, PROVIDERS, providerName } from "../src/providers.js";
 import { Receipts } from "../src/receipts.js";
@@ -161,6 +167,48 @@ describe("the permission rules molt writes", () => {
   });
 
   /**
+   * The gate that makes this backend cost one step instead of two.
+   *
+   * Without it Antigravity spends the first step trying its own `read_file`,
+   * being refused by the permission system, and stopping with nothing said —
+   * a denial ends the turn. The hook's `reason` reaches the model instead, so
+   * it corrects in the same turn. Measured: two steps became one.
+   */
+  it("gates every tool but molt's, and says what to use instead", () => {
+    const entry = moltHookEntry("/opt/molt/agy-hook.js", "/usr/bin/node") as {
+      PreToolUse: { matcher: string; hooks: { command: string }[] }[];
+    };
+    assert.equal(entry.PreToolUse[0]?.matcher, "*", "every tool, not a guessed list");
+    const cmd = entry.PreToolUse[0]?.hooks[0]?.command ?? "";
+    assert.match(cmd, /ELECTRON_RUN_AS_NODE=1/u, "execPath is Electron in the packaged app");
+    assert.match(cmd, /agy-hook\.js/u);
+  });
+
+  /**
+   * The hooks file is global — it applies to sessions molt did not start — so
+   * molt writes exactly its own key and leaves the rest alone.
+   */
+  it("adds its hook beside yours without touching them", () => {
+    const path = join(ws(), "hooks.json");
+    writeFileSync(path, JSON.stringify({ "lint-checker": { PostToolUse: [{ matcher: "x" }] } }), "utf8");
+    assert.equal(ensureAgyHook(path, "/opt/molt/agy-hook.js"), true);
+
+    const after = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    assert.ok(after["lint-checker"], "a hook molt did not write must survive");
+    assert.ok(after["molt-tool-gate"], "and molt's must be there");
+
+    // Idempotent: the same command written twice changes nothing.
+    assert.equal(ensureAgyHook(path, "/opt/molt/agy-hook.js"), false);
+    // But a moved script is rewritten — a hook pointing at a file that is gone
+    // fails on every tool call.
+    assert.equal(ensureAgyHook(path, "/elsewhere/agy-hook.js"), true);
+  });
+
+  it("puts the hook where agy actually reads global customisations", () => {
+    assert.equal(agyHooksPath("/home/x"), "/home/x/.gemini/config/hooks.json");
+  });
+
+  /**
    * The trick that removes the second sign-in: the port and token travel in
    * the environment, so the registered command line never changes and no
    * per-session config rewrite is needed. An MCP child spawned by `agy`
@@ -267,6 +315,31 @@ describe("a turn done by Antigravity", () => {
     await drain(engine.run("break things", denyAll));
     assert.equal(existsSync(join(dir, "no.txt")), false, "a denied call must not have written");
   });
+
+  it("exposes refused tools apart from unaccounted tools", async () => {
+    const dir = ws();
+    const agy = scriptedAgy([{
+      refusedBuiltins: ["write_to_file"],
+      ranBuiltins: ["view_file"],
+      text: "Done.",
+    }]);
+    
+    const session = new AgySession<any>({
+      model: "gemini-3.1-pro-low",
+      cwd: dir,
+      systemPrompt: "test",
+      tools: [],
+      runTool: async () => "",
+      setup: agy.setup,
+      spawnFn: agy.spawnFn,
+    });
+    
+    for await (const _ of session.send(["hello"])) {}
+    
+    assert.deepEqual(session.refusedTools(), ["write_to_file"]);
+    assert.deepEqual(session.unaccountedTools(), ["view_file"]);
+    await session.close();
+  });
 });
 
 /**
@@ -302,10 +375,15 @@ describe("nothing on the Antigravity endpoint reaches for HTTP", () => {
   });
 
   /**
-   * Refused in words rather than by a failed fetch. `agy` brings its 57 tools
-   * whatever you ask of it, so there is no tool-free one-shot to draft with.
+   * Drafted through the CLI, not over HTTP — and not refused.
+   *
+   * This used to answer "Antigravity cannot draft criteria yet", which the
+   * window turns into an apology on every first Run because it drafts
+   * automatically. `interview.ts` already carried that lesson from the Claude
+   * Code backend; this repeated it anyway, and a user hit it.
    */
-  it("says why it cannot draft criteria, instead of failing as a network error", async () => {
+  it("drafts criteria through the CLI instead of over HTTP", async () => {
+    let argv: string[] = [];
     const r = await draftCriteria({
       task: "audit this repo",
       scripts: ["test"],
@@ -313,9 +391,60 @@ describe("nothing on the Antigravity endpoint reaches for HTTP", () => {
       baseUrl: AGY_URL,
       model: "gemini-3.1-pro-low",
       fetchFn: noFetch("draftCriteria"),
+      agyRun: async (_c, args) => {
+        argv = args;
+        return {
+          stdout: JSON.stringify({
+            status: "SUCCESS",
+            response: '{"checks":[{"name":"suite","run":"npm test"}],"notes":["reads cleanly"]}',
+          }),
+        };
+      },
+    });
+    assert.ok(r.ok, r.ok ? "" : r.error);
+    assert.deepEqual(r.ok ? r.draft.checks.map((c) => c.run) : [], ["npm test"]);
+    // The task reached the model, so this is its answer and not a canned one.
+    assert.ok(
+      argv.some((a) => a.includes("audit this repo")),
+      `the task must be in the prompt: ${JSON.stringify(argv)}`,
+    );
+    // And no MCP server is on offer for a question: nothing here can write.
+    assert.ok(!argv.some((a) => /mcp/iu.test(a)), JSON.stringify(argv));
+  });
+
+  it("runs the interview through the CLI too", async () => {
+    const r = await interviewTurn({
+      task: "audit this repo",
+      scripts: ["test"],
+      barChecks: ["types"],
+      history: [],
+      round: 1,
+      baseUrl: AGY_URL,
+      model: "gemini-3.1-pro-low",
+      fetchFn: noFetch("interviewTurn"),
+      agyRun: async () => ({
+        stdout: JSON.stringify({
+          status: "SUCCESS",
+          response: JSON.stringify({
+            questions: [{ id: "q1", prompt: "What counts as done?", options: ["tests pass", "a demo"] }],
+          }),
+        }),
+      }),
+    });
+    assert.equal(r.kind, "ask");
+    assert.equal(r.kind === "ask" ? r.questions[0]?.prompt : "", "What counts as done?");
+  });
+
+  /** A refusal from the CLI is reported as itself, not as an empty answer. */
+  it("reports a refusal from the CLI rather than returning nothing", async () => {
+    const r = await agyAsk({
+      model: "gemini-3.1-pro-low",
+      systemPrompt: "S",
+      prompt: "P",
+      run: async () => ({ stdout: JSON.stringify({ status: "ERROR", error: "usage limit" }) }),
     });
     assert.equal(r.ok, false);
-    assert.match(r.ok ? "" : r.error, /Antigravity/u);
+    assert.match(r.ok ? "" : r.error, /usage limit/u);
   });
 });
 

@@ -25,9 +25,18 @@ was fixed, and each fix ships with a test that goes red without it.
 - **`/attempts` and `/autoshed`** on both surfaces, from one implementation.
 - **`Integrity.verifyProject`**: journals and the ledger as one verdict, used
   by `molt verify` and the window's "verify evidence chain" button alike.
+- **`molt init` writes the rungs the README advertises.** The generated bar
+  always includes `spec-intact`. When a test command is detected it also
+  includes `diff-covered` and `mutation`, pointed at that command.
 
 ### Fixed
 
+- `diff-covered` refused a missing report and then passed when every changed
+  file was simply absent from it. Fifteen receipts read "0 changed file(s)
+  executed" and the bar was met. Source files missing from lcov now refuse;
+  a docs-only turn establishes nothing and says so.
+- Receipts and ask-mode read the turn's writes, not the session's. A later
+  question was being filed as a verified change of files it never opened.
 - Coverage is reported in source coordinates (`--enable-source-maps`), so
   `diff-covered` examines the lines the ledger names.
 - The integrity ledger checks that every bound journal root still names an

@@ -22,20 +22,24 @@
  * out of cache where the first read 8,122, so a process per turn would pay for
  * the context again every step.
  *
- * ## Why the ledger is safe here, and why it is safer than on ACP
+ * ## Why the ledger is safe here
  *
  * Antigravity's headless mode **denies by default**. A tool that needs
  * permission and has no matching rule cannot prompt anybody, so it is refused
- * — verified three ways on a live account: `write_to_file` refused,
- * `run_command touch …` refused (the file never appeared), and `call_mcp_tool`
- * refused until a rule allowed it. Only its read-only shell commands run
- * unasked, and those cannot change the tree.
+ * — verified on a live account: `write_to_file` refused, `run_command touch …`
+ * refused with the file never created, `call_mcp_tool` refused until a rule
+ * allowed it, and `read_file` refused too.
  *
- * So molt does not have to take anything away. It adds exactly one thing: an
- * allow-rule per molt tool, `mcp(molt/<name>)`, which is the rule string the
- * CLI itself prints when it refuses one. Everything molt has not named stays
- * refused. That is the opposite of the Grok backend, where molt must strip
- * tools and refuse permissions and still cannot stop an auto-approved read.
+ * So molt does not have to take anything away. It adds an allow-rule per molt
+ * tool, `mcp(molt/<name>)`, which is the rule string the CLI itself prints
+ * when it refuses one. Everything molt has not named stays refused.
+ *
+ * That alone is safe but not usable: **a denied tool ends the turn**, so the
+ * first step went to Antigravity trying its own `read_file`, being refused,
+ * and stopping with nothing said. `agy-hook.ts` is what fixes it — a
+ * `PreToolUse` gate whose `reason` reaches the model, so it is told mid-turn
+ * to use molt's tools instead. Two steps became one, and a bar of
+ * `files-changed` + `tree-accounted` now passes on the first attempt.
  *
  * ## Why it edits the config you already have
  *
@@ -70,13 +74,12 @@
  * own, which molt does not write.
  */
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname } from "node:path";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 
-import { bridgePath, Channel, McpToolServer } from "./acp.js";
+import { bridgePath, Channel, McpToolServer, shippedScript } from "./acp.js";
 import type { BackendEvent, MoltTool, ToolRunner } from "./claude-code.js";
 import { errorText } from "./format.js";
 
@@ -259,6 +262,60 @@ export function ensureAgyRules(
   return state.missingRules;
 }
 
+/** `~/.gemini/config/hooks.json` — global customisations, all sessions. */
+export function agyHooksPath(home = homedir()): string {
+  return join(home, ".gemini", "config", "hooks.json");
+}
+
+/** The hook entry molt installs, so a test can assert it without a filesystem. */
+export function moltHookEntry(script: string, exe = process.execPath): Record<string, unknown> {
+  return {
+    PreToolUse: [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            // `ELECTRON_RUN_AS_NODE` because in the packaged app `execPath` is
+            // Electron, and without it this starts a second window instead of
+            // a script. The hook runs through `sh -c`, so the assignment works.
+            command: `ELECTRON_RUN_AS_NODE=1 ${JSON.stringify(exe)} ${JSON.stringify(script)}`,
+            timeout: 15,
+          },
+        ],
+      },
+    ],
+  };
+}
+
+/**
+ * Install the `PreToolUse` gate, once, beside whatever hooks you already have.
+ *
+ * Merged by name: molt writes exactly the `molt-tool-gate` key and leaves every
+ * other hook in the file untouched. Rewritten when the command changes — the
+ * path to the script moves when the app is reinstalled, and a hook pointing at
+ * a file that is gone is a hook that fails on every tool call.
+ *
+ * Safe to have installed permanently: the gate has no opinion unless
+ * `MOLT_MCP_URL` is in its environment. See `agy-hook.ts`.
+ */
+export function ensureAgyHook(path = agyHooksPath(), script?: string): boolean {
+  const entry = moltHookEntry(script ?? shippedScript("agy-hook.js"));
+  let current: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      current = parsed as Record<string, unknown>;
+    }
+  } catch {
+    /* no hooks yet, or not ours to read */
+  }
+  if (JSON.stringify(current["molt-tool-gate"]) === JSON.stringify(entry)) return false;
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({ ...current, "molt-tool-gate": entry }, null, 2), "utf8");
+  return true;
+}
+
 /**
  * Register molt's tool server, once, with a command line that never changes.
  *
@@ -350,6 +407,79 @@ export async function agyHealth(
   };
 }
 
+/**
+ * One question, one answer — the pre-turn calls on this backend.
+ *
+ * `interviewTurn` and `draftCriteria` are the two places molt asks a model
+ * something that is not the work. Both were written against
+ * `/chat/completions`, and `antigravity://subscription` is a name rather than
+ * a URL, so both were dead ends here.
+ *
+ * They used to refuse in words, on the grounds that `agy` always brings its 57
+ * tools and a proposal drafted by something that can read the repo is a
+ * different artefact from the one every other backend produces. That was true
+ * and it was the wrong trade: the window drafts criteria automatically on Run,
+ * so the refusal meant every first Run on this backend ended in an apology and
+ * started no turn. `interview.ts` already carries that exact lesson from the
+ * Claude Code backend, and this managed to repeat it anyway.
+ *
+ * What makes it safe without a `tools: []` to ask for:
+ *
+ *   - **No MCP server is registered for this call.** Molt's tools are not on
+ *     offer, so nothing here can reach the ledger.
+ *   - **It runs in an empty temporary directory.** Its read-only tools work
+ *     and find nothing, which is the closest thing to no tools that a CLI
+ *     without a tool switch can be given — and it keeps the proposal a
+ *     function of the prompt, the way the other backends' proposals are.
+ *   - **Everything else is denied by default** in headless mode, which is the
+ *     property this whole backend rests on.
+ *
+ * `--disable-slash-commands` because a task that happens to begin with `/`
+ * is a task, not a command.
+ */
+export type AgyAskOptions = {
+  model: string;
+  systemPrompt: string;
+  prompt: string;
+  /** Injected in tests. Real callers spawn the CLI. */
+  run?: (cmd: string, args: string[], opts: object) => Promise<{ stdout: string }>;
+};
+
+export async function agyAsk(
+  opts: AgyAskOptions,
+): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+  const run = opts.run ?? ((c: string, a: string[], o: object) => exec(c, a, o));
+  const dir = opts.run ? tmpdir() : mkdtempSync(join(tmpdir(), "molt-agy-ask-"));
+  try {
+    const { stdout } = await run(
+      "agy",
+      [
+        `--print=${opts.systemPrompt}\n\n${opts.prompt}`,
+        "--output-format",
+        "json",
+        "--model",
+        opts.model,
+        "--print-timeout",
+        "180s",
+        "--disable-slash-commands",
+      ],
+      { cwd: dir, env: agyEnv(), maxBuffer: 1024 * 1024 * 16 },
+    );
+    const parsed = JSON.parse(stdout) as { status?: string; response?: string; error?: string };
+    if (parsed.status && !/SUCCESS/iu.test(parsed.status)) {
+      // The status names the refusal — a usage limit, a timeout — and a
+      // refusal reported as an empty answer would read as molt's bug.
+      return { ok: false, error: parsed.error || parsed.status };
+    }
+    const text = (parsed.response ?? "").trim();
+    return text ? { ok: true, text } : { ok: false, error: "Antigravity returned nothing" };
+  } catch (e) {
+    return { ok: false, error: errorText(e) };
+  } finally {
+    if (!opts.run) rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The session
 // ---------------------------------------------------------------------------
@@ -408,6 +538,8 @@ export class AgySession<H> {
   private preface?: string;
   /** Builtins that ran without reaching molt's ledger. Reported, not hidden. */
   private unaccounted = new Set<string>();
+  /** Builtins that arrived with state ERROR and did not run. */
+  private refused = new Set<string>();
 
   constructor(private opts: AgyOptions<H>) {}
 
@@ -418,6 +550,10 @@ export class AgySession<H> {
 
   unaccountedTools(): string[] {
     return [...this.unaccounted];
+  }
+
+  refusedTools(): string[] {
+    return [...this.refused];
   }
 
   private async start(): Promise<void> {
@@ -434,7 +570,16 @@ export class AgySession<H> {
     if (this.opts.setup) await this.opts.setup(endpoint);
     else {
       const added = ensureAgyRules(tools);
+      const hooked = ensureAgyHook();
       await ensureAgyServer(bridgePath());
+      if (hooked) {
+        this.events.push({
+          kind: "info",
+          text:
+            `installed molt's tool gate in ${agyHooksPath()} — it has no effect on ` +
+            `Antigravity sessions molt did not start`,
+        });
+      }
       if (added.length) {
         this.events.push({
           kind: "info",
@@ -548,12 +693,18 @@ export class AgySession<H> {
        *
        * A refusal arrives as ERROR and is the system working — those are not
        * reported as unaccounted, because nothing happened. A DONE is a builtin
-       * that ran: Antigravity's read-only shell commands and file reads are
-       * auto-approved and never reach a permission check, so they are the one
-       * thing molt cannot stop. They cannot change the tree, so the bar is
-       * unharmed; the ledger is simply not a record of what was read.
+       * that ran without molt.
+       *
+       * Less of this happens than first assumed: `read_file` is gated too, not
+       * only writes — a live run had Antigravity's own read auto-denied and
+       * fall back to molt's `read_file`, at the cost of one empty step. Safe
+       * shell commands (`echo`) are the ones seen to pass unasked. Whatever
+       * gets through cannot change the tree, so the bar is unharmed; the
+       * ledger simply may not be a complete record of what was read.
        */
-      if (su.state === "DONE" && !this.unaccounted.has(name)) {
+      if (su.state === "ERROR" && !this.refused.has(name)) {
+        this.refused.add(name);
+      } else if (su.state === "DONE" && !this.unaccounted.has(name)) {
         this.unaccounted.add(name);
         this.events.push({
           kind: "info",

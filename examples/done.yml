@@ -22,3 +22,19 @@ checks:
 
   - name: record-intact
     builtin: record-intact
+
+  - name: work-accounted
+    builtin: tree-accounted
+
+  - name: spec-intact
+    builtin: spec-intact
+
+  # Point `lcov` at whatever `npm test` actually writes.
+  - name: work-proven
+    builtin: diff-covered
+    lcov: coverage/lcov.info
+
+  - name: work-checked
+    builtin: mutation
+    run: npm test
+    sample: 3

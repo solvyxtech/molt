@@ -9,7 +9,7 @@
  * Nothing here asks a model anything. A bar result is an exit code.
  */
 import { runCommand } from "./run.js";
-import { parseLcov, coverageFor, unprovenIn, type Unproven } from "./coverage.js";
+import { parseLcov, coverageFor, coverageCouldSpeak, unprovenIn, type Unproven } from "./coverage.js";
 import { planMutations, applyMutation, type Mutation } from "./mutate.js";
 import { proposeBar, type Detected } from "./detect.js";
 import { assertionsIn, fingerprint, isTestPath, treeChanges, type TreeSnapshot } from "./files.js";
@@ -1217,6 +1217,19 @@ function diffCovered(
     // says so, rather than presenting an empty scope as a covered one.
     return { ok: true, established: false, output: "No changed lines to cover." };
   }
+  // A markdown file will never appear in lcov. A `.ts` file that does not
+  // appear is a report that did not look. Counting both as "not instrumented"
+  // is how this check passed on zero covered files for fifteen receipts.
+  const measurable = judged.filter((e) => coverageCouldSpeak(e.path));
+  if (measurable.length === 0) {
+    return {
+      ok: true,
+      established: false,
+      output:
+        `${judged.length} changed file(s), none that coverage instruments. ` +
+        "Nothing is claimed about whether tests execute them.",
+    };
+  }
   if (!lcovPath) {
     return { ok: false, output: "diff-covered needs an `lcov` path in done.yml." };
   }
@@ -1237,7 +1250,7 @@ function diffCovered(
   const cov = parseLcov(text);
   const problems: Unproven[] = [];
   let unmatched = 0;
-  for (const entry of judged) {
+  for (const entry of measurable) {
     const found = coverageFor(cov, entry.path);
     if (!found) {
       unmatched++;
@@ -1248,14 +1261,26 @@ function diffCovered(
   }
 
   if (problems.length === 0) {
-    const covered = judged.length - unmatched;
+    const covered = measurable.length - unmatched;
+    if (covered === 0) {
+      return {
+        ok: false,
+        output:
+          `${measurable.length} changed file(s) that coverage should speak about, and none of ` +
+          `them is in ${lcovPath}. Passing would be a claim molt has not earned — the same ` +
+          `green row as a missing report, reached by a report that does not mention the work. ` +
+          `Point \`lcov\` at a report that includes these paths, or drop this check.`,
+      };
+    }
+    const other = judged.length - measurable.length;
     return {
       ok: true,
       output:
         `${covered} changed file(s) executed by the tests` +
         (unmatched > 0
           ? ` · ${unmatched} not in the coverage report (not instrumented — nothing is claimed about them)`
-          : ""),
+          : "") +
+        (other > 0 ? ` · ${other} not a source file coverage instruments` : ""),
     };
   }
 
