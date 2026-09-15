@@ -161,4 +161,43 @@ describe("what molt proposes to a project it has never seen", () => {
     const bar = parseBar(proposeBar(w.dir).yaml);
     assert.ok(bar.checks.some((c) => c.name === "work-complete"));
   });
+
+  it("always includes spec-intact, even with nothing to detect", async () => {
+    const { proposeBar } = await import("../src/detect.js");
+    const w = workspace();
+    cleanups.push(w.cleanup);
+    const bar = parseBar(proposeBar(w.dir).yaml);
+    assert.ok(
+      bar.checks.some((c) => c.kind === "builtin" && c.builtin === "spec-intact"),
+      "a deleted assertion is a change to the contract on every project",
+    );
+  });
+
+  it("adds coverage and mutation once a test command exists", async () => {
+    const { proposeBar } = await import("../src/detect.js");
+    const w = workspace();
+    cleanups.push(w.cleanup);
+    writeFileSync(
+      join(w.dir, "package.json"),
+      JSON.stringify({ name: "x", scripts: { test: "node --test" } }),
+    );
+    const { yaml } = proposeBar(w.dir);
+    const bar = parseBar(yaml);
+    const proven = bar.checks.find((c) => c.name === "work-proven");
+    const checked = bar.checks.find((c) => c.name === "work-checked");
+    assert.ok(proven && proven.kind === "builtin" && proven.builtin === "diff-covered");
+    assert.equal(proven.kind === "builtin" ? proven.lcov : undefined, "coverage/lcov.info");
+    assert.ok(checked && checked.kind === "builtin" && checked.builtin === "mutation");
+    assert.equal(checked.kind === "builtin" ? checked.run : undefined, "npm test");
+  });
+
+  it("does not write a mutation check that cannot parse, when there is no test command", async () => {
+    const { proposeBar } = await import("../src/detect.js");
+    const w = workspace();
+    cleanups.push(w.cleanup);
+    const { yaml } = proposeBar(w.dir);
+    assert.doesNotMatch(yaml, /builtin: mutation/);
+    assert.doesNotMatch(yaml, /builtin: diff-covered/);
+    parseBar(yaml);
+  });
 });
