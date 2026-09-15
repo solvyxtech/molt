@@ -75,10 +75,8 @@
  */
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { homedir, tmpdir as _tmpdir } from "node:os";
-import { dirname } from "node:path";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 
 import { bridgePath, Channel, McpToolServer, shippedScript } from "./acp.js";
@@ -540,6 +538,8 @@ export class AgySession<H> {
   private preface?: string;
   /** Builtins that ran without reaching molt's ledger. Reported, not hidden. */
   private unaccounted = new Set<string>();
+  /** Builtins that arrived with state ERROR and did not run. */
+  private refused = new Set<string>();
 
   constructor(private opts: AgyOptions<H>) {}
 
@@ -550,6 +550,10 @@ export class AgySession<H> {
 
   unaccountedTools(): string[] {
     return [...this.unaccounted];
+  }
+
+  refusedTools(): string[] {
+    return [...this.refused];
   }
 
   private async start(): Promise<void> {
@@ -698,7 +702,9 @@ export class AgySession<H> {
        * gets through cannot change the tree, so the bar is unharmed; the
        * ledger simply may not be a complete record of what was read.
        */
-      if (su.state === "DONE" && !this.unaccounted.has(name)) {
+      if (su.state === "ERROR" && !this.refused.has(name)) {
+        this.refused.add(name);
+      } else if (su.state === "DONE" && !this.unaccounted.has(name)) {
         this.unaccounted.add(name);
         this.events.push({
           kind: "info",

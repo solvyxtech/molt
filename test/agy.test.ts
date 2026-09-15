@@ -24,6 +24,7 @@ import {
   agySetupState,
   ensureAgyRules,
   isAgy,
+  AgySession,
 } from "../src/agy.js";
 import { Archive } from "../src/archive.js";
 import { parseBar } from "../src/bar.js";
@@ -313,6 +314,31 @@ describe("a turn done by Antigravity", () => {
     ]);
     await drain(engine.run("break things", denyAll));
     assert.equal(existsSync(join(dir, "no.txt")), false, "a denied call must not have written");
+  });
+
+  it("exposes refused tools apart from unaccounted tools", async () => {
+    const dir = ws();
+    const agy = scriptedAgy([{
+      refusedBuiltins: ["write_to_file"],
+      ranBuiltins: ["view_file"],
+      text: "Done.",
+    }]);
+    
+    const session = new AgySession<any>({
+      model: "gemini-3.1-pro-low",
+      cwd: dir,
+      systemPrompt: "test",
+      tools: [],
+      runTool: async () => "",
+      setup: agy.setup,
+      spawnFn: agy.spawnFn,
+    });
+    
+    for await (const _ of session.send(["hello"])) {}
+    
+    assert.deepEqual(session.refusedTools(), ["write_to_file"]);
+    assert.deepEqual(session.unaccountedTools(), ["view_file"]);
+    await session.close();
   });
 });
 
