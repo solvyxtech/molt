@@ -17,7 +17,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { readFileSync } from "node:fs";
-import { parseLcov, coverageFor, unprovenIn, normalise } from "../src/coverage.js";
+import { parseLcov, coverageFor, coverageCouldSpeak, unprovenIn, normalise } from "../src/coverage.js";
 
 const LCOV = `TN:
 SF:dist/src/files.js
@@ -133,5 +133,23 @@ describe("what counts as unproven", () => {
   it("says nothing about a file absent from the report", () => {
     const cov = parseLcov(LCOV);
     assert.equal(unprovenIn(cov, "ui/styles.css", [1, 2, 3]), null);
+  });
+});
+
+describe("what coverage can speak about", () => {
+  it("includes the languages molt's own bar is written for", () => {
+    assert.equal(coverageCouldSpeak("src/bar.ts"), true);
+    assert.equal(coverageCouldSpeak("src/app.tsx"), true);
+    assert.equal(coverageCouldSpeak("lib/a.js"), true);
+    assert.equal(coverageCouldSpeak("pkg/mod.go"), true);
+    assert.equal(coverageCouldSpeak("src/main.rs"), true);
+    assert.equal(coverageCouldSpeak("foo.py"), true);
+  });
+
+  it("does not include the files lcov never lists", () => {
+    assert.equal(coverageCouldSpeak("ui/styles.css"), false);
+    assert.equal(coverageCouldSpeak("README.md"), false);
+    assert.equal(coverageCouldSpeak(".molt/done.yml"), false);
+    assert.equal(coverageCouldSpeak("docs/why.md"), false);
   });
 });
