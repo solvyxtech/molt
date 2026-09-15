@@ -125,6 +125,65 @@ describe("a completion claim is judged on the turn that made it", () => {
     assert.match(ran, /write_file b\.txt/);
     assert.doesNotMatch(ran, /write_file a\.txt/, "receipt two lists turn one's call");
   });
+
+  it("lists on a receipt only the files this turn wrote", async () => {
+    const dir = ws();
+    const provider = scriptedProvider([
+      { calls: [{ name: "write_file", args: { path: "a.txt", content: "a\n" } }] },
+      { text: "done" },
+      { calls: [{ name: "write_file", args: { path: "b.txt", content: "b\n" } }] },
+      { text: "done again" },
+    ]);
+    const engine = new Engine({
+      baseUrl: "http://mock/v1",
+      model: "m",
+      cwd: dir,
+      fetchFn: provider.fetchFn,
+      bar: LANDED,
+      archive: new Archive(dir),
+      receipts: new Receipts(dir),
+    });
+    await drain(engine.run("one", allowAll));
+    await drain(engine.run("two", allowAll));
+    const rows = new Receipts(dir).records();
+    assert.equal(rows[0]?.changed, 1);
+    assert.equal(rows[1]?.changed, 1, "turn two's receipt counted turn one's write as well");
+    const [, second] = receiptsIn(dir);
+    const body = readFileSync(join(dir, ".molt", "receipts", second!), "utf8");
+    assert.match(body, /`b\.txt`/);
+    assert.doesNotMatch(body, /`a\.txt`/, "the change table is the session, not the turn");
+  });
+
+  it("records a later question as an answer, not as a verified change of earlier files", async () => {
+    const dir = ws();
+    writeFileSync(join(dir, "check.sh"), "exit 0\n");
+    const provider = scriptedProvider([
+      { calls: [{ name: "write_file", args: { path: "a.txt", content: "a\n" } }] },
+      { text: "wrote it" },
+      { text: "It is 64°F and sunny." },
+    ]);
+    const engine = new Engine({
+      baseUrl: "http://mock/v1",
+      model: "m",
+      cwd: dir,
+      fetchFn: provider.fetchFn,
+      bar: parseBar(
+        "version: 1\nchecks:\n  - name: landed\n    builtin: files-changed\n  - name: suite\n    run: sh ./check.sh\n",
+      ),
+      archive: new Archive(dir),
+      receipts: new Receipts(dir),
+    });
+    await drain(engine.run("write a file", allowAll));
+    const events = await drain(engine.run("what is the weather", allowAll, { ask: true }));
+    assert.equal((events.at(-1) as { outcome: string }).outcome, "answered");
+    const rows = new Receipts(dir).records();
+    assert.equal(rows[0]?.changed, 1);
+    assert.equal(rows[1]?.ask, true, "a question after a write was filed as work");
+    assert.equal(rows[1]?.changed, 0);
+    const s = new Receipts(dir).stats();
+    assert.equal(s.verifiedChanges, 1);
+    assert.equal(s.answered, 1);
+  });
 });
 
 describe("every shed is journalled", () => {

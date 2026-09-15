@@ -244,6 +244,25 @@ describe("the proof loop", () => {
     );
   });
 
+  it("does not refuse a question because an earlier turn in the same session wrote", async () => {
+    const dir = ws();
+    writeFileSync(join(dir, "check.sh"), 'echo "suite is broken"\nexit 1\n');
+    const { engine } = engineIn(
+      dir,
+      [
+        { calls: [{ name: "write_file", args: { path: "a.txt", content: "x\n" } }] },
+        { text: "Changed it." },
+        { text: "It is 64°F and sunny." },
+      ],
+      { bar: BAR_WITH_TESTS, maxProofAttempts: 2 },
+    );
+    await drain(engine.run("change a.txt", allowAll, { ask: true }));
+    const events = await drain(engine.run("what is the weather", allowAll, { ask: true }));
+    assert.ok(!kinds(events).includes("proof_refused"), "a later question was refused on the earlier write");
+    assert.ok(!kinds(events).includes("proof_exhausted"));
+    assert.equal((events.at(-1) as { outcome: string }).outcome, "answered");
+  });
+
   it("feeds the exact failing output back to the model", async () => {
     const dir = ws();
     writeFileSync(join(dir, "check.sh"), 'echo "3 tests failed: auth token refresh"\nexit 1\n');

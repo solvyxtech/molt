@@ -1928,6 +1928,20 @@ export class Engine {
     return [...byPath.values()];
   }
 
+  /**
+   * What THIS turn wrote.
+   *
+   * The session ledger outlives a turn. A receipt or an ask-mode decision that
+   * reads it attributes earlier work to a claim that never opened those files
+   * — a later question filed as a verified change of the previous turn's
+   * writes, which is how stats counted answers as work. `turnCalls` is reset
+   * at the start of each run; filtering on it is the same floor
+   * `files-changed` already uses.
+   */
+  turnLedger(): LedgerEntry[] {
+    return this.sessionLedger().filter((e) => this.turnCalls.has(e.callId));
+  }
+
   barContext(claim?: string): BarContext {
     return {
       cwd: this.cwd,
@@ -1937,7 +1951,7 @@ export class Engine {
       read: [...this.readPaths],
       cache: this.cache,
       ledger: this.sessionLedger(),
-      turnLedger: this.sessionLedger().filter((e) => this.turnCalls.has(e.callId)),
+      turnLedger: this.turnLedger(),
       treeBefore: this.turnTree ?? undefined,
       liveLedger: [...this.ledger],
       archive: this.cfg.archive,
@@ -2314,8 +2328,7 @@ export class Engine {
        */
       /** As the ledger spells it: project-relative, always this. */
       const BAR_PATH = `.molt/${BAR_FILENAME}`;
-      const editedHere = this.sessionLedger()
-        .filter((e) => this.turnCalls.has(e.callId))
+      const editedHere = this.turnLedger()
         .some((e) => e.path === BAR_PATH || e.path.endsWith(`/${BAR_FILENAME}`));
       const tamper: CheckResult = {
         name: "bar-unmodified",
@@ -2774,7 +2787,7 @@ export class Engine {
         claim,
         transcript: this.transcript.wire(),
         ledger: this.sessionLedger(),
-        turnLedger: this.sessionLedger().filter((e) => this.turnCalls.has(e.callId)),
+        turnLedger: this.turnLedger(),
         did: [...this.did],
         result,
         sessionTokens: this.sessionTokens,
@@ -3574,7 +3587,7 @@ export class Engine {
       : withTaskChecks(this.cfg.bar, taskChecks);
     const barNow = (): Bar | null =>
       opts.ask
-        ? asQuestion(withTaskChecks(this.cfg.bar, taskChecks), this.sessionLedger().length === 0)
+        ? asQuestion(withTaskChecks(this.cfg.bar, taskChecks), this.turnLedger().length === 0)
         : withTaskChecks(this.cfg.bar, taskChecks);
     if (opts.ask) {
       const dropped = (this.cfg.bar?.checks.length ?? 0) - (bar?.checks.length ?? 0);
@@ -4834,8 +4847,8 @@ export class Engine {
           shedBatches: this.transcript.shedCount,
           // A question the bar could not refuse is recorded as one, so stats
           // never count an answer as a verified change.
-          ask: opts.ask === true && this.sessionLedger().length === 0,
-          changed: this.sessionLedger().map((e) => ({
+          ask: opts.ask === true && this.turnLedger().length === 0,
+          changed: this.turnLedger().map((e) => ({
             path: e.path,
             before: e.before,
             after: e.after,
