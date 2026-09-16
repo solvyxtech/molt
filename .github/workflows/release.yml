@@ -1,0 +1,129 @@
+# Desktop installers → GitHub Release.
+# CLI is not packaged here; the product is the Electron app.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.2.0). Created on this commit if missing."
+        required: true
+        default: "v0.2.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            script: dist:mac
+            artifact: mac
+          - os: windows-latest
+            script: dist:win
+            artifact: win
+          - os: ubuntu-latest
+            script: dist:linux
+            artifact: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build desktop package
+        run: npm run ${{ matrix.script }}
+        env:
+          # unsigned mac is intentional (electron-builder.yml identity: null)
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: molt-${{ matrix.artifact }}
+          path: |
+            release/*.dmg
+            release/*.exe
+            release/*.zip
+            release/*.AppImage
+            release/*.tar.gz
+            release/*/*.dmg
+            release/*/*.exe
+            release/*/*.zip
+            release/*/*.AppImage
+            release/*/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Collect release assets
+        id: assets
+        shell: bash
+        run: |
+          mkdir -p assets
+          find dist -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.zip' -o -name '*.AppImage' -o -name '*.tar.gz' \) -print -exec cp -v {} assets/ \;
+          ls -la assets
+          count=$(find assets -type f | wc -l)
+          if [ "$count" -lt 1 ]; then
+            echo "No installer assets found" >&2
+            exit 1
+          fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: molt ${{ steps.tag.outputs.name }} (desktop)
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          files: assets/*
+          body: |
+            **A coding agent that cannot say "done" without proving it.**
+
+            This release is the **desktop app** (macOS, Windows, Linux). The terminal CLI is legacy and not the install path.
+
+            ### Downloads
+            - **macOS:** `.dmg` (arm64 and x64). Unsigned on purpose — first open: right-click the app → Open → Open.
+            - **Windows:** NSIS installer and `.zip`
+            - **Linux:** `.AppImage` and `.tar.gz`
+
+            ### After install
+            Pick a provider, add a key, point molt at a project. Completions are claims; `.molt/done.yml` has to pass against the real disk before "done" sticks. Every attempt gets a receipt.
+
+            Studio page: https://www.solvyx.xyz/work/molt  
+            Source: https://github.com/solvyxtech/molt
+
+            > Older tags (`v0.9.0`, `v1.0.0-rc.3`) were the prior CLI line. This is the desktop line from `main`.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
