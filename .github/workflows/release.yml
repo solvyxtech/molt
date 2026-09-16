@@ -23,13 +23,13 @@ jobs:
       matrix:
         include:
           - os: macos-latest
-            script: dist:mac
+            builder_args: --mac
             artifact: mac
           - os: windows-latest
-            script: dist:win
+            builder_args: --win
             artifact: win
           - os: ubuntu-latest
-            script: dist:linux
+            builder_args: --linux
             artifact: linux
     runs-on: ${{ matrix.os }}
     steps:
@@ -43,7 +43,12 @@ jobs:
       - run: npm ci
 
       - name: Build desktop package
-        run: npm run ${{ matrix.script }}
+        # --publish never: on a git tag electron-builder otherwise tries to
+        # publish the Release itself and fails without GH_TOKEN. We publish
+        # via softprops/action-gh-release after all platforms finish.
+        run: |
+          npm run bundle
+          npx electron-builder ${{ matrix.builder_args }} --publish never
         env:
           # unsigned mac is intentional (electron-builder.yml identity: null)
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
