@@ -124,11 +124,27 @@ hash-chained.
 
 ## Downloads
 
-The install path is the desktop app for macOS, Windows, and Linux.
+Same engine, two install paths.
 
-Get **v0.2.0** from the [GitHub release](https://github.com/solvyxtech/molt/releases/tag/v0.2.0).
+### Desktop
+
+Get **v0.2.0** from the [GitHub release](https://github.com/solvyxtech/molt/releases/tag/v0.2.0) (macOS, Windows, Linux).
 
 macOS builds are unsigned on purpose. On first open, right-click the app, choose Open, then Open again.
+
+### CLI / TUI
+
+```sh
+npm i -g @solvyx/molt
+molt                  # interactive TUI
+molt run "…" --yes    # headless
+```
+
+Or without installing: `npx @solvyx/molt`.
+
+**Do not** `npm i -g molt` or `npm i -g molt-cli` — those are unrelated packages on the registry. The binary name is still `molt`; the package name is `@solvyx/molt`.
+
+Desktop and CLI share one version. See [docs/versioning.md](docs/versioning.md).
 
 ## Build from source
 
@@ -138,6 +154,7 @@ For contributors working in this repository:
 npm install
 npm run app            # the desktop window
 npm start              # the terminal UI (node dist/cli.js)
+npm run pack:cli       # stage publishable @solvyx/molt under out-cli/ (do not publish without COO)
 ```
 
 First run: `/login`, pick a provider, paste a key, `/model`, go. Keys live in

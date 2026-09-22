@@ -82,3 +82,10 @@ The most valuable bug report for this project is a case where molt accepted a
 completion it should have refused. Include the bar, the scenario, and ideally a
 scripted-provider test that reproduces it. Those go to the front of the
 queue.
+
+## Versioning
+
+Desktop and CLI ship the same semver from root `package.json`. The publishable
+CLI is staged with `npm run pack:cli` as `@solvyx/molt` (binary `molt`). See
+[docs/versioning.md](docs/versioning.md). Do not publish without COO say-so.
+

@@ -1,5 +1,5 @@
 # Desktop installers → GitHub Release.
-# CLI is not packaged here; the product is the Electron app.
+# CLI ships separately as npm package @solvyx/molt (see npm run pack:cli).
 name: release
 
 on:
@@ -108,7 +108,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}
-          name: molt ${{ steps.tag.outputs.name }} (desktop)
+          name: molt ${{ steps.tag.outputs.name }} (desktop + CLI)
           draft: false
           prerelease: false
           generate_release_notes: false
@@ -116,12 +116,18 @@ jobs:
           body: |
             **A coding agent that cannot say "done" without proving it.**
 
-            This release is the **desktop app** (macOS, Windows, Linux). The terminal CLI is legacy and not the install path.
+            This release ships the **desktop app** (macOS, Windows, Linux) and matches the **CLI** published as `@solvyx/molt` (binary `molt`) at the same version.
 
-            ### Downloads
+            ### Desktop downloads
             - **macOS:** `.dmg` (arm64 and x64). Unsigned on purpose — first open: right-click the app → Open → Open.
             - **Windows:** NSIS installer and `.zip`
             - **Linux:** `.AppImage` and `.tar.gz`
+
+            ### CLI
+            ```
+            npm i -g @solvyx/molt
+            ```
+            Do **not** install unscoped `molt` or `molt-cli` from npm — those are other projects. Use `@solvyx/molt`.
 
             ### After install
             Pick a provider, add a key, point molt at a project. Completions are claims; `.molt/done.yml` has to pass against the real disk before "done" sticks. Every attempt gets a receipt.
@@ -129,6 +135,6 @@ jobs:
             Studio page: https://www.solvyx.xyz/work/molt  
             Source: https://github.com/solvyxtech/molt
 
-            > Older tags (`v0.9.0`, `v1.0.0-rc.3`) were the prior CLI line. This is the desktop line from `main`.
+            > Older tags (`v0.9.0`, `v1.0.0-rc.3`) were an earlier CLI line. From this line forward, desktop and CLI share one engine and one version.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
