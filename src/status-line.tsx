@@ -72,6 +72,9 @@ export function StatusLine({ theme, status, busy = false }: StatusLineProps) {
       {status.proofHint ? (
         <Text color={proofTone}>{` · ${status.proofHint}`}</Text>
       ) : null}
+      {status.nextProofs ? (
+        <Text color={theme.ghost}>{` · next ${status.nextProofs}`}</Text>
+      ) : null}
     </Box>
   );
 }

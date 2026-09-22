@@ -3065,16 +3065,6 @@ export function App({
         </Box>
       )}
 
-      {settled && mode.kind === "chat" && !busy && !pending && !showPalette ? (
-        <Text color={theme.ghost}>
-          {fit(
-            spineNames.length
-              ? "  next proofs · /prove · /verify · /receipts last · /bar"
-              : "  next proofs · /init · /login · /verify · /help",
-          )}
-        </Text>
-      ) : null}
-
       <StatusLine
         theme={theme}
         busy={busy}
@@ -3092,6 +3082,14 @@ export function App({
           pendingEst,
           proofHint,
           barChecks: spineNames.length,
+          // Lives on the status row, not between prompt and status — a second
+          // row there made paste repaint at two heights and tear the live region.
+          nextProofs:
+            settled && mode.kind === "chat" && !busy && !pending && !showPalette
+              ? spineNames.length
+                ? "/prove · /verify · /receipts last"
+                : "/init · /login · /verify"
+              : undefined,
         }}
       />
     </Box>

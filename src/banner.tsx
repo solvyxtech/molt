@@ -96,6 +96,11 @@ export type SessionStatus = {
   proofHint?: string;
   /** How many bar checks are sealed for this project. */
   barChecks?: number;
+  /**
+   * Short "next proofs" hint, rendered on the status row so it cannot sit
+   * between the prompt and the meter (that second row broke paste height).
+   */
+  nextProofs?: string;
 };
 
 /**
