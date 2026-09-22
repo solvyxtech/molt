@@ -11,6 +11,8 @@ False done does not count. Acceptance lives outside the model. Every write gets 
 
 Studio page: [solvyx.xyz/work/molt](https://solvyx.xyz/work/molt).
 
+Support ongoing maintenance via [GitHub Sponsors](https://github.com/sponsors/solvyxtech) or [Polar](https://polar.sh/solvyx).
+
 <p align="center">
   <img src="docs/images/demo.gif" alt="molt fixing a defect in its own source, then proving it against eleven checks" width="860">
 </p>
