@@ -5,10 +5,15 @@
 [![check](https://github.com/solvyxtech/molt/actions/workflows/check.yml/badge.svg)](https://github.com/solvyxtech/molt/actions/workflows/check.yml)
 [![licence: Apache 2.0](https://img.shields.io/badge/licence-Apache%202.0-blue.svg)](LICENSE)
 
-molt runs any OpenAI-compatible model (and Anthropic's native API) as a coding
-agent, then refuses to accept "done" until every check in your project's
-`.molt/done.yml` passes against the real state on disk. A completion is a
-claim; molt checks the claim and writes a receipt either way.
+molt is an open-source AI coding agent for developers — terminal CLI and Electron
+desktop, written in TypeScript. It runs any OpenAI-compatible LLM (and Anthropic's
+native API), then refuses to accept "done" until every check in your project's
+`.molt/done.yml` passes against the real state on disk. A completion is a claim;
+molt verifies the claim with disk checks and writes a receipt either way.
+
+Proof-gated done means the model cannot lower the bar: before/after hashes on
+every write, one receipt per attempt (refusals included), and a hash-chained
+journal you can recompute with `molt verify`.
 
 <p align="center">
   <img src="docs/images/demo.gif" alt="molt fixing a defect in its own source, then proving it against eleven checks" width="860">
