@@ -8,8 +8,12 @@
  *
  * Formatting is shared with the banner via statusSegments(), so the
  * settle line and the footer can never drift apart.
+ *
+ * Proof pressure sits at the end of the row: bar check count and the
+ * last receipt verdict. Budget pressure still shouts; proof pressure
+ * is quieter but always readable — that is the product.
  */
- 
+
 import { Box, Text } from "ink";
 import { statusSegments, type SessionStatus, type Tone } from "./banner.js";
 import type { Theme } from "./theme.js";
@@ -43,6 +47,13 @@ export function StatusLine({ theme, status, busy = false }: StatusLineProps) {
     status.budgetTokens !== undefined &&
     status.sessionTokens / status.budgetTokens >= PRESSURE_AT;
 
+  const proofTone =
+    status.proofHint?.includes("refused") || status.proofHint?.includes("exhausted")
+      ? theme.fail
+      : status.proofHint?.includes("accepted")
+        ? theme.ok
+        : theme.ghost;
+
   return (
     <Box>
       <Text color={color.ghost}>{busy ? "\u00b7 " : "  "}</Text>
@@ -55,6 +66,12 @@ export function StatusLine({ theme, status, busy = false }: StatusLineProps) {
           {s.text}
         </Text>
       ))}
+      {status.barChecks !== undefined && status.barChecks > 0 ? (
+        <Text color={theme.ghost}>{` · bar ${status.barChecks}`}</Text>
+      ) : null}
+      {status.proofHint ? (
+        <Text color={proofTone}>{` · ${status.proofHint}`}</Text>
+      ) : null}
     </Box>
   );
 }
