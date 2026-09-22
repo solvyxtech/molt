@@ -89,6 +89,18 @@ export type SessionStatus = {
    * status line stop being read.
    */
   hint?: string;
+  /**
+   * Proof pressure: last receipt verdict or "bar sealed · no receipts yet".
+   * Omitted when there is nothing to prove against.
+   */
+  proofHint?: string;
+  /** How many bar checks are sealed for this project. */
+  barChecks?: number;
+  /**
+   * Short "next proofs" hint, rendered on the status row so it cannot sit
+   * between the prompt and the meter (that second row broke paste height).
+   */
+  nextProofs?: string;
 };
 
 /**

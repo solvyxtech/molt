@@ -20,3 +20,11 @@ jobs:
       # checks (self-check, e2e) need a display and run in `npm run check`
       # locally; the bar in .molt/done.yml runs all four.
       - run: npm test
+      - name: CLI binary smoke
+        run: |
+          # npm test already built dist/; rebuild only if missing
+          test -x dist/cli.js || npm run build
+          node dist/cli.js --help
+          node dist/cli.js --version
+          # doctor may exit >1 when default localhost endpoint is down (no Ollama in CI)
+          node dist/cli.js doctor || true

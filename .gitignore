@@ -30,3 +30,6 @@ finetune/captures/
 finetune/repro-2026-09-02/*.log
 finetune/repro-2026-09-02/index.jsonl.before-repair
 .molt/integrity/
+
+# staged CLI publish package
+out-cli/

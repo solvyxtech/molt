@@ -53,7 +53,8 @@
     "self-check": "npm run bundle && electron out/main.cjs --self-check",
     "app:install": "npm run bundle && electron-builder --dir && node install.mjs",
     "app:push": "npm run bundle && node install.mjs --push",
-    "e2e:direct": "npm run bundle && node test-e2e/drive.mjs"
+    "e2e:direct": "npm run bundle && node test-e2e/drive.mjs",
+    "pack:cli": "node scripts/prepare-cli-package.mjs"
   },
   "dependencies": {
     "ink": "^5.0.1",

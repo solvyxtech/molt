@@ -6,6 +6,9 @@
  * work, the receipts, and the refusals, and nothing else.
  */
 import { CLAUDE_CODE_URL, claudeCodeHealth } from "./claude-code.js";
+import { ACP_AGENTS, acpHealth } from "./acp.js";
+import { AGY_URL, agyHealth } from "./agy.js";
+import { Integrity } from "./integrity.js";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Box, Static, Text, render, useApp, useInput, useStdout } from "ink";
 import type { RenderOptions } from "ink";
@@ -21,7 +24,7 @@ import {
 } from "./commands.js";
 import { RemappedStdin } from "./keys.js";
 import { StatusLine } from "./status-line.js";
-import { loadBar, writeDefaultBar, BarError } from "./bar.js";
+import { loadBar, writeDefaultBar, BarError, hasBar } from "./bar.js";
 import { taskChecksFrom } from "./criteria.js";
 import {
   applyBarAdds,
@@ -312,8 +315,21 @@ const LOCAL_ROW = "local or self-hosted…";
  * looks here.
  */
 const CLAUDE_CODE_ROW = "claude code (your Pro/Max plan)…";
+/** Google AI Pro via Antigravity CLI — same door as desktop Settings. */
+const AGY_ROW = "google plan (Antigravity)…";
+/** xAI subscription via Grok Build ACP agent. */
+const GROK_ROW = "grok build (your xAI plan)…";
+
+const FIRST_RUN_OPTIONS = [
+  "Login with a provider key",
+  "Local or self-hosted endpoint",
+  "Claude plan (Pro/Max)",
+  "Quit",
+] as const;
 
 const PALETTE_ROWS = 6;
+/** How many receipt body lines to show at once in the in-session viewer. */
+const RECEIPT_VIEW_ROWS = 18;
 
 /**
  * The working indicator. Braille cells are a single column wide in every
@@ -403,6 +419,11 @@ export function App({
    * of work a footer should never do.
    */
   const [hasKey, setHasKey] = useState(() => Object.keys(readAuth()).length > 0);
+  /** Compact bar strip: check names when .molt/done.yml exists. */
+  const [spineNames, setSpineNames] = useState<string[]>([]);
+  const [spineOn, setSpineOn] = useState(true);
+  /** Last receipt verdict for the status "proof pressure" meter. */
+  const [proofHint, setProofHint] = useState<string | undefined>(undefined);
   const [streamText, setStreamText] = useState("");
   /** The line still being written, waiting for the newline that ends it. */
   const partial = useRef("");
@@ -432,11 +453,21 @@ export function App({
   // type, so it is a distinct state rather than a flag on a shared one.
   type Mode =
     | { kind: "chat" }
+    | {
+        kind: "first-run";
+        index: number;
+      }
     | { kind: "login-select"; providers: { name: string; hasKey: boolean }[]; index: number }
     | { kind: "login-key"; provider: string }
     | { kind: "login-url" }
     | { kind: "model-select"; rows: PickerRow[]; index: number }
     | { kind: "autonomy-select"; index: number }
+    | {
+        kind: "receipt-view";
+        title: string;
+        lines: string[];
+        scroll: number;
+      }
     | {
         kind: "interview-ask";
         task: string;
@@ -448,7 +479,11 @@ export function App({
         picks: Record<string, string>;
       }
     | { kind: "interview-seal"; task: string; proposal: InterviewProposal };
-  const [mode, setMode] = useState<Mode>({ kind: "chat" });
+  const [mode, setMode] = useState<Mode>(() => {
+    // Cold start: no stored keys and no model — guide before a blank prompt.
+    const cold = Object.keys(readAuth()).length === 0 && !engine.model;
+    return cold ? { kind: "first-run", index: 0 } : { kind: "chat" };
+  });
   /** Sealed at interview, consumed by the next work turn. */
   const pendingCriteria = useRef<ReturnType<typeof taskChecksFrom> | null>(null);
   /** Bumped on cancel so a late interview reply cannot reopen the cards. */
@@ -789,6 +824,37 @@ export function App({
     [add, note],
   );
 
+  const refreshSpine = useCallback(() => {
+    try {
+      if (!hasBar(engine.cwd)) {
+        setSpineNames([]);
+        setProofHint(undefined);
+        return;
+      }
+      const bar = loadBar(engine.cwd);
+      setSpineNames(bar?.checks.map((c) => c.name) ?? []);
+      const rows = engine.receipts?.records() ?? [];
+      const last = rows.at(-1);
+      if (last) {
+        setProofHint(
+          last.verdict === "accepted"
+            ? "receipt accepted"
+            : last.verdict === "refused"
+              ? "receipt refused"
+              : "receipt exhausted",
+        );
+      } else {
+        setProofHint(bar ? "bar sealed · no receipts yet" : undefined);
+      }
+    } catch {
+      setSpineNames([]);
+    }
+  }, [engine]);
+
+  useEffect(() => {
+    refreshSpine();
+  }, [refreshSpine]);
+
   const handleEvent = useCallback(
     (ev: EngineEvent) => {
       switch (ev.kind) {
@@ -993,16 +1059,19 @@ export function App({
           // would be its own small dishonesty, and it is the thing the reader
           // most needs to see next to the reason it was rejected.
           flushPartial();
-          add("info", "↑ that claim was refused. What follows is why.");
+          add("fail", "↑ that claim was refused. What follows is why.");
           renderBar(ev.result, `completion refused (attempt ${ev.attempt}) — continuing`);
           add("info", "  the failures above go back to the model; it keeps working");
+          refreshSpine();
           break;
         case "proof_exhausted":
           flushPartial();
           renderBar(ev.result, `bar not met after ${ev.attempts} attempts`);
+          refreshSpine();
           break;
         case "receipt":
-          add("info", `receipt: ${ev.path}`);
+          add("info", `receipt: ${ev.path} · /receipts last to read it`);
+          refreshSpine();
           break;
         case "shed":
           add("info", `shed ${ev.dropped} messages · ${ev.before} → ${ev.after} tokens · ${ev.path}`);
@@ -1015,7 +1084,7 @@ export function App({
           break;
       }
     },
-    [add, beginActivity, flushPartial, note, renderBar],
+    [add, beginActivity, flushPartial, note, refreshSpine, renderBar],
   );
 
   /** Remember the endpoint so the next bare `molt` starts where this left off. */
@@ -1133,6 +1202,40 @@ export function App({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+
+  /**
+   * Connect a plan backend the way desktop Settings buttons do: health first,
+   * set URL only when healthy, otherwise say how to install or log in.
+   */
+  const connectPlan = useCallback(
+    async (
+      label: string,
+      look: () => Promise<{ ok: boolean; detail: string; fix?: string; url?: string }>,
+      url: string,
+      provider: string,
+      nextHint: string,
+    ) => {
+      setBusy(true);
+      const h = await look();
+      setBusy(false);
+      if (!h.ok) {
+        add(
+          "error",
+          h.fix ? `${h.detail} — run \`${h.fix}\`` : h.detail,
+        );
+        add("info", `${label} was not selected. Endpoint unchanged.`);
+        return;
+      }
+      engine.setBaseUrl(url, undefined, provider);
+      setTokens(0);
+      setCost(undefined);
+      setCostEstimated(false);
+      add("ok", `connected to ${h.detail} — molt runs it, your plan pays for it`);
+      add("info", nextHint);
+    },
+    [add, engine],
+  );
+
   const startLogin = useCallback(
     (arg?: string) => {
       const stored = readAuth();
@@ -1157,6 +1260,9 @@ export function App({
         providers: [
           ...keyedProviders().map((name) => ({ name, hasKey: Boolean(stored[name]) })),
           { name: CLAUDE_CODE_ROW, hasKey: false },
+          { name: AGY_ROW, hasKey: false },
+          { name: GROK_ROW, hasKey: false },
+          // LOCAL_ROW stays last so ↑ from the top still lands on it in tests.
           { name: LOCAL_ROW, hasKey: false },
         ],
         index: 0,
@@ -1567,14 +1673,112 @@ export function App({
           return true;
         }
         case "/receipts": {
-          const rows = engine.receipts?.records() ?? [];
-          if (rows.length === 0) add("info", "no completion attempts recorded yet");
-          for (const r of rows.slice(-10))
+          const receipts = engine.receipts;
+          const rows = receipts?.records() ?? [];
+          if (rows.length === 0) {
+            add("info", "no completion attempts recorded yet");
+            return true;
+          }
+          const showArg = arg.trim();
+          const openBody = (file: string, label: string) => {
+            if (!receipts) return;
+            try {
+              const body = receipts.read(file);
+              const lines = body.split("\n");
+              add(
+                "info",
+                `receipt ${label} · ${file} · ${lines.length} line(s) · ↑↓ scroll · esc close`,
+              );
+              setMode({
+                kind: "receipt-view",
+                title: file,
+                lines,
+                scroll: 0,
+              });
+            } catch (e) {
+              add("error", `could not read ${file}: ${String(e)}`);
+            }
+          };
+          if (showArg === "last" || showArg === "show" || showArg === "show last") {
+            const last = rows.at(-1)!;
+            openBody(last.file, "last");
+            return true;
+          }
+          const showMatch = /^show\s+(\S+)$/u.exec(showArg);
+          if (showMatch) {
+            const want = showMatch[1]!;
+            const byIndex = /^\d+$/u.test(want) ? rows[Number(want) - 1] : undefined;
+            const byFile =
+              byIndex ??
+              rows.find((r) => r.file === want || r.file.startsWith(want));
+            if (!byFile) {
+              add("error", `no receipt matches "${want}" — /receipts lists indices`);
+              return true;
+            }
+            openBody(byFile.file, want);
+            return true;
+          }
+          if (showArg && showArg !== "list") {
+            add("info", "usage: /receipts | /receipts last | /receipts show <n|file>");
+            return true;
+          }
+          const slice = rows.slice(-20);
+          const start = rows.length - slice.length;
+          add("info", `${slice.length} recent receipt(s) · /receipts show <n> or /receipts last`);
+          for (let i = 0; i < slice.length; i++) {
+            const r = slice[i]!;
+            const n = start + i + 1;
             add(
               r.verdict === "accepted" ? "ok" : "fail",
-              `  ${r.file}  ${r.verdict}  attempt ${r.attempt}` +
+              `  ${String(n).padStart(3)}  ${r.file}  ${r.verdict}  attempt ${r.attempt}` +
                 (r.failed.length ? `  failed: ${r.failed.join(", ")}` : ""),
             );
+          }
+          refreshSpine();
+          return true;
+        }
+        case "/verify": {
+          const p = Integrity.verifyProject(engine.cwd);
+          const brokenJ = p.journals.filter((j) => !j.ok);
+          if (p.ok) {
+            add("ok", "evidence chain intact — journals and integrity ledger recompute");
+            if (p.root) add("info", `root of trust: ${p.root}`);
+            else add("info", "no integrity root yet — nothing has been bound");
+          } else {
+            add("fail", "evidence chain broken — a claim here is not proof");
+            if (!p.ledger.ok) {
+              add(
+                "fail",
+                p.ledger.reason
+                  ? `integrity ledger: ${p.ledger.reason}`
+                  : `integrity ledger drift (${p.ledger.drift.length} item(s))`,
+              );
+            }
+            for (const j of brokenJ) {
+              add("fail", `journal ${j.file}: broken at entry ${j.brokenAt ?? "?"}`);
+            }
+            if (p.root) add("info", `last exported root (untrusted until repaired): ${p.root}`);
+          }
+          return true;
+        }
+        case "/spine": {
+          const a = arg.trim().toLowerCase();
+          if (a === "off") {
+            setSpineOn(false);
+            add("info", "spine hidden — /spine on to pin the bar again");
+            return true;
+          }
+          if (a === "on" || a === "") {
+            setSpineOn(true);
+            refreshSpine();
+            if (!spineNames.length && !hasBar(engine.cwd)) {
+              add("info", "no .molt/done.yml — /init to seal a bar, then the spine appears");
+            } else {
+              add("info", `spine on · ${spineNames.length || "?"} check(s) pinned above the prompt`);
+            }
+            return true;
+          }
+          add("error", "usage: /spine [on|off]");
           return true;
         }
         case "/stats": {
@@ -1638,6 +1842,7 @@ export function App({
                   "Add your own — that is where a bar gets its value.",
               );
             }
+            refreshSpine();
           } catch (e) {
             add("error", String(e));
           }
@@ -1703,7 +1908,10 @@ export function App({
           void engine.proveNow().then(
             (result) => {
               if (!result) add("info", "no bar to check — /init to create one");
-              else renderBar(result, result.ok ? "bar met" : "bar not met");
+              else {
+                renderBar(result, result.ok ? "bar met" : "bar not met");
+                refreshSpine();
+              }
             },
             (e: unknown) => add("error", String(e)),
           );
@@ -1722,8 +1930,10 @@ export function App({
       openAutonomy,
       persistEndpoint,
       refreshPricing,
+      refreshSpine,
       renderBar,
       setInput,
+      spineNames,
       startLogin,
       startModelPicker,
       themeName,
@@ -2040,6 +2250,86 @@ export function App({
       return;
     }
 
+    // --- first-run claim card ---
+    if (mode.kind === "first-run") {
+      if (key.escape || (key.ctrl && char === "c")) {
+        // Esc does not quit — it would leave a blank prompt, which is the
+        // problem this card exists to prevent. Point at Quit instead.
+        setMode({ ...mode, index: FIRST_RUN_OPTIONS.length - 1 });
+        return;
+      }
+      const back = key.upArrow || (key.shift && key.tab);
+      const forward = key.downArrow || key.tab;
+      if (back || forward) {
+        setMode({
+          ...mode,
+          index: wrapIndex(mode.index + (back ? -1 : 1), FIRST_RUN_OPTIONS.length),
+        });
+        return;
+      }
+      if (key.return) {
+        const pick = FIRST_RUN_OPTIONS[mode.index]!;
+        if (pick.startsWith("Quit")) {
+          exit();
+          return;
+        }
+        setMode({ kind: "chat" });
+        if (pick.startsWith("Login")) {
+          startLogin();
+          return;
+        }
+        if (pick.startsWith("Local")) {
+          add(
+            "info",
+            "enter the base URL — e.g. http://localhost:11434/v1. enter to connect, esc to cancel",
+          );
+          setMode({ kind: "login-url" });
+          return;
+        }
+        if (pick.startsWith("Claude")) {
+          void connectPlan(
+            "Claude Code",
+            async () => {
+              const h = await claudeCodeHealth();
+              return { ...h, url: CLAUDE_CODE_URL };
+            },
+            CLAUDE_CODE_URL,
+            "claude-code",
+            "choose a model with /model (opus, sonnet, haiku)",
+          );
+          return;
+        }
+      }
+      return;
+    }
+
+    // --- receipt body viewer ---
+    if (mode.kind === "receipt-view") {
+      if (key.escape || (key.ctrl && char === "c")) {
+        setMode({ kind: "chat" });
+        add("info", "closed receipt");
+        return;
+      }
+      const maxScroll = Math.max(0, mode.lines.length - RECEIPT_VIEW_ROWS);
+      if (key.upArrow) {
+        setMode({ ...mode, scroll: Math.max(0, mode.scroll - 1) });
+        return;
+      }
+      if (key.downArrow) {
+        setMode({ ...mode, scroll: Math.min(maxScroll, mode.scroll + 1) });
+        return;
+      }
+      if (char === " ") {
+        setMode({ ...mode, scroll: Math.min(maxScroll, mode.scroll + RECEIPT_VIEW_ROWS) });
+        return;
+      }
+      if (char === "b") {
+        setMode({ ...mode, scroll: Math.max(0, mode.scroll - RECEIPT_VIEW_ROWS) });
+        return;
+      }
+      return;
+    }
+
     // --- the autonomy picker: nothing changes until enter ---
     if (mode.kind === "autonomy-select") {
       if (key.escape || (key.ctrl && char === "c")) {
@@ -2080,19 +2370,49 @@ export function App({
           const provider = mode.providers[mode.index]!.name;
           if (provider === CLAUDE_CODE_ROW) {
             setMode({ kind: "chat" });
-            void (async () => {
-              const health = await claudeCodeHealth();
-              if (!health.ok) {
-                add("error", `${health.detail}${health.fix ? ` — run \`${health.fix}\`` : ""}`);
-                return;
-              }
-              engine.setBaseUrl(CLAUDE_CODE_URL, undefined, "claude-code");
-              setTokens(0);
-              setCost(undefined);
-              setCostEstimated(false);
-              add("ok", `connected to ${health.detail} — molt runs it, your plan pays for it`);
-              add("info", "choose a model with /model (opus, sonnet, haiku)");
-            })();
+            void connectPlan(
+              "Claude Code",
+              async () => {
+                const h = await claudeCodeHealth();
+                return { ...h, url: CLAUDE_CODE_URL };
+              },
+              CLAUDE_CODE_URL,
+              "claude-code",
+              "choose a model with /model (opus, sonnet, haiku)",
+            );
+            return;
+          }
+          if (provider === AGY_ROW) {
+            setMode({ kind: "chat" });
+            void connectPlan(
+              "Antigravity",
+              async () => {
+                const h = await agyHealth();
+                return { ...h, url: AGY_URL };
+              },
+              AGY_URL,
+              "antigravity",
+              "choose a model with /model (gemini-3.1-pro-high, …)",
+            );
+            return;
+          }
+          if (provider === GROK_ROW) {
+            setMode({ kind: "chat" });
+            const spec = ACP_AGENTS.find((a) => a.name === "grok-build");
+            if (!spec) {
+              add("error", "Grok Build is not one of the backends this build knows.");
+              return;
+            }
+            void connectPlan(
+              "Grok Build",
+              async () => {
+                const h = await acpHealth(spec);
+                return { ...h, url: spec.url };
+              },
+              spec.url,
+              "grok-build",
+              "choose a model with /model (grok-4.6, …)",
+            );
             return;
           }
           if (provider === LOCAL_ROW) {
@@ -2352,6 +2672,25 @@ export function App({
         />
       )}
 
+      {/* Proof spine: what "done" means, pinned while a bar exists. */}
+      {settled && spineOn && spineNames.length > 0 && mode.kind === "chat" && !busy ? (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color={theme.ghost}>
+            {fit(
+              `── bar · ${spineNames.length} check(s) ${"─".repeat(Math.max(2, room - 28))}`,
+            )}
+          </Text>
+          <Text color={theme.dim} wrap="wrap">
+            {"  " + spineNames.join(" · ")}
+          </Text>
+          {proofHint ? (
+            <Text color={proofHint.includes("refused") || proofHint.includes("exhausted") ? theme.fail : theme.ok}>
+              {"  " + proofHint}
+            </Text>
+          ) : null}
+        </Box>
+      ) : null}
+
       {/* The line currently being written. Every completed line is already in
           the transcript above, so this is one line at most — bounded without
           being truncated, and wrapped rather than clipped. */}
@@ -2434,7 +2773,49 @@ export function App({
         </Box>
       ) : (
         <Box flexDirection="column" marginTop={1}>
-          {mode.kind === "login-select" ? (
+          {mode.kind === "first-run" ? (
+            <Box flexDirection="column">
+              <Text color={theme.accent}>{"  ┌ claim ─ sealed until you connect ─────────────┐"}</Text>
+              <Text color={theme.text}>{"  │  No provider, no model. Nothing to prove yet. │"}</Text>
+              <Text color={theme.ghost}>{"  │                                               │"}</Text>
+              {FIRST_RUN_OPTIONS.map((label, i) => {
+                const active = i === mode.index;
+                return (
+                  <Text key={label} color={active ? theme.accent : theme.dim} bold={active}>
+                    {active ? "  │ ▸ " : "  │   "}
+                    {label.padEnd(42)}
+                    {"│"}
+                  </Text>
+                );
+              })}
+              <Text color={theme.ghost}>{"  │                                               │"}</Text>
+              <Text color={theme.dim}>{"  │  A claim without proof is still a claim.      │"}</Text>
+              <Text color={theme.accent}>{"  └───────────────────────────────────────────────┘"}</Text>
+              <Text color={theme.ghost}>{"   ↑↓ choose · enter · Quit to leave"}</Text>
+            </Box>
+          ) : mode.kind === "receipt-view" ? (
+            <Box flexDirection="column">
+              <Text color={theme.accent}>
+                {fit(`── receipt · ${mode.title} ${"─".repeat(Math.max(2, room - 20 - mode.title.length))}`)}
+              </Text>
+              {mode.lines.slice(mode.scroll, mode.scroll + RECEIPT_VIEW_ROWS).map((line, i) => {
+                const refused = /refused|FAIL|exhausted/i.test(line);
+                const accepted = /accepted|passed/i.test(line) && !refused;
+                return (
+                  <Text
+                    key={`rv${mode.scroll + i}`}
+                    color={refused ? theme.fail : accepted ? theme.ok : theme.text}
+                    wrap="wrap"
+                  >
+                    {"  " + fit(line)}
+                  </Text>
+                );
+              })}
+              <Text color={theme.ghost}>
+                {`  lines ${mode.scroll + 1}–${Math.min(mode.lines.length, mode.scroll + RECEIPT_VIEW_ROWS)} of ${mode.lines.length} · ↑↓ · space page · b back · esc close`}
+              </Text>
+            </Box>
+          ) : mode.kind === "login-select" ? (
             <Box flexDirection="column">
               {mode.providers.map((p, i) => {
                 const active = i === mode.index;
@@ -2699,6 +3080,16 @@ export function App({
           hint: hasKey ? "/model" : "/login",
           budgetTokens: engine.budgetTokens,
           pendingEst,
+          proofHint,
+          barChecks: spineNames.length,
+          // Lives on the status row, not between prompt and status — a second
+          // row there made paste repaint at two heights and tear the live region.
+          nextProofs:
+            settled && mode.kind === "chat" && !busy && !pending && !showPalette
+              ? spineNames.length
+                ? "/prove · /verify · /receipts last"
+                : "/init · /login · /verify"
+              : undefined,
         }}
       />
     </Box>

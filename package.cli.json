@@ -1,0 +1,52 @@
+{
+  "name": "@solvyx/molt",
+  "version": "0.2.0",
+  "description": "molt — a coding agent that can't say done without proving it. Terminal CLI and TUI.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/solvyxtech/molt.git"
+  },
+  "homepage": "https://solvyx.xyz/work/molt",
+  "bugs": {
+    "url": "https://github.com/solvyxtech/molt/issues"
+  },
+  "keywords": [
+    "coding-agent",
+    "verification",
+    "cli",
+    "tui",
+    "openai-compatible",
+    "anthropic",
+    "receipts"
+  ],
+  "author": "Tyler Skelton",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bin": {
+    "molt": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "examples",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "dependencies": {
+    "ink": "^5.0.1",
+    "react": "^18.3.1",
+    "yaml": "^2.5.1"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.258",
+    "zod": "^4.5.4"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
