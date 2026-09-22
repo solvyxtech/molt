@@ -7,7 +7,7 @@
 
 molt is an open source coding agent for developers. Terminal CLI and Electron desktop. Written in TypeScript. It runs any OpenAI compatible model and Anthropic’s native API. Then it refuses to accept done until every check in your project’s `.molt/done.yml` passes against the real state on disk. A completion is a claim. molt checks the claim and writes a receipt either way.
 
-The model cannot lower the bar. Every write gets before and after hashes. One receipt per attempt including refusals. A hash chained journal you can recompute with `molt verify`.
+False done does not count. Acceptance lives outside the model. Every write gets before and after hashes. One receipt per attempt including refusals. A hash chained journal you can recompute with `molt verify`.
 
 <p align="center">
   <img src="docs/images/demo.gif" alt="molt fixing a defect in its own source, then proving it against eleven checks" width="860">
