@@ -7,17 +7,17 @@
     "type": "git",
     "url": "https://github.com/solvyxtech/molt.git"
   },
-  "homepage": "https://github.com/solvyxtech/molt#readme",
+  "homepage": "https://solvyx.xyz/work/molt",
   "bugs": {
     "url": "https://github.com/solvyxtech/molt/issues"
   },
   "keywords": [
     "coding-agent",
-    "llm",
     "verification",
     "electron",
     "openai-compatible",
-    "anthropic"
+    "anthropic",
+    "receipts"
   ],
   "author": "Tyler Skelton",
   "type": "module",
