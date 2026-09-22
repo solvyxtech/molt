@@ -33,6 +33,9 @@ import { App, renderApp } from "../src/app.js";
 import { Engine } from "../src/engine.js";
 import type { Msg } from "../src/types.js";
 import { workspace } from "./helpers.js";
+import { Receipts } from "../src/receipts.js";
+import { writeDefaultBar } from "../src/bar.js";
+import type { BarResult } from "../src/types.js";
 
 /** What a terminal sends for ctrl+V and ctrl+A. */
 const CTRL_V = String.fromCharCode(22);
@@ -1940,5 +1943,123 @@ describe("/interview asks before work", { concurrency: true }, () => {
     assert.match(body, /pendingCriteria\.current = null/, "sealed checks would survive a reset");
     assert.match(body, /interviewSeq\.current \+= 1/, "a late interview reply could reopen the cards");
     assert.match(body, /setInput\(""\)/, "the sealed task would still fire on Enter");
+  });
+});
+
+
+describe("first-run empty-state", () => {
+  it("shows a sealed claim card when there is no key and no model", async () => {
+    // Fresh config home is empty; mounting with no model must not drop into a
+    // blank prompt with no guidance — that was the desktop Settings win.
+    const t = await mount({ model: "" });
+    try {
+      await until(t, /No provider, no model/, 3_000);
+      assert.match(t.stdout.lastFrame, /Login with a provider key/);
+      assert.match(t.stdout.lastFrame, /Local or self-hosted endpoint/);
+      assert.match(t.stdout.lastFrame, /Claude plan/);
+      assert.match(t.stdout.lastFrame, /Quit/);
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("opens /login from the claim card", async () => {
+    const t = await mount({ model: "" });
+    try {
+      await until(t, /Login with a provider key/, 3_000);
+      t.stdin.press("\r"); // first option: Login
+      await until(t, /local or self-hosted|choose a provider/i, 3_000);
+      assert.match(t.stdout.lastFrame, /local or self-hosted/i);
+    } finally {
+      t.cleanup();
+    }
+  });
+});
+
+describe("/login lists plan backends", () => {
+  it("offers Claude, Antigravity, and Grok Build beside local", async () => {
+    const t = await mount();
+    try {
+      await submit(t.stdin, "/login");
+      await tick(150);
+      const frame = t.stdout.lastFrame;
+      assert.match(frame, /claude code \(your Pro\/Max plan\)/i);
+      assert.match(frame, /google plan \(Antigravity\)/i);
+      assert.match(frame, /grok build \(your xAI plan\)/i);
+      assert.match(frame, /local or self-hosted/i);
+    } finally {
+      t.cleanup();
+    }
+  });
+});
+
+describe("/verify and /receipts in session", () => {
+  it("runs /verify against the project integrity path", async () => {
+    const t = await mount();
+    try {
+      await submit(t.stdin, "/verify");
+      await until(t, /evidence chain|integrity|root of trust|nothing has been bound/i, 3_000);
+    } finally {
+      t.cleanup();
+    }
+  });
+
+  it("lists receipts with indices and opens a body in the viewer", async () => {
+    const ws = workspace();
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const receipts = new Receipts(ws.dir);
+    // Minimal accepted receipt so /receipts has something to open.
+    receipts.write({
+      claim: "demo claim for TUI",
+      result: { ok: true, results: [], durationMs: 1 } as BarResult,
+      attempt: 1,
+      verdict: "accepted",
+      model: "test-model",
+      provider: "test",
+      sessionTokens: 10,
+      shedBatches: 0,
+    });
+    const engine = new Engine({
+      baseUrl: "http://provider.test/v1",
+      model: "test-model",
+      provider: "test",
+      cwd: ws.dir,
+      bar: null,
+      fetchFn: provider(),
+      stream: false,
+      receipts,
+    });
+    const app = renderApp(
+      { engine, version: "vtest" },
+      {
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream,
+        debug: true,
+        patchConsole: false,
+      },
+    );
+    try {
+      await tick(80);
+      await submit(stdin, "/receipts");
+      await until({ stdout }, /\d+\s+.*accepted/i, 3_000);
+      await submit(stdin, "/receipts last");
+      await until({ stdout }, /receipt ·|demo claim|accepted/i, 3_000);
+      assert.match(stdout.lastFrame, /esc close|lines \d/i);
+    } finally {
+      app.unmount();
+      ws.cleanup();
+    }
+  });
+
+  it("pins the spine after /init", async () => {
+    const t = await mount();
+    try {
+      writeDefaultBar(t.engine.cwd);
+      await submit(t.stdin, "/spine on");
+      await until(t, /bar ·|check\(s\)|spine on/i, 3_000);
+    } finally {
+      t.cleanup();
+    }
   });
 });

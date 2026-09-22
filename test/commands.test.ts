@@ -57,6 +57,13 @@ describe("matchCommands", () => {
     assert.equal(names("/ask")[0], "/ask");
   });
 
+  it("registers /verify and /spine for proof parity", () => {
+    assert.equal(names("/verify")[0], "/verify");
+    assert.ok(names("/integrity").includes("/verify"));
+    assert.equal(names("/spine")[0], "/spine");
+    assert.ok(names("/receipts")[0] === "/receipts");
+  });
+
   it("orders prefix matches ahead of subsequence matches", () => {
     const r = names("/ba");
     assert.equal(r[0], "/bar");
