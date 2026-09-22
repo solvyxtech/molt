@@ -9,6 +9,8 @@ molt is an open source coding agent for developers. Terminal CLI and Electron de
 
 False done does not count. Acceptance lives outside the model. Every write gets before and after hashes. One receipt per attempt including refusals. A hash chained journal you can recompute with `molt verify`.
 
+Studio page: [solvyx.xyz/work/molt](https://solvyx.xyz/work/molt).
+
 <p align="center">
   <img src="docs/images/demo.gif" alt="molt fixing a defect in its own source, then proving it against eleven checks" width="860">
 </p>
@@ -118,7 +120,17 @@ you ask  →  the model works  →  it says "done"
 Either way a receipt is written, the journal is appended, and both are
 hash-chained.
 
-## Quick start
+## Downloads
+
+The install path is the desktop app for macOS, Windows, and Linux.
+
+Get **v0.2.0** from the [GitHub release](https://github.com/solvyxtech/molt/releases/tag/v0.2.0).
+
+macOS builds are unsigned on purpose. On first open, right-click the app, choose Open, then Open again.
+
+## Build from source
+
+For contributors working in this repository:
 
 ```sh
 npm install
