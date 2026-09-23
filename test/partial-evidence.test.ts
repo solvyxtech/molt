@@ -371,3 +371,54 @@ describe("a receipt names the tree it judged", () => {
     );
   });
 });
+
+describe("the receipt outranks the summary", () => {
+  it("tells whether the tree in front of you is the one a verdict judged", async () => {
+    const { driftSince, describeDrift } = await import("../src/git.js");
+    const dir = ws();
+    const git = (...a: string[]) =>
+      execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...a], {
+        cwd: dir,
+        stdio: ["ignore", "pipe", "ignore"],
+      }).toString().trim();
+    git("init", "-q", "-b", "main");
+    git("commit", "-q", "--allow-empty", "-m", "judged");
+    const judged = git("rev-parse", "HEAD");
+
+    let d = await driftSince(dir, judged, false);
+    assert.deepEqual(d, { kind: "same", dirtyThen: false, dirtyNow: false });
+    assert.match(describeDrift(d), /exactly the commit it judged/);
+
+    writeFileSync(join(dir, "wip.txt"), "x\n");
+    d = await driftSince(dir, judged, false);
+    assert.match(describeDrift(d), /uncommitted changes now/);
+
+    git("add", "wip.txt");
+    git("commit", "-q", "-m", "later");
+    git("commit", "-q", "--allow-empty", "-m", "later still");
+    d = await driftSince(dir, judged, false);
+    assert.deepEqual(d, { kind: "ahead", commits: 2, dirtyNow: false });
+    assert.match(describeDrift(d), /moved 2 commits past/);
+
+    git("checkout", "-q", "--orphan", "other");
+    git("commit", "-q", "--allow-empty", "-m", "unrelated");
+    d = await driftSince(dir, judged, false);
+    assert.equal(d.kind, "elsewhere");
+    assert.match(describeDrift(d), /does not describe this tree/);
+
+    d = await driftSince(dir, "0".repeat(40), false);
+    assert.equal(d.kind, "unknown");
+  });
+
+  it("ignores molt's own writes when deciding a tree is dirty", async () => {
+    const { treeState } = await import("../src/git.js");
+    const dir = ws();
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "s"], {
+      cwd: dir,
+    });
+    new Receipts(dir); // creates .molt/receipts
+    writeFileSync(join(dir, ".molt", "note.json"), "{}\n");
+    assert.equal((await treeState(dir))?.dirty, false, "every judged tree would read dirty otherwise");
+  });
+});

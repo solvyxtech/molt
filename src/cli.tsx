@@ -18,6 +18,7 @@ import { isAutonomy, type Autonomy } from "./autonomy.js";
 import { fmtCost, fmtDuration } from "./banner.js";
 import { BarError, hasBar, loadBar, selectChecks, writeDefaultBar } from "./bar.js";
 import { Engine } from "./engine.js";
+import { describeDrift, driftSince } from "./git.js";
 import { Journal } from "./journal.js";
 import { Integrity } from "./integrity.js";
 import { buildRepoMap, DEFAULT_MAP_TOKENS } from "./repomap.js";
@@ -1005,7 +1006,7 @@ async function cmdDoctor(args: Args): Promise<number> {
   return d.ok && hasBar(args.cwd) ? 0 : 1;
 }
 
-function cmdReceipts(args: Args): number {
+async function cmdReceipts(args: Args): Promise<number> {
   const receipts = new Receipts(args.cwd);
 
   if (args.repair) {
@@ -1080,8 +1081,20 @@ function cmdReceipts(args: Args): number {
   for (const r of rows) {
     const failed = r.failed.length ? `  failed: ${r.failed.join(", ")}` : "";
     const gone = onDisk.has(r.file) ? "" : "  MISSING";
+    const tree = r.head ? `  @${r.head.slice(0, 7)}${r.dirty ? "+" : ""}` : "";
     process.stdout.write(
-      `${r.file}  ${r.verdict.padEnd(9)} attempt ${r.attempt}  ${r.model}  ${r.sessionTokens} tok${failed}${gone}\n`,
+      `${r.file}  ${r.verdict.padEnd(12)} attempt ${r.attempt}  ${r.model}  ${r.sessionTokens} tok${tree}${failed}${gone}\n`,
+    );
+  }
+  // The receipt outranks anything that summarises the work, so the listing
+  // ends by checking the summary nobody wrote down: that the tree in front of
+  // you is the one the latest verdict was about.
+  const latest = rows.at(-1)!;
+  if (latest.head) {
+    const drift = await driftSince(args.cwd, latest.head, latest.dirty === true);
+    process.stdout.write(
+      `\nlatest: ${latest.file} (${latest.verdict}) judged ${latest.head.slice(0, 7)}` +
+        `${latest.dirty ? " + uncommitted changes" : ""} — ${describeDrift(drift)}\n`,
     );
   }
   return 0;
@@ -1371,7 +1384,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     case "doctor":
       return cmdDoctor(args);
     case "receipts":
-      return cmdReceipts(args);
+      return await cmdReceipts(args);
     case "archive":
       return cmdArchive(args);
     case "stats":

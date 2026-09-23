@@ -32,6 +32,14 @@ especially — the refused ones.
   was not run (left out by `--only`/`--skip`). Not a pass and not a false
   claim, and `molt stats` counts it apart from both.
 
+## Is this the tree that was judged?
+
+`molt receipts` ends by comparing the latest receipt's judged commit with the
+tree as it is now: the same commit (clean or not), N commits later, or a
+different history. A status panel, a handoff summary, or a note written
+before a context reset is a *claim* about the work. The receipt is the
+record, and this line is how the claim gets checked.
+
 ## Why refusals are kept
 
 A record containing only successes has the same shape as a record that was

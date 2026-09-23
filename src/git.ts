@@ -88,6 +88,58 @@ export async function treeState(cwd: string): Promise<{ sha: string; dirty: bool
   return { sha, dirty: !r.ok || r.stdout.length > 0 };
 }
 
+/**
+ * Where the tree stands now against the tree a receipt judged.
+ *
+ * The receipt is the record; anything else that describes the work — a
+ * status panel, a handoff summary, a note written before a context reset —
+ * is a claim about it. This is how the claim is checked: the judged commit,
+ * compared with HEAD and the working tree as they are now.
+ */
+export type TreeDrift =
+  | { kind: "same"; dirtyThen: boolean; dirtyNow: boolean }
+  | { kind: "ahead"; commits: number; dirtyNow: boolean }
+  | { kind: "elsewhere"; head: string; dirtyNow: boolean }
+  | { kind: "unknown"; reason: string };
+
+export async function driftSince(cwd: string, sha: string, dirtyThen: boolean): Promise<TreeDrift> {
+  const now = await treeState(cwd);
+  if (!now) return { kind: "unknown", reason: "not a git repository, or no commits" };
+  if (now.sha === sha) return { kind: "same", dirtyThen, dirtyNow: now.dirty };
+  const known = await git(cwd, ["cat-file", "-e", `${sha}^{commit}`]);
+  if (!known.ok) return { kind: "unknown", reason: `the judged commit ${sha.slice(0, 7)} is not in this repository` };
+  const anc = await git(cwd, ["merge-base", "--is-ancestor", sha, now.sha]);
+  if (anc.ok) {
+    const n = await git(cwd, ["rev-list", "--count", `${sha}..${now.sha}`]);
+    return { kind: "ahead", commits: Number(n.stdout) || 0, dirtyNow: now.dirty };
+  }
+  return { kind: "elsewhere", head: now.sha, dirtyNow: now.dirty };
+}
+
+/** One sentence for a person: is the tree in front of them the one that was judged? */
+export function describeDrift(d: TreeDrift): string {
+  switch (d.kind) {
+    case "same":
+      return !d.dirtyThen && !d.dirtyNow
+        ? "the tree is exactly the commit it judged, with no uncommitted changes either side."
+        : d.dirtyNow
+          ? "HEAD is the commit it judged, but the tree has uncommitted changes now — they may not be what was judged."
+          : "HEAD is the commit it judged, which then carried uncommitted changes that are not in the tree now.";
+    case "ahead":
+      return (
+        `HEAD has moved ${d.commits} commit${d.commits === 1 ? "" : "s"} past what it judged` +
+        `${d.dirtyNow ? ", and the tree has uncommitted changes" : ""}. That verdict is about an earlier tree.`
+      );
+    case "elsewhere":
+      return (
+        `HEAD (${d.head.slice(0, 7)}) is not descended from what it judged — another branch, or ` +
+        "rewritten history. That verdict does not describe this tree."
+      );
+    case "unknown":
+      return `cannot compare: ${d.reason}.`;
+  }
+}
+
 export async function currentBranch(cwd: string): Promise<string | null> {
   const r = await git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
   return r.ok && r.stdout ? r.stdout : null;
