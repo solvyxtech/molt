@@ -54,6 +54,8 @@ export type JournalKind =
   | "repeat_step"
   /** An assistant turn that arrived with no text and no tool call. */
   | "empty_turn"
+  /** A reply that wrote a tool call out as text and made no real one. */
+  | "narrated_call"
   /**
    * Retired. molt used to end a turn after two repeated steps; spend is
    * bounded by /budget and the turn ceiling instead. Kept in the union so

@@ -1001,7 +1001,11 @@ export function App({
               ? "claims done"
               : ev.outcome === "empty"
                 ? "empty turn"
-                : ev.tools.join(", ") || "no tools";
+                : ev.outcome === "narrated"
+                  ? "wrote a tool call as text"
+                  : ev.outcome === "truncated"
+                    ? "cut off at the output ceiling"
+                    : ev.tools.join(", ") || "no tools";
           add(
             "info",
             `step ${ev.step + 1} · ${did} · ${spendText(s)} · ${fmtDuration(ev.durationMs)}` +

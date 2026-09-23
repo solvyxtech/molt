@@ -840,7 +840,11 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
             ? "claims done"
             : ev.outcome === "empty"
               ? "empty turn"
-              : ev.tools.join(", ") || "no tools";
+              : ev.outcome === "narrated"
+                ? "wrote a tool call as text"
+                : ev.outcome === "truncated"
+                  ? "cut off at the output ceiling"
+                  : ev.tools.join(", ") || "no tools";
         const spent =
           sp.costUsd === undefined ? "" : ` · ${sp.estimated ? "~" : ""}${fmtCost(sp.costUsd)}`;
         process.stdout.write(

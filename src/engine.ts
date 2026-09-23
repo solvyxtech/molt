@@ -41,6 +41,7 @@ import {
   type Autonomy,
 } from "./autonomy.js";
 import { errorText } from "./format.js";
+import { narratedCallIn, narratedCallNudge } from "./narrated.js";
 import { redact } from "./redact.js";
 import {
   SKIP_DIRS,
@@ -445,6 +446,21 @@ export const MAX_PROOF_ATTEMPTS = 4;
  * what molt used to assume the first one meant.
  */
 export const EMPTY_TURN_RETRIES = 2;
+
+/**
+ * How many replies that imitate a tool call in text are sent back before one
+ * is let through to the bar.
+ *
+ * The same shape as EMPTY_TURN_RETRIES. A model that writes
+ * `<tool_call>{"name": "write_file", …}</tool_call>` into its reply, or a
+ * `[Tool result]` it made up, and then "Done", has run nothing — the provider
+ * returned no tool call — and molt used to read that as a finished claim and
+ * spend the bar on an unchanged tree. Telling it costs one request. Telling it
+ * forever would be a hang, and the detector can be wrong about a reply that
+ * only quotes a call, so after two the reply goes to the bar, which is the
+ * thing that decides whether work happened.
+ */
+export const NARRATED_CALL_RETRIES = 2;
 
 /**
  * How many times a reply cut off at the output ceiling is asked to continue
@@ -3572,6 +3588,8 @@ export class Engine {
     let emptyTurns = 0;
     /** Consecutive replies that stopped at the output ceiling. */
     let truncatedTurns = 0;
+    /** Consecutive replies that wrote a tool call out as text instead of making one. */
+    let narratedTurns = 0;
     /** The dry streak molt has already written into the transcript. */
     let nudgedAtStreak = 0;
 
@@ -3821,6 +3839,8 @@ export class Engine {
       }
 
       const stepStartedAt = Date.now();
+      /** Calls made before this step, so a subprocess step can tell whether it ran any. */
+      const callsBeforeStep = this.turnCalls.size;
       const wire = this.transcript.wire();
       const requestEst = this.bom().requestTotalEst;
       let msg: Msg | undefined;
@@ -4516,7 +4536,10 @@ export class Engine {
         billed: typeof billedUsd === "number",
       };
       /** Close out the step with what it did and what it cost. */
-      const summary = (tools: string[], outcome: "tools" | "claim" | "empty" | "truncated"): EngineEvent => ({
+      const summary = (
+        tools: string[],
+        outcome: "tools" | "claim" | "empty" | "truncated" | "narrated",
+      ): EngineEvent => ({
         kind: "step_summary",
         job,
         step,
@@ -4679,6 +4702,61 @@ export class Engine {
           nudgedAtStreak = 0;
         }
         continue; // let the model see tool results
+      }
+
+      // ---- A tool call written as text is not a tool call. ----
+      //
+      // The reply names a call — `<tool_call>…`, a JSON `{"name": "write_file",
+      // "arguments": …}`, "Calling edit_file with …", a `[Tool result]` it
+      // wrote itself — and the provider returned no tool call. Nothing ran.
+      // Read as a claim, that is a bar spent on an unchanged tree and, in ask
+      // mode or with no bar, an answer built on results nobody produced. It
+      // happens most after a shed, when the transcript the model is imitating
+      // is a digest that describes calls in prose.
+      //
+      // Said in the transcript, because the screen is not where the model
+      // reads. A subprocess backend runs its tools inside the step, so there a
+      // step that did call something is left alone: its text is a report.
+      const narrated =
+        msg.content && !(this.subprocess && this.turnCalls.size > callsBeforeStep)
+          ? narratedCallIn(msg.content)
+          : null;
+      if (narrated) {
+        narratedTurns += 1;
+        const giveUp = narratedTurns > NARRATED_CALL_RETRIES;
+        log?.append("narrated_call", {
+          step,
+          attempt: narratedTurns,
+          found: narrated,
+          finishReason: finishReason ?? null,
+          ...(giveUp ? { passedToBar: true } : {}),
+        });
+        if (!giveUp) {
+          this.transcript.push({
+            role: "user",
+            content: narratedCallNudge(narrated),
+            molt: { nudge: true },
+          });
+          yield summary([], "narrated");
+          yield {
+            kind: "info",
+            text:
+              `the model wrote a tool call as text instead of making one (${narrated}) — ` +
+              `nothing ran. Telling it so rather than reading that as a finished claim` +
+              (narratedTurns === NARRATED_CALL_RETRIES
+                ? "; the next one goes to the bar as its answer"
+                : ""),
+          };
+          continue;
+        }
+        yield {
+          kind: "info",
+          text:
+            `the model has written tool calls as text ${narratedTurns} times running — ` +
+            `passing this reply to the bar as its answer. The calls it describes did not run.`,
+        };
+      } else {
+        narratedTurns = 0;
       }
 
       // ---- A sentence that stopped mid-word is not a claim of completion. ----
