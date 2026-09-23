@@ -17,8 +17,15 @@
   called broken when a pipe without `pipefail` swallowed the status. A check
   ending in `|| true` cannot fail and is refused as establishing nothing.
 
+- **A criterion that passed before the work is a guard, not proof.** It is
+  written as `pass (nothing to establish)` with the reason, so a receipt
+  never presents "the suite still passes" as "the task was done".
+
 ### Added
 
+- **`molt receipts` checks the summary against the record**: it ends by
+  comparing the latest verdict's judged commit with the tree now (same
+  commit, N commits later, or a history it does not describe).
 - **Receipts name the tree they judged**: HEAD's commit, and whether the tree
   had uncommitted changes. Index rows carry `head`/`dirty`.
 

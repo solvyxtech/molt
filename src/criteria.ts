@@ -130,8 +130,20 @@ export function taskChecksFrom(raw: unknown): {
 export type BrokenCriterion = { name: string; run: string; why: string };
 
 export async function preflightCriteria(
-  checks: readonly { name: string; kind?: string; run?: string }[],
-  opts: { cwd: string; timeoutMs?: number; signal?: AbortSignal },
+  checks: readonly { name: string; kind?: string; run?: string; expectExit?: number }[],
+  opts: {
+    cwd: string;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    /**
+     * Filled with the names of criteria that already PASS before the work.
+     *
+     * Such a criterion guards against breaking something; it cannot tell a
+     * finished task from an untouched one, so its pass at the end is not
+     * evidence the task was done. The engine uses this to say so.
+     */
+    passed?: string[];
+  },
 ): Promise<BrokenCriterion[]> {
   const broken: BrokenCriterion[] = [];
   for (const c of checks) {
@@ -150,6 +162,7 @@ export async function preflightCriteria(
       // here — a second copy of this judgement is a second place to drift.
       const d = diagnoseFailure(r.code ?? 0, r.stdout, r.stderr);
       if (d.didNotRun) broken.push({ name: c.name, run: c.run, why: d.hint ?? "did not run" });
+      else if (!r.timedOut && r.code === (c.expectExit ?? 0)) opts.passed?.push(c.name);
     } catch {
       // Failing to spawn it here is molt's problem, not the criterion's.
       // Reporting it as broken would block work for the wrong reason.

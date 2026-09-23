@@ -1398,6 +1398,14 @@ export class Engine {
   /** Exact JSON body of the most recent request — the wire, unhidden. */
   lastRequestBody?: string;
   /** sha256 of .molt/done.yml as it stood when the session began. */
+  /**
+   * Task criteria that already passed when tried before the work began.
+   *
+   * A pass at the end from one of these is a guard holding, not the task
+   * being shown done: it passed on the untouched tree too. The receipt says
+   * `pass (nothing to establish)` for it rather than presenting it as proof.
+   */
+  private passedBeforeWork: ReadonlySet<string> = new Set();
   /** True only while `proveNow` runs: a bar with no turn behind it. */
   private standalone = false;
   private barHash: string | null;
@@ -2362,7 +2370,27 @@ export class Engine {
         durationMs: Date.now() - t0,
       };
     }
-    return runBar(bar, this.barContext(claim));
+    return this.markGuards(await runBar(bar, this.barContext(claim)));
+  }
+
+  /** See `passedBeforeWork`. Only a passing command criterion is relabelled. */
+  private markGuards(result: BarResult): BarResult {
+    if (this.passedBeforeWork.size === 0) return result;
+    return {
+      ...result,
+      results: result.results.map((r) =>
+        r.ok && r.kind === "command" && this.passedBeforeWork.has(r.name)
+          ? {
+              ...r,
+              established: false,
+              output:
+                "passed before the work began too, so it guards against a regression and " +
+                "does not show this task was done · " +
+                r.output,
+            }
+          : r,
+      ),
+    };
   }
 
   /**
@@ -3447,6 +3475,7 @@ export class Engine {
   ): AsyncGenerator<EngineEvent> {
     // Remember where this turn began so a cancellation can leave no trace.
     const turnStart = this.transcript.length;
+    this.passedBeforeWork = new Set();
     const log = this.cfg.journal;
     /**
      * This turn's criteria, copied and sealed before anything runs.
@@ -3487,11 +3516,16 @@ export class Engine {
         // preflight rather than waiting it out.
         this.running = new AbortController();
         let broken: Awaited<ReturnType<typeof preflightCriteria>> = [];
+        const passed: string[] = [];
         try {
           broken = await preflightCriteria(taskChecks, {
             cwd: this.cwd,
             signal: this.running.signal,
+            passed,
           });
+          this.passedBeforeWork = new Set(
+            passed.map((n) => (n.startsWith("task:") ? n : `task:${n}`)),
+          );
         } finally {
           this.running = undefined;
         }

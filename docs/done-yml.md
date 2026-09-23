@@ -467,6 +467,12 @@ about creating the file so the error would stop. It spent the whole turn
 satisfying a typo, and the run looked exactly like one that had checked
 something and found it wanting.
 
+A criterion that already **passes** when tried before the work is a guard: it
+shows nothing broke, not that the task was done, because it passed on the
+untouched tree too. Its pass at the end is written as `pass (nothing to
+establish)`, with that reason, and never presented as proof. It is not a
+refusal: a person sealed it, and guards are worth having.
+
 Task criteria are also tried once at the moment they are sealed, before the
 first request. A criterion that cannot run is reported there, which is the
 cheapest possible place to learn it. It is a warning, not a veto: a criterion is

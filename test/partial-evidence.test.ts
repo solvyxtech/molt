@@ -422,3 +422,37 @@ describe("the receipt outranks the summary", () => {
     assert.equal((await treeState(dir))?.dirty, false, "every judged tree would read dirty otherwise");
   });
 });
+
+describe("a criterion that passed before the work", () => {
+  it("is shown as a guard holding, never as proof the task was done", async () => {
+    const dir = ws();
+    const engine = new Engine({
+      baseUrl: "http://mock/v1",
+      model: "test-model",
+      provider: "mock",
+      cwd: dir,
+      fetchFn: scriptedProvider([
+        { calls: [{ name: "write_file", args: { path: "done.txt", content: "yes\n" } }] },
+        { text: "Done: wrote done.txt." },
+      ]).fetchFn,
+      bar: parseBar(`version: 1\nchecks:\n  - name: ok\n    run: "true"\n`),
+      archive: new Archive(dir),
+      receipts: new Receipts(dir),
+    });
+    await drain(
+      engine.run("create done.txt", allowAll, {
+        taskChecks: [
+          // Fails on the untouched tree, passes after: this one discriminates.
+          { name: "made", kind: "command", run: "test -f done.txt", timeoutMs: 10_000, expectExit: 0, tags: ["task"] },
+          // Passes either way: it cannot tell done from not done.
+          { name: "guard", kind: "command", run: "true", timeoutMs: 10_000, expectExit: 0, tags: ["task"] },
+        ],
+      }),
+    );
+    const [file] = readdirSync(join(dir, ".molt", "receipts")).filter((f) => f.endsWith(".md"));
+    assert.match(file!, /accepted/, "a guard is not a reason to refuse — a person sealed it");
+    const body = readFileSync(join(dir, ".molt", "receipts", file!), "utf8");
+    assert.match(body, /\| task:guard \| pass \(nothing to establish\) \| passed before the work began/);
+    assert.match(body, /\| task:made \| pass \|/, "the criterion that discriminated is proof");
+  });
+});
