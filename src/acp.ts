@@ -404,6 +404,10 @@ export class AcpConnection {
       env: { ...process.env },
     });
     this.child = child;
+    // A write to a child that has died raises EPIPE as an 'error' event on its
+    // stdin, and an 'error' event nobody listens for is thrown — in the window,
+    // from Electron's main process. It is the same fact as the exit below.
+    child.stdin?.on("error", (e) => this.fail(e));
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (d: string) => this.feed(d));
     child.stderr?.setEncoding("utf8");
@@ -561,13 +565,21 @@ export class McpToolServer<H> {
   async listen(): Promise<{ url: string; headers: { name: string; value: string }[] }> {
     const server = createServer((req, res) => void this.handle(req, res));
     this.server = server;
+    // Before listening, not after: see the comment below. A listen that never
+    // completes must not be the thing holding Node open either.
+    server.unref();
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
+      // A close while this is pending shut the server before its listen
+      // callback could fire, so this promise never settled — and the session
+      // start-up awaiting it, and the turn awaiting that, hung for ever.
+      this.abortListen = () => reject(new Error("tool server closed while starting"));
       // Port 0 lets the OS pick, and 127.0.0.1 rather than 0.0.0.0 keeps it
       // off the network entirely — a tool server bound to every interface is
       // a remote write primitive on a shared LAN.
       server.listen(0, "127.0.0.1", () => resolve());
     });
+    this.abortListen = undefined;
     /**
      * An open listener is a reason for Node not to exit.
      *
@@ -656,7 +668,10 @@ export class McpToolServer<H> {
     return { jsonrpc: "2.0", id, error: { code: -32601, message: `unknown method ${msg.method}` } };
   }
 
+  private abortListen?: () => void;
+
   async close(): Promise<void> {
+    this.abortListen?.();
     await new Promise<void>((resolve) => {
       if (!this.server) return resolve();
       this.server.close(() => resolve());
@@ -888,6 +903,9 @@ export class AcpSession<H> {
     );
     this.mcp = mcp;
     const endpoint = await mcp.listen();
+    // Closed while the tool server was starting: spawning now would start an
+    // agent nothing will ever stop. See `close`.
+    if (this.closing) throw new Error("session closed");
 
     const conn = new AcpConnection(spec, {
       cwd,
@@ -1171,7 +1189,17 @@ export class AcpSession<H> {
   }
 
   /** End the session. The CLI subprocess and the tool server go with it. */
+  /**
+   * Set by `close`, read by `start` after each await.
+   *
+   * A cancel during start-up reached `close` while `start` was still awaiting
+   * the tool server: there was no child yet, so nothing was killed, and `start`
+   * then carried on and spawned one that nothing would ever stop.
+   */
+  private closing = false;
+
   async close(): Promise<void> {
+    this.closing = true;
     this.events.close();
     await this.conn?.close();
     await this.mcp?.close();

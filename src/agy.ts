@@ -596,6 +596,7 @@ export class AgySession<H> {
     );
     this.mcp = mcp;
     const endpoint = await mcp.listen();
+    if (this.closing) throw new Error("session closed");
 
     // Rules and registration first: they have to be on disk before anything
     // reads them, and a server registered after the process starts is one this
@@ -623,6 +624,13 @@ export class AgySession<H> {
       }
     }
 
+    // Setup can take seconds (it may run `agy mcp add`). A cancel in that
+    // window reached `close` before there was a child to kill, and the spawn
+    // below then started an `agy` that nothing would ever stop.
+    if (this.closing) {
+      await mcp.close();
+      throw new Error("session closed");
+    }
     const spawnFn = this.opts.spawnFn ?? spawn;
     const child = spawnFn(
       "agy",
@@ -642,6 +650,9 @@ export class AgySession<H> {
       { cwd, env: agyEnv(endpoint), stdio: ["pipe", "pipe", "pipe"] },
     );
     this.child = child;
+    // EPIPE on a dead child's stdin is an 'error' event; unheard, it is thrown
+    // from Electron's main process. Reported as the turn ending, which it is.
+    child.stdin?.on("error", (e) => this.events.push(doneEvent("", errorText(e))));
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (d: string) => this.feed(d));
     child.stderr?.setEncoding("utf8");
@@ -796,7 +807,11 @@ export class AgySession<H> {
     }
   }
 
+  /** See the spawn in `start`: set here, checked there after every await. */
+  private closing = false;
+
   async close(): Promise<void> {
+    this.closing = true;
     this.started = false;
     this.events.close();
     this.child?.stdin?.end();
