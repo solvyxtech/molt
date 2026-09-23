@@ -16,6 +16,7 @@ import { acpAgentFor, acpAsk } from "./acp.js";
 import { agyAsk, isAgy } from "./agy.js";
 import { claudeCodeAsk, isClaudeCode, type Sdk } from "./claude-code.js";
 import { errorText } from "./format.js";
+import { askError, askTimeoutMs, probeSignal } from "./watchdog.js";
 import { authHeaders } from "./providers.js";
 import { loadBar, parseBar, barPath } from "./bar.js";
 import type { Bar, Check } from "./types.js";
@@ -278,6 +279,8 @@ export async function interviewTurn(opts: {
   acpSpawn?: typeof import("node:child_process").spawn;
   /** How `agy` is run for a pre-turn question. Tests only. */
   agyRun?: (cmd: string, args: string[], opts: object) => Promise<{ stdout: string }>;
+  /** How long the HTTP question may wait for its answer; see askTimeoutMs. Tests only. */
+  timeoutMs?: number;
 }): Promise<InterviewTurn> {
   const f = opts.fetchFn ?? fetch;
   const base = opts.baseUrl.replace(/\/$/, "");
@@ -361,9 +364,11 @@ export async function interviewTurn(opts: {
     return parseInterviewReply(asked.text, opts.round);
   }
 
+  const limitMs = askTimeoutMs(800, opts.timeoutMs);
   try {
     const res = await f(`${base}/chat/completions`, {
       method: "POST",
+      signal: probeSignal(limitMs),
       headers: { "content-type": "application/json", ...authHeaders(base, opts.apiKey) },
       body: JSON.stringify({
         model: opts.model,
@@ -391,6 +396,6 @@ export async function interviewTurn(opts: {
      */
     return parseInterviewReply(text, opts.round);
   } catch (e) {
-    return { kind: "error", error: errorText(e) };
+    return { kind: "error", error: askError(e, limitMs, errorText) };
   }
 }

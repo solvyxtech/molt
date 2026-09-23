@@ -134,6 +134,21 @@ export async function agyModels(
   run: (cmd: string, args: string[], opts: object) => Promise<{ stdout: string }> = (c, a, o) =>
     exec(c, a, o),
 ): Promise<string[]> {
+  const r = await agyModelList(run);
+  return "ids" in r ? r.ids : [];
+}
+
+/**
+ * The same question, keeping a failure apart from an answer.
+ *
+ * `agyModels` folds both into `[]`, which is right for a picker and wrong for
+ * a diagnosis: `agyHealth` read every `[]` as "not signed in" and sent the
+ * person to log in again when `agy models` had timed out, crashed, or lost
+ * the network — a fix for a fault they did not have.
+ */
+async function agyModelList(
+  run: (cmd: string, args: string[], opts: object) => Promise<{ stdout: string }>,
+): Promise<{ ids: string[] } | { error: string }> {
   try {
     const { stdout } = await run("agy", ["models"], {});
     /**
@@ -145,13 +160,21 @@ export async function agyModels(
      * one-item list — so `agyHealth` reported an account that cannot run
      * anything as signed in, with the sign-in sentence as its only model.
      */
-    return stdout
-      .split("\n")
-      .filter((l) => l.includes("\t"))
-      .map((l) => l.split("\t")[0]?.trim() ?? "")
-      .filter(Boolean);
-  } catch {
-    return [];
+    return {
+      ids: stdout
+        .split("\n")
+        .filter((l) => l.includes("\t"))
+        .map((l) => l.split("\t")[0]?.trim() ?? "")
+        .filter(Boolean),
+    };
+  } catch (e) {
+    // A sign-in refusal that exits non-zero is still a sign-in refusal.
+    const said = `${(e as { stdout?: unknown }).stdout ?? ""}${(e as { stderr?: unknown }).stderr ?? ""}`;
+    if (/sign in/i.test(said)) return { ids: [] };
+    // What agy said, when it said anything; otherwise the failure itself.
+    const stderr = String((e as { stderr?: unknown }).stderr ?? "").trim();
+    const lines = (stderr || errorText(e)).split("\n").map((l) => l.trim()).filter(Boolean);
+    return { error: (lines.at(-1) ?? "agy models failed").slice(0, 200) };
   }
 }
 
@@ -375,7 +398,17 @@ export async function agyHealth(
     };
   }
   // The login you already have. Nothing here asks you to make a second one.
-  const ids = await agyModels((c, a, o) => run(c, a, o));
+  const listed = await agyModelList((c, a, o) => run(c, a, o));
+  if ("error" in listed) {
+    return {
+      ok: false,
+      installed: true,
+      version,
+      authenticated: false,
+      detail: `agy ${version} · could not list models: ${listed.error}`,
+    };
+  }
+  const ids = listed.ids;
   if (!ids.length) {
     return {
       ok: false,

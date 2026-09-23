@@ -221,6 +221,8 @@ export type BuiltinCheck =
    * perfectly on the machine that made it and not anywhere else.
    */
   | "imports-tracked"
+  /** Tests added this turn that cannot fail: tautologies, no assertion, not linked. See src/tests-real.ts. */
+  | "tests-real"
   | "files-changed"
   | "record-intact"
   | "claims-grounded"
@@ -559,9 +561,10 @@ export type EngineEvent =
        * What the model did with the step: called tools, claimed done,
        * returned nothing at all, or ran out of room mid-sentence. `empty` and
        * `truncated` are their own outcomes because neither is a claim — see
-       * the empty-turn and truncated-turn guards in engine.ts.
+       * the empty-turn and truncated-turn guards in engine.ts. `narrated` is a
+       * reply that wrote a tool call out as text and made none.
        */
-      outcome: "tools" | "claim" | "empty" | "truncated";
+      outcome: "tools" | "claim" | "empty" | "truncated" | "narrated";
       /** Provider-reported stop reason, when one was given. */
       finishReason?: string;
     }

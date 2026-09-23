@@ -32,7 +32,8 @@ import { render } from "ink";
 import { App, renderApp } from "../src/app.js";
 import { Engine } from "../src/engine.js";
 import type { Msg } from "../src/types.js";
-import { workspace } from "./helpers.js";
+import { scriptedClaudeCode, workspace } from "./helpers.js";
+import { CLAUDE_CODE_URL } from "../src/claude-code.js";
 import { Receipts } from "../src/receipts.js";
 import { writeDefaultBar } from "../src/bar.js";
 import type { BarResult } from "../src/types.js";
@@ -299,6 +300,73 @@ describe("the transparency view", { concurrency: true }, () => {
         partway.includes(`answer line ${n}`),
       ).length;
       assert.ok(midCount > 8, `only ${midCount} lines visible mid-stream`);
+    } finally {
+      app.unmount();
+      ws.cleanup();
+    }
+  });
+
+  it("takes back a half-written line when the attempt is replayed", async () => {
+    // A stream that dies part-way is retried from the start. The TUI ignored
+    // `stream_reset`, so the half line it was holding ran straight into the
+    // replay — "the first attemthe answer" — and the lines already printed
+    // sat above a second copy with nothing to say which one counted.
+    const ws = workspace();
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const enc = new TextEncoder();
+    const frame = (content: string) =>
+      enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: null }] })}\n\n`);
+    let calls = 0;
+    const engine = new Engine({
+      baseUrl: "http://provider.test/v1",
+      model: "m",
+      cwd: ws.dir,
+      bar: null,
+      stream: true,
+      retryBackoffMs: [5],
+      fetchFn: (async () => {
+        calls += 1;
+        const first = calls === 1;
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => "text/event-stream" },
+          body: new ReadableStream<Uint8Array>({
+            start(c) {
+              if (first) {
+                c.enqueue(frame("an abandoned line\nthe first attem"));
+                // Dies after the words reached the screen, not before.
+                setTimeout(() => c.error(new TypeError("terminated")), 60);
+                return;
+              }
+              c.enqueue(frame("the answer"));
+              c.enqueue(enc.encode(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`));
+              c.enqueue(enc.encode("data: [DONE]\n\n"));
+              c.close();
+            },
+          }),
+          text: async () => "",
+        } as unknown as Response;
+      }) as unknown as typeof fetch,
+    });
+    const app = render(createElement(App, { engine, version: "vtest" }), {
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      debug: true,
+      exitOnCtrlC: false,
+      patchConsole: false,
+    });
+    try {
+      await tick();
+      await submit(stdin, "answer me");
+      await until({ stdout }, /the answer/);
+      await tick(100);
+      const text = stdout.text;
+      assert.equal(calls, 2, "the dropped stream should have been retried once");
+      assert.match(text, /an abandoned line/, "the first attempt never reached the screen");
+      assert.ok(!text.includes("the first attemthe answer"), "the half line ran into the replay");
+      assert.match(text, /The reply above was abandoned; it starts again below/);
     } finally {
       app.unmount();
       ws.cleanup();
@@ -2067,6 +2135,52 @@ describe("/verify and /receipts in session", () => {
       writeDefaultBar(t.engine.cwd);
       await submit(t.stdin, "/spine on");
       await until(t, /bar ·|check\(s\)|spine on/i, 3_000);
+    } finally {
+      t.cleanup();
+    }
+  });
+});
+
+describe("pricing on a plan", () => {
+  it("says the plan is paying, not that a price is missing, when the model changes", async () => {
+    // The window has always said this. The terminal told a Max subscriber
+    // "publishes no price for sonnet — /price <in> <out> to set one": a gap
+    // in molt's knowledge, and advice to invent a rate, for a run that costs
+    // no money at all.
+    const t = await mount({
+      baseUrl: CLAUDE_CODE_URL,
+      provider: "claude-code",
+      model: "opus",
+      claudeCodeSdk: scriptedClaudeCode([]).sdk,
+      priceInPerMtok: undefined,
+      priceOutPerMtok: undefined,
+    });
+    try {
+      await submit(t.stdin, "/model sonnet");
+      await until(t, /your Claude plan is paying for this — the meter shows tokens, not money/);
+      assert.doesNotMatch(t.stdout.text, /publishes no price/);
+    } finally {
+      t.cleanup();
+    }
+  });
+});
+
+describe("the model picker", () => {
+  it("names the endpoint you are pointed at when it cannot be asked, keyed or not", async () => {
+    // A server you run holds no stored key, and its failure was filtered out
+    // with the keyless presets nobody connected to. With it down, /model
+    // listed everyone else's models and said nothing about it.
+    const t = await mount({
+      baseUrl: "http://my-box.test/v1",
+      provider: "my-box",
+      fetchFn: (async () => {
+        throw new TypeError("fetch failed");
+      }) as unknown as typeof fetch,
+    });
+    try {
+      await submit(t.stdin, "/model");
+      await until(t, /my-box: unreachable \(TypeError: fetch failed\)/);
+      assert.doesNotMatch(t.stdout.text, /ollama: unreachable/i, "keyless presets stay quiet");
     } finally {
       t.cleanup();
     }

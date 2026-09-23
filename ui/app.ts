@@ -1656,6 +1656,23 @@ async function runCommand(name: string, arg: string): Promise<void> {
     case "/receipts":
       showTab("receipts");
       return;
+    // Both were in the palette and `/help` here — the list is shared — and
+    // both answered "unknown command". The terminal handled them; this side
+    // had the button and the toggle and no command pointing at either.
+    case "/verify":
+      showTab("receipts");
+      await runVerify();
+      return;
+    case "/spine": {
+      const a = arg.trim().toLowerCase();
+      if (a !== "" && a !== "on" && a !== "off") {
+        say("error", "usage: /spine [on|off]", "error");
+        return;
+      }
+      setSpineOpen(a !== "off");
+      say("", a === "off" ? "spine hidden — /spine on to pin the bar again" : "spine on", "info");
+      return;
+    }
     case "/login":
       showTab("settings");
       ($("set-key") as HTMLInputElement).focus();

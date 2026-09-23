@@ -576,6 +576,19 @@ describe("health", () => {
    * `session/new` — the state that would otherwise read as healthy right up
    * until the first turn spent nothing and reported nothing.
    */
+  it("does not send a turn the agent abandoned at its own call limit to the bar", async () => {
+    // ACP's `max_turn_requests`: the agent ran out of calls part-way through.
+    // What it said last was taken as the finished claim and judged.
+    const dir = ws();
+    const { engine } = engineIn(dir, [{ text: "I have finished everything.", stopReason: "max_turn_requests" }]);
+    const events = await drain(engine.run("do the work", allowAll));
+    assert.ok(!events.some((e) => e.kind === "proof_start"), "a half-finished turn was judged as a claim");
+    assert.ok(
+      events.some((e) => e.kind === "error" && /max_turn_requests/.test((e as { text: string }).text)),
+      JSON.stringify(events.filter((e) => e.kind === "error")),
+    );
+  });
+
   it("surfaces a signed-out agent as a turn that failed, not as a hang", async () => {
     const dir = ws();
     const { engine } = engineIn(dir, [{ authError: true }]);

@@ -17,7 +17,7 @@ import { after, describe, it } from "node:test";
 import { parseBar } from "../src/bar.js";
 import { Engine } from "../src/engine.js";
 import { Receipts } from "../src/receipts.js";
-import { cmdAttempts, cmdAutoShed } from "../src/session-commands.js";
+import { cmdAttempts, cmdAutoShed, cmdBudget } from "../src/session-commands.js";
 import { criteriaFromArgs, parseArgs } from "../src/cli.js";
 import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
@@ -180,6 +180,55 @@ describe("attempts and auto-shed, one implementation for both surfaces", () => {
   });
 });
 
+describe("/budget, one meaning on both surfaces", () => {
+  it("reports on a bare /budget rather than clearing every limit", () => {
+    // The terminal cleared both limits on a bare /budget; the window printed
+    // usage. A command typed to ask what the limits are removed them.
+    const engine = new Engine({ baseUrl: "http://mock/v1", model: "m", cwd: ws(), bar: null });
+    engine.setBudget(40_000);
+    engine.setTurnBudgetUsd(2.5);
+    const r = cmdBudget(engine, "");
+    assert.equal(r.kind, "info");
+    assert.match(r.text, /budget: 40000 tokens.*per-turn ceiling \$2\.5/);
+    assert.equal(engine.budgetTokens, 40_000, "a bare /budget cleared the token budget");
+    assert.equal(engine.turnBudgetUsd, 2.5, "a bare /budget cleared the money ceiling");
+  });
+
+  it("lifts the money ceiling with $0, which the window refused", () => {
+    const engine = new Engine({ baseUrl: "http://mock/v1", model: "m", cwd: ws(), bar: null });
+    engine.setBudget(40_000);
+    engine.setTurnBudgetUsd(2.5);
+    assert.equal(cmdBudget(engine, "$0").text, "per-turn spending ceiling removed");
+    assert.equal(engine.turnBudgetUsd, 0);
+    assert.equal(engine.budgetTokens, 40_000, "removing the money ceiling must leave the token budget");
+  });
+
+  it("says off clears both, because it does", () => {
+    const engine = new Engine({ baseUrl: "http://mock/v1", model: "m", cwd: ws(), bar: null });
+    engine.setBudget(40_000);
+    engine.setTurnBudgetUsd(2.5);
+    assert.match(cmdBudget(engine, "off").text, /no session budget and no per-turn ceiling/);
+    assert.equal(engine.budgetTokens, undefined);
+    assert.equal(engine.turnBudgetUsd, 0);
+  });
+
+  it("sets each and refuses nonsense", () => {
+    const engine = new Engine({ baseUrl: "http://mock/v1", model: "m", cwd: ws(), bar: null });
+    assert.match(cmdBudget(engine, "40_000").text, /budget: 40000 tokens/);
+    assert.match(cmdBudget(engine, "$9").text, /per-turn ceiling: \$9/);
+    assert.match(cmdBudget(engine, "2.5usd").text, /per-turn ceiling: \$2\.5/);
+    assert.equal(engine.turnBudgetUsd, 2.5);
+    assert.equal(cmdBudget(engine, "lots").kind, "error");
+    assert.equal(cmdBudget(engine, "$-1").kind, "error");
+    assert.equal(cmdBudget(engine, "0").kind, "error");
+  });
+
+  it("is the one both surfaces call", () => {
+    const read = (p: string) => readFileSync(join(process.cwd(), p), "utf8");
+    assert.match(read("src/app.tsx"), /case "\/budget": \{\s*const r = cmdBudget\(engine, arg\)/);
+    assert.match(read("electron/commands.ts"), /case "\/budget":\s*return cmdBudget\(engine, arg\)/);
+  });
+});
 
 describe("repair backfills what the receipt body already says", () => {
   it("copies the change count in, and stats stop counting an unchanged acceptance", async () => {

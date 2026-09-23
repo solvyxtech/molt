@@ -64,6 +64,7 @@ import {
   isSelfHosted,
   modelSources,
   fetchPricing,
+  planFor,
   savePricing,
   PROVIDERS,
 } from "../src/providers.js";
@@ -215,6 +216,11 @@ function openSession(cwd: string, model: string, baseUrl: string, apiKey?: strin
     archive: new Archive(cwd),
     receipts,
     integrity,
+    // `molt run --capture` and MOLT_CAPTURE_DIR record one file per attempt
+    // for the fine-tuning set. The terminal read the variable; the window
+    // never did, so a desktop session launched with it set captured nothing
+    // and said nothing about it.
+    captureDir: process.env.MOLT_CAPTURE_DIR || undefined,
   });
 
   return { engine, cwd, model, baseUrl, provider, bar, barError, journal, receipts };
@@ -1223,11 +1229,7 @@ async function refreshPricing(s: Session, announce: boolean): Promise<void> {
    * publishes no rate reads as a gap in molt's knowledge rather than the
    * absence of a charge. Same correction the terminal footer got.
    */
-  const plan = isClaudeCode(s.baseUrl)
-    ? "Claude"
-    : isAgy(s.baseUrl)
-      ? "Google AI"
-      : acpAgentFor(s.baseUrl)?.label;
+  const plan = planFor(s.baseUrl);
   if (plan) {
     if (announce)
       send("engine:event", {

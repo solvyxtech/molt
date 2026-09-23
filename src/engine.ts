@@ -41,7 +41,9 @@ import {
   type Autonomy,
 } from "./autonomy.js";
 import { errorText } from "./format.js";
+import { narratedCallIn, narratedCallNudge } from "./narrated.js";
 import { redact } from "./redact.js";
+import { Watchdog, firstByteMs, probeError, probeSignal, requestIdleMs, waited } from "./watchdog.js";
 import {
   SKIP_DIRS,
   WALK_DEADLINE_MS,
@@ -446,6 +448,21 @@ export const MAX_PROOF_ATTEMPTS = 4;
  * what molt used to assume the first one meant.
  */
 export const EMPTY_TURN_RETRIES = 2;
+
+/**
+ * How many replies that imitate a tool call in text are sent back before one
+ * is let through to the bar.
+ *
+ * The same shape as EMPTY_TURN_RETRIES. A model that writes
+ * `<tool_call>{"name": "write_file", …}</tool_call>` into its reply, or a
+ * `[Tool result]` it made up, and then "Done", has run nothing — the provider
+ * returned no tool call — and molt used to read that as a finished claim and
+ * spend the bar on an unchanged tree. Telling it costs one request. Telling it
+ * forever would be a hang, and the detector can be wrong about a reply that
+ * only quotes a call, so after two the reply goes to the bar, which is the
+ * thing that decides whether work happened.
+ */
+export const NARRATED_CALL_RETRIES = 2;
 
 /**
  * How many times a reply cut off at the output ceiling is asked to continue
@@ -887,6 +904,21 @@ export type EngineConfig = {
    * find that out is at minute five.
    */
   turnDeadlineMs?: number;
+  /**
+   * How long a model request may go without receiving a byte before it is
+   * abandoned as hung and retried. Not a limit on the answer: every byte that
+   * arrives resets it. Unset means `MOLT_REQUEST_IDLE_MS`, then
+   * REQUEST_IDLE_MS (src/watchdog.ts); 0 turns it off.
+   */
+  requestIdleMs?: number;
+  /**
+   * The allowance before a request's first byte, overriding the one scaled
+   * from the prompt and output sizes (see firstByteMs in src/watchdog.ts).
+   * For a server whose speed is known, and for tests.
+   */
+  requestFirstByteMs?: number;
+  /** How long `doctor` and `listModels` wait on `/models`. PROBE_TIMEOUT_MS unless set; 0 is none. */
+  probeTimeoutMs?: number;
   /**
    * A map of the repository, added to the system prompt. Built by the caller
    * (it walks the disk, which the constructor must not) and paid for once,
@@ -1410,6 +1442,8 @@ export class Engine {
   private standalone = false;
   private barHash: string | null;
   private inFlight?: AbortController;
+  /** ctrl+C dropped the subscription session mid-step; the step reports a cancel, not a fault. */
+  private ccCancelled = false;
   /** Aborts the command or bar check currently executing, if any. */
   private running?: AbortController;
   /**
@@ -1543,6 +1577,11 @@ export class Engine {
     if (tokens === undefined) this.cfg.maxTurnUsd = 0;
   }
 
+  /** The per-turn spending ceiling in dollars; 0 is none. */
+  get turnBudgetUsd(): number {
+    return this.cfg.maxTurnUsd ?? 0;
+  }
+
   /** A per-turn spending ceiling in dollars. 0 removes it. */
   setTurnBudgetUsd(usd: number): void {
     this.cfg.maxTurnUsd = usd;
@@ -1614,7 +1653,10 @@ export class Engine {
      * watching. Ending the session is the only way to unask the question, so
      * the next turn starts a new one.
      */
-    if (this.cc) void this.dropClaudeCode();
+    if (this.cc) {
+      this.ccCancelled = true;
+      void this.dropClaudeCode();
+    }
   }
 
   get streaming(): boolean {
@@ -1725,6 +1767,12 @@ export class Engine {
 
   setAutoShed(tokens: number): void {
     this.cfg.autoShedAtTokens = Math.max(0, Math.floor(tokens));
+  }
+
+  /** When this turn's wall clock runs out, as an epoch ms, or undefined for never. */
+  private deadlineAt(): number | undefined {
+    const ms = this.turnDeadlineMs;
+    return ms > 0 && this.turnStartedAt > 0 ? this.turnStartedAt + ms : undefined;
   }
 
   /** Has this turn run past its wall-clock ceiling? */
@@ -2443,15 +2491,30 @@ export class Engine {
     // you cannot climb out of is a trap.
     const controller = new AbortController();
     this.inFlight = controller;
+    // Watched like any other request. The salvage is what runs after a
+    // provider has already failed, which is exactly when it is most likely
+    // to be hung — and a closing summary that never returns is a turn that
+    // never closes.
+    const idle = requestIdleMs(this.cfg.requestIdleMs);
+    const watch = new Watchdog(controller.signal, {
+      firstByteMs:
+        this.cfg.requestFirstByteMs ??
+        firstByteMs(idle, {
+          promptTokens: Math.round(this.bom().requestTotalEst * this.tokenScale),
+          maxTokens: this.maxTokensFor(),
+          stream: false,
+        }),
+      idleMs: idle,
+    });
     try {
       // The salvage is a request like any other, so it speaks whichever
       // protocol the rest of the turn spoke — sending it to the OpenAI path
       // while the session ran on the native one would fail the one request
       // whose entire job is to rescue a turn that already went wrong.
       const wire = this.transcript.wire();
-      const res = await fetchFn(this.endpoint, {
+      const res = watch.watch(await fetchFn(this.endpoint, {
         method: "POST",
-        signal: controller.signal,
+        signal: watch.signal,
         headers: {
           "content-type": "application/json",
           ...authHeaders(this.cfg.baseUrl, this.cfg.apiKey),
@@ -2478,7 +2541,7 @@ export class Engine {
                 tool_choice: "none",
               },
         ),
-      });
+      }));
       if (!res.ok) {
         // A safety net that fails silently is not a safety net. Say so.
         const why = await res.text().catch(() => "");
@@ -2520,10 +2583,19 @@ export class Engine {
       if (controller.signal.aborted) {
         log?.append("cancelled", { reason: "salvage cancelled" });
         yield { kind: "info", text: "cancelled — no closing summary was written" };
+      } else if (watch.reason === "idle") {
+        log?.append("error", { text: `salvage failed: no response in ${waited(watch.waitedMs)}` });
+        yield {
+          kind: "info",
+          text:
+            `could not write a closing summary — the provider sent nothing for ` +
+            `${waited(watch.waitedMs)} — the work above is all there is`,
+        };
       } else {
         log?.append("error", { text: `salvage failed: ${errorText(e)}` });
       }
     } finally {
+      watch.dispose();
       this.inFlight = undefined;
     }
   }
@@ -3076,9 +3148,10 @@ export class Engine {
     ctx: ToolContext,
   ): AsyncGenerator<
     EngineEvent,
-    { msg: Msg; usage: Usage; finishReason?: string; streamed: boolean } | null
+    { msg: Msg; usage: Usage; finishReason?: string; streamed: boolean } | "cancelled" | null
   > {
     this.ccCtx = ctx;
+    this.ccCancelled = false;
     let cc: BackendSession<EngineEvent>;
     try {
       cc = await this.subprocessSession();
@@ -3186,6 +3259,15 @@ export class Engine {
       }
     }
 
+    // ctrl+C ends the session, which is the only way to unask the question —
+    // and a session ended that way stops without a result. That silence was
+    // reported as "the session ended without answering", an error, with the
+    // transcript left holding the abandoned step and no `cancelled` in the
+    // journal: the HTTP path's cancel, told as a provider fault.
+    if (this.ccCancelled) {
+      this.ccCancelled = false;
+      return "cancelled";
+    }
     if (!done) {
       yield { kind: "error", text: `the ${this.backendLabel} session ended without answering` };
       await this.dropClaudeCode();
@@ -3297,7 +3379,21 @@ export class Engine {
     });
     // The prompt shows the command in full. You are being asked to judge
     // it, and a redacted command is one you cannot judge.
-    const allowed = decision.ask ? await ctx.confirm(name, `${detail}${decision.why ? ` — ${decision.why}` : ""}`) : true;
+    //
+    // Past the turn's wall clock, nothing more runs. The step loop reads the
+    // clock between steps, which on the HTTP path is between tool batches —
+    // but a subscription backend runs a whole agentic step, every call in it,
+    // inside one of molt's steps, so `--for 5m` on Claude Code bounded
+    // nothing: the step could go on calling tools for as long as it liked.
+    // Every call comes through here, whichever backend made it, so this is
+    // where the clock is honoured; the model is told, and the step loop
+    // closes the turn the way any deadline closes one.
+    const outOfTime = this.pastDeadline();
+    const allowed = outOfTime
+      ? false
+      : decision.ask
+        ? await ctx.confirm(name, `${detail}${decision.why ? ` — ${decision.why}` : ""}`)
+        : true;
 
     let result: string;
     let note: string | undefined;
@@ -3336,8 +3432,12 @@ export class Engine {
     // would make every gated call look like one.
     let durationMs: number | undefined;
     if (!allowed) {
-      result = "User denied this action.";
-      note = "denied";
+      result = outOfTime
+        ? `[molt: the time budget for this turn is up — ${name} was not run, and no further ` +
+          `call will be. Stop calling tools and answer now with what you have already found, ` +
+          `saying plainly what is unfinished.]`
+        : "User denied this action.";
+      note = outOfTime ? "out of time" : "denied";
     } else {
       yield { kind: "tool_start", name, detail };
       const toolStartedAt = Date.now();
@@ -3618,6 +3718,8 @@ export class Engine {
     let emptyTurns = 0;
     /** Consecutive replies that stopped at the output ceiling. */
     let truncatedTurns = 0;
+    /** Consecutive replies that wrote a tool call out as text instead of making one. */
+    let narratedTurns = 0;
     /** The dry streak molt has already written into the transcript. */
     let nudgedAtStreak = 0;
 
@@ -3656,6 +3758,12 @@ export class Engine {
     // So the cap is extensible on the same terms: asked once per cap, stopping
     // the default, and only where somebody is watching.
     let stepCap = MAX_STEPS;
+    /**
+     * The deadline fired while a request was in flight. The timer and the
+     * clock agree to the millisecond at best, so the check below is told
+     * rather than left to re-measure and perhaps disagree.
+     */
+    let deadlineInterrupted = false;
     for (let step = 0; ; step++) {
       if (step >= stepCap) {
         if (!opts.onCeiling) break;
@@ -3675,7 +3783,7 @@ export class Engine {
       // whatever state the work is in when they are up is the state the judge
       // sees. Unlike a token ceiling it is not a proxy for anything — it is
       // the thing the person waiting actually spends.
-      if (this.pastDeadline()) {
+      if (deadlineInterrupted || this.pastDeadline()) {
         const spentMs = Date.now() - this.turnStartedAt;
         log?.append("deadline", { limitMs: this.turnDeadlineMs, spentMs });
         const clock = (ms: number) => (ms < 1000 ? `${Math.round(ms)}ms` : `${Math.round(ms / 1000)}s`);
@@ -3867,6 +3975,8 @@ export class Engine {
       }
 
       const stepStartedAt = Date.now();
+      /** Calls made before this step, so a subprocess step can tell whether it ran any. */
+      const callsBeforeStep = this.turnCalls.size;
       const wire = this.transcript.wire();
       const requestEst = this.bom().requestTotalEst;
       let msg: Msg | undefined;
@@ -3888,6 +3998,13 @@ export class Engine {
           shown,
           answered,
         });
+        if (got === "cancelled") {
+          this.transcript.rollbackTo(turnStart);
+          const wrote = [...new Set(this.ledger.map((e) => e.path))];
+          log?.append("cancelled", { step, rolledBack: true, filesWritten: wrote });
+          yield { kind: "cancelled", filesWritten: wrote };
+          return;
+        }
         if (!got) return;
         msg = got.msg;
         usage = got.usage;
@@ -3923,6 +4040,13 @@ export class Engine {
          * the code path that is on by default. Asking costs one field.
          */
         const askForUsage = stream && !this.streamUsageUnsupported && !this.native;
+        /**
+         * This attempt's watchdog: silence and the deadline, on top of ctrl+C.
+         * Every send in the attempt goes through it, so the fallbacks below
+         * (stream_options, cache_control, the output ceiling) are watched too.
+         */
+        let watch: Watchdog | undefined;
+        const idle = requestIdleMs(this.cfg.requestIdleMs);
         const send = (withUsage: boolean, withCache = !this.cachingUnsupported): Promise<Response> => {
           const marks = withCache && this.cacheStyle === "explicit" ? new Set(breakpoints(wire)) : undefined;
           const body = this.native
@@ -3943,15 +4067,16 @@ export class Engine {
                 ...(stream ? { stream: true } : {}),
                 ...(withUsage ? { stream_options: { include_usage: true } } : {}),
               };
+          const w = watch;
           return fetchFn(this.endpoint, {
             method: "POST",
-            signal: controller.signal,
+            signal: w?.signal ?? controller.signal,
             headers: {
               "content-type": "application/json",
               ...authHeaders(this.cfg.baseUrl, this.cfg.apiKey),
             },
             body: (this.lastRequestBody = JSON.stringify(body)),
-          });
+          }).then((r) => (w ? w.watch(r) : r));
         };
 
         // A failed step is not a verdict on the work.
@@ -3993,10 +4118,24 @@ export class Engine {
          * which one the model actually finished.
          */
         let shownThisAttempt = false;
+        /** The deadline ended this step's request; the step loop closes the turn. */
+        let deadlineHit = false;
 
         for (let attempt = 0; ; attempt++) {
           failure = undefined;
           msg = undefined;
+          watch?.dispose();
+          watch = new Watchdog(controller.signal, {
+            firstByteMs:
+              this.cfg.requestFirstByteMs ??
+              firstByteMs(idle, {
+                promptTokens: Math.round(requestEst * this.tokenScale),
+                maxTokens: this.maxTokensFor(),
+                stream,
+              }),
+            idleMs: idle,
+            deadlineAt: this.deadlineAt(),
+          });
           let res: Response | undefined;
           try {
             res = await send(askForUsage);
@@ -4324,6 +4463,7 @@ export class Engine {
             }
           } catch (e) {
             if (controller.signal.aborted) {
+              watch.dispose();
               this.inFlight = undefined;
               this.transcript.rollbackTo(turnStart);
               const wrote = [...new Set(this.ledger.map((e) => e.path))];
@@ -4353,6 +4493,25 @@ export class Engine {
                   why: "The connection to the provider failed and could not be re-established.",
                   retryable: true,
                 };
+          }
+          // The watchdog, whichever layer noticed it. A body read cut off by
+          // it can surface as "not JSON" or as a network error, and neither is
+          // what happened.
+          if (watch.reason === "deadline") {
+            deadlineHit = true;
+            failure = undefined;
+            msg = undefined;
+            break;
+          }
+          if (watch.reason === "idle") {
+            msg = undefined;
+            failure = {
+              text:
+                `no response from the provider for ${waited(watch.waitedMs)} — the ` +
+                `connection looks hung`,
+              why: "The provider stopped responding.",
+              retryable: true,
+            };
           }
 
           if (!failure) break;
@@ -4385,7 +4544,18 @@ export class Engine {
           }
         }
 
+        watch?.dispose();
         this.inFlight = undefined;
+
+        if (deadlineHit) {
+          // The request was ended by the clock, not by the provider. Nothing
+          // it said is kept — the step loop's deadline check closes the turn
+          // the way it closes any other that ran out of time, salvage and all.
+          if (shownThisAttempt) yield { kind: "stream_reset", why: "time budget reached" };
+          log?.append("note", { text: `time budget reached during step ${step}'s request — request ended` });
+          deadlineInterrupted = true;
+          continue;
+        }
 
         if (failure || !msg) {
           const text = failure?.text ?? "provider response missing choices[0].message";
@@ -4562,7 +4732,10 @@ export class Engine {
         billed: typeof billedUsd === "number",
       };
       /** Close out the step with what it did and what it cost. */
-      const summary = (tools: string[], outcome: "tools" | "claim" | "empty" | "truncated"): EngineEvent => ({
+      const summary = (
+        tools: string[],
+        outcome: "tools" | "claim" | "empty" | "truncated" | "narrated",
+      ): EngineEvent => ({
         kind: "step_summary",
         job,
         step,
@@ -4725,6 +4898,61 @@ export class Engine {
           nudgedAtStreak = 0;
         }
         continue; // let the model see tool results
+      }
+
+      // ---- A tool call written as text is not a tool call. ----
+      //
+      // The reply names a call — `<tool_call>…`, a JSON `{"name": "write_file",
+      // "arguments": …}`, "Calling edit_file with …", a `[Tool result]` it
+      // wrote itself — and the provider returned no tool call. Nothing ran.
+      // Read as a claim, that is a bar spent on an unchanged tree and, in ask
+      // mode or with no bar, an answer built on results nobody produced. It
+      // happens most after a shed, when the transcript the model is imitating
+      // is a digest that describes calls in prose.
+      //
+      // Said in the transcript, because the screen is not where the model
+      // reads. A subprocess backend runs its tools inside the step, so there a
+      // step that did call something is left alone: its text is a report.
+      const narrated =
+        msg.content && !(this.subprocess && this.turnCalls.size > callsBeforeStep)
+          ? narratedCallIn(msg.content)
+          : null;
+      if (narrated) {
+        narratedTurns += 1;
+        const giveUp = narratedTurns > NARRATED_CALL_RETRIES;
+        log?.append("narrated_call", {
+          step,
+          attempt: narratedTurns,
+          found: narrated,
+          finishReason: finishReason ?? null,
+          ...(giveUp ? { passedToBar: true } : {}),
+        });
+        if (!giveUp) {
+          this.transcript.push({
+            role: "user",
+            content: narratedCallNudge(narrated),
+            molt: { nudge: true },
+          });
+          yield summary([], "narrated");
+          yield {
+            kind: "info",
+            text:
+              `the model wrote a tool call as text instead of making one (${narrated}) — ` +
+              `nothing ran. Telling it so rather than reading that as a finished claim` +
+              (narratedTurns === NARRATED_CALL_RETRIES
+                ? "; the next one goes to the bar as its answer"
+                : ""),
+          };
+          continue;
+        }
+        yield {
+          kind: "info",
+          text:
+            `the model has written tool calls as text ${narratedTurns} times running — ` +
+            `passing this reply to the bar as its answer. The calls it describes did not run.`,
+        };
+      } else {
+        narratedTurns = 0;
       }
 
       // ---- A sentence that stopped mid-word is not a claim of completion. ----
@@ -5111,12 +5339,33 @@ export class Engine {
      */
     const badEndpoint = endpointProblem(this.cfg.baseUrl);
     if (badEndpoint) return { ok: false, reachable: false, detail: badEndpoint };
+    const probeMs = this.cfg.probeTimeoutMs;
     try {
-      const res = await fetchFn(`${base}/models`, { headers: authHeaders(base, this.cfg.apiKey) });
+      const res = await fetchFn(`${base}/models`, {
+        headers: authHeaders(base, this.cfg.apiKey),
+        signal: probeSignal(probeMs),
+      });
       if (!res.ok) {
         return { ok: false, reachable: false, detail: `HTTP ${res.status} from ${base}/models` };
       }
-      const json = (await res.json().catch(() => null)) as { data?: { id?: string }[] } | null;
+      type Listing = { data?: { id?: string }[] } | null;
+      let json: Listing;
+      try {
+        json = (await res.json()) as Listing;
+      } catch {
+        // Something answered, and it was not an API. `--url https://openrouter.ai`
+        // without its `/api/v1` gets a 200 web page here, and doctor called that
+        // "endpoint reachable · model list unavailable" and exited 0 — the one
+        // command meant to catch a wrong URL passing it, for the first real
+        // request to fail on.
+        return {
+          ok: false,
+          reachable: false,
+          detail:
+            `${base}/models answered with a page, not JSON — this looks like a website rather ` +
+            `than the API. The base URL usually ends in /v1 (for example /api/v1).`,
+        };
+      }
       const ids = (json?.data ?? []).map((m) => m.id).filter(Boolean) as string[];
       // No list at all is not evidence against the model; endpoints that hide
       // /models exist, and refusing them would be a guess dressed as a check.
@@ -5143,7 +5392,7 @@ export class Engine {
             : ` · ⚠ '${this.cfg.model}' NOT in list (try: ${ids.slice(0, 3).join(", ")})`),
       };
     } catch (e) {
-      return { ok: false, reachable: false, detail: `cannot reach ${base}: ${String(e)}` };
+      return { ok: false, reachable: false, detail: `cannot reach ${base}: ${probeError(e, `${base}/models`, probeMs)}` };
     }
   }
 
@@ -5162,14 +5411,18 @@ export class Engine {
     // The constant, not the live list: `/model` asks every provider it knows,
     // and a picker keystroke must not spawn a CLI. See AGY_MODELS.
     if (isAgy(baseUrl)) return { ok: true, ids: [...AGY_MODELS] };
+    const probeMs = this.cfg.probeTimeoutMs;
     try {
-      const res = await fetchFn(`${base}/models`, { headers: authHeaders(base, apiKey) });
+      const res = await fetchFn(`${base}/models`, {
+        headers: authHeaders(base, apiKey),
+        signal: probeSignal(probeMs),
+      });
       if (!res.ok) return { ok: false, error: `HTTP ${res.status} from ${base}/models` };
       const json = (await res.json().catch(() => null)) as { data?: { id?: string }[] } | null;
       const ids = (json?.data ?? []).map((m) => m.id).filter(Boolean) as string[];
       return { ok: true, ids };
     } catch (e) {
-      return { ok: false, error: String(e) };
+      return { ok: false, error: probeError(e, `${base}/models`, probeMs) };
     }
   }
 }

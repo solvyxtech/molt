@@ -37,6 +37,7 @@ import {
 import {
   cmdCommit,
   cmdAttempts,
+  cmdBudget,
   cmdAutoShed,
   cmdFor,
   cmdMap,
@@ -55,6 +56,7 @@ import {
   moveSelection,
   needsPriceLookup,
   pickerRows,
+  planFor,
   readAuth,
   resolveProvider,
   saveEndpoint,
@@ -877,6 +879,18 @@ export function App({
           setStreamText(partial.current);
           break;
         }
+        case "stream_reset":
+          // The attempt that produced the text above is being abandoned and
+          // replayed from the start. This was not handled, so the replay was
+          // printed under the abandoned copy and the reader saw the answer
+          // twice with nothing to say which one counted. Lines already in the
+          // transcript cannot be taken back; the half-written line can, and
+          // the rest is named for what it is.
+          partial.current = "";
+          pendingGap.current = false;
+          setStreamText("");
+          add("info", `retrying — ${ev.why}. The reply above was abandoned; it starts again below.`);
+          break;
         case "cancelled":
           setPendingEst(undefined);
           flushPartial();
@@ -1001,7 +1015,11 @@ export function App({
               ? "claims done"
               : ev.outcome === "empty"
                 ? "empty turn"
-                : ev.tools.join(", ") || "no tools";
+                : ev.outcome === "narrated"
+                  ? "wrote a tool call as text"
+                  : ev.outcome === "truncated"
+                    ? "cut off at the output ceiling"
+                    : ev.tools.join(", ") || "no tools";
           add(
             "info",
             `step ${ev.step + 1} · ${did} · ${spendText(s)} · ${fmtDuration(ev.durationMs)}` +
@@ -1162,6 +1180,12 @@ export function App({
     async (announce: boolean) => {
       const model = engine.model;
       if (!model) return;
+      // A plan is not a price list. See planFor: the window already said this.
+      const plan = planFor(engine.baseUrl);
+      if (plan) {
+        if (announce) add("info", `your ${plan} plan is paying for this — the meter shows tokens, not money`);
+        return;
+      }
       const p = await fetchPricing(engine.baseUrl, model, engine.cfg.apiKey);
       if (!p) {
         // Nothing published for this model. A price may still stand — but only
@@ -1339,7 +1363,17 @@ export function App({
     }
     // Report unreachable keyed providers — a silently short list reads as
     // "this provider has no models" when it means "molt could not ask".
-    for (const src of results.filter((x) => !x.r.ok && auth[x.name])) {
+    //
+    // And the endpoint molt is pointed at, keyed or not. It was dropped here
+    // whenever it held no stored key — a server you run, a URL from
+    // /endpoint — so with it down the picker listed everyone else's models
+    // and said nothing about the one you were using. Keyless presets nobody
+    // connected to stay quiet: not running Ollama is not an error.
+    const here = engine.baseUrl.replace(/\/$/, "");
+    const failed = results.filter(
+      (x) => !x.r.ok && (auth[x.name] || x.url.replace(/\/$/, "") === here),
+    );
+    for (const src of failed) {
       add("error", `${src.name}: unreachable (${(src.r as { error: string }).error})`);
     }
     if (!choices.length) {
@@ -1501,35 +1535,8 @@ export function App({
           add("info", engine.lastRequestBody ?? "(nothing sent yet)");
           return true;
         case "/budget": {
-          // "$2.50" or "2.50usd" is a money ceiling for a single turn; a bare
-          // number is the session's token budget. Both, because tokens are
-          // what a context window is measured in and money is what a bill is.
-          const money = /^\$?([\d.]+)\s*(usd|\$)?$/i.exec(arg.trim());
-          if (arg.trim().startsWith("$") || /usd$/i.test(arg.trim())) {
-            const usd = Number(money?.[1]);
-            if (!Number.isFinite(usd) || usd < 0) {
-              add("error", "usage: /budget $2.50");
-              return true;
-            }
-            engine.setTurnBudgetUsd(usd);
-            add("info", usd === 0 ? "per-turn spending ceiling removed" : `per-turn ceiling: $${usd}`);
-            return true;
-          }
-          if (arg === "off" || arg === "") {
-            engine.setBudget(undefined);
-            add(
-              "info",
-              "budget cleared — no session budget and no per-turn ceiling. molt will now " +
-                "run a turn to the 32-step guard, which on a large codebase is a real bill.",
-            );
-          } else {
-            const n = Number(arg);
-            if (!Number.isFinite(n) || n <= 0) add("error", "usage: /budget <tokens|off>");
-            else {
-              engine.setBudget(n);
-              add("info", `budget: ${n} tokens — for the session, and for any single turn`);
-            }
-          }
+          const r = cmdBudget(engine, arg);
+          add(r.kind, r.text);
           return true;
         }
         case "/login":
