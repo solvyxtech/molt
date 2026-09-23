@@ -31,6 +31,13 @@
   sorted last, and `molt log`/`molt verify` name a session that stopped
   mid-turn (killed, crashed or closed) instead of presenting it as finished.
 
+- **`molt run` and `molt prove` exit 3 when there is no verdict**: no bar to
+  meet, or required checks not run. It exited 0 with no bar, which read to CI
+  exactly like a verified run, and 1 when undetermined, as though the work had
+  failed. Now 0 verified, 1 not met, 2 usage, 3 no verdict.
+- **`diff-covered` refuses a coverage report older than the change**: its
+  line numbers belong to the file before the edit.
+
 ### Added
 
 - **`molt receipts` checks the summary against the record**: it ends by

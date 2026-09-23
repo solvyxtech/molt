@@ -81,7 +81,7 @@ const USAGE = `molt ${VERSION} — a coding agent that can't say "done" without 
 
 usage
   molt                      interactive session
-  molt run "<task>"         headless; exits non-zero if the bar is not met
+  molt run "<task>"         headless; exit 0 verified · 1 not met · 3 no verdict
   molt ask "<question>"     a question, not a change — no work-landed check
   molt prove                run .molt/done.yml now and exit
   molt init                 write a starter .molt/done.yml
@@ -756,6 +756,9 @@ export function criteriaFromArgs(args: Pick<Args, "criteria" | "notes">): {
   return taskChecksFrom({ checks: args.criteria ?? [], notes: args.notes ?? [] });
 }
 
+/** Finished, but nothing established a verdict: no bar, or required checks not run. */
+const EXIT_NO_VERDICT = 3;
+
 async function cmdRun(args: Args, ask = false): Promise<number> {
   if (!args.task) {
     process.stderr.write(
@@ -919,9 +922,13 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   };
 
   const { taskChecks, taskNotes } = criteriaFromArgs(args);
+  let undetermined = false;
   for await (const ev of engine.run(args.task, confirm, { ask, taskChecks, taskNotes })) {
     emit(ev);
-    if (ev.kind === "proof_exhausted" || ev.kind === "error") failed = true;
+    if (ev.kind === "proof_exhausted" && ev.result.undetermined?.length) undetermined = true;
+    // The sentence that explains an undetermined bar arrives as an error, so
+    // it is read, but it is not a failure of the work.
+    else if (ev.kind === "proof_exhausted" || (ev.kind === "error" && !undetermined)) failed = true;
     if (ev.kind === "assistant_text") sawAnswer = true;
   }
 
@@ -953,8 +960,19 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   }
 
   // An unverified answer is not a success. Neither is no answer at all.
+  //
+  // It still exited 0 when the project had no bar: the one case where nothing
+  // was checked read, to CI, exactly like the case where everything was. And
+  // a bar that was only partly run (undetermined) exited 1, as though the
+  // work had failed something. Three answers, three codes: 0 verified, 1 not
+  // met, 3 finished without a verdict. A question (`molt ask`) is answered,
+  // not verified, and 0 is the right answer to it.
   if (failed) return 1;
+  // Before the answer check: an undetermined turn made its claim and was
+  // judged — it just could not be settled — so there is no answer event to wait for.
+  if (undetermined) return EXIT_NO_VERDICT;
   if (!sawAnswer) return 1;
+  if (!ask && !engine.cfg.bar) return EXIT_NO_VERDICT;
   return 0;
 }
 
@@ -971,7 +989,9 @@ async function cmdProve(args: Args): Promise<number> {
   } else {
     printBar(result, "prove");
   }
-  return result.ok ? 0 : 1;
+  if (result.ok) return 0;
+  const failedAny = result.results.some((r) => !r.ok && !r.advisory && !r.skipped);
+  return result.undetermined?.length && !failedAny ? EXIT_NO_VERDICT : 1;
 }
 
 function cmdInit(args: Args): number {
