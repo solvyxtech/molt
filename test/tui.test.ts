@@ -590,7 +590,10 @@ describe("the transparency view", { concurrency: true }, () => {
     const t = await mount({ fetchFn: slowProvider(200) });
     try {
       void submit(t.stdin, "read the seed");
-      await tick(80);
+      // Wait for the turn, not the clock. Under load a fixed sleep let these
+      // keys reach ink before the submitted line had, and they were sent AS
+      // part of it: "read the seedand then summarise it".
+      await until(t, /thinking|working|responding/);
       for (const ch of "and then summarise it") t.stdin.press(ch);
       await tick(60);
       assert.match(t.stdout.lastFrame, /and then summarise it/, "typing was swallowed mid-turn");
@@ -616,7 +619,10 @@ describe("the transparency view", { concurrency: true }, () => {
     const t = await mount({ fetchFn: slowProvider(400) }, 60);
     try {
       void submit(t.stdin, "read the seed");
-      await tick(120);
+      // Wait for the turn, not the clock. Under load a fixed sleep let these
+      // keys reach ink before the submitted line had, and they were sent AS
+      // part of it: "read the seedand then summarise it".
+      await until(t, /thinking|working|responding/);
       const typed = "and then summarise what it says about the proof gate";
       for (const ch of typed) t.stdin.press(ch);
       await tick(120);
@@ -634,7 +640,10 @@ describe("the transparency view", { concurrency: true }, () => {
     const t = await mount({ fetchFn: slowProvider(200) });
     try {
       void submit(t.stdin, "read the seed");
-      await tick(80);
+      // Wait for the turn, not the clock. Under load a fixed sleep let these
+      // keys reach ink before the submitted line had, and they were sent AS
+      // part of it: "read the seedand then summarise it".
+      await until(t, /thinking|working|responding/);
       t.stdin.press("V");
       await tick(60);
       assert.match(t.stdout.lastFrame, /what the model is doing/, "shift+V stopped working");
