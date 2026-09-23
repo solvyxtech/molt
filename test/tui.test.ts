@@ -32,7 +32,8 @@ import { render } from "ink";
 import { App, renderApp } from "../src/app.js";
 import { Engine } from "../src/engine.js";
 import type { Msg } from "../src/types.js";
-import { workspace } from "./helpers.js";
+import { scriptedClaudeCode, workspace } from "./helpers.js";
+import { CLAUDE_CODE_URL } from "../src/claude-code.js";
 import { Receipts } from "../src/receipts.js";
 import { writeDefaultBar } from "../src/bar.js";
 import type { BarResult } from "../src/types.js";
@@ -2125,6 +2126,30 @@ describe("/verify and /receipts in session", () => {
       writeDefaultBar(t.engine.cwd);
       await submit(t.stdin, "/spine on");
       await until(t, /bar ·|check\(s\)|spine on/i, 3_000);
+    } finally {
+      t.cleanup();
+    }
+  });
+});
+
+describe("pricing on a plan", () => {
+  it("says the plan is paying, not that a price is missing, when the model changes", async () => {
+    // The window has always said this. The terminal told a Max subscriber
+    // "publishes no price for sonnet — /price <in> <out> to set one": a gap
+    // in molt's knowledge, and advice to invent a rate, for a run that costs
+    // no money at all.
+    const t = await mount({
+      baseUrl: CLAUDE_CODE_URL,
+      provider: "claude-code",
+      model: "opus",
+      claudeCodeSdk: scriptedClaudeCode([]).sdk,
+      priceInPerMtok: undefined,
+      priceOutPerMtok: undefined,
+    });
+    try {
+      await submit(t.stdin, "/model sonnet");
+      await until(t, /your Claude plan is paying for this — the meter shows tokens, not money/);
+      assert.doesNotMatch(t.stdout.text, /publishes no price/);
     } finally {
       t.cleanup();
     }

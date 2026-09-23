@@ -11,14 +11,14 @@
  * tool whose whole pitch is an auditable record never writes a credential
  * into one.
  */
-import { probeSignal } from "./watchdog.js";
-import { ACP_AGENTS, isAcp } from "./acp.js";
+import { ACP_AGENTS, acpAgentFor, isAcp } from "./acp.js";
 import { AGY_URL, isAgy } from "./agy.js";
 import { CLAUDE_CODE_URL, isClaudeCode } from "./claude-code.js";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { windowAround } from "./commands.js";
 import { defaultConfigDir } from "./config-dir.js";
+import { probeSignal } from "./watchdog.js";
 
 /** Re-exported: it lived here first, and callers import it from here. */
 export { defaultConfigDir };
@@ -311,6 +311,22 @@ export function anthropicPricing(model: string): Pricing | null {
     cached: row.in / 10,
     source: "published rates (standard, not introductory) — /price to override",
   };
+}
+
+/**
+ * The plan paying for a subscription backend, by name — or undefined for an
+ * endpoint that bills per token.
+ *
+ * One answer for both surfaces. The window asked this before looking up a
+ * price and said "your Claude plan is paying for this"; the terminal did
+ * not, and on `/model opus` told a Max subscriber that "subscription
+ * publishes no price for opus — /price <in> <out> to set one": a missing
+ * rate, and advice to invent one, for a run that costs no money at all.
+ */
+export function planFor(baseUrl: string): string | undefined {
+  if (isClaudeCode(baseUrl)) return "Claude";
+  if (isAgy(baseUrl)) return "Google AI";
+  return acpAgentFor(baseUrl)?.label;
 }
 
 export async function fetchPricing(

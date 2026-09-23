@@ -55,6 +55,7 @@ import {
   moveSelection,
   needsPriceLookup,
   pickerRows,
+  planFor,
   readAuth,
   resolveProvider,
   saveEndpoint,
@@ -1173,6 +1174,12 @@ export function App({
     async (announce: boolean) => {
       const model = engine.model;
       if (!model) return;
+      // A plan is not a price list. See planFor: the window already said this.
+      const plan = planFor(engine.baseUrl);
+      if (plan) {
+        if (announce) add("info", `your ${plan} plan is paying for this — the meter shows tokens, not money`);
+        return;
+      }
       const p = await fetchPricing(engine.baseUrl, model, engine.cfg.apiKey);
       if (!p) {
         // Nothing published for this model. A price may still stand — but only

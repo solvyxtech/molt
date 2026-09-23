@@ -63,6 +63,7 @@ import {
   isSelfHosted,
   modelSources,
   fetchPricing,
+  planFor,
   savePricing,
   PROVIDERS,
 } from "../src/providers.js";
@@ -1201,11 +1202,7 @@ async function refreshPricing(s: Session, announce: boolean): Promise<void> {
    * publishes no rate reads as a gap in molt's knowledge rather than the
    * absence of a charge. Same correction the terminal footer got.
    */
-  const plan = isClaudeCode(s.baseUrl)
-    ? "Claude"
-    : isAgy(s.baseUrl)
-      ? "Google AI"
-      : acpAgentFor(s.baseUrl)?.label;
+  const plan = planFor(s.baseUrl);
   if (plan) {
     if (announce)
       send("engine:event", {
