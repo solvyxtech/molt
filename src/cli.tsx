@@ -623,7 +623,9 @@ function printBar(result: BarResult, from: "run" | "prove"): void {
     (result.cancelled
       ? "\nbar cancelled — not a verdict on the work"
       : result.ok
-        ? "\nbar met"
+        ? result.results.some((r) => r.ok && !r.skipped && r.established !== false)
+          ? "\nbar met"
+          : "\nbar met · but nothing was established: no check had anything to examine"
         : unasked.length && !failedAny
           ? `\nbar UNDETERMINED — ${unasked.length} required check(s) not run: ${unasked.join(", ")}`
           : "\nbar NOT met") +

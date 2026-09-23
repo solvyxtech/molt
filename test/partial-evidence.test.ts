@@ -465,3 +465,76 @@ describe("the window's receipt list", () => {
     assert.deepEqual(receiptName("notes.md"), { n: 0, verdict: "unknown" });
   });
 });
+
+describe("molt prove with no turn behind it", () => {
+  const BAR = `
+version: 1
+checks:
+  - name: ok
+    run: "true"
+  - name: landed
+    builtin: files-changed
+    tags: [session]
+  - name: accounted
+    builtin: tree-accounted
+    tags: [session]
+  - name: intact
+    builtin: record-intact
+    tags: [session]
+`;
+
+  it("reports the turn-reading builtins as n/a instead of failing a healthy project", async () => {
+    const dir = ws();
+    const engine = new Engine({
+      baseUrl: "http://mock/v1",
+      model: "test-model",
+      provider: "mock",
+      cwd: dir,
+      bar: parseBar(BAR),
+      archive: new Archive(dir),
+    });
+    const result = (await engine.proveNow())!;
+    assert.equal(result.ok, true, "a standalone prove over a green project is green");
+    for (const name of ["landed", "accounted"]) {
+      const r = result.results.find((x) => x.name === name)!;
+      assert.equal(r.established, false, `${name} never presents as evidence`);
+      assert.match(r.skipped ?? "", /no turn has run/);
+    }
+    const intact = result.results.find((x) => x.name === "intact")!;
+    assert.equal(intact.skipped, undefined, "record-intact audits the archive, which exists without a turn");
+  });
+
+  it("still refuses what it can judge", async () => {
+    const dir = ws();
+    const engine = new Engine({
+      baseUrl: "http://mock/v1",
+      model: "test-model",
+      provider: "mock",
+      cwd: dir,
+      bar: parseBar(BAR.replace('run: "true"', 'run: "false"')),
+      archive: new Archive(dir),
+    });
+    assert.equal((await engine.proveNow())!.ok, false);
+  });
+
+  it("judges the turn normally once one has run", async () => {
+    const dir = ws();
+    const engine = new Engine({
+      baseUrl: "http://mock/v1",
+      model: "test-model",
+      provider: "mock",
+      cwd: dir,
+      fetchFn: scriptedProvider([
+        { calls: [{ name: "write_file", args: { path: "a.txt", content: "a\n" } }] },
+        { text: "Done." },
+      ]).fetchFn,
+      bar: parseBar(BAR),
+      archive: new Archive(dir),
+      receipts: new Receipts(dir),
+    });
+    await drain(engine.run("write a.txt", allowAll));
+    const again = (await engine.proveNow())!;
+    const landed = again.results.find((x) => x.name === "landed")!;
+    assert.equal(landed.skipped, undefined, "after a turn, files-changed has a ledger to read");
+  });
+});

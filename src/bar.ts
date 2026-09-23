@@ -472,14 +472,29 @@ export function selectChecks(bar: Bar, sel: Selection = {}): Bar {
  * those out of a standalone run is not skipping a question; there is no
  * question for them to answer.
  */
-const SESSIONLESS_BUILTINS: ReadonlySet<BuiltinCheck> = new Set(["imports-tracked"]);
+const SESSIONLESS_BUILTINS: ReadonlySet<BuiltinCheck> = new Set(["imports-tracked", "record-intact"]);
+
+/**
+ * A check with nothing to read here, and why — or null if it should run.
+ *
+ * `molt prove` with no turn behind it ran `files-changed` and
+ * `tree-accounted` anyway, and both failed by definition: there were no
+ * writes to find and no snapshot to compare. Every standalone prove printed
+ * "bar NOT met" over a healthy project unless the person knew to pass
+ * `--skip session`, and the ones that did not learned to ignore the verdict.
+ * The turn-reading builtins are not run at all here; they are not failures
+ * and not passes, and the result says which.
+ */
+function noTurnToRead(c: Check, ctx: BarContext): string | null {
+  if (!ctx.standalone || c.kind !== "builtin" || SESSIONLESS_BUILTINS.has(c.builtin)) return null;
+  return "not applicable: no turn has run, so there is nothing for it to read";
+}
 
 /** Why this deselected check does not leave the verdict undetermined, or null if it does. */
 function notApplicable(c: Check, ctx: BarContext): string | null {
   if (c.advisory) return "advisory, and not run";
-  if (ctx.standalone && c.kind === "builtin" && !SESSIONLESS_BUILTINS.has(c.builtin)) {
-    return "not applicable: a standalone prove has no session for it to read";
-  }
+  const na = noTurnToRead(c, ctx);
+  if (na) return na;
   return null;
 }
 
@@ -2187,6 +2202,22 @@ export async function runBar(bar: Bar, ctx: BarContext): Promise<BarResult> {
         detail: c.kind === "command" ? c.run : c.builtin,
         ok: false,
         output: "not run — the bar was cancelled before this check",
+        durationMs: 0,
+      });
+      continue;
+    }
+    const na = noTurnToRead(c, ctx);
+    if (na) {
+      results.push({
+        name: c.name,
+        ...(c.advisory ? { advisory: true } : {}),
+        tags: c.tags,
+        kind: c.kind,
+        detail: c.kind === "command" ? c.run : c.builtin,
+        ok: true,
+        established: false,
+        skipped: na,
+        output: na,
         durationMs: 0,
       });
       continue;

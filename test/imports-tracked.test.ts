@@ -154,6 +154,21 @@ describe("what molt proposes to a project it has never seen", () => {
     );
   });
 
+  it("does not read npm's placeholder test script as a suite", async () => {
+    // `npm init` writes a test script that can only fail. Proposing it gave
+    // every fresh package a bar no work could meet.
+    const { proposeBar } = await import("../src/detect.js");
+    const w = workspace();
+    cleanups.push(w.cleanup);
+    writeFileSync(
+      join(w.dir, "package.json"),
+      JSON.stringify({ name: "x", scripts: { test: 'echo "Error: no test specified" && exit 1' } }),
+    );
+    const { yaml, detected } = proposeBar(w.dir);
+    assert.equal(detected.some((d) => d.name === "tests"), false);
+    assert.doesNotMatch(yaml, /run: npm test/);
+  });
+
   it("still parses as a bar", async () => {
     const { proposeBar } = await import("../src/detect.js");
     const w = workspace();

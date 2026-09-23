@@ -2865,7 +2865,10 @@ export class Engine {
   /** Run the bar without touching the loop — backs the /prove command. */
   async proveNow(claim?: string): Promise<BarResult | null> {
     if (!this.cfg.bar) return null;
-    this.standalone = true;
+    // Standalone means no turn has run in this engine: no snapshot, nothing
+    // written. After a turn, a prove is a re-judgement of that turn and every
+    // builtin has something to read.
+    this.standalone = this.turnTree === null && this.ledger.length === 0 && this.archivedWrites === 0;
     try {
       return await this.runBarGuarded(claim);
     } finally {

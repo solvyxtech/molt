@@ -21,6 +21,16 @@
   written as `pass (nothing to establish)` with the reason, so a receipt
   never presents "the suite still passes" as "the task was done".
 
+- **`molt prove` works with no flags.** With no turn behind it, the builtins
+  that read a turn (`files-changed`, `tree-accounted`, …) are reported `n/a`
+  rather than failing by definition; `--skip session` is no longer needed.
+  A met bar where no check examined anything says so.
+- **`molt init` ignores npm's placeholder test script**, which can only fail
+  and gave every fresh package a bar no work could meet.
+- **`molt log` opens the session that ran last**, not whichever random id
+  sorted last, and `molt log`/`molt verify` name a session that stopped
+  mid-turn (killed, crashed or closed) instead of presenting it as finished.
+
 ### Added
 
 - **`molt receipts` checks the summary against the record**: it ends by

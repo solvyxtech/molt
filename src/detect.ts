@@ -79,7 +79,15 @@ export function detectChecks(cwd: string): Detected[] {
   if (pkg) {
     const scripts = (pkg.scripts ?? {}) as Record<string, string>;
     const run = jsRunner(cwd);
-    const has = (name: string) => typeof scripts[name] === "string" && scripts[name]!.trim() !== "";
+    // `npm init` writes `echo "Error: no test specified" && exit 1` as the test
+    // script. It is a placeholder that can only fail, and reading it as the
+    // project's suite gave every fresh package a bar no work could meet — plus
+    // coverage and mutation checks pointed at a command that runs nothing.
+    const placeholder = (cmd: string) => /no test specified/i.test(cmd) && /exit\s+1/.test(cmd);
+    const has = (name: string) =>
+      typeof scripts[name] === "string" &&
+      scripts[name]!.trim() !== "" &&
+      !(name === "test" && placeholder(scripts[name]!));
     const invoke = (name: string) =>
       name === "test" && run === "npm" ? "npm test" : `${run} run ${name}`;
 
@@ -203,7 +211,7 @@ export function proposeBar(cwd: string): { yaml: string; detected: Detected[] } 
 
   const tail = [
     "  # molt runs these itself, against the session record. They are meaningful",
-    "  # inside a session, so `molt prove` on its own skips them with --skip session.",
+    "  # after a turn; a `molt prove` with no turn behind it reports them as n/a.",
     "  - name: work-landed",
     "    builtin: files-changed",
     "    tags: [session]",
