@@ -1261,6 +1261,14 @@ function cmdLog(args: Args): number {
   const check = Journal.verify(file);
   process.stdout.write(`${file}\n${entries.length} entries · chain ${check.ok ? "intact" : "BROKEN"}\n\n`);
   for (const line of Journal.summarize(entries)) process.stdout.write(line + "\n");
+  const open = Journal.unfinished(entries);
+  if (open) {
+    process.stdout.write(
+      `\nno recorded end: the log stops at a ${open.kind} (${open.iso.slice(0, 19).replace("T", " ")}Z), ` +
+        "mid-turn. The process was killed, crashed, or the window was closed; the last " +
+        "receipt is its final word, and anything still showing this session as working is stale.\n",
+    );
+  }
   process.stdout.write(
     "\nEvery line above is recomputed from the log, not narrated. Values marked ~ are\n" +
       "estimates (chars/4) because the provider did not report usage; everything else\n" +
@@ -1288,8 +1296,11 @@ function cmdVerify(args: Args): number {
       process.stdout.write(`none  ${f}  0 entries — nothing to verify\n`);
       continue;
     }
+    const open = r.ok ? Journal.unfinished(Journal.read(join(args.cwd, ".molt", "log", f))) : null;
     process.stdout.write(
-      `${r.ok ? "ok  " : "FAIL"}  ${f}  ${r.entries} entries${r.ok ? "" : `\n      ${r.reason}`}\n`,
+      `${r.ok ? "ok  " : "FAIL"}  ${f}  ${r.entries} entries` +
+        (open ? `  · no recorded end (stops at ${open.kind})` : "") +
+        `${r.ok ? "" : `\n      ${r.reason}`}\n`,
     );
     if (!r.ok) bad++;
   }

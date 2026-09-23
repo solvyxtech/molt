@@ -16,7 +16,17 @@
  * Costs nothing in tokens. It is disk only, and never enters the context.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import {
+  appendFileSync,
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  statSync,
+} from "node:fs";
 import { join } from "node:path";
 import { MIN_SECRET_CHARS, redactData } from "./redact.js";
 
@@ -186,12 +196,40 @@ export class Journal {
       });
   }
 
+  /**
+   * Every session log, oldest first — by when the session STARTED.
+   *
+   * This sorted by file name, and a session id is random hex, so "the most
+   * recent session" that `molt log` opens by default was whichever id sorted
+   * last: a one-line session from three weeks earlier, while the 681-entry
+   * session that had actually run last sat in the middle of the list. The
+   * start time is read from the first entry; the file's mtime stands in only
+   * when that cannot be read, and the name breaks ties so the order is stable.
+   */
   static sessions(root: string): string[] {
     const dir = join(root, ".molt", "log");
     if (!existsSync(dir)) return [];
     return readdirSync(dir)
       .filter((f) => f.endsWith(".jsonl"))
-      .sort();
+      .map((f) => ({ f, t: startedAt(join(dir, f)) }))
+      .sort((a, b) => a.t - b.t || (a.f < b.f ? -1 : a.f > b.f ? 1 : 0))
+      .map((x) => x.f);
+  }
+
+  /**
+   * The last entry, when the log stops somewhere a session cannot end.
+   *
+   * A turn ends in `session_end`, `cancelled`, `error` or `salvage`, and a
+   * session that did nothing ends on its `session_start`. A log whose last
+   * entry is a request, a tool result or a refused receipt stopped mid-turn:
+   * the process was killed, crashed, or the window was closed. Nothing in the
+   * record said so, and a status line that still reads "working" is exactly
+   * the kind of summary this is here to contradict. Anything this list does
+   * not name is left unjudged.
+   */
+  static unfinished(entries: JournalEntry[]): JournalEntry | null {
+    const last = entries.at(-1);
+    return last && MID_TURN.has(last.kind) ? last : null;
   }
 
   /**
@@ -385,5 +423,39 @@ export class Journal {
       }
     }
     return out;
+  }
+}
+
+const MID_TURN = new Set([
+  "user_message",
+  "request",
+  "response",
+  "permission",
+  "tool_call",
+  "tool_result",
+  "bar_run",
+  "receipt",
+]);
+
+/** When a session log began, from its first entry; mtime if that cannot be read. */
+function startedAt(file: string): number {
+  try {
+    const fd = openSync(file, "r");
+    try {
+      const buf = Buffer.alloc(4096);
+      const n = readSync(fd, buf, 0, buf.length, 0);
+      const first = buf.subarray(0, n).toString("utf8").split("\n")[0] ?? "";
+      const t = Date.parse((JSON.parse(first) as { iso?: string }).iso ?? "");
+      if (Number.isFinite(t)) return t;
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    // Unreadable or not JSON: fall through to the file's own clock.
+  }
+  try {
+    return statSync(file).mtimeMs;
+  } catch {
+    return 0;
   }
 }
