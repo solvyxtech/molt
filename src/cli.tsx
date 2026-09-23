@@ -1184,7 +1184,9 @@ function cmdStats(args: Args): number {
       `  still on disk         ${s.present}\n` +
       `  accepted              ${s.accepted}\n` +
       `  refused               ${s.refused}\n` +
-      `  exhausted             ${s.exhausted}\n\n` +
+      `  exhausted             ${s.exhausted}\n` +
+      (s.undetermined ? `  undetermined          ${s.undetermined}  (required checks not run — neither accepted nor refused)\n` : "") +
+      "\n" +
       `false-claim rate        ${rate}\n` +
       `verified changes        ${s.verifiedChanges}` +
       (s.answered || s.unchanged
