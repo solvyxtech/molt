@@ -1836,6 +1836,8 @@ function runBuiltin(
       const tests = ctx.ledger.filter((e) => isTestPath(e.path)).length;
       return {
         ok: true,
+        // No test file in scope is nothing examined, not a contract upheld.
+        ...(tests ? {} : { established: false }),
         output: tests
           ? `${tests} test file(s) changed, no assertion removed`
           : "no test file was changed",

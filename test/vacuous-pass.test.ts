@@ -436,3 +436,15 @@ describe("claims-grounded with no claim to ground", () => {
     assert.notEqual(r?.established, false);
   });
 });
+
+describe("spec-intact with no test file in scope", () => {
+  it("says it examined nothing rather than that the contract held", async () => {
+    const dir = ws();
+    writeFileSync(join(dir, "a.ts"), "x\n");
+    const BAR = parseBar("version: 1\nchecks:\n  - name: spec\n    builtin: spec-intact\n");
+    const [r] = (await runBar(BAR, ctxIn(dir, [wrote("a.ts", [1])]))).results;
+    assert.equal(r?.ok, true);
+    assert.equal(r?.established, false);
+    assert.match(r?.output ?? "", /no test file was changed/);
+  });
+});
