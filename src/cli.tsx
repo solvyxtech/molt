@@ -776,6 +776,12 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         process.stdout.write(ev.text);
         midLine = !ev.text.endsWith("\n");
         break;
+      case "stream_reset":
+        // The text above belongs to an attempt that is being replayed from
+        // the start. Unhandled, a log showed the answer twice with nothing to
+        // say which copy counted.
+        process.stdout.write(`· retrying — ${ev.why}. The reply above was abandoned; it starts again below.\n`);
+        break;
       case "message_end":
         // Handled by the midLine break above; the case is here so a streamed
         // step does not fall through to a default that prints something.

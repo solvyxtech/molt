@@ -877,6 +877,18 @@ export function App({
           setStreamText(partial.current);
           break;
         }
+        case "stream_reset":
+          // The attempt that produced the text above is being abandoned and
+          // replayed from the start. This was not handled, so the replay was
+          // printed under the abandoned copy and the reader saw the answer
+          // twice with nothing to say which one counted. Lines already in the
+          // transcript cannot be taken back; the half-written line can, and
+          // the rest is named for what it is.
+          partial.current = "";
+          pendingGap.current = false;
+          setStreamText("");
+          add("info", `retrying — ${ev.why}. The reply above was abandoned; it starts again below.`);
+          break;
         case "cancelled":
           setPendingEst(undefined);
           flushPartial();

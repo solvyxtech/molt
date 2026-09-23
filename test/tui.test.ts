@@ -305,6 +305,73 @@ describe("the transparency view", { concurrency: true }, () => {
     }
   });
 
+  it("takes back a half-written line when the attempt is replayed", async () => {
+    // A stream that dies part-way is retried from the start. The TUI ignored
+    // `stream_reset`, so the half line it was holding ran straight into the
+    // replay — "the first attemthe answer" — and the lines already printed
+    // sat above a second copy with nothing to say which one counted.
+    const ws = workspace();
+    const stdin = new FakeStdin();
+    const stdout = new FakeStdout();
+    const enc = new TextEncoder();
+    const frame = (content: string) =>
+      enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content }, finish_reason: null }] })}\n\n`);
+    let calls = 0;
+    const engine = new Engine({
+      baseUrl: "http://provider.test/v1",
+      model: "m",
+      cwd: ws.dir,
+      bar: null,
+      stream: true,
+      retryBackoffMs: [5],
+      fetchFn: (async () => {
+        calls += 1;
+        const first = calls === 1;
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => "text/event-stream" },
+          body: new ReadableStream<Uint8Array>({
+            start(c) {
+              if (first) {
+                c.enqueue(frame("an abandoned line\nthe first attem"));
+                // Dies after the words reached the screen, not before.
+                setTimeout(() => c.error(new TypeError("terminated")), 60);
+                return;
+              }
+              c.enqueue(frame("the answer"));
+              c.enqueue(enc.encode(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`));
+              c.enqueue(enc.encode("data: [DONE]\n\n"));
+              c.close();
+            },
+          }),
+          text: async () => "",
+        } as unknown as Response;
+      }) as unknown as typeof fetch,
+    });
+    const app = render(createElement(App, { engine, version: "vtest" }), {
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream,
+      debug: true,
+      exitOnCtrlC: false,
+      patchConsole: false,
+    });
+    try {
+      await tick();
+      await submit(stdin, "answer me");
+      await until({ stdout }, /the answer/);
+      await tick(100);
+      const text = stdout.text;
+      assert.equal(calls, 2, "the dropped stream should have been retried once");
+      assert.match(text, /an abandoned line/, "the first attempt never reached the screen");
+      assert.ok(!text.includes("the first attemthe answer"), "the half line ran into the replay");
+      assert.match(text, /The reply above was abandoned; it starts again below/);
+    } finally {
+      app.unmount();
+      ws.cleanup();
+    }
+  });
+
   it("shows the whole result, not a sample of it", async () => {
     // "I want to see everything happening — the whole point is transparency."
     // A view that shows five lines of a forty-line result is asking you to
