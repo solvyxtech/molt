@@ -11,7 +11,7 @@
 import { judgePass } from "./evidence.js";
 import { runCommand } from "./run.js";
 import { parseLcov, coverageFor, coverageCouldSpeak, unprovenIn, type Unproven } from "./coverage.js";
-import { planMutations, applyMutation, type Mutation } from "./mutate.js";
+import { planMutations, applyMutation, negateComparison, type Mutation } from "./mutate.js";
 import { proposeBar, type Detected } from "./detect.js";
 import { assertionsIn, fingerprint, isTestPath, treeChanges, type TreeSnapshot } from "./files.js";
 import { createHash } from "node:crypto";
@@ -1015,6 +1015,7 @@ async function mutationCheck(
 
   const survived: string[] = [];
   const killed: string[] = [];
+  const boundaryOnly: string[] = [];
   const restoreFailures: string[] = [];
 
   for (const m of plan) {
@@ -1033,9 +1034,24 @@ async function mutationCheck(
         timeoutMs,
         signal: ctx.signal,
       });
-      // A mutation the command still passes is a line nothing checks.
-      if (r.code === 0) survived.push(`${m.path}:${m.line} (${m.operator}) — ${m.before.trim()}`);
-      else killed.push(`${m.path}:${m.line} (${m.operator})`);
+      // A mutation the command still passes is a line nothing checks — unless
+      // it was a boundary nudge and negating the same condition is caught.
+      // Then the condition is tested and only its exact edge is not, which is
+      // either an equivalent mutant or a missing edge test; molt cannot tell
+      // which, so it names the gap instead of refusing on a guess.
+      if (r.code !== 0) killed.push(`${m.path}:${m.line} (${m.operator})`);
+      else {
+        const neg = negateComparison(m);
+        const negText = neg ? applyMutation(file.text, neg) : null;
+        let negKilled = false;
+        if (neg && negText !== null && negText !== file.text) {
+          writeFileSync(file.abs, negText, "utf8");
+          const rn = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal });
+          negKilled = rn.code !== 0;
+        }
+        if (negKilled) boundaryOnly.push(`${m.path}:${m.line} (${m.operator}) — ${m.before.trim()}`);
+        else survived.push(`${m.path}:${m.line} (${m.operator}) — ${m.before.trim()}`);
+      }
     } finally {
       writeFileSync(file.abs, file.text, "utf8");
       if (sha256Of(file.abs) !== file.sha) restoreFailures.push(file.path);
@@ -1064,7 +1080,7 @@ async function mutationCheck(
   }
 
   const total = files.reduce((n, f) => n + f.changedLines.length, 0);
-  return mutationVerdict({ killed, survived, planned: plan.length, total, sample, allowEmpty });
+  return mutationVerdict({ killed, survived, boundaryOnly, planned: plan.length, total, sample, allowEmpty });
 }
 
 /**
@@ -1203,6 +1219,11 @@ function buildCurrent(
 export function mutationVerdict(r: {
   killed: string[];
   survived: string[];
+  /**
+   * Boundary mutants that survived while the negated condition was caught:
+   * the condition is tested, its exact edge is not distinguished by any test.
+   */
+  boundaryOnly?: string[];
   planned: number;
   total: number;
   sample: number;
@@ -1210,7 +1231,16 @@ export function mutationVerdict(r: {
   allowEmpty?: boolean;
 }): { ok: boolean; output: string; established?: boolean } {
   const { killed, survived, planned, total, sample, allowEmpty } = r;
-  const examined = killed.length + survived.length;
+  const edge = r.boundaryOnly ?? [];
+  const examined = killed.length + survived.length + edge.length;
+  // Said on the receipt, never hidden in a pass: no test distinguishes these
+  // edges. Not a refusal, because an equivalent mutant cannot be killed by any
+  // test and refusing it only teaches the model to rewrite correct code.
+  const edgeNote = edge.length
+    ? ` · ${edge.length} boundary nudge(s) survived while the negated condition broke a test — ` +
+      `the condition is checked, its exact edge is not distinguished by any test (an ` +
+      `equivalent mutant, or an edge case worth pinning): ${edge.join("; ")}`
+    : "";
   const unexamined = total - examined;
   const note =
     unexamined > 0
@@ -1273,7 +1303,11 @@ This check establishes that your tests would notice this code being broken, ` +
   if (survived.length === 0) {
     return {
       ok: true,
-      output: `${killed.length} mutation(s) broke a test, as they should${note}`,
+      output:
+        (killed.length
+          ? `${killed.length} mutation(s) broke a test, as they should`
+          : "every changed condition is checked: negating it broke a test") +
+        `${edgeNote}${note}`,
     };
   }
   return {
@@ -1282,7 +1316,7 @@ This check establishes that your tests would notice this code being broken, ` +
       `${survived.length} of ${examined} mutation(s) changed the code and nothing failed:\n` +
       survived.map((s) => `  ${s}`).join("\n") +
       `\n\nThose lines run but nothing checks what they do. A test that executes code ` +
-      `without asserting on it leaves the code exactly as unproven as no test at all.${note}`,
+      `without asserting on it leaves the code exactly as unproven as no test at all.${edgeNote}${note}`,
   };
 }
 

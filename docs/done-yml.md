@@ -211,6 +211,21 @@ it small and expect this on a slow tag rather than the inner loop. The report
 says how many changed lines went unexamined; a bound nobody is told about reads
 as completeness.
 
+Only changed **source** files are broken, never manifests, docs, config or the
+tests themselves.
+
+A comparison is first nudged across its boundary (`>` to `>=`), because
+off-by-one is where tests are thinnest. If that survives, molt also negates
+the same condition (`>` to `<=`):
+
+- **the negation survives too**: nothing tests the condition. Refused.
+- **the negation breaks a test**: the condition is tested and only its exact
+  edge is not distinguished. That is either an equivalent mutant (`if (x > hi)
+  return hi; return x` gives the same answer at `x === hi` either way, so no
+  test can ever kill it) or an edge case worth pinning. molt cannot tell which,
+  so it names the line on the receipt instead of refusing. Refusing an
+  unkillable mutant only teaches a model to rewrite correct code.
+
 It runs the command once **unmutated** first and refuses to proceed unless that
 passes. Without it, a suite that is already failing makes every mutation look
 killed — the command failed, after all — and the check reports success having

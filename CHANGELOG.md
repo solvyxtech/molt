@@ -38,6 +38,19 @@
 - **`diff-covered` refuses a coverage report older than the change**: its
   line numbers belong to the file before the edit.
 
+- **Mutation stops refusing correct code over equivalent mutants.** A
+  surviving boundary nudge (`>` to `>=`) is followed by negating the same
+  condition; if that breaks a test, the undistinguished edge is named on the
+  receipt instead of refused. A live run had rewritten a correct fix into
+  `Math.min(Math.max(...))` to get past a mutant no test could kill. Mutation
+  also no longer breaks manifests, docs or the tests themselves.
+- **`molt init` proposes `diff-covered` only when the project already writes
+  lcov**, and offers it commented out otherwise. Proposed for every test
+  command, it failed the first turn on correct work and pushed a live model
+  into rewriting the project's test script.
+- **`claims-grounded` reads a disclaimer as one**: naming a file in order to
+  say it was *not* made (or that a build wrote it) is not a creation claim.
+
 ### Added
 
 - **`molt receipts` checks the summary against the record**: it ends by

@@ -117,6 +117,31 @@ export function planMutations(
 }
 
 /** Apply a mutation to a file's text, or null if the line no longer matches. */
+/**
+ * The same comparison, negated instead of nudged across its boundary.
+ *
+ * Used only after a boundary mutant survives. `x > hi` to `x >= hi` differs
+ * only when x equals hi, and when both branches give the same answer there
+ * (`if (x > hi) return hi; return x`) no test can ever tell them apart: an
+ * equivalent mutant. A live run was refused on exactly that and rewrote
+ * correct code to get past it. Negation always changes behaviour, so it
+ * separates "this condition is untested" (negation survives too) from "only
+ * its exact boundary is undistinguished" (negation is killed).
+ */
+const NEGATE: Record<string, { find: RegExp; to: string }> = {
+  "> to >=": { find: /(?<![<>=!-])>(?![=>])/, to: "<=" },
+  "< to <=": { find: /(?<![<>=!])<(?![=<])/, to: ">=" },
+  ">= to >": { find: /(?<![<>=!])>=(?!=)/, to: "<" },
+  "<= to <": { find: /(?<![<>=!])<=(?!=)/, to: ">" },
+};
+
+export function negateComparison(m: Mutation): Mutation | null {
+  const n = NEGATE[m.operator];
+  if (!n || !n.find.test(m.before)) return null;
+  const after = m.before.replace(n.find, n.to);
+  return after === m.before ? null : { ...m, after, operator: `${m.operator.split(" to ")[0]} to ${n.to}` };
+}
+
 export function applyMutation(text: string, m: Mutation): string | null {
   const lines = text.split("\n");
   if (lines[m.line - 1] !== m.before) return null;

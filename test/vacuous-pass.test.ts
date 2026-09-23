@@ -463,3 +463,54 @@ describe("mutation breaks source code, not manifests or the tests themselves", (
     assert.match(r?.output ?? "", /No changed source lines/);
   });
 });
+
+describe("mutation does not refuse correct code over a change nothing could notice", () => {
+  it("accepts the live clamp fix its tests pin (a boundary nudge here was an equivalent mutant)", async () => {
+    // The run: `if (x > hi) return x` fixed to `return hi`, with a test for
+    // x above hi. `x >= hi` also returns hi at x === hi, so the boundary
+    // mutant survived every possible test and the fix was refused.
+    const dir = ws();
+    mkdirSync(join(dir, "src"), { recursive: true });
+    mkdirSync(join(dir, "test"), { recursive: true });
+    writeFileSync(join(dir, "package.json"), '{ "type": "module" }\n');
+    writeFileSync(
+      join(dir, "src/clamp.js"),
+      "export function clamp(x, lo, hi) {\n  if (x < lo) return lo;\n  if (x > hi) return hi;\n  return x;\n}\n",
+    );
+    // A plain script, not `node --test`: a runner spawned from inside this
+    // suite inherits NODE_TEST_CONTEXT and reports to the parent instead of
+    // setting its own exit code.
+    writeFileSync(
+      join(dir, "test/clamp.check.mjs"),
+      'import assert from "node:assert/strict";\nimport { clamp } from "../src/clamp.js";\n' +
+        "assert.equal(clamp(5, 0, 10), 5);\n" +
+        "assert.equal(clamp(-1, 0, 10), 0);\n" +
+        "assert.equal(clamp(11, 0, 10), 10);\n",
+    );
+    const BAR = parseBar("version: 1\nchecks:\n  - name: mutated\n    builtin: mutation\n    run: node test/clamp.check.mjs\n");
+    const [r] = (await runBar(BAR, ctxIn(dir, [wrote("src/clamp.js", [3])]))).results;
+    assert.equal(r?.ok, true, r?.output);
+    assert.match(r?.output ?? "", /negating it broke a test/);
+    assert.match(r?.output ?? "", /src\/clamp\.js:3 \(> to >=\)/, "the undistinguished edge is named, not hidden");
+  });
+
+  it("still refuses a condition nothing tests, boundary or not", async () => {
+    const dir = ws();
+    mkdirSync(join(dir, "src"), { recursive: true });
+    mkdirSync(join(dir, "test"), { recursive: true });
+    writeFileSync(join(dir, "package.json"), '{ "type": "module" }\n');
+    writeFileSync(
+      join(dir, "src/clamp.js"),
+      "export function clamp(x, lo, hi) {\n  if (x < lo) return lo;\n  if (x > hi) return hi;\n  return x;\n}\n",
+    );
+    // Runs the code and checks nothing about the upper bound.
+    writeFileSync(
+      join(dir, "test/clamp.check.mjs"),
+      'import assert from "node:assert/strict";\nimport { clamp } from "../src/clamp.js";\n' +
+        "assert.equal(clamp(-1, 0, 10), 0);\nclamp(11, 0, 10);\n",
+    );
+    const BAR = parseBar("version: 1\nchecks:\n  - name: mutated\n    builtin: mutation\n    run: node test/clamp.check.mjs\n");
+    const [r] = (await runBar(BAR, ctxIn(dir, [wrote("src/clamp.js", [3])]))).results;
+    assert.equal(r?.ok, false, "negation survived too: the condition is untested");
+  });
+});
