@@ -644,13 +644,12 @@ function printBar(result: BarResult, from: "run" | "prove"): void {
       from === "prove"
         ? "\nwork-landed requires a file to have changed in this session. `molt prove` runs\n" +
             "standalone, so there is no session and no write for it to find — it fails here by\n" +
-            "definition, not because anything is wrong. Run `molt prove --skip session` to check\n" +
-            "the command checks on their own.\n"
+            "definition, not because anything is wrong. Once a turn has run it has one to read.\n"
         : "\neverything else passed. work-landed requires this turn to have changed a file, so a\n" +
             "question, a lookup, or an explanation can never satisfy it — and molt would rather\n" +
             "refuse an honest answer than accept an invented file edit.\n" +
             'ask questions with `molt ask "<question>"`, which runs the rest of the bar and drops\n' +
-            "that one check for the turn. For a whole run of questions, add --skip session.\n",
+            "that one check for the turn. (--skip session would leave the turn undetermined.)\n",
     );
   }
 }

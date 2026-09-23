@@ -820,8 +820,8 @@ export function App({
           "everything else passed. work-landed requires this turn to have changed a file, so\n" +
             "a question, a lookup, or an explanation can never satisfy it — and molt would\n" +
             "rather refuse an honest answer than accept an invented file edit.\n" +
-            "ask questions with /ask <question>: it runs the rest of the bar and drops that\n" +
-            "one check for the turn. For a whole session of questions, start with --skip session.",
+            "ask questions with /ask <question> (or a leading ?): it runs the rest of the bar\n" +
+            "and drops that one check for the turn.",
         );
       }
     },
