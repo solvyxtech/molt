@@ -16,6 +16,7 @@ import { join, resolve } from "node:path";
 import { Archive } from "./archive.js";
 import { isAutonomy, type Autonomy } from "./autonomy.js";
 import { fmtCost, fmtDuration } from "./banner.js";
+import { stepDid } from "./format.js";
 import { BarError, hasBar, loadBar, selectChecks, writeDefaultBar } from "./bar.js";
 import { Engine } from "./engine.js";
 import { describeDrift, driftSince } from "./git.js";
@@ -866,16 +867,7 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         // you can audit and one you can only pay.
         const sp = ev.spend;
         const cached = sp.cachedTokens > 0 ? ` (${sp.cachedTokens} cached)` : "";
-        const did =
-          ev.outcome === "claim"
-            ? "claims done"
-            : ev.outcome === "empty"
-              ? "empty turn"
-              : ev.outcome === "narrated"
-                ? "wrote a tool call as text"
-                : ev.outcome === "truncated"
-                  ? "cut off at the output ceiling"
-                  : ev.tools.join(", ") || "no tools";
+        const did = stepDid(ev.outcome, ev.tools);
         const spent =
           sp.costUsd === undefined ? "" : ` · ${sp.estimated ? "~" : ""}${fmtCost(sp.costUsd)}`;
         process.stdout.write(

@@ -692,6 +692,7 @@ function createWindow(): void {
                // The wire view must show the request as the engine stated it —
                // a step number and a message count — not a placeholder.
                wireRequest: [...document.querySelectorAll("#wire .frame")].map((f) => f.textContent || "").find((t) => /messages/.test(t)) || "",
+               stepLines: [...document.querySelectorAll("#stream .said.step .what")].map((e) => e.textContent || ""),
                text: (document.getElementById("stream")||{}).textContent||"",
              })`,
           )
@@ -701,6 +702,7 @@ function createWindow(): void {
             console.log(`[self-drive] tool rows  ${r.tools}`);
             console.log(`[self-drive] proofs     ${r.proofs}`);
             console.log(`[self-drive] wire rows  ${r.wire} · request frame: ${String(r.wireRequest).slice(0, 60) || "MISSING"}`);
+            console.log(`[self-drive] ledger     ${(r.stepLines as string[]).length} line(s) · ${(r.stepLines as string[]).at(-1) ?? "MISSING"}`);
             console.log(`[self-drive] active     ${r.activeTab} / ${r.activePanel}`);
             console.log(`[self-drive] picker     ${r.pickerRows} model(s) in ${r.pickerGroups} group(s)`);
             console.log(
@@ -719,6 +721,9 @@ function createWindow(): void {
               Number(r.rows) > 0 &&
               text.includes(process.env.MOLT_E2E_EXPECT ?? "") &&
               /step \d+ · \d+ messages/.test(String(r.wireRequest)) &&
+              // Each step's cost, and how the job ended, on the window too.
+              (r.stepLines as string[]).some((t) => /^step \d+ · /.test(t)) &&
+              (r.stepLines as string[]).some((t) => /^job \w+ · \d+ step/.test(t)) &&
               Number(r.pickerRows) >= 2 &&
               // A server the app was never pointed at, only remembered, must
               // still be asked — that is the whole of the reported bug.

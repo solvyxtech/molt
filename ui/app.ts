@@ -15,7 +15,7 @@
 import { renderMarkdown } from "./markdown.js";
 import { nextWaitWord } from "./wait-words.js";
 import { playSplash } from "./splash.js";
-import { fmtCost } from "../src/format.js";
+import { fmtCost, spendLine, stepDid } from "../src/format.js";
 import { expandEndpointShorthand, typedEndpointProblem } from "../src/endpoint.js";
 import { matchCommands } from "../src/commands.js";
 import { JOURNAL_RENDER_CAP, STREAM_CAP, contextCap, contextFill, newest, trimOldest } from "./bounds.js";
@@ -915,6 +915,29 @@ molt.onEvent((ev) => {
        */
       setPhase("thinking");
       bumpActivity();
+      break;
+
+    // What each step did and cost, and how the job ended. The terminal has
+    // printed both since the start; the window dropped them, so a long turn
+    // showed a bill with no line it came from and never said how it ended.
+    // Dimmed: they are the ledger beside the conversation, not part of it.
+    case "step_summary":
+      say(
+        "",
+        `step ${Number(ev.step) + 1} · ${stepDid(String(ev.outcome), (ev.tools as string[]) ?? [])} · ` +
+          `${spendLine(ev.spend)} · ${fmtMs(Number(ev.durationMs) || 0)}` +
+          (ev.spend?.estimated ? " · tokens estimated" : ""),
+        "step",
+      );
+      break;
+
+    case "job_end":
+      say(
+        "",
+        `job ${ev.outcome} · ${ev.steps} step(s) · ${spendLine(ev.spend)} · ${fmtMs(Number(ev.durationMs) || 0)}`,
+        "step",
+      );
+      void refreshStats();
       break;
 
     case "usage":

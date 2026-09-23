@@ -13,6 +13,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { Box, Static, Text, render, useApp, useInput, useStdout } from "ink";
 import type { RenderOptions } from "ink";
 import { Banner, fmtCost, fmtDuration, fmtTokens } from "./banner.js";
+import { stepDid } from "./format.js";
 import {
   COMMANDS,
   COMMAND_COL,
@@ -1010,16 +1011,7 @@ export function App({
           // is reconciled step by step, so a surprising bill has a line
           // where it came from rather than only a final number.
           const s = ev.spend;
-          const did =
-            ev.outcome === "claim"
-              ? "claims done"
-              : ev.outcome === "empty"
-                ? "empty turn"
-                : ev.outcome === "narrated"
-                  ? "wrote a tool call as text"
-                  : ev.outcome === "truncated"
-                    ? "cut off at the output ceiling"
-                    : ev.tools.join(", ") || "no tools";
+          const did = stepDid(ev.outcome, ev.tools);
           add(
             "info",
             `step ${ev.step + 1} · ${did} · ${spendText(s)} · ${fmtDuration(ev.durationMs)}` +

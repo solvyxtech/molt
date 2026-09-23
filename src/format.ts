@@ -85,3 +85,37 @@ export function errorText(e: unknown): string {
   const tail = String(cause);
   return tail && tail !== head ? `${head} (${tail})` : head;
 }
+
+/**
+ * What a step did, in the words every surface uses.
+ *
+ * Written twice (terminal and headless) and not at all in the window, which
+ * showed neither a step's cost nor how a job ended — the numbers were in the
+ * event and on the floor. One wording, three surfaces.
+ */
+export function stepDid(outcome: string, tools: readonly string[]): string {
+  return outcome === "claim"
+    ? "claims done"
+    : outcome === "empty"
+      ? "empty turn"
+      : outcome === "narrated"
+        ? "wrote a tool call as text"
+        : outcome === "truncated"
+          ? "cut off at the output ceiling"
+          : tools.join(", ") || "no tools";
+}
+
+/** A spend in one line: tokens in (cached) · out · cost, `~` when estimated. */
+export function spendLine(sp: {
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  costUsd?: number;
+  estimated: boolean;
+}): string {
+  return (
+    `${sp.promptTokens} in${sp.cachedTokens > 0 ? ` (${sp.cachedTokens} cached)` : ""} · ` +
+    `${sp.completionTokens} out` +
+    (sp.costUsd === undefined ? "" : ` · ${sp.estimated ? "~" : ""}${fmtCost(sp.costUsd)}`)
+  );
+}
