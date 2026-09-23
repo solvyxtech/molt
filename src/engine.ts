@@ -43,6 +43,7 @@ import {
 import { errorText } from "./format.js";
 import { narratedCallIn, narratedCallNudge } from "./narrated.js";
 import { redact } from "./redact.js";
+import { Watchdog, firstByteMs, requestIdleMs, waited } from "./watchdog.js";
 import {
   SKIP_DIRS,
   WALK_DEADLINE_MS,
@@ -903,6 +904,19 @@ export type EngineConfig = {
    */
   turnDeadlineMs?: number;
   /**
+   * How long a model request may go without receiving a byte before it is
+   * abandoned as hung and retried. Not a limit on the answer: every byte that
+   * arrives resets it. Unset means `MOLT_REQUEST_IDLE_MS`, then
+   * REQUEST_IDLE_MS (src/watchdog.ts); 0 turns it off.
+   */
+  requestIdleMs?: number;
+  /**
+   * The allowance before a request's first byte, overriding the one scaled
+   * from the prompt and output sizes (see firstByteMs in src/watchdog.ts).
+   * For a server whose speed is known, and for tests.
+   */
+  requestFirstByteMs?: number;
+  /**
    * A map of the repository, added to the system prompt. Built by the caller
    * (it walks the disk, which the constructor must not) and paid for once,
    * inside the cached prefix.
@@ -1732,6 +1746,12 @@ export class Engine {
     this.cfg.autoShedAtTokens = Math.max(0, Math.floor(tokens));
   }
 
+  /** When this turn's wall clock runs out, as an epoch ms, or undefined for never. */
+  private deadlineAt(): number | undefined {
+    const ms = this.turnDeadlineMs;
+    return ms > 0 && this.turnStartedAt > 0 ? this.turnStartedAt + ms : undefined;
+  }
+
   /** Has this turn run past its wall-clock ceiling? */
   private pastDeadline(): boolean {
     const ms = this.turnDeadlineMs;
@@ -2427,15 +2447,30 @@ export class Engine {
     // you cannot climb out of is a trap.
     const controller = new AbortController();
     this.inFlight = controller;
+    // Watched like any other request. The salvage is what runs after a
+    // provider has already failed, which is exactly when it is most likely
+    // to be hung — and a closing summary that never returns is a turn that
+    // never closes.
+    const idle = requestIdleMs(this.cfg.requestIdleMs);
+    const watch = new Watchdog(controller.signal, {
+      firstByteMs:
+        this.cfg.requestFirstByteMs ??
+        firstByteMs(idle, {
+          promptTokens: Math.round(this.bom().requestTotalEst * this.tokenScale),
+          maxTokens: this.maxTokensFor(),
+          stream: false,
+        }),
+      idleMs: idle,
+    });
     try {
       // The salvage is a request like any other, so it speaks whichever
       // protocol the rest of the turn spoke — sending it to the OpenAI path
       // while the session ran on the native one would fail the one request
       // whose entire job is to rescue a turn that already went wrong.
       const wire = this.transcript.wire();
-      const res = await fetchFn(this.endpoint, {
+      const res = watch.watch(await fetchFn(this.endpoint, {
         method: "POST",
-        signal: controller.signal,
+        signal: watch.signal,
         headers: {
           "content-type": "application/json",
           ...authHeaders(this.cfg.baseUrl, this.cfg.apiKey),
@@ -2462,7 +2497,7 @@ export class Engine {
                 tool_choice: "none",
               },
         ),
-      });
+      }));
       if (!res.ok) {
         // A safety net that fails silently is not a safety net. Say so.
         const why = await res.text().catch(() => "");
@@ -2504,10 +2539,19 @@ export class Engine {
       if (controller.signal.aborted) {
         log?.append("cancelled", { reason: "salvage cancelled" });
         yield { kind: "info", text: "cancelled — no closing summary was written" };
+      } else if (watch.reason === "idle") {
+        log?.append("error", { text: `salvage failed: no response in ${waited(watch.waitedMs)}` });
+        yield {
+          kind: "info",
+          text:
+            `could not write a closing summary — the provider sent nothing for ` +
+            `${waited(watch.waitedMs)} — the work above is all there is`,
+        };
       } else {
         log?.append("error", { text: `salvage failed: ${errorText(e)}` });
       }
     } finally {
+      watch.dispose();
       this.inFlight = undefined;
     }
   }
@@ -3628,6 +3672,12 @@ export class Engine {
     // So the cap is extensible on the same terms: asked once per cap, stopping
     // the default, and only where somebody is watching.
     let stepCap = MAX_STEPS;
+    /**
+     * The deadline fired while a request was in flight. The timer and the
+     * clock agree to the millisecond at best, so the check below is told
+     * rather than left to re-measure and perhaps disagree.
+     */
+    let deadlineInterrupted = false;
     for (let step = 0; ; step++) {
       if (step >= stepCap) {
         if (!opts.onCeiling) break;
@@ -3647,7 +3697,7 @@ export class Engine {
       // whatever state the work is in when they are up is the state the judge
       // sees. Unlike a token ceiling it is not a proxy for anything — it is
       // the thing the person waiting actually spends.
-      if (this.pastDeadline()) {
+      if (deadlineInterrupted || this.pastDeadline()) {
         const spentMs = Date.now() - this.turnStartedAt;
         log?.append("deadline", { limitMs: this.turnDeadlineMs, spentMs });
         const clock = (ms: number) => (ms < 1000 ? `${Math.round(ms)}ms` : `${Math.round(ms / 1000)}s`);
@@ -3897,6 +3947,13 @@ export class Engine {
          * the code path that is on by default. Asking costs one field.
          */
         const askForUsage = stream && !this.streamUsageUnsupported && !this.native;
+        /**
+         * This attempt's watchdog: silence and the deadline, on top of ctrl+C.
+         * Every send in the attempt goes through it, so the fallbacks below
+         * (stream_options, cache_control, the output ceiling) are watched too.
+         */
+        let watch: Watchdog | undefined;
+        const idle = requestIdleMs(this.cfg.requestIdleMs);
         const send = (withUsage: boolean, withCache = !this.cachingUnsupported): Promise<Response> => {
           const marks = withCache && this.cacheStyle === "explicit" ? new Set(breakpoints(wire)) : undefined;
           const body = this.native
@@ -3917,15 +3974,16 @@ export class Engine {
                 ...(stream ? { stream: true } : {}),
                 ...(withUsage ? { stream_options: { include_usage: true } } : {}),
               };
+          const w = watch;
           return fetchFn(this.endpoint, {
             method: "POST",
-            signal: controller.signal,
+            signal: w?.signal ?? controller.signal,
             headers: {
               "content-type": "application/json",
               ...authHeaders(this.cfg.baseUrl, this.cfg.apiKey),
             },
             body: (this.lastRequestBody = JSON.stringify(body)),
-          });
+          }).then((r) => (w ? w.watch(r) : r));
         };
 
         // A failed step is not a verdict on the work.
@@ -3967,10 +4025,24 @@ export class Engine {
          * which one the model actually finished.
          */
         let shownThisAttempt = false;
+        /** The deadline ended this step's request; the step loop closes the turn. */
+        let deadlineHit = false;
 
         for (let attempt = 0; ; attempt++) {
           failure = undefined;
           msg = undefined;
+          watch?.dispose();
+          watch = new Watchdog(controller.signal, {
+            firstByteMs:
+              this.cfg.requestFirstByteMs ??
+              firstByteMs(idle, {
+                promptTokens: Math.round(requestEst * this.tokenScale),
+                maxTokens: this.maxTokensFor(),
+                stream,
+              }),
+            idleMs: idle,
+            deadlineAt: this.deadlineAt(),
+          });
           let res: Response | undefined;
           try {
             res = await send(askForUsage);
@@ -4298,6 +4370,7 @@ export class Engine {
             }
           } catch (e) {
             if (controller.signal.aborted) {
+              watch.dispose();
               this.inFlight = undefined;
               this.transcript.rollbackTo(turnStart);
               const wrote = [...new Set(this.ledger.map((e) => e.path))];
@@ -4327,6 +4400,25 @@ export class Engine {
                   why: "The connection to the provider failed and could not be re-established.",
                   retryable: true,
                 };
+          }
+          // The watchdog, whichever layer noticed it. A body read cut off by
+          // it can surface as "not JSON" or as a network error, and neither is
+          // what happened.
+          if (watch.reason === "deadline") {
+            deadlineHit = true;
+            failure = undefined;
+            msg = undefined;
+            break;
+          }
+          if (watch.reason === "idle") {
+            msg = undefined;
+            failure = {
+              text:
+                `no response from the provider for ${waited(watch.waitedMs)} — the ` +
+                `connection looks hung`,
+              why: "The provider stopped responding.",
+              retryable: true,
+            };
           }
 
           if (!failure) break;
@@ -4359,7 +4451,18 @@ export class Engine {
           }
         }
 
+        watch?.dispose();
         this.inFlight = undefined;
+
+        if (deadlineHit) {
+          // The request was ended by the clock, not by the provider. Nothing
+          // it said is kept — the step loop's deadline check closes the turn
+          // the way it closes any other that ran out of time, salvage and all.
+          if (shownThisAttempt) yield { kind: "stream_reset", why: "time budget reached" };
+          log?.append("note", { text: `time budget reached during step ${step}'s request — request ended` });
+          deadlineInterrupted = true;
+          continue;
+        }
 
         if (failure || !msg) {
           const text = failure?.text ?? "provider response missing choices[0].message";
