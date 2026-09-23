@@ -687,6 +687,24 @@ describe("one palette, two surfaces", () => {
     assert.match(ui, /if \(paletteChoosing\(\)\) \{/);
   });
 
+  it("handles every command the palette offers, on both surfaces", () => {
+    // The list is shared, so the window's palette and /help offered /verify
+    // and /spine — and the window answered both with "unknown command". A
+    // command either surface lists and cannot run is a promise the palette
+    // breaks on one of them.
+    const read = (...p: string[]) => readFileSync(path.join(repoRoot(), ...p), "utf8");
+    const cases = (text: string) => new Set([...text.matchAll(/case "(\/[a-z-]+)"/g)].map((m) => m[1]!));
+    const window = new Set([
+      ...cases(read("ui", "app.ts")),
+      ...cases(read("electron", "commands.ts")),
+      ...cases(read("electron", "main.ts")),
+    ]);
+    const terminal = cases(read("src", "app.tsx"));
+    const names = COMMANDS.map((c) => c.name);
+    assert.deepEqual(names.filter((n) => !window.has(n)), [], "offered in the window, not handled there");
+    assert.deepEqual(names.filter((n) => !terminal.has(n)), [], "offered in the terminal, not handled there");
+  });
+
   it("still ranks the way the terminal does", () => {
     const cmds = [
       { name: "/model", args: "[id]", summary: "choose the model" },
