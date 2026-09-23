@@ -1307,7 +1307,39 @@ function diffCovered(
     };
   }
 
+  // A report older than the change describes the code before it. The tests
+  // check it came from was reused because nothing it watches moved, or it
+  // ran before the edit — either way its line numbers belong to a version of
+  // the file that no longer exists, and "line 12 ran" is a fact about that
+  // version. Judged against the files as they are on disk now.
+  let reportAt = 0;
+  try {
+    reportAt = statSync(abs).mtimeMs;
+  } catch {
+    // Read a moment ago; a vanished stat leaves the comparison below inert.
+  }
   const cov = parseLcov(text);
+  // Only files the report claims to speak for: one it does not mention is
+  // reported below as exactly that, which is the more useful sentence.
+  const newer = measurable.filter((e) => {
+    if (!coverageFor(cov, e.path)) return false;
+    try {
+      return statSync(resolve(ctx.cwd, e.path)).mtimeMs > reportAt;
+    } catch {
+      return false;
+    }
+  });
+  if (reportAt > 0 && newer.length > 0) {
+    return {
+      ok: false,
+      output:
+        `${lcovPath} is older than ${newer.map((e) => e.path).join(", ")}, so it describes the ` +
+        `code before this change and cannot say whether the tests execute it. Run the test ` +
+        `command that writes it before this check (and check its \`watch\` covers these files, ` +
+        `or its result is reused without running).`,
+    };
+  }
+
   const problems: Unproven[] = [];
   let unmatched = 0;
   for (const entry of measurable) {

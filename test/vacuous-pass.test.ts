@@ -182,6 +182,23 @@ describe("diff-covered does not pass on a report that never looked", () => {
     assert.match(r?.output ?? "", /none that coverage instruments/);
   });
 
+  it("refuses a report written before the change it is asked about", async () => {
+    // The tests check was reused (nothing it watches moved) or ran before the
+    // edit, so the report describes the old file. Its line numbers belong to
+    // a version of the code that no longer exists; "line 1 ran" is a fact
+    // about that version.
+    const dir = ws();
+    mkdirSync(join(dir, "src"), { recursive: true });
+    withReport(dir, "SF:src/a.ts\nDA:1,1\nend_of_record\n");
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(join(dir, "coverage/lcov.info"), old, old);
+    writeFileSync(join(dir, "src/a.ts"), "export const x = 2;\n");
+    const [r] = (await runBar(BAR, ctxIn(dir, [wrote("src/a.ts", [1])]))).results;
+    assert.equal(r?.ok, false, "coverage of the previous version is not coverage of this one");
+    assert.match(r?.output ?? "", /older than/);
+    assert.match(r?.output ?? "", /src\/a\.ts/);
+  });
+
   it("still passes when the changed source ran", async () => {
     const dir = ws();
     mkdirSync(join(dir, "src"), { recursive: true });
