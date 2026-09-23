@@ -479,4 +479,34 @@ describe("health", () => {
     assert.equal(ok.ok, true);
     assert.equal(ok.fix, undefined);
   });
+
+  it("does not call a failed model listing a signed-out account", async () => {
+    // Every empty answer read as "not signed in", fix "agy" — so a listing
+    // that timed out sent the person to log in again, a fix for a fault they
+    // did not have.
+    const failed = await agyHealth({
+      run: async (_c, args) => {
+        if (args[0] === "--version") return { stdout: "1.1.25\n" };
+        throw Object.assign(new Error("Command failed: agy models\nconnect ETIMEDOUT"), { stdout: "", stderr: "" });
+      },
+    });
+    assert.equal(failed.ok, false);
+    assert.equal(failed.installed, true);
+    assert.match(failed.detail, /could not list models: connect ETIMEDOUT/);
+    assert.doesNotMatch(failed.detail, /not signed in/);
+    assert.equal(failed.fix, undefined, "no login to suggest for a fault that is not the login");
+
+    // A sign-in refusal that exits non-zero is still a sign-in refusal.
+    const out = await agyHealth({
+      run: async (_c, args) => {
+        if (args[0] === "--version") return { stdout: "1.1.25\n" };
+        throw Object.assign(new Error("Command failed: agy models"), {
+          stdout: "Error: Please sign in to view available models.\n",
+          stderr: "",
+        });
+      },
+    });
+    assert.match(out.detail, /not signed in/);
+    assert.equal(out.fix, "agy");
+  });
 });
