@@ -2479,6 +2479,22 @@ async function boot(): Promise<void> {
   const storedWrong = endpointFieldProblem();
   if (storedWrong) $("set-status").textContent = storedWrong;
 
+  // Spec first is off by default and remembered once chosen. Wrapped: storage
+  // can be unavailable, and a preference is not worth failing boot over.
+  const specBox = $("ck-auto") as HTMLInputElement;
+  try {
+    specBox.checked = localStorage.getItem("molt.specFirst") === "on";
+  } catch {
+    specBox.checked = false;
+  }
+  specBox.addEventListener("change", () => {
+    try {
+      localStorage.setItem("molt.specFirst", specBox.checked ? "on" : "off");
+    } catch {
+      // Not remembered this time; the box still does what it says.
+    }
+  });
+
   const savedAutonomy = localStorage.getItem("molt.autonomy");
   if (savedAutonomy && savedAutonomy !== state.autonomy) {
     const r = await molt.setAutonomy(savedAutonomy);

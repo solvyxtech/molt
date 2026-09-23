@@ -14,7 +14,8 @@
  * same proof because they came from the same code.
  */
 import { app, BrowserWindow, ipcMain, dialog, shell, nativeImage } from "electron";
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
@@ -492,6 +493,15 @@ function createWindow(): void {
           })()`);
           await new Promise((r) => setTimeout(r, 200));
         }
+        // The spec-first path is opt-in now, so the drive opts in the way a
+        // person does: by ticking the box.
+        if (process.env.MOLT_E2E_AUTO === "1") {
+          await win!.webContents.executeJavaScript(`(() => {
+            const box = document.getElementById("ck-auto");
+            if (!box.checked) box.click();
+            return 0;
+          })()`);
+        }
         await win!.webContents.executeJavaScript(`(() => {
           const task = ${JSON.stringify(process.env.MOLT_E2E_TASK ?? "say hello")};
           document.getElementById("prompt").value = ${
@@ -916,7 +926,10 @@ function createWindow(): void {
             r.autonomyButtons === 3 &&
             String(r.autonomyOn).length > 0 &&
             r.autonomySticks === true &&
-            r.autoCriteriaDefault === true &&
+            // Off unless the person turns it on: the interview is a paid
+            // request before any work, and nothing the project declared asked
+            // for it. Verification belongs to the bar, on a claim.
+            r.autoCriteriaDefault === false &&
             (r.criteriaRows as { distinct: boolean; converted: boolean }).distinct === true &&
             (r.criteriaRows as { distinct: boolean; converted: boolean }).converted === true &&
             r.claudeCode === true &&
@@ -1039,6 +1052,15 @@ function fixPath(): PathFixReport {
 }
 
 const pathFix = fixPath();
+
+// A driven window (self-check, self-drive, e2e) gets a profile of its own.
+// It shared the developer's: the drive clicks autonomy and spec-first like a
+// person would, localStorage remembered both, and the next real launch — and
+// the next self-check — started from whatever the test had last clicked.
+// Before ready, because Electron fixes the profile path then.
+if (process.argv.includes("--self-check") || process.argv.includes("--self-drive")) {
+  app.setPath("userData", mkdtempSync(join(tmpdir(), "molt-driven-")));
+}
 
 app.whenReady().then(() => {
   if (pathFix.outcome === "already-usable") {
