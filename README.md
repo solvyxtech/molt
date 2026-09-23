@@ -179,7 +179,9 @@ molt prove                                  # run the bar now, no model
 molt verify                                 # recompute every hash chain
 ```
 
-Exit code is non-zero when the bar is not met.
+Exit codes: `0` the bar was met · `1` it was not · `2` usage · `3` finished
+without a verdict (no bar, or `--only`/`--skip` left required checks unrun, which
+is never reported as a pass).
 
 ## The bar
 
@@ -256,7 +258,7 @@ FAIL  work-accounted
         src/session-commands.ts (changed)
       A change made through bash — a script, sed, cp, a generator — has no entry in the
       write ledger, so nothing here can prove what it did or judge it.
-pass  spec-intact         —  no test file was changed
+pass·none  spec-intact     —  no test file was changed
 
 bar NOT met
 molt: bar not met after 1 attempts. molt is reporting failure rather than success.
