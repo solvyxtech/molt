@@ -758,15 +758,19 @@ export function App({
   const renderBar = useCallback(
     (result: BarResult, header: string) => {
       add(result.ok ? "ok" : "fail", header);
-      const passed = result.results.filter((r) => r.ok).length;
+      const ran = result.results.filter((r) => !r.skipped);
+      const passed = ran.filter((r) => r.ok).length;
+      const unasked = result.results.filter((r) => r.skipped && !r.ok).length;
       // The one-line verdict, before the per-check list. A reader who wants
       // the detail scrolls; a reader who wants to know whether to trust the
       // last thing the model said does not have to.
-      const blocking = result.results.filter((r) => !r.ok && !r.advisory);
+      const blocking = ran.filter((r) => !r.ok && !r.advisory);
       const warned = result.warnings ?? [];
       add(
         result.ok ? "ok" : "fail",
-        `  ${passed} of ${result.results.length} checks passed · ${fmtDuration(result.durationMs)}` +
+        `  ${passed} of ${ran.length} checks passed` +
+          (unasked ? ` · ${unasked} not run` : "") +
+          ` · ${fmtDuration(result.durationMs)}` +
           (blocking.length ? ` · failed: ${blocking.map((r) => r.name).join(", ")}` : "") +
           (warned.length ? ` · advisory: ${warned.map((r) => r.name).join(", ")}` : ""),
       );
@@ -774,7 +778,7 @@ export function App({
         // An advisory failure reads as a warning, because that is what it is:
         // it did not stop anything, and printing it as FAIL next to a met bar
         // teaches people to delete the check rather than read it.
-        const label = r.ok ? "pass" : r.advisory ? "warn" : "FAIL";
+        const label = r.skipped ? (r.ok ? "n/a" : "SKIP") : r.ok ? "pass" : r.advisory ? "warn" : "FAIL";
         // What the check actually established, on the same line. "pass
         // work-landed" is a header; "2 files modified and verified byte-for-byte
         // on disk" is the finding, and it is the reason anyone should believe
@@ -1066,7 +1070,12 @@ export function App({
           break;
         case "proof_exhausted":
           flushPartial();
-          renderBar(ev.result, `bar not met after ${ev.attempts} attempts`);
+          renderBar(
+            ev.result,
+            ev.result.undetermined?.length
+              ? `bar undetermined — not run: ${ev.result.undetermined.join(", ")}`
+              : `bar not met after ${ev.attempts} attempts`,
+          );
           refreshSpine();
           break;
         case "receipt":

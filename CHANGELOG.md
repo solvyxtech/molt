@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **A bar that was only partly asked is `undetermined`, never accepted.**
+  `--only`/`--skip` used to drop checks from the result entirely, so "7 of 7
+  checks passed" and an accepted receipt were printed for a bar of twelve. A
+  skipped required check now appears as *not run*, the verdict is
+  `undetermined`, and the turn ends without spending attempts on a question
+  it is not asking. A session builtin in a standalone `molt prove` reads
+  `n/a` instead.
+- **An exit 0 is read before it is believed.** A passing command whose test
+  runner reported zero tests is refused (`empty: allow` permits it). One
+  whose runner reported failures is refused whatever the exit code said, and
+  called broken when a pipe without `pipefail` swallowed the status. A check
+  ending in `|| true` cannot fail and is refused as establishing nothing.
+
+### Added
+
+- **Receipts name the tree they judged**: HEAD's commit, and whether the tree
+  had uncommitted changes. Index rows carry `head`/`dirty`.
+
 ## 0.2.0 — the disk is the evidence, and the bar reaches the terminal
 
 An audit through the live record found checks that passed on nothing: the

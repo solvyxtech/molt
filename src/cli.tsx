@@ -579,15 +579,27 @@ async function priceEngine(engine: Engine, args: Args): Promise<void> {
  * did not run. This printer was context-blind and always said the second.
  */
 function printBar(result: BarResult, from: "run" | "prove"): void {
-  const passed = result.results.filter((r) => r.ok).length;
+  // A check that did not run is not one of the checks that passed. Counting
+  // "n/a" rows as passes printed "11 of 12 passed" over five that ran.
+  const ran = result.results.filter((r) => !r.skipped);
+  const passed = ran.filter((r) => r.ok).length;
+  const na = result.results.filter((r) => r.skipped && r.ok).length;
+  const notRun = result.results.filter((r) => r.skipped && !r.ok).length;
   process.stdout.write(
-    `${passed} of ${result.results.length} checks passed · ${fmtDuration(result.durationMs)}\n`,
+    `${passed} of ${ran.length} checks passed` +
+      (notRun ? ` · ${notRun} not run` : "") +
+      (na ? ` · ${na} n/a` : "") +
+      ` · ${fmtDuration(result.durationMs)}\n`,
   );
   for (const r of result.results) {
     const tags = r.tags?.length ? `  [${r.tags.join(",")}]` : "";
     // Same three-way distinction the receipt makes: a check that established
     // nothing is not a check that cleared the work.
-    const label = r.ok
+    const label = r.skipped
+      ? r.ok
+        ? "n/a"
+        : "SKIP"
+      : r.ok
       ? r.established === false
         ? "pass·none"
         : "pass"
@@ -604,8 +616,16 @@ function printBar(result: BarResult, from: "run" | "prove"): void {
     }
   }
   const warned = result.warnings ?? [];
+  const unasked = result.undetermined ?? [];
+  const failedAny = result.results.some((r) => !r.ok && !r.advisory && !r.skipped);
   process.stdout.write(
-    (result.cancelled ? "\nbar cancelled — not a verdict on the work" : result.ok ? "\nbar met" : "\nbar NOT met") +
+    (result.cancelled
+      ? "\nbar cancelled — not a verdict on the work"
+      : result.ok
+        ? "\nbar met"
+        : unasked.length && !failedAny
+          ? `\nbar UNDETERMINED — ${unasked.length} required check(s) not run: ${unasked.join(", ")}`
+          : "\nbar NOT met") +
       (warned.length ? ` · ${warned.length} advisory check(s) failed` : "") +
       "\n",
   );
@@ -863,7 +883,11 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         printBar(ev.result, "run");
         break;
       case "proof_exhausted":
-        process.stdout.write(`bar not met after ${ev.attempts} attempts\n`);
+        process.stdout.write(
+          ev.result.undetermined?.length
+            ? `bar undetermined: required checks were not run\n`
+            : `bar not met after ${ev.attempts} attempts\n`,
+        );
         printBar(ev.result, "run");
         break;
       case "shed":

@@ -124,6 +124,13 @@ export type Check = Advisory &
          * reusable, and that is the right default for a verification tool.
          */
         watch?: string[];
+        /**
+         * `empty: allow` — this suite may legitimately run zero tests.
+         *
+         * Off by default: an exit 0 from a runner that says it ran nothing is
+         * refused, because a deleted or mis-globbed suite exits 0 too.
+         */
+        empty?: "allow";
       }
     | {
         name: string;
@@ -264,6 +271,13 @@ export type BuiltinCheck =
 export type Bar = {
   version: 1;
   checks: Check[];
+  /**
+   * Checks in done.yml that a tag selection left out of this run.
+   *
+   * Carried, not discarded, so the result can say the bar was only partly
+   * asked — see `BarResult.undetermined`.
+   */
+  deselected?: Check[];
 };
 
 export type CheckResult = {
@@ -301,6 +315,15 @@ export type CheckResult = {
    * displayed as though it had proven something.
    */
   established?: boolean;
+  /**
+   * Why this check was not run at all, when it was not.
+   *
+   * A check dropped by `--skip`/`--only` used to vanish from the result, so
+   * "7 of 7 checks passed" and an accepted receipt were printed for a bar of
+   * twelve. A missing required check is not a pass; it is a question nobody
+   * asked, and the verdict has to say so.
+   */
+  skipped?: string;
   tags?: string[];
   kind: "command" | "builtin";
   /** The command run, or the builtin's identifier. */
@@ -326,6 +349,17 @@ export type BarResult = {
   cancelled?: boolean;
   /** Advisory checks that failed. Reported, never blocking. */
   warnings?: CheckResult[];
+  /**
+   * Required checks that were never run, by name.
+   *
+   * Set whenever done.yml names a blocking check this run did not ask. `ok`
+   * is false when it is set: five of nineteen questions answered is not an
+   * accepted claim, and neither is a green fast suite with the slow one
+   * skipped. It is not a refusal either — nothing failed, and no change to
+   * the work can answer a question that was not asked — so the verdict is
+   * `undetermined` and the turn does not spend attempts on it.
+   */
+  undetermined?: string[];
   results: CheckResult[];
   durationMs: number;
 };

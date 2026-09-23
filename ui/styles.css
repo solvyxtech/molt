@@ -619,6 +619,7 @@ main {
 .list .vd.accepted { color: var(--ok); }
 .list .vd.refused { color: var(--warn); }
 .list .vd.exhausted { color: var(--fail); }
+.list .vd.undetermined { color: var(--warn); }
 
 .doc { overflow: auto; padding: 22px 26px; max-width: 96ch; }
 .pad { padding: var(--pad); }

@@ -81,6 +81,7 @@ import {
   restore as restoreFiles,
   revertPlan,
   snapshot,
+  treeState,
   type LedgerLike,
 } from "./git.js";
 import { Integrity } from "./integrity.js";
@@ -1397,6 +1398,8 @@ export class Engine {
   /** Exact JSON body of the most recent request — the wire, unhidden. */
   lastRequestBody?: string;
   /** sha256 of .molt/done.yml as it stood when the session began. */
+  /** True only while `proveNow` runs: a bar with no turn behind it. */
+  private standalone = false;
   private barHash: string | null;
   private inFlight?: AbortController;
   /** Aborts the command or bar check currently executing, if any. */
@@ -1945,6 +1948,7 @@ export class Engine {
   barContext(claim?: string): BarContext {
     return {
       cwd: this.cwd,
+      ...(this.standalone ? { standalone: true } : {}),
       // So ctrl+C during a long suite kills the suite, not just the spinner.
       signal: this.running?.signal,
       record: this.transcript.record(),
@@ -2833,7 +2837,12 @@ export class Engine {
   /** Run the bar without touching the loop — backs the /prove command. */
   async proveNow(claim?: string): Promise<BarResult | null> {
     if (!this.cfg.bar) return null;
-    return this.runBarGuarded(claim);
+    this.standalone = true;
+    try {
+      return await this.runBarGuarded(claim);
+    } finally {
+      this.standalone = false;
+    }
   }
 
   /**
@@ -4817,8 +4826,22 @@ export class Engine {
       // There is no work that satisfies a command which did not run, so every
       // further attempt is spend with no possible outcome.
       const allBroken = onlyBrokenChecks(result);
-      const exhausted = !result.ok && (stuck || allBroken || proofAttempts >= maxAttempts);
-      const verdict = result.ok ? "accepted" : exhausted ? "exhausted" : "refused";
+      // Everything that ran passed, and something done.yml requires did not
+      // run. Not accepted — a partial bar is not a bar — and not refused
+      // either: the work did not fail anything, and no attempt can answer a
+      // check this run never asks. So it ends now, named as what it is.
+      const undetermined =
+        !result.ok && !result.cancelled && (result.undetermined?.length ?? 0) > 0 &&
+        result.results.every((r) => r.ok || r.advisory || r.skipped);
+      const exhausted =
+        !result.ok && (undetermined || stuck || allBroken || proofAttempts >= maxAttempts);
+      const verdict = result.ok
+        ? "accepted"
+        : undetermined
+          ? "undetermined"
+          : exhausted
+            ? "exhausted"
+            : "refused";
 
       // A stuck bar is its own fact, worth a separate journal entry: the run
       // records the outcome, this records the signal that a check may be
@@ -4833,11 +4856,13 @@ export class Engine {
       }
 
       if (this.cfg.receipts) {
+        const head = await treeState(this.cwd).catch(() => null);
         const receipt = this.cfg.receipts.write({
           claim,
           result,
           attempt: proofAttempts,
           verdict,
+          head,
           model: this.cfg.model,
           provider: this.provider,
           sessionTokens: this.sessionTokens,
@@ -4904,6 +4929,19 @@ export class Engine {
         log?.append("session_end", { reason: "bar not met", attempts: proofAttempts });
         yield { kind: "proof_exhausted", result, attempts: proofAttempts };
         const onlyWrites = failedOnlyWriteChecks(result);
+        if (undetermined) {
+          const names = (result.undetermined ?? []).map((n) => `\`${n}\``).join(", ");
+          yield {
+            kind: "error",
+            text:
+              `undetermined: every check that ran passed, but ${names} did not run — this ` +
+              `run's tag selection left ${result.undetermined!.length === 1 ? "it" : "them"} out. ` +
+              `A claim is accepted against the whole of .molt/done.yml, not the part that was ` +
+              `asked. Nothing was refused and the work is left as it is; run without the ` +
+              `selection to settle it.`,
+          };
+          return;
+        }
         if (allBroken) {
           const names = brokenChecks(result).map((n) => `\`${n}\``).join(", ");
           yield {

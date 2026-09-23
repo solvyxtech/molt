@@ -479,6 +479,8 @@ function proofBlock(ev: Ev): HTMLElement {
   } else if (ok) {
     head = `bar met — ${passed} of ${rows.length} checks`;
     dur = fmtMs(r.durationMs ?? 0);
+  } else if ((r.undetermined ?? []).length) {
+    head = `undetermined — ${r.undetermined.length} required check(s) not run`;
   } else {
     head = `bar not met — ${passed} of ${rows.length} checks${
       ev.attempt ? ` · attempt ${ev.attempt}` : ""
@@ -490,14 +492,18 @@ function proofBlock(ev: Ev): HTMLElement {
 
   for (const c of rows) {
     const row = el("div", "check");
-    const label = c.ok
+    const label = c.skipped
+      ? c.ok
+        ? "n/a"
+        : "not run"
+      : c.ok
       ? c.established === false
         ? "pass·none"
         : "pass"
       : c.advisory
         ? "note"
         : "FAIL";
-    const cls = c.ok ? "pass" : c.advisory ? "note" : "fail";
+    const cls = c.skipped ? "note" : c.ok ? "pass" : c.advisory ? "note" : "fail";
     row.appendChild(el("div", `verdict ${cls}`, label));
     // The name was missing entirely. Four rows reading "PASS" with a blank
     // middle told you the bar was met and refused to say by what — and on a

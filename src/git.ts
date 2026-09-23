@@ -72,6 +72,22 @@ export async function headSha(cwd: string): Promise<string | null> {
   return r.ok && r.stdout ? r.stdout : null;
 }
 
+/**
+ * The commit the working tree sits on, and whether the tree differs from it.
+ *
+ * What a receipt binds itself to. `.molt/` is left out of the comparison:
+ * molt writes its own journal and receipts there on every turn, so counting
+ * them would mark every judged tree dirty and the flag would mean nothing.
+ * `null` outside a repository or before the first commit.
+ */
+export async function treeState(cwd: string): Promise<{ sha: string; dirty: boolean } | null> {
+  const sha = await headSha(cwd);
+  if (!sha) return null;
+  const r = await git(cwd, ["status", "--porcelain", "--", ".", ":(exclude).molt"]);
+  // Unknown is not clean: a status that could not be read says "dirty".
+  return { sha, dirty: !r.ok || r.stdout.length > 0 };
+}
+
 export async function currentBranch(cwd: string): Promise<string | null> {
   const r = await git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
   return r.ok && r.stdout ? r.stdout : null;

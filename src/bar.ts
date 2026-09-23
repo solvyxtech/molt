@@ -8,6 +8,7 @@
  *
  * Nothing here asks a model anything. A bar result is an exit code.
  */
+import { judgePass } from "./evidence.js";
 import { runCommand } from "./run.js";
 import { parseLcov, coverageFor, coverageCouldSpeak, unprovenIn, type Unproven } from "./coverage.js";
 import { planMutations, applyMutation, type Mutation } from "./mutate.js";
@@ -131,6 +132,12 @@ export type BarContext = {
    * running it again — "it is slow" is not that reason.
    */
   earlier?: { check: Check; result: CheckResult }[];
+  /**
+   * True for a standalone `molt prove`: no turn, no session record. Only
+   * changes how a DESELECTED session builtin is described (not applicable,
+   * rather than unasked); a check that runs is judged the same either way.
+   */
+  standalone?: boolean;
   /**
    * Files one check writes and another reads — the bar's declared `lcov`
    * reports. A check that reruns a build has to put these back, or it corrupts
@@ -389,6 +396,16 @@ export function parseBar(source: string): Bar {
     if (!Number.isInteger(expectExit)) {
       throw new BarError(`done.yml: check "${name}" has a non-integer expect_exit.`);
     }
+    // On a command, `empty: allow` says this suite may run zero tests. Parsed
+    // with the same strictness as everywhere else: a typo that silently kept
+    // the refusal on is merely annoying, but one that silently turned it off
+    // would be a gate people believe is on.
+    if (c["empty"] !== undefined && c["empty"] !== "allow" && c["empty"] !== "refuse") {
+      throw new BarError(
+        `done.yml: check "${name}" has \`empty: ${JSON.stringify(c["empty"])}\` ` +
+          `— it takes "allow" or "refuse".`,
+      );
+    }
     return {
       name,
       kind: "command",
@@ -397,6 +414,7 @@ export function parseBar(source: string): Bar {
       expectExit,
       tags,
       ...(watch ? { watch } : {}),
+      ...(c["empty"] === "allow" ? { empty: "allow" as const } : {}),
       ...advisory,
     };
   });
@@ -430,12 +448,39 @@ export type Selection = { only?: string[]; skip?: string[] };
 export function selectChecks(bar: Bar, sel: Selection = {}): Bar {
   const { only, skip } = sel;
   if (!only?.length && !skip?.length) return bar;
-  const checks = bar.checks.filter((c) => {
+  const keep = (c: Check): boolean => {
     if (skip?.length && c.tags.some((t) => skip.includes(t))) return false;
     if (only?.length) return c.tags.length === 0 || c.tags.some((t) => only.includes(t));
     return true;
-  });
-  return { version: 1, checks };
+  };
+  // What was left out travels with what was kept. Dropping it here is how a
+  // run of seven checks out of twelve printed "7 of 7 passed" and wrote an
+  // accepted receipt.
+  const deselected = [...(bar.deselected ?? []), ...bar.checks.filter((c) => !keep(c))];
+  return {
+    version: 1,
+    checks: bar.checks.filter(keep),
+    ...(deselected.length ? { deselected } : {}),
+  };
+}
+
+/**
+ * Builtins that judge the tree or the repository rather than a turn.
+ *
+ * Every other builtin reads the session record — what the model wrote, what
+ * it claimed, what it shed — and a standalone `molt prove` has none. Leaving
+ * those out of a standalone run is not skipping a question; there is no
+ * question for them to answer.
+ */
+const SESSIONLESS_BUILTINS: ReadonlySet<BuiltinCheck> = new Set(["imports-tracked"]);
+
+/** Why this deselected check does not leave the verdict undetermined, or null if it does. */
+function notApplicable(c: Check, ctx: BarContext): string | null {
+  if (c.advisory) return "advisory, and not run";
+  if (ctx.standalone && c.kind === "builtin" && !SESSIONLESS_BUILTINS.has(c.builtin)) {
+    return "not applicable: a standalone prove has no session for it to read";
+  }
+  return null;
 }
 
 export function loadBar(cwd: string): Bar | null {
@@ -2026,9 +2071,21 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
     exitCode = 1;
     output = String(e);
   }
-  const passed = exitCode === check.expectExit;
+  let passed = exitCode === check.expectExit;
   if (!passed && diagnosis.hint) {
     output = `[molt] ${diagnosis.hint}\n\n${output}`;
+  }
+  // An exit 0 is the command's account of itself. Read the runner's own
+  // summary before believing it: zero tests collected, or failures reported
+  // by a runner whose status a pipe or `|| true` threw away. Only for checks
+  // that expect success — a check built to exit non-zero has its own logic.
+  if (passed && check.expectExit === 0) {
+    const judged = judgePass(check.run, output, check.empty === "allow");
+    if (!judged.ok) {
+      passed = false;
+      if (judged.broken) diagnosis = { didNotRun: true, hint: judged.why };
+      output = `[molt] ${judged.why}\n\n${output}`;
+    }
   }
   return {
     name: check.name,
@@ -2149,12 +2206,33 @@ export async function runBar(bar: Bar, ctx: BarContext): Promise<BarResult> {
     results.push(fresh);
     earlier.push({ check: c, result: fresh });
   }
+  // Every check done.yml names appears in the result, run or not. A skipped
+  // required check is not a pass and not a failure: it is a question nobody
+  // asked, and while one stands the claim cannot be accepted.
+  const undetermined: string[] = [];
+  for (const c of bar.deselected ?? []) {
+    const na = notApplicable(c, ctx);
+    if (!na) undetermined.push(c.name);
+    results.push({
+      name: c.name,
+      ...(c.advisory ? { advisory: true } : {}),
+      tags: c.tags,
+      kind: c.kind,
+      detail: c.kind === "command" ? c.run : c.builtin,
+      ok: na !== null,
+      ...(na !== null ? { established: false } : {}),
+      skipped: na ?? `not run — left out by tag selection${c.tags.length ? ` [${c.tags.join(",")}]` : ""}`,
+      output: na ?? "not run: this run's tag selection left it out, so nothing was established either way",
+      durationMs: 0,
+    });
+  }
   const warnings = results.filter((r) => !r.ok && r.advisory);
   return {
     // An advisory failure is not a failed contract. It is still reported, and
     // still goes to the model — it just does not refuse the completion.
-    ok: !aborted() && results.every((r) => r.ok || r.advisory),
+    ok: !aborted() && undetermined.length === 0 && results.every((r) => r.ok || r.advisory),
     ...(aborted() ? { cancelled: true } : {}),
+    ...(undetermined.length ? { undetermined } : {}),
     ...(warnings.length ? { warnings } : {}),
     results,
     durationMs: Date.now() - t0,
@@ -2179,7 +2257,7 @@ export function formatBarFailure(result: BarResult, attempt: number, maxAttempts
   // failing test, a line number. A builtin reports molt's bookkeeping about
   // the session. When both fail, the first is the one to act on, so it goes
   // first and says so.
-  const all = result.results.filter((r) => !r.ok && !r.advisory);
+  const all = result.results.filter((r) => !r.ok && !r.advisory && !r.skipped);
   // A check that never ran is not work to do. Kept out of the ordered list
   // below and reported at the end as what it is: a broken gate, for a human.
   const broken = all.filter((r) => r.didNotRun);

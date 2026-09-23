@@ -51,6 +51,36 @@ mapping is rejected.
 Every check runs on every attempt, even after one fails. A partial bar is not
 a bar.
 
+**An exit 0 is read before it is believed.** When a passing command printed a
+test runner's own summary — node:test, jest, vitest, pytest, cargo, mocha,
+go test — molt reads it:
+
+- **Zero tests collected is refused.** A glob that matched nothing, a filter
+  that selected nothing, or a deleted suite all exit 0. Set `empty: allow` on
+  the check if the suite may legitimately be empty.
+- **Failures the runner reported are refused**, whatever the exit code said.
+  When the command has a pipe and no `pipefail`, the check is reported as
+  broken (the runner's status was lost in the pipe) rather than as work to do.
+- **A command ending in `|| true`, `|| :`, `; true` or `exit 0` cannot fail**,
+  so its pass is refused as establishing nothing, unless the runner's own
+  summary shows tests that ran and passed.
+
+Output molt does not recognise is left exactly as it was. This only ever turns
+a pass into a refusal on the runner's own words; it never guesses.
+
+### Selecting by tag: `--only` / `--skip`
+
+A tag selection narrows what *runs*, not what the claim is judged against. A
+required check that the selection left out appears in the result as **not
+run**, and a bar where everything that ran passed but something required did
+not run is **undetermined**: not accepted, not refused. The turn ends at once,
+because no attempt can answer a check that is not being asked, and the receipt
+is written as `NNNN-undetermined.md`, with `notRun` in its index row.
+
+Two cases are not "unasked": an `advisory` check, and a session builtin in a
+standalone `molt prove`, which has no session for it to read. Those print as
+`n/a` and never present themselves as evidence.
+
 ### Builtins
 
 Builtins are checks only molt can run, because only molt still holds the full

@@ -13,10 +13,24 @@ especially — the refused ones.
 ## What is in one
 
 - **When**, which provider, which model, session token count
+- **Which tree was judged**: the commit HEAD pointed at, and whether the tree
+  had uncommitted changes (`.molt/` excluded). A summary written later — "still
+  in progress", "done" — can be checked against it with git, and the receipt
+  outranks it
 - **How many batches of context had been shed** at that point
 - **The claim**, verbatim: exactly what the model said when it thought it was done
 - **A table of every check**: name, kind, command, exit code, verdict, duration
 - **The real output of every check**, not just the verdict
+
+## Verdicts
+
+- `accepted`: every check that can block a completion ran and passed.
+- `refused`: a check failed; the failures went back to the model.
+- `exhausted`: the attempt limit was reached (or the bar was stuck, or every
+  unmet check was broken) with checks still failing.
+- `undetermined`: everything that ran passed, but a check `done.yml` requires
+  was not run (left out by `--only`/`--skip`). Not a pass and not a false
+  claim, and `molt stats` counts it apart from both.
 
 ## Why refusals are kept
 

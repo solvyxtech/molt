@@ -16,7 +16,7 @@ import type { BarResult } from "./types.js";
 export type Receipt = {
   path: string;
   attempt: number;
-  verdict: "accepted" | "refused" | "exhausted";
+  verdict: "accepted" | "refused" | "exhausted" | "undetermined";
 };
 
 /** One machine-readable line per receipt, for stats and for grepping. */
@@ -64,6 +64,11 @@ export type ReceiptRecord = {
    * its own audit trail.
    */
   missing?: boolean;
+  /** Required checks this attempt never ran. Present only on `undetermined`. */
+  notRun?: string[];
+  /** The commit the judged tree sat on; `dirty` when it differed from it. */
+  head?: string;
+  dirty?: boolean;
 };
 
 /** What `repair()` changed, and what it left alone. */
@@ -110,6 +115,8 @@ export type Stats = {
   accepted: number;
   refused: number;
   exhausted: number;
+  /** Claims neither accepted nor refused: required checks were not run. */
+  undetermined: number;
   /**
    * Share of *present* completion claims that did not survive the bar.
    *
@@ -306,6 +313,17 @@ export class Receipts {
     task?: { seal: string; checks: string[]; notes: string[] };
     /** What the model ran and read, in order, as one line each. */
     did?: string[];
+    /**
+     * The commit the tree sat on when the bar ran, and whether the tree
+     * differed from it.
+     *
+     * A receipt is evidence about one tree at one moment. Without this it
+     * read as evidence about "the project", and a summary written hours
+     * later — "still in progress", "done" — could not be checked against it.
+     * With it, anyone can ask git whether the tree they are looking at is the
+     * one that was judged. `null` means not a repository, or no commits yet.
+     */
+    head?: { sha: string; dirty: boolean } | null;
   }): Receipt {
     const iso = new Date().toISOString();
     const seq = this.nextSeq();
@@ -325,7 +343,10 @@ export class Receipts {
         ? "molt accepted this claim: every check that can block a completion passed."
         : args.verdict === "refused"
           ? "molt refused this claim and sent the failures back to the model."
-          : "molt reported failure: the attempt limit was reached with checks still failing.";
+          : args.verdict === "undetermined"
+            ? "molt did not accept this claim: every check that ran passed, but checks " +
+              "done.yml requires were not run. Nothing failed, and nothing established the rest."
+            : "molt reported failure: the attempt limit was reached with checks still failing.";
 
     const changed = args.changed ?? [];
     // The task's own criteria go above what changed, because they are what the
@@ -413,7 +434,11 @@ export class Receipts {
       // looked and found nothing wrong, and printing both as "pass" is how a
       // check that has never examined anything reads as a check that keeps
       // clearing the work.
-      const verdict = r.ok
+      const verdict = r.skipped
+        ? r.ok
+          ? "n/a"
+          : "**not run**"
+        : r.ok
         ? r.established === false
           ? "pass (nothing to establish)"
           : "pass"
@@ -434,7 +459,11 @@ export class Receipts {
       // and reconstruct the claim without parsing a markdown table.
       detail.push(
         `### ${r.name} — ${
-          r.ok
+          r.skipped
+            ? r.ok
+              ? "not applicable"
+              : "not run"
+            : r.ok
             ? r.established === false
               ? "pass (nothing to establish)"
               : "pass"
@@ -448,11 +477,17 @@ export class Receipts {
         `command: ${r.detail}`,
         `exit: ${r.exitCode ?? "n/a"}`,
         `result: ${
-          r.ok ? (r.established === false ? "pass-vacuous" : "pass") : r.didNotRun ? "did-not-run" : "fail"
+          r.skipped
+            ? r.ok
+              ? "not-applicable"
+              : "not-run"
+            : r.ok ? (r.established === false ? "pass-vacuous" : "pass") : r.didNotRun ? "did-not-run" : "fail"
         }`,
         // Evidence of a different kind, and the receipt is the document handed
         // to someone who was not there to watch it run.
-        `ran: ${r.cached ? "no — reused, nothing it watches had changed" : "yes"}`,
+        `ran: ${
+          r.skipped ? `no — ${r.skipped}` : r.cached ? "no — reused, nothing it watches had changed" : "yes"
+        }`,
         `duration_ms: ${r.durationMs}`,
         "",
         "```",
@@ -468,6 +503,15 @@ export class Receipts {
       "## Session",
       "",
       `- when: ${iso}`,
+      ...(args.head === undefined
+        ? []
+        : [
+            `- judged tree: ${
+              args.head === null
+                ? "not a git commit (no repository, or no commits yet)"
+                : `${args.head.sha}${args.head.dirty ? " + uncommitted changes" : " (clean)"}`
+            }`,
+          ]),
       `- attempt: ${args.attempt}`,
       `- provider: ${args.provider}`,
       `- model: ${args.model}`,
@@ -482,7 +526,9 @@ export class Receipts {
         ? "Every check passed. This is the evidence behind that claim."
         : args.verdict === "refused"
           ? "molt refused the completion claim and returned the failures to the model."
-          : "The attempt limit was reached with checks still failing. molt reported failure rather than success.",
+          : args.verdict === "undetermined"
+            ? "Required checks were not run. molt neither accepted nor refused the claim."
+            : "The attempt limit was reached with checks still failing. molt reported failure rather than success.",
       "",
     ];
 
@@ -510,7 +556,9 @@ export class Receipts {
       ...(args.changed === undefined ? {} : { changed: changed.length }),
       shedBatches: args.shedBatches,
       barMs: args.result.durationMs,
-      failed: args.result.results.filter((r) => !r.ok).map((r) => r.name),
+      failed: args.result.results.filter((r) => !r.ok && !r.skipped).map((r) => r.name),
+      ...(args.result.undetermined?.length ? { notRun: [...args.result.undetermined] } : {}),
+      ...(args.head ? { head: args.head.sha, ...(args.head.dirty ? { dirty: true } : {}) } : {}),
       file,
     };
     appendFileSync(this.indexPath, redact(JSON.stringify(record), this.secrets) + "\n", "utf8");
@@ -611,6 +659,7 @@ export class Receipts {
     let accepted = 0;
     let refused = 0;
     let exhausted = 0;
+    let undetermined = 0;
     let verifiedChanges = 0;
     let answered = 0;
     let unchanged = 0;
@@ -626,6 +675,10 @@ export class Receipts {
         if (r.ask) answered += 1;
         else if (r.changed === 0) unchanged += 1;
         else verifiedChanges += 1;
+      } else if (r.verdict === "undetermined") {
+        // Not a false claim and not a verified one. Counted apart from both,
+        // so an unasked check never moves the false-claim rate either way.
+        undetermined += 1;
       } else {
         refused += r.verdict === "refused" ? 1 : 0;
         exhausted += r.verdict === "exhausted" ? 1 : 0;
@@ -678,10 +731,14 @@ export class Receipts {
       accepted,
       refused,
       exhausted,
+      undetermined,
       verifiedChanges,
       answered,
       unchanged,
-      falseClaimRate: presentRows.length ? (refused + exhausted) / presentRows.length : 0,
+      falseClaimRate:
+        presentRows.length - undetermined > 0
+          ? (refused + exhausted) / (presentRows.length - undetermined)
+          : 0,
       totalTokens,
       tokensPerVerifiedChange: verifiedChanges ? Math.round(totalTokens / verifiedChanges) : undefined,
       totalUsd,
