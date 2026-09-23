@@ -1894,12 +1894,15 @@ function runBuiltin(
     // names a file it never created and reports success.
     const claim = ctx.claim ?? "";
     if (!claim.trim()) {
-      return { ok: true, output: "No textual claim was made; nothing to ground." };
+      // Nothing was examined, so nothing is claimed — the same rule every
+      // other builtin follows. A bare `pass` here read as "the claim checked
+      // out" on a turn that made no claim at all.
+      return { ok: true, established: false, output: "No textual claim was made; nothing to ground." };
     }
 
     const mentioned = mentionedPaths(claim);
     if (mentioned.length === 0) {
-      return { ok: true, output: "The claim references no files." };
+      return { ok: true, established: false, output: "The claim references no files." };
     }
 
     const written = new Set(ctx.ledger.map((e) => e.path));

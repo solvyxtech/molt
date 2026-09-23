@@ -411,3 +411,28 @@ describe("build-current judges what this machine actually builds", () => {
     assert.equal(r?.established, false, "nothing was compared, so nothing is claimed");
   });
 });
+
+describe("claims-grounded with no claim to ground", () => {
+  const BAR = parseBar("version: 1\nchecks:\n  - name: grounded\n    builtin: claims-grounded\n");
+
+  it("does not present an empty claim as one that checked out", async () => {
+    const dir = ws();
+    const [r] = (await runBar(BAR, { ...ctxIn(dir, []), claim: "" })).results;
+    assert.equal(r?.ok, true);
+    assert.equal(r?.established, false);
+  });
+
+  it("nor a claim that names no file", async () => {
+    const dir = ws();
+    const [r] = (await runBar(BAR, { ...ctxIn(dir, []), claim: "Done, it works now." })).results;
+    assert.equal(r?.established, false);
+  });
+
+  it("still establishes something when the claim names files", async () => {
+    const dir = ws();
+    writeFileSync(join(dir, "a.ts"), "x\n");
+    const [r] = (await runBar(BAR, { ...ctxIn(dir, []), claim: "Updated a.ts." })).results;
+    assert.equal(r?.ok, true);
+    assert.notEqual(r?.established, false);
+  });
+});
