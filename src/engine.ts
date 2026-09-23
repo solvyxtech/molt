@@ -3324,7 +3324,21 @@ export class Engine {
     });
     // The prompt shows the command in full. You are being asked to judge
     // it, and a redacted command is one you cannot judge.
-    const allowed = decision.ask ? await ctx.confirm(name, `${detail}${decision.why ? ` — ${decision.why}` : ""}`) : true;
+    //
+    // Past the turn's wall clock, nothing more runs. The step loop reads the
+    // clock between steps, which on the HTTP path is between tool batches —
+    // but a subscription backend runs a whole agentic step, every call in it,
+    // inside one of molt's steps, so `--for 5m` on Claude Code bounded
+    // nothing: the step could go on calling tools for as long as it liked.
+    // Every call comes through here, whichever backend made it, so this is
+    // where the clock is honoured; the model is told, and the step loop
+    // closes the turn the way any deadline closes one.
+    const outOfTime = this.pastDeadline();
+    const allowed = outOfTime
+      ? false
+      : decision.ask
+        ? await ctx.confirm(name, `${detail}${decision.why ? ` — ${decision.why}` : ""}`)
+        : true;
 
     let result: string;
     let note: string | undefined;
@@ -3363,8 +3377,12 @@ export class Engine {
     // would make every gated call look like one.
     let durationMs: number | undefined;
     if (!allowed) {
-      result = "User denied this action.";
-      note = "denied";
+      result = outOfTime
+        ? `[molt: the time budget for this turn is up — ${name} was not run, and no further ` +
+          `call will be. Stop calling tools and answer now with what you have already found, ` +
+          `saying plainly what is unfinished.]`
+        : "User denied this action.";
+      note = outOfTime ? "out of time" : "denied";
     } else {
       yield { kind: "tool_start", name, detail };
       const toolStartedAt = Date.now();

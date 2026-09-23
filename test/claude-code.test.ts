@@ -377,3 +377,40 @@ describe("when the session fails", () => {
     );
   });
 });
+
+describe("the wall clock on a subscription backend", () => {
+  it("stops the step's tool calls once the time is up, and closes the turn", async () => {
+    // One molt step is a whole agentic step here: every call the model makes
+    // happens inside it. The clock was read only between molt's steps, so
+    // `--for` bounded nothing — the step could keep calling tools for ever.
+    const dir = ws();
+    const { engine, cc } = engineIn(dir, [
+      {
+        calls: [
+          // Outlasts the 300ms budget on its own.
+          { name: "bash", args: { command: "sleep 0.6" } },
+          { name: "write_file", args: { path: "late.txt", content: "written after the deadline\n" } },
+        ],
+        text: "Done — late.txt is written.",
+      },
+      { text: "The time ran out before late.txt could be written." },
+    ]);
+    engine.setTurnDeadline(300);
+    const events = await drain(engine.run("write late.txt", allowAll));
+
+    assert.equal(existsSync(join(dir, "late.txt")), false, "a call ran after the time budget was up");
+    const refused = events.find(
+      (e): e is Extract<EngineEvent, { kind: "tool" }> => e.kind === "tool" && e.name === "write_file",
+    );
+    assert.equal(refused?.note, "out of time");
+    assert.ok(
+      events.some((e) => e.kind === "info" && /time budget reached/.test(e.text)),
+      "the turn did not close on the deadline",
+    );
+    // The claim that arrived with the step is still judged — the state the
+    // work is in when the time is up is the state the bar sees — and it is
+    // not accepted, because the write it claims never happened.
+    assert.ok(!events.some((e) => e.kind === "proof_result"), "a claim of a write that never ran was accepted");
+    assert.ok(cc.sent.some((t) => /time budget for this turn is up/i.test(t)));
+  });
+});
