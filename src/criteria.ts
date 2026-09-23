@@ -179,19 +179,44 @@ const SYSTEM = [
   "no criterion beyond the project's own bar, return empty lists.",
 ].join("\n");
 
-/** Strip a fenced block, which models add whatever the instructions say. */
-function parseDraft(text: string): Draft {
+/**
+ * Strip a fenced block, which models add whatever the instructions say.
+ *
+ * A reply that holds no JSON object is a failed draft, not an empty one. It
+ * used to come back as `{ checks: [], notes: [] }`, which the window reads as
+ * the model's considered answer and prints as "the model had nothing to add
+ * beyond the project's bar" — over a reply cut off at the token limit, an
+ * apology, or nothing at all. `parseInterviewReply` already said "not JSON".
+ */
+function parseDraft(text: string): Draft | null {
   const body = text.replace(/^\s*```(?:json)?/i, "").replace(/```\s*$/, "").trim();
   const start = body.indexOf("{");
   const end = body.lastIndexOf("}");
-  if (start === -1 || end === -1) return { checks: [], notes: [] };
+  if (start === -1 || end === -1) return null;
   let raw: unknown;
   try {
     raw = JSON.parse(body.slice(start, end + 1));
   } catch {
-    return { checks: [], notes: [] };
+    return null;
   }
   return sanitizeCriteria(raw);
+}
+
+/** The draft, or a failure that says what came back instead. */
+function drafted(
+  text: string,
+  cutOff = false,
+): { ok: true; draft: Draft } | { ok: false; error: string } {
+  const draft = parseDraft(text);
+  if (draft) return { ok: true, draft };
+  const said = text.trim().replace(/\s+/g, " ");
+  return {
+    ok: false,
+    error:
+      `the draft reply was not JSON, so nothing was proposed` +
+      (cutOff ? " — it was cut off at the token limit" : "") +
+      (said ? `: "${said.slice(0, 80)}${said.length > 80 ? "…" : ""}"` : ": the reply was empty"),
+  };
 }
 
 export async function draftCriteria(opts: {
@@ -252,7 +277,7 @@ export async function draftCriteria(opts: {
       ...(opts.agyRun ? { run: opts.agyRun } : {}),
     });
     if (!asked.ok) return { ok: false, error: asked.error };
-    return { ok: true, draft: parseDraft(asked.text) };
+    return drafted(asked.text);
   }
 
   const acp = acpAgentFor(opts.baseUrl);
@@ -266,7 +291,7 @@ export async function draftCriteria(opts: {
       ...(opts.acpSpawn ? { spawnFn: opts.acpSpawn } : {}),
     });
     if (!asked.ok) return { ok: false, error: asked.error };
-    return { ok: true, draft: parseDraft(asked.text) };
+    return drafted(asked.text);
   }
 
   if (isClaudeCode(opts.baseUrl)) {
@@ -278,7 +303,7 @@ export async function draftCriteria(opts: {
       sdk: opts.claudeCodeSdk,
     });
     if (!asked.ok) return { ok: false, error: asked.error };
-    return { ok: true, draft: parseDraft(asked.text) };
+    return drafted(asked.text);
   }
 
   try {
@@ -297,9 +322,11 @@ export async function draftCriteria(opts: {
       }),
     });
     if (!res.ok) return { ok: false, error: `HTTP ${res.status} drafting criteria` };
-    const json = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+    const json = (await res.json()) as {
+      choices?: { message?: { content?: string | null }; finish_reason?: string | null }[];
+    };
     const text = json.choices?.[0]?.message?.content ?? "";
-    return { ok: true, draft: parseDraft(text) };
+    return drafted(text, json.choices?.[0]?.finish_reason === "length");
   } catch (e) {
     return { ok: false, error: errorText(e) };
   }
