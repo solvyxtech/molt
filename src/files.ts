@@ -504,6 +504,14 @@ export type TreeSnapshot = {
   files: Map<string, string>;
   /** test path -> its assertions, normalised, at snapshot time. */
   assertions: Map<string, string[]>;
+  /**
+   * test path -> its text at snapshot time, for files under TEST_TEXT_CAP.
+   *
+   * `tests-real` needs to know which tests the turn *added*, and a hash only
+   * says that something changed. Test files are small and few next to the
+   * tree, so keeping them costs little.
+   */
+  testTexts?: Map<string, string>;
   truncated: boolean;
   examined: number;
 };
@@ -512,12 +520,15 @@ export type TreeSnapshot = {
 export const TREE_SKIP = new Set([...SKIP_DIRS, ".molt", "dist-test", "release"]);
 /** Past this size a file is identified by size and mtime rather than hashed. */
 const TREE_HASH_CAP = 8 * 1024 * 1024;
+/** Past this size a test file's text is not kept in the snapshot. */
+const TEST_TEXT_CAP = 1024 * 1024;
 
 export function snapshotTree(root: string): TreeSnapshot {
   const out: TreeSnapshot = {
     takenAt: Date.now(),
     files: new Map(),
     assertions: new Map(),
+    testTexts: new Map(),
     truncated: false,
     examined: 0,
   };
@@ -539,7 +550,11 @@ export function snapshotTree(root: string): TreeSnapshot {
       }
       const buf = readFileSync(abs);
       out.files.set(e.path, createHash("sha256").update(buf).digest("hex"));
-      if (isTestPath(e.path) && isText(buf)) out.assertions.set(e.path, assertionsIn(buf.toString("utf8")));
+      if (isTestPath(e.path) && isText(buf)) {
+        const text = buf.toString("utf8");
+        out.assertions.set(e.path, assertionsIn(text));
+        if (buf.length <= TEST_TEXT_CAP) out.testTexts?.set(e.path, text);
+      }
     } catch {
       // Unreadable now is unreadable then: absent from the map on both sides.
     }

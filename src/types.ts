@@ -214,6 +214,8 @@ export type BuiltinCheck =
    * perfectly on the machine that made it and not anywhere else.
    */
   | "imports-tracked"
+  /** Tests added this turn that cannot fail: tautologies, no assertion, not linked. See src/tests-real.ts. */
+  | "tests-real"
   | "files-changed"
   | "record-intact"
   | "claims-grounded"
