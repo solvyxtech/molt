@@ -2675,7 +2675,7 @@ export class Engine {
           `changed. molt is reporting failure rather than success. Either the work was not ` +
           `done, or this was a question — ask questions with /ask, or a leading "?", which ` +
           `runs the rest of the bar and drops that one check.`
-        : `bar not met after ${attempts} attempts. molt is reporting failure rather ` +
+        : `bar not met after ${attempts} attempt${attempts === 1 ? "" : "s"}. molt is reporting failure rather ` +
           `than success. See .molt/receipts/ for what was checked.`,
     };
     yield* this.settleFailed(log);
@@ -5016,7 +5016,7 @@ export class Engine {
               `none changed. molt is reporting failure rather than success. Either the work ` +
               `was not done, or this was a question — ask questions with /ask, or a leading ` +
               `"?", which runs the rest of the bar and drops that one check.`
-            : `bar not met after ${proofAttempts} attempts. molt is reporting failure rather ` +
+            : `bar not met after ${proofAttempts} attempt${proofAttempts === 1 ? "" : "s"}. molt is reporting failure rather ` +
               `than success. See .molt/receipts/ for what was checked.`,
         };
         yield* this.settleFailed(log);

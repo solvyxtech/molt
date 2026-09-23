@@ -1070,7 +1070,7 @@ export function App({
             ev.result,
             ev.result.undetermined?.length
               ? `bar undetermined — not run: ${ev.result.undetermined.join(", ")}`
-              : `bar not met after ${ev.attempts} attempts`,
+              : `bar not met after ${ev.attempts} attempt${ev.attempts === 1 ? "" : "s"}`,
           );
           refreshSpine();
           break;

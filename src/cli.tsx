@@ -891,7 +891,7 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         process.stdout.write(
           ev.result.undetermined?.length
             ? `bar undetermined: required checks were not run\n`
-            : `bar not met after ${ev.attempts} attempts\n`,
+            : `bar not met after ${ev.attempts} attempt${ev.attempts === 1 ? "" : "s"}\n`,
         );
         printBar(ev.result, "run");
         break;
