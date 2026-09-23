@@ -1764,6 +1764,11 @@ export function App({
             }
             if (p.root) add("info", `last exported root (untrusted until repaired): ${p.root}`);
           }
+          // Same line as `molt verify` and the window: intact is about
+          // tampering, not about a session having finished.
+          for (const j of p.journals.filter((x) => x.unfinished)) {
+            add("info", `session ${j.file}: no recorded end (stops at ${j.unfinished}) — killed, crashed or closed`);
+          }
           return true;
         }
         case "/spine": {

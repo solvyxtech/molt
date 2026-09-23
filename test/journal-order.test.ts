@@ -14,7 +14,11 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { Journal } from "../src/journal.js";
 import type { JournalEntry } from "../src/journal.js";
-import { workspace } from "./helpers.js";
+import { Archive } from "../src/archive.js";
+import { parseBar, selectChecks } from "../src/bar.js";
+import { Engine } from "../src/engine.js";
+import { Receipts } from "../src/receipts.js";
+import { allowAll, drain, scriptedProvider, workspace, type ScriptedTurn } from "./helpers.js";
 
 const cleanups: (() => void)[] = [];
 after(() => cleanups.forEach((c) => c()));
@@ -65,5 +69,58 @@ describe("a session that never ended", () => {
     assert.equal(Journal.unfinished(entries("session_start")), null);
     assert.equal(Journal.unfinished(entries("session_start", "note")), null, "unknown kinds are left unjudged");
     assert.equal(Journal.unfinished([]), null);
+  });
+});
+
+describe("every way a turn ends is written down", () => {
+  // `unfinished` is only as honest as the engine's record: a turn that ends
+  // normally without a closing entry reads exactly like one that was killed.
+  // Each path a turn can take to its end, and the journal after it.
+  const BAR_OK = "version: 1\nchecks:\n  - name: ok\n    run: \"true\"\n";
+  const BAR_RED = "version: 1\nchecks:\n  - name: red\n    run: \"false\"\n";
+  const BAR_TAGGED = "version: 1\nchecks:\n  - name: fast\n    run: \"true\"\n    tags: [fast]\n  - name: slow\n    run: \"true\"\n    tags: [slow]\n";
+  const writeThenClaim: ScriptedTurn[] = [
+    { calls: [{ name: "write_file", args: { path: "a.txt", content: "a\n" } }] },
+    { text: "Done: wrote a.txt." },
+  ];
+
+  async function ending(bar: string | null, opts: { ask?: boolean; skip?: string[] } = {}, turns = writeThenClaim) {
+    const { root } = logDir();
+    const journal = new Journal(root);
+    let parsed = bar === null ? null : parseBar(bar);
+    if (parsed && opts.skip) parsed = selectChecks(parsed, { skip: opts.skip });
+    const engine = new Engine({
+      baseUrl: "http://mock/v1",
+      model: "m",
+      provider: "mock",
+      cwd: root,
+      journal,
+      fetchFn: scriptedProvider(turns).fetchFn,
+      bar: parsed,
+      archive: new Archive(root),
+      receipts: new Receipts(root),
+      maxProofAttempts: 1,
+    });
+    await drain(engine.run("write a.txt", allowAll, { ask: opts.ask }));
+    return Journal.unfinished(Journal.read(journal.path));
+  }
+
+  it("accepted", async () => assert.equal(await ending(BAR_OK), null));
+  it("refused to the attempt limit", async () => assert.equal(await ending(BAR_RED), null));
+  it("no bar at all", async () => assert.equal(await ending(null), null));
+  it("a question", async () => assert.equal(await ending(BAR_OK, { ask: true }, [{ text: "It checks ok." }]), null));
+  it("undetermined", async () => assert.equal(await ending(BAR_TAGGED, { skip: ["slow"] }), null));
+});
+
+describe("the shared verify names an unfinished session for every surface", () => {
+  it("carries it on Integrity.verifyProject, which the TUI and the window both read", async () => {
+    const { Integrity } = await import("../src/integrity.js");
+    const { root, dir } = logDir();
+    writeFileSync(
+      join(dir, "killed.jsonl"),
+      [line("session_start", "2026-09-08T14:00:00.000Z"), line("request", "2026-09-08T14:00:01.000Z")].join("\n") + "\n",
+    );
+    const row = Integrity.verifyProject(root).journals.find((j) => j.file === "killed.jsonl");
+    assert.equal(row?.unfinished, "request");
   });
 });

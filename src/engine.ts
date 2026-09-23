@@ -4773,6 +4773,10 @@ export class Engine {
             ? "nothing left in the bar to check a question against — this answer is unverified."
             : "no .molt/done.yml — completion is unverified. run `molt init` to add a bar.",
         };
+        // The turn is over, and the record says so. Without this a turn with
+        // no bar ended on its last `response`, which is exactly what a turn
+        // killed mid-request looks like — and `molt verify` would say so.
+        log?.append("session_end", { reason: opts.ask ? "answered" : "unverified: no bar" });
         // `streamed` says the deltas already carried this text. Still sent, so
         // that "the model gave a final answer" stays one event a caller can
         // wait on — `molt run`'s exit code turns on it — but a surface that
@@ -4963,7 +4967,10 @@ export class Engine {
       }
 
       if (exhausted) {
-        log?.append("session_end", { reason: "bar not met", attempts: proofAttempts });
+        log?.append("session_end", {
+          reason: undetermined ? "undetermined" : "bar not met",
+          attempts: proofAttempts,
+        });
         yield { kind: "proof_exhausted", result, attempts: proofAttempts };
         const onlyWrites = failedOnlyWriteChecks(result);
         if (undetermined) {

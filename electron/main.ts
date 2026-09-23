@@ -1739,7 +1739,13 @@ ipcMain.handle("integrity:verify", () => {
     reason: i.reason ?? null,
     drift: i.drift,
     unbound: i.unbound,
-    journals: p.journals.map((j) => ({ file: j.file, ok: j.ok, entries: j.entries, reason: j.reason ?? null })),
+    journals: p.journals.map((j) => ({
+      file: j.file,
+      ok: j.ok,
+      entries: j.entries,
+      reason: j.reason ?? null,
+      unfinished: j.unfinished,
+    })),
     root: p.root,
     generatedAt: new Date().toISOString(),
   };

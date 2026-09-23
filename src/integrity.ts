@@ -324,14 +324,22 @@ export class Integrity {
   static verifyProject(root: string): {
     ok: boolean;
     ledger: IntegrityVerify;
-    /** One row per session log, in the order `Journal.sessions` lists them. */
-    journals: ({ file: string } & VerifyResult)[];
+    /**
+     * One row per session log, in the order `Journal.sessions` lists them.
+     * `unfinished` names the entry a log stops at when it stopped mid-turn —
+     * killed, crashed or closed — so no surface presents it as finished.
+     */
+    journals: ({ file: string; unfinished: string | null } & VerifyResult)[];
     root: string | null;
   } {
-    const journals = Journal.sessions(root).map((file) => ({
-      file,
-      ...Journal.verify(join(root, ".molt", "log", file)),
-    }));
+    const journals = Journal.sessions(root).map((file) => {
+      const path = join(root, ".molt", "log", file);
+      return {
+        file,
+        ...Journal.verify(path),
+        unfinished: Journal.unfinished(Journal.read(path))?.kind ?? null,
+      };
+    });
     const ledger = Integrity.verify(root);
     return {
       ok: ledger.ok && journals.every((j) => j.ok),

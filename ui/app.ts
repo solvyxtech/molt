@@ -97,7 +97,7 @@ type VerifyResult = {
   drift: { kind: string; file: string; bound: string }[];
   unbound: { kind: string; file: string }[];
   /** Every session log's own chain, recomputed — half of what `molt verify` checks. */
-  journals?: { file: string; ok: boolean; entries: number; reason: string | null }[];
+  journals?: { file: string; ok: boolean; entries: number; reason: string | null; unfinished?: string | null }[];
   root: string | null;
   generatedAt: string;
 };
@@ -741,6 +741,12 @@ async function runVerify(): Promise<void> {
   }
   for (const j of badLogs) {
     out.appendChild(el("div", undefined, `journal ${j.file}: ${j.reason ?? "chain broken"}`));
+  }
+  // Intact is about tampering, not about finishing. A log that stops
+  // mid-turn is a session that was killed or closed, and anything still
+  // describing it as working is stale — the same line `molt verify` prints.
+  for (const j of (ev.journals ?? []).filter((x) => x.unfinished)) {
+    out.appendChild(el("div", undefined, `session ${j.file}: no recorded end (stops at ${j.unfinished})`));
   }
   // What the chain does not reach, said plainly beside what it does.
   if (ev.unbound.length) {
