@@ -1069,8 +1069,11 @@ export class AcpSession<H> {
         const stop = res?.stopReason ?? "completed";
         // `refusal` and `max_tokens` are the model declining or running out —
         // both are failures of the step, not of molt, and the engine drops the
-        // session on either. `cancelled` is molt's own abort and says nothing.
-        const bad = /refusal|max_tokens/iu.test(stop) ? stop : undefined;
+        // session on either. So is `max_turn_requests`: the agent hit its own
+        // limit on calls part-way through the work, and what it said last was
+        // read as the turn's finished claim and sent to the bar. `cancelled`
+        // is molt's own abort and says nothing.
+        const bad = /refusal|max_tokens|max_turn_requests/iu.test(stop) ? stop : undefined;
         this.events.push(this.finish(bad));
       } catch (e) {
         this.events.push(this.finish(errorText(e)));
