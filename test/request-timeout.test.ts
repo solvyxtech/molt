@@ -245,3 +245,28 @@ describe("a probe that never answers", () => {
     assert.equal((await engine.doctor()).ok, true);
   });
 });
+
+describe("molt doctor against something that is not an API", () => {
+  it("fails a 200 that is a web page instead of calling the endpoint reachable", async () => {
+    // `--url https://openrouter.ai` without `/api/v1` gets the site's HTML.
+    const server = await serve((_n, _req, res) => {
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end("<!doctype html><html><body>Welcome</body></html>");
+    });
+    const { engine } = engineAt(server.url);
+    const d = await engine.doctor();
+    assert.equal(d.ok, false);
+    assert.match(d.detail, /answered with a page, not JSON/);
+  });
+
+  it("still passes an API that hides its model list", async () => {
+    const server = await serve((_n, _req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ object: "list" }));
+    });
+    const { engine } = engineAt(server.url);
+    const d = await engine.doctor();
+    assert.equal(d.ok, true);
+    assert.match(d.detail, /model list unavailable/);
+  });
+});

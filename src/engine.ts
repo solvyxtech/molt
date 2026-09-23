@@ -5226,7 +5226,24 @@ export class Engine {
       if (!res.ok) {
         return { ok: false, reachable: false, detail: `HTTP ${res.status} from ${base}/models` };
       }
-      const json = (await res.json().catch(() => null)) as { data?: { id?: string }[] } | null;
+      type Listing = { data?: { id?: string }[] } | null;
+      let json: Listing;
+      try {
+        json = (await res.json()) as Listing;
+      } catch {
+        // Something answered, and it was not an API. `--url https://openrouter.ai`
+        // without its `/api/v1` gets a 200 web page here, and doctor called that
+        // "endpoint reachable · model list unavailable" and exited 0 — the one
+        // command meant to catch a wrong URL passing it, for the first real
+        // request to fail on.
+        return {
+          ok: false,
+          reachable: false,
+          detail:
+            `${base}/models answered with a page, not JSON — this looks like a website rather ` +
+            `than the API. The base URL usually ends in /v1 (for example /api/v1).`,
+        };
+      }
       const ids = (json?.data ?? []).map((m) => m.id).filter(Boolean) as string[];
       // No list at all is not evidence against the model; endpoints that hide
       // /models exist, and refusing them would be a guess dressed as a check.
