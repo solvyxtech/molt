@@ -25,6 +25,7 @@ import { acpAgentFor, acpAsk } from "./acp.js";
 import { agyAsk, isAgy } from "./agy.js";
 import { claudeCodeAsk, isClaudeCode, type Sdk } from "./claude-code.js";
 import { errorText } from "./format.js";
+import { askError, askTimeoutMs, probeSignal } from "./watchdog.js";
 import { authHeaders } from "./providers.js";
 import { runCommand } from "./run.js";
 import { diagnoseFailure } from "./bar.js";
@@ -234,6 +235,8 @@ export async function draftCriteria(opts: {
   acpSpawn?: typeof import("node:child_process").spawn;
   /** How `agy` is run for a pre-turn question. Tests only. */
   agyRun?: (cmd: string, args: string[], opts: object) => Promise<{ stdout: string }>;
+  /** How long the HTTP question may wait for its answer; see askTimeoutMs. Tests only. */
+  timeoutMs?: number;
 }): Promise<{ ok: true; draft: Draft } | { ok: false; error: string }> {
   const f = opts.fetchFn ?? fetch;
   const base = opts.baseUrl.replace(/\/$/, "");
@@ -306,9 +309,11 @@ export async function draftCriteria(opts: {
     return drafted(asked.text);
   }
 
+  const limitMs = askTimeoutMs(500, opts.timeoutMs);
   try {
     const res = await f(`${base}/chat/completions`, {
       method: "POST",
+      signal: probeSignal(limitMs),
       headers: { "content-type": "application/json", ...authHeaders(base, opts.apiKey) },
       body: JSON.stringify({
         model: opts.model,
@@ -328,6 +333,6 @@ export async function draftCriteria(opts: {
     const text = json.choices?.[0]?.message?.content ?? "";
     return drafted(text, json.choices?.[0]?.finish_reason === "length");
   } catch (e) {
-    return { ok: false, error: errorText(e) };
+    return { ok: false, error: askError(e, limitMs, errorText) };
   }
 }

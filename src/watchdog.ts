@@ -183,3 +183,24 @@ export function probeError(e: unknown, url: string, ms = PROBE_TIMEOUT_MS): stri
   const name = (e as { name?: string } | null)?.name;
   return name === "TimeoutError" ? `no answer from ${url} in ${waited(ms)}` : String(e);
 }
+
+/**
+ * How long a one-shot question to the model — a criteria draft, an interview
+ * round — may wait for its answer.
+ *
+ * These are not streamed, so the whole answer is one silence: the allowance
+ * is the first-byte one for a short prompt and this output ceiling. Before
+ * this they had none, and an endpoint that accepted the connection and never
+ * answered left the window's checks panel reading "asking the model…" for
+ * ever.
+ */
+export function askTimeoutMs(maxTokens: number, override?: number): number {
+  if (override !== undefined) return Math.max(0, override);
+  return firstByteMs(requestIdleMs(), { promptTokens: 2_000, maxTokens, stream: false });
+}
+
+/** A failed one-shot question, with its own timeout named as such. */
+export function askError(e: unknown, ms: number, fallback: (e: unknown) => string): string {
+  const name = (e as { name?: string } | null)?.name;
+  return name === "TimeoutError" ? `the model did not answer within ${waited(ms)}` : fallback(e);
+}

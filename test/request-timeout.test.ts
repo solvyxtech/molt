@@ -15,11 +15,14 @@ import type { AddressInfo } from "node:net";
 import { readFileSync } from "node:fs";
 import { after, describe, it } from "node:test";
 import { Engine, NETWORK_RETRIES } from "../src/engine.js";
+import { draftCriteria } from "../src/criteria.js";
+import { interviewTurn } from "../src/interview.js";
 import { Journal } from "../src/journal.js";
 import {
   GENERATE_MS_PER_TOKEN,
   PREFILL_MS_PER_TOKEN,
   REQUEST_IDLE_MS,
+  askTimeoutMs,
   firstByteMs,
   requestIdleMs,
 } from "../src/watchdog.js";
@@ -268,5 +271,27 @@ describe("molt doctor against something that is not an API", () => {
     const d = await engine.doctor();
     assert.equal(d.ok, true);
     assert.match(d.detail, /model list unavailable/);
+  });
+});
+
+describe("a one-shot question that never answers", () => {
+  it("ends a criteria draft and an interview round instead of waiting for ever", async () => {
+    // The window's checks panel read "asking the model…" indefinitely.
+    const server = await serve(() => {});
+    const common = { task: "t", scripts: [], barChecks: [], baseUrl: server.url, model: "m", timeoutMs: 150 };
+    const t0 = Date.now();
+    const [draft, round] = await Promise.all([
+      draftCriteria(common),
+      interviewTurn({ ...common, history: [], round: 1 }),
+    ]);
+    assert.ok(Date.now() - t0 < 3_000);
+    assert.deepEqual(draft, { ok: false, error: "the model did not answer within 150ms" });
+    assert.deepEqual(round, { kind: "error", error: "the model did not answer within 150ms" });
+  });
+
+  it("allows a whole unstreamed answer, not just the idle window", () => {
+    assert.equal(askTimeoutMs(800, 40), 40);
+    assert.ok(askTimeoutMs(800) >= REQUEST_IDLE_MS);
+    assert.ok(askTimeoutMs(10_000) > REQUEST_IDLE_MS, "a long answer's allowance grows with it");
   });
 });
