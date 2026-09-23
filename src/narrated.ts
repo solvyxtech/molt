@@ -65,9 +65,15 @@ const FAKE_RESULT: RegExp[] = [
   /<\/?(?:tool_result|tool_response|function_results?)>/i,
 ];
 
-/** Words that lead into an action, on the line before a fenced call. */
+/**
+ * Words that lead into an action, on the line before a fenced call.
+ *
+ * First-person intent only. "Now" and "next" are how an explanation moves on
+ * as often as how an agent does — "Now, the request body looks like this:" —
+ * and a fenced example after one is still an example.
+ */
 const LEAD_IN =
-  /\b(?:I'll|I will|I'm going to|I am going to|let me|let's|now|next|calling|invoking|executing)\b/i;
+  /\b(?:I'll|I will|I'm going to|I am going to|let me|let's|calling|invoking|executing)\b/i;
 
 const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 

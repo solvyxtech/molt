@@ -131,6 +131,12 @@ const NEGATIVE: [string, string][] = [
     "The loader reads a manifest like this:\n\n```json\n" +
       '{"name": "molt", "path": "dist/cli.js"}\n```\n\nand resolves `path` against the package root.',
   ],
+  [
+    "an example introduced with 'Now'",
+    "Now, the request body looks like this:\n\n```json\n" +
+      '{"name": "edit_file", "arguments": {"path": "a.ts", "old_text": "1", "new_text": "2"}}\n```\n\n' +
+      "and the response carries the result under `content`.",
+  ],
   ["a report that names the ReAct format", "Older agents used an Action: / Action Input: loop; molt does not."],
   ["an ordinary claim", "Done. src/a.ts now exports `parse`, and the new test covers the empty case."],
   ["empty", ""],
