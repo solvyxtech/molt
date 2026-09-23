@@ -1462,7 +1462,7 @@ $("ck-add-note").addEventListener("click", () => {
 /**
  * Draft criteria from the task text.
  *
- * Automatic by default, but `send` holds after a non-empty draft so a person
+ * Automatic only when "spec first" is ticked (off by default), and `send` holds after a non-empty draft so a person
  * sees the commands before they run. A drafted check is a process, not a
  * stricter boolean — `true` does not weaken the project bar, and `rm -rf`
  * still runs. The project bar is the one that must never come from a prompt,
