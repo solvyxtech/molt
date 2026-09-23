@@ -37,6 +37,7 @@ import {
 import {
   cmdCommit,
   cmdAttempts,
+  cmdBudget,
   cmdAutoShed,
   cmdFor,
   cmdMap,
@@ -1529,35 +1530,8 @@ export function App({
           add("info", engine.lastRequestBody ?? "(nothing sent yet)");
           return true;
         case "/budget": {
-          // "$2.50" or "2.50usd" is a money ceiling for a single turn; a bare
-          // number is the session's token budget. Both, because tokens are
-          // what a context window is measured in and money is what a bill is.
-          const money = /^\$?([\d.]+)\s*(usd|\$)?$/i.exec(arg.trim());
-          if (arg.trim().startsWith("$") || /usd$/i.test(arg.trim())) {
-            const usd = Number(money?.[1]);
-            if (!Number.isFinite(usd) || usd < 0) {
-              add("error", "usage: /budget $2.50");
-              return true;
-            }
-            engine.setTurnBudgetUsd(usd);
-            add("info", usd === 0 ? "per-turn spending ceiling removed" : `per-turn ceiling: $${usd}`);
-            return true;
-          }
-          if (arg === "off" || arg === "") {
-            engine.setBudget(undefined);
-            add(
-              "info",
-              "budget cleared — no session budget and no per-turn ceiling. molt will now " +
-                "run a turn to the 32-step guard, which on a large codebase is a real bill.",
-            );
-          } else {
-            const n = Number(arg);
-            if (!Number.isFinite(n) || n <= 0) add("error", "usage: /budget <tokens|off>");
-            else {
-              engine.setBudget(n);
-              add("info", `budget: ${n} tokens — for the session, and for any single turn`);
-            }
-          }
+          const r = cmdBudget(engine, arg);
+          add(r.kind, r.text);
           return true;
         }
         case "/login":

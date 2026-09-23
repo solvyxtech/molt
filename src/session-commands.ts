@@ -241,3 +241,48 @@ export function cmdAutoShed(engine: Engine, arg: string): CommandReply {
   engine.setAutoShed(n);
   return ok(`auto-shed above ${Math.floor(n)} tokens of history — the full record is archived, never summarized`);
 }
+
+/**
+ * `/budget 40000` is a token ceiling for the session and any one turn;
+ * `/budget $2.50` is a money ceiling for one turn; `/budget off` clears both.
+ *
+ * It existed twice and the two meant different things. A bare `/budget`
+ * cleared every limit in the terminal and printed usage in the window.
+ * `/budget $0` removed the money ceiling in the terminal and was refused in
+ * the window as "not a spend ceiling", leaving `/budget off` — which also
+ * dropped the token budget — as the window's only way to lift it. And the
+ * window's `/budget off` said "no session token ceiling" while the engine
+ * cleared the money ceiling too, a limit removed that nothing mentioned.
+ *
+ * A bare `/budget` reports; it does not clear. A command typed to ask what
+ * the limits are must not be the one that removes them.
+ */
+export function cmdBudget(engine: Engine, arg: string): CommandReply {
+  const s = arg.trim();
+  if (!s) {
+    const tokens = engine.budgetTokens;
+    const usd = engine.turnBudgetUsd;
+    return ok(
+      (tokens === undefined ? "no token budget" : `budget: ${tokens} tokens — for the session, and for any single turn`) +
+        (usd > 0 ? ` · per-turn ceiling $${usd}` : " · no per-turn money ceiling") +
+        " — /budget <tokens|$usd|off>",
+    );
+  }
+  if (s === "off") {
+    engine.setBudget(undefined);
+    return ok(
+      "budget cleared — no session budget and no per-turn ceiling. molt will now run a turn to " +
+        "the 32-step guard, which on a large codebase is a real bill.",
+    );
+  }
+  if (s.startsWith("$") || /usd$/i.test(s)) {
+    const n = Number(/^\$?\s*([\d.]+)\s*(?:usd)?$/i.exec(s)?.[1]);
+    if (!Number.isFinite(n) || n < 0) return bad(`not a spend ceiling: ${arg} — try /budget $2.50, or $0 to remove it`);
+    engine.setTurnBudgetUsd(n);
+    return ok(n === 0 ? "per-turn spending ceiling removed" : `per-turn ceiling: $${n} — a turn stops there and asks`);
+  }
+  const n = Number(s.replace(/[_,]/g, ""));
+  if (!Number.isFinite(n) || n <= 0) return bad(`not a token budget: ${arg} — /budget <tokens|$usd|off>`);
+  engine.setBudget(n);
+  return ok(`budget: ${n} tokens — for the session, and for any single turn`);
+}

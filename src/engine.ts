@@ -1564,6 +1564,11 @@ export class Engine {
     if (tokens === undefined) this.cfg.maxTurnUsd = 0;
   }
 
+  /** The per-turn spending ceiling in dollars; 0 is none. */
+  get turnBudgetUsd(): number {
+    return this.cfg.maxTurnUsd ?? 0;
+  }
+
   /** A per-turn spending ceiling in dollars. 0 removes it. */
   setTurnBudgetUsd(usd: number): void {
     this.cfg.maxTurnUsd = usd;

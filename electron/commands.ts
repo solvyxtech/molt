@@ -15,6 +15,7 @@
 import { loadBar, BarError } from "../src/bar.js";
 import {
   cmdAttempts,
+  cmdBudget,
   cmdAutoShed,
   cmdCommit,
   cmdFor,
@@ -33,31 +34,6 @@ export type CommandOutcome =
   | { kind: "unhandled" };
 
 const usd = (n: number): string => (n < 0.01 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`);
-
-/**
- * `/budget 40000` is a token ceiling for the session; `/budget $2.50` is a
- * money ceiling for one turn. Both spellings exist because a context window is
- * measured in tokens and a bill is measured in money, and people reach for
- * whichever unit their worry is in.
- */
-function budget(engine: Engine, arg: string): CommandOutcome {
-  if (!arg) return { kind: "info", text: "usage: /budget <tokens|$usd|off>" };
-  if (arg === "off") {
-    engine.setBudget(undefined);
-    return { kind: "info", text: "budget off — no session token ceiling" };
-  }
-  const money = /^\$?([\d.]+)\s*(usd)?$/i.exec(arg);
-  if (arg.startsWith("$") || /usd$/i.test(arg)) {
-    const n = Number(money?.[1]);
-    if (!Number.isFinite(n) || n <= 0) return { kind: "error", text: `not a spend ceiling: ${arg}` };
-    engine.setTurnBudgetUsd(n);
-    return { kind: "info", text: `turn ceiling ${usd(n)} — a turn stops there and asks` };
-  }
-  const n = Number(arg.replace(/[_,]/g, ""));
-  if (!Number.isFinite(n) || n <= 0) return { kind: "error", text: `not a token budget: ${arg}` };
-  engine.setBudget(n);
-  return { kind: "info", text: `session budget ${n} tokens` };
-}
 
 function price(engine: Engine, arg: string): CommandOutcome {
   const p = engine.pricing();
@@ -105,7 +81,7 @@ export async function runEngineCommand(
     }
 
     case "/budget":
-      return budget(engine, arg);
+      return cmdBudget(engine, arg);
 
     case "/price":
       return price(engine, arg);
