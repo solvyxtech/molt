@@ -437,3 +437,35 @@ describe("ctrl+C on a subscription backend", () => {
     );
   });
 });
+
+describe("when the Claude Code process just stops", () => {
+  it("ends the turn with an error instead of waiting for ever", async () => {
+    // The SDK stream ending cleanly mid-turn — the CLI exiting 0 — pushed no
+    // `done`, and the step waited in drain() indefinitely.
+    const dir = ws();
+    const base = scriptedClaudeCode([]).sdk as unknown as Record<string, unknown>;
+    const sdk = {
+      ...base,
+      query: () => ({
+        async *[Symbol.asyncIterator]() {
+          // Reads nothing, answers nothing, and ends.
+        },
+      }),
+    } as unknown as typeof base;
+    const engine = new Engine({
+      baseUrl: CLAUDE_CODE_URL,
+      model: "sonnet",
+      provider: "claude-code",
+      cwd: dir,
+      bar: BAR,
+      claudeCodeSdk: sdk as never,
+    });
+    const run = drain(engine.run("do it", allowAll));
+    const timeout = new Promise<"hung">((r) => setTimeout(() => r("hung"), 3_000).unref());
+    const events = await Promise.race([run, timeout]);
+    assert.notEqual(events, "hung", "the turn never ended");
+    assert.ok(
+      (events as EngineEvent[]).some((e) => e.kind === "error" && /ended without answering/.test(e.text)),
+    );
+  });
+});

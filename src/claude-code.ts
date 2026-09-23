@@ -825,6 +825,13 @@ export class ClaudeCodeSession<H> {
           cumulativeCostUsd: this.lastCumulativeCost,
           error: errorText(e),
         });
+      } finally {
+        // The SDK's stream can also just end — the CLI exiting 0 part-way
+        // through a turn. Nothing pushed a `done` then, and `send` waited in
+        // `drain()` for ever: the turn hung with no error and no way to tell
+        // it from a slow answer. Closing the channel ends that wait; a step
+        // left without its `done` is reported as a session that stopped.
+        this.events.close();
       }
     })();
     this.started = true;
