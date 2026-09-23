@@ -1249,6 +1249,15 @@ describe("the task a Run acts on", () => {
   });
 });
 
+describe("capture is wired on both surfaces", () => {
+  it("gives the window's engine MOLT_CAPTURE_DIR, as the terminal's has", () => {
+    const main = readFileSync(path.join(repoRoot(), "electron", "main.ts"), "utf8");
+    const cli = readFileSync(path.join(repoRoot(), "src", "cli.tsx"), "utf8");
+    assert.match(cli, /captureDir: args\.capture \?\? process\.env\.MOLT_CAPTURE_DIR/);
+    assert.match(main, /captureDir: process\.env\.MOLT_CAPTURE_DIR/, "a window session never captures");
+  });
+});
+
 describe("the evidence chain is wired on both surfaces", () => {
   it("gives the window's engine a ledger, not just a button that reads one", () => {
     const src = readFileSync(path.join(repoRoot(), "electron", "main.ts"), "utf8");

@@ -215,6 +215,11 @@ function openSession(cwd: string, model: string, baseUrl: string, apiKey?: strin
     archive: new Archive(cwd),
     receipts,
     integrity,
+    // `molt run --capture` and MOLT_CAPTURE_DIR record one file per attempt
+    // for the fine-tuning set. The terminal read the variable; the window
+    // never did, so a desktop session launched with it set captured nothing
+    // and said nothing about it.
+    captureDir: process.env.MOLT_CAPTURE_DIR || undefined,
   });
 
   return { engine, cwd, model, baseUrl, provider, bar, barError, journal, receipts };
