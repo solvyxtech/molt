@@ -112,6 +112,14 @@ checks:
     builtin: spec-intact
     tags: [session]
 
+  # A test this turn added that cannot fail — a value compared with itself, no
+  # assertion at all, or a new test file that never touches the change — is a
+  # green row that establishes nothing. Opt-in in general; this project writes
+  # every test to assert.
+  - name: tests-meaningful
+    builtin: tests-real
+    tags: [session]
+
   - name: work-proven
     builtin: diff-covered
     lcov: coverage/lcov.info

@@ -296,6 +296,26 @@ Known limit: it reads the write ledger, so an edit made through `bash` — a
 script the model wrote and ran, `sed -i`, `cp` — is not seen by it, or by any
 other ledger-reading builtin. At `--yes` those commands do not prompt.
 
+#### `tests-real`
+
+Fails when a test this turn **added** cannot fail: a value compared with
+itself (`assert.equal(f(x), f(x))`), a new test with no assertion, or a new
+test file that imports nothing the turn changed. Each is a green row that
+establishes nothing, and `mutation` and `spec-intact` both miss them.
+
+Only what the turn added is judged, strings and comments are masked first, and
+only JavaScript and TypeScript are read (a file it cannot read is reported as
+not examined, never as passed).
+
+**Opt-in; `molt init` does not write it.** It refuses a "just call it" smoke
+test with no assertion, and some projects write those deliberately.
+
+```yaml
+  - name: tests-meaningful
+    builtin: tests-real
+    tags: [session]
+```
+
 #### `tree-accounted`
 
 Passes when every file that changed on disk this turn was written through

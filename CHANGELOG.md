@@ -51,8 +51,32 @@
 - **`claims-grounded` reads a disclaimer as one**: naming a file in order to
   say it was *not* made (or that a build wrote it) is not a creation claim.
 
+- **A tool call written as text is not a claim.** A reply that narrates a
+  call (JSON, `<tool_call>`, `<invoke>`, `[TOOL_CALLS]`, "I'll now call
+  write_file(…)", invented tool results) with no real call is told nothing
+  ran, journalled as `narrated_call`, and retried a bounded number of times
+  instead of going to the bar as "done". No false positives across ~4,300
+  real assistant messages.
+- **A model request that never answers no longer holds a turn open for
+  ever.** An idle timeout that resets on every byte (so a long streamed answer
+  is never cut), retried like a network failure; `--for` now interrupts a
+  request in flight and bounds subscription backends too. `MOLT_REQUEST_IDLE_MS`
+  sets it; `0` turns it off. `/model`, `molt doctor`, pricing, criteria drafts
+  and interviews no longer hang on a silent endpoint.
+- **Both surfaces agree**: `/budget` is one implementation (a bare `/budget`
+  now reports the limits in the terminal too, rather than clearing them); the
+  window answers `/verify` and `/spine`, which it listed and refused.
+- Smaller: a retried stream no longer prints its answer twice; `molt verify`
+  fails when every session log is gone; a draft with no JSON is not "nothing to
+  add"; `molt doctor` rejects a URL that is a website, not an API; ctrl+C on a
+  subscription backend is a cancel; an ACP turn stopped by the agent's own
+  call limit is not a finished claim; the window honours `MOLT_CAPTURE_DIR`.
+
 ### Added
 
+- **`tests-real` builtin (opt-in)**: refuses a test this turn added that
+  cannot fail — a value compared with itself, no assertion, or a new test file
+  that never touches the change. In molt's own bar as `tests-meaningful`.
 - **`molt receipts` checks the summary against the record**: it ends by
   comparing the latest verdict's judged commit with the tree now (same
   commit, N commits later, or a history it does not describe).

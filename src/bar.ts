@@ -9,6 +9,7 @@
  * Nothing here asks a model anything. A bar result is an exit code.
  */
 import { judgePass } from "./evidence.js";
+import { testsRealFor } from "./tests-real.js";
 import { runCommand } from "./run.js";
 import { parseLcov, coverageFor, coverageCouldSpeak, unprovenIn, type Unproven } from "./coverage.js";
 import { planMutations, applyMutation, negateComparison, type Mutation } from "./mutate.js";
@@ -51,6 +52,7 @@ export const BUILTINS: BuiltinCheck[] = [
   "mutation",
   "build-current",
   "imports-tracked",
+  "tests-real",
 ];
 
 /**
@@ -1956,6 +1958,10 @@ function runBuiltin(
           : ""),
     };
   }
+
+  // Opt-in, never in the bar `molt init` writes: it refuses a new test with no
+  // assertion, which is how some projects deliberately write smoke tests.
+  if (builtin === "tests-real") return testsRealFor(ctx);
 
   if (builtin === "claims-grounded") {
     // The model's own words, checked against what actually happened.

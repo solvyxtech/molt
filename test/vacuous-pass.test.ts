@@ -514,3 +514,23 @@ describe("mutation does not refuse correct code over a change nothing could noti
     assert.equal(r?.ok, false, "negation survived too: the condition is untested");
   });
 });
+
+describe("tests-real, registered as a builtin", () => {
+  it("refuses a turn whose new test compares a value with itself", async () => {
+    const dir = ws();
+    mkdirSync(join(dir, "src"), { recursive: true });
+    mkdirSync(join(dir, "test"), { recursive: true });
+    writeFileSync(join(dir, "src/f.ts"), "export const f = (x: number) => x + 1;\n");
+    writeFileSync(
+      join(dir, "test/f.test.ts"),
+      'import { test } from "node:test";\nimport assert from "node:assert/strict";\nimport { f } from "../src/f.js";\n' +
+        'test("f", () => { assert.equal(f(1), f(1)); });\n',
+    );
+    const BAR = parseBar("version: 1\nchecks:\n  - name: real\n    builtin: tests-real\n");
+    const ledger = [wrote("src/f.ts", [1]), wrote("test/f.test.ts", [1, 2, 3, 4])];
+    // The tree as the turn found it: neither file existed, so both are new.
+    const treeBefore = { takenAt: Date.now() - 1000, files: new Map(), truncated: false, testTexts: new Map() };
+    const [r] = (await runBar(BAR, { ...ctxIn(dir, ledger), treeBefore } as BarContext)).results;
+    assert.equal(r?.ok, false, r?.output);
+  });
+});
