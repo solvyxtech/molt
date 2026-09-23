@@ -1734,9 +1734,11 @@ export function App({
             const r = slice[i]!;
             const n = start + i + 1;
             add(
-              r.verdict === "accepted" ? "ok" : "fail",
+              r.verdict === "accepted" ? "ok" : r.verdict === "undetermined" ? "info" : "fail",
               `  ${String(n).padStart(3)}  ${r.file}  ${r.verdict}  attempt ${r.attempt}` +
-                (r.failed.length ? `  failed: ${r.failed.join(", ")}` : ""),
+                (r.head ? `  @${r.head.slice(0, 7)}${r.dirty ? "+" : ""}` : "") +
+                (r.failed.length ? `  failed: ${r.failed.join(", ")}` : "") +
+                (r.notRun?.length ? `  not run: ${r.notRun.join(", ")}` : ""),
             );
           }
           refreshSpine();
