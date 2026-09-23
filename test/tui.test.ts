@@ -2155,3 +2155,25 @@ describe("pricing on a plan", () => {
     }
   });
 });
+
+describe("the model picker", () => {
+  it("names the endpoint you are pointed at when it cannot be asked, keyed or not", async () => {
+    // A server you run holds no stored key, and its failure was filtered out
+    // with the keyless presets nobody connected to. With it down, /model
+    // listed everyone else's models and said nothing about it.
+    const t = await mount({
+      baseUrl: "http://my-box.test/v1",
+      provider: "my-box",
+      fetchFn: (async () => {
+        throw new TypeError("fetch failed");
+      }) as unknown as typeof fetch,
+    });
+    try {
+      await submit(t.stdin, "/model");
+      await until(t, /my-box: unreachable \(TypeError: fetch failed\)/);
+      assert.doesNotMatch(t.stdout.text, /ollama: unreachable/i, "keyless presets stay quiet");
+    } finally {
+      t.cleanup();
+    }
+  });
+});

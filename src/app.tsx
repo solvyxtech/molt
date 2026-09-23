@@ -1357,7 +1357,17 @@ export function App({
     }
     // Report unreachable keyed providers — a silently short list reads as
     // "this provider has no models" when it means "molt could not ask".
-    for (const src of results.filter((x) => !x.r.ok && auth[x.name])) {
+    //
+    // And the endpoint molt is pointed at, keyed or not. It was dropped here
+    // whenever it held no stored key — a server you run, a URL from
+    // /endpoint — so with it down the picker listed everyone else's models
+    // and said nothing about the one you were using. Keyless presets nobody
+    // connected to stay quiet: not running Ollama is not an error.
+    const here = engine.baseUrl.replace(/\/$/, "");
+    const failed = results.filter(
+      (x) => !x.r.ok && (auth[x.name] || x.url.replace(/\/$/, "") === here),
+    );
+    for (const src of failed) {
       add("error", `${src.name}: unreachable (${(src.r as { error: string }).error})`);
     }
     if (!choices.length) {
