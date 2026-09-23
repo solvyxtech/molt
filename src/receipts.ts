@@ -808,3 +808,15 @@ export class Receipts {
       .sort();
   }
 }
+
+/**
+ * A receipt's number and verdict, read from its file name.
+ *
+ * Any verdict the name carries. The window's listing matched only the three
+ * that existed when it was written, and turned a fourth (`undetermined`)
+ * into receipt 0, verdict "unknown": a real record shown as a malformed one.
+ */
+export function receiptName(file: string): { n: number; verdict: string } {
+  const m = /^(\d+)-([a-z]+)\.md$/.exec(file);
+  return { n: m ? Number(m[1]) : 0, verdict: m?.[2] ?? "unknown" };
+}

@@ -456,3 +456,12 @@ describe("a criterion that passed before the work", () => {
     assert.match(body, /\| task:made \| pass \|/, "the criterion that discriminated is proof");
   });
 });
+
+describe("the window's receipt list", () => {
+  it("reads every verdict a receipt file can carry", async () => {
+    const { receiptName } = await import("../src/receipts.js");
+    assert.deepEqual(receiptName("0007-undetermined.md"), { n: 7, verdict: "undetermined" });
+    assert.deepEqual(receiptName("0012-accepted.md"), { n: 12, verdict: "accepted" });
+    assert.deepEqual(receiptName("notes.md"), { n: 0, verdict: "unknown" });
+  });
+});

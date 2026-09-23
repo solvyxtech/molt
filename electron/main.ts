@@ -46,7 +46,7 @@ import { barInitText, parseJournal, mutatesSession } from "./limits.js";
 import { resolvePath, PATH_PROBE, type PathFixReport } from "./login-path.js";
 import { Engine, MAX_STEPS } from "../src/engine.js";
 import { Archive } from "../src/archive.js";
-import { Receipts } from "../src/receipts.js";
+import { Receipts, receiptName } from "../src/receipts.js";
 import { Journal } from "../src/journal.js";
 import { Integrity } from "../src/integrity.js";
 import { buildRepoMap } from "../src/repomap.js";
@@ -1676,13 +1676,7 @@ ipcMain.handle("receipts:list", () => {
     .reverse()
     .map((f) => {
       const p = join(dir, f);
-      const m = /^(\d+)-(accepted|refused|exhausted)\.md$/.exec(f);
-      return {
-        file: f,
-        n: m ? Number(m[1]) : 0,
-        verdict: m?.[2] ?? "unknown",
-        mtime: statSync(p).mtimeMs,
-      };
+      return { file: f, ...receiptName(f), mtime: statSync(p).mtimeMs };
     });
 });
 
