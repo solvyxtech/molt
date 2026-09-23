@@ -115,3 +115,44 @@ describe("a dead child's stdin does not throw", () => {
     assert.match(events.find((e) => e.kind === "done")?.error ?? "", /EPIPE/);
   });
 });
+
+describe("what a subscription step would have cost", () => {
+  it("journals each step's own share, not the session's running total again", async () => {
+    const { Engine } = await import("../src/engine.js");
+    const { Journal } = await import("../src/journal.js");
+    const { Archive } = await import("../src/archive.js");
+    const { Receipts } = await import("../src/receipts.js");
+    const { parseBar } = await import("../src/bar.js");
+    const { CLAUDE_CODE_URL } = await import("../src/claude-code.js");
+    const { allowAll, drain, scriptedClaudeCode, workspace } = await import("./helpers.js");
+    const w = workspace();
+    try {
+      const journal = new Journal(w.dir);
+      // The SDK reports 0.01 after step one and 0.02 after step two: a running
+      // total. Each step cost 0.01.
+      const cc = scriptedClaudeCode([
+        { calls: [{ name: "write_file", args: { path: "a.txt", content: "a\n" } }], text: "Done." },
+        { calls: [{ name: "write_file", args: { path: "b.txt", content: "b\n" } }], text: "Done now." },
+      ]);
+      const engine = new Engine({
+        baseUrl: CLAUDE_CODE_URL,
+        model: "sonnet",
+        provider: "claude-code",
+        cwd: w.dir,
+        journal,
+        claudeCodeSdk: cc.sdk,
+        bar: parseBar("version: 1\nchecks:\n  - name: b\n    run: test -f b.txt\n"),
+        archive: new Archive(w.dir),
+        receipts: new Receipts(w.dir),
+      });
+      await drain(engine.run("write a.txt and b.txt", allowAll));
+      const notes = Journal.read(journal.path)
+        .filter((e) => e.kind === "note" && (e.data as { subscription?: boolean }).subscription)
+        .map((e) => (e.data as { costEstimateUsd: number }).costEstimateUsd);
+      assert.equal(notes.length, 2);
+      assert.deepEqual(notes.map((n) => n.toFixed(2)), ["0.01", "0.01"]);
+    } finally {
+      w.cleanup();
+    }
+  });
+});

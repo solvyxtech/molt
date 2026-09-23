@@ -1247,6 +1247,8 @@ export class Engine {
    * 958 fresh ones, and a session per turn pays that back every time.
    */
   private cc?: BackendSession<EngineEvent>;
+  /** The subscription backend's last running cost total; see the note it feeds. */
+  private subscriptionCostSeen = 0;
 
   /**
    * The model a receipt names: what the backend confirms ran, not what was
@@ -3077,6 +3079,7 @@ export class Engine {
     if (this.cc && this.ccSystem !== system) {
       await this.cc.close();
       this.cc = undefined;
+      this.subscriptionCostSeen = 0;
     }
     if (!this.cc) {
       this.ccSystem = system;
@@ -3311,10 +3314,21 @@ export class Engine {
      * "0.0000 USD would have been billed" is not a cheap turn — it is a
      * missing number wearing a measurement's clothes.
      */
+    /**
+     * The SDK's figure is the session's running total, and it was journalled
+     * as each step's: summing the notes over a session counted the first step
+     * once per step after it. The step's own share is the difference from the
+     * last reading; the running total is kept beside it, named as such.
+     */
     if (done.cumulativeCostUsd > 0) {
+      const step = Math.max(0, done.cumulativeCostUsd - this.subscriptionCostSeen);
+      this.subscriptionCostSeen = done.cumulativeCostUsd;
       ctx.log?.append("note", {
-        text: `${this.cfg.provider ?? "subscription"}: ${done.cumulativeCostUsd.toFixed(4)} USD would have been billed on the API`,
-        costEstimateUsd: done.cumulativeCostUsd,
+        text:
+          `${this.cfg.provider ?? "subscription"}: ${step.toFixed(4)} USD would have been billed ` +
+          `on the API for this step (${done.cumulativeCostUsd.toFixed(4)} this session)`,
+        costEstimateUsd: step,
+        sessionCostEstimateUsd: done.cumulativeCostUsd,
         subscription: true,
       });
     }
@@ -3337,6 +3351,7 @@ export class Engine {
   private async dropClaudeCode(): Promise<void> {
     const cc = this.cc;
     this.cc = undefined;
+    this.subscriptionCostSeen = 0;
     this.ccCtx = undefined;
     await cc?.close();
   }
