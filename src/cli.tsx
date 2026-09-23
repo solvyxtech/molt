@@ -1242,10 +1242,11 @@ function cmdLog(args: Args): number {
 
 function cmdVerify(args: Args): number {
   const files = Journal.sessions(args.cwd);
-  if (files.length === 0) {
-    process.stdout.write("no session logs to verify\n");
-    return 0;
-  }
+  // No logs is not the end of the question. It returned here, exit 0, before
+  // the integrity chain was read — so deleting every session log, which is
+  // the one tampering the chain exists to name, was reported as a project
+  // with nothing to verify. The chain still binds those logs; ask it.
+  if (files.length === 0) process.stdout.write("no session logs on disk\n");
   let bad = 0;
   let empty = 0;
   for (const f of files) {
@@ -1265,11 +1266,13 @@ function cmdVerify(args: Args): number {
     if (!r.ok) bad++;
   }
   const verified = files.length - empty - bad;
-  process.stdout.write(
-    bad === 0
-      ? `\n${verified} log(s) verified${empty ? ` · ${empty} empty log(s) hold nothing to verify` : ""}. Each entry hashes its predecessor, so any\nalteration or deletion breaks the chain from that point on.\n`
-      : `\n${bad} log(s) failed verification.\n`,
-  );
+  if (files.length) {
+    process.stdout.write(
+      bad === 0
+        ? `\n${verified} log(s) verified${empty ? ` · ${empty} empty log(s) hold nothing to verify` : ""}. Each entry hashes its predecessor, so any\nalteration or deletion breaks the chain from that point on.\n`
+        : `\n${bad} log(s) failed verification.\n`,
+    );
+  }
 
   // The cross-link: journals, receipts and exuviae are only as trustworthy as
   // the binding that connects them. Verify the project-level integrity chain
