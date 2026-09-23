@@ -414,3 +414,26 @@ describe("the wall clock on a subscription backend", () => {
     assert.ok(cc.sent.some((t) => /time budget for this turn is up/i.test(t)));
   });
 });
+
+describe("ctrl+C on a subscription backend", () => {
+  it("ends the turn as cancelled, not as a session that failed to answer", async () => {
+    // cancel() ends the session, which stops without a result; that was
+    // reported as "the Claude Code session ended without answering", an
+    // error, with no rollback and no `cancelled` in the journal.
+    const dir = ws();
+    const { engine } = engineIn(dir, [
+      { calls: [{ name: "bash", args: { command: "echo hi" } }], text: "done" },
+    ]);
+    const events = await drain(
+      engine.run("do it", async () => {
+        engine.cancel();
+        return false;
+      }),
+    );
+    assert.ok(events.some((e) => e.kind === "cancelled"), JSON.stringify(events.map((e) => e.kind)));
+    assert.ok(
+      !events.some((e) => e.kind === "error" && /ended without answering/.test(e.text)),
+      "a cancel was reported as a failure",
+    );
+  });
+});

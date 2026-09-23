@@ -1431,6 +1431,8 @@ export class Engine {
   /** sha256 of .molt/done.yml as it stood when the session began. */
   private barHash: string | null;
   private inFlight?: AbortController;
+  /** ctrl+C dropped the subscription session mid-step; the step reports a cancel, not a fault. */
+  private ccCancelled = false;
   /** Aborts the command or bar check currently executing, if any. */
   private running?: AbortController;
   /**
@@ -1640,7 +1642,10 @@ export class Engine {
      * watching. Ending the session is the only way to unask the question, so
      * the next turn starts a new one.
      */
-    if (this.cc) void this.dropClaudeCode();
+    if (this.cc) {
+      this.ccCancelled = true;
+      void this.dropClaudeCode();
+    }
   }
 
   get streaming(): boolean {
@@ -3103,9 +3108,10 @@ export class Engine {
     ctx: ToolContext,
   ): AsyncGenerator<
     EngineEvent,
-    { msg: Msg; usage: Usage; finishReason?: string; streamed: boolean } | null
+    { msg: Msg; usage: Usage; finishReason?: string; streamed: boolean } | "cancelled" | null
   > {
     this.ccCtx = ctx;
+    this.ccCancelled = false;
     let cc: BackendSession<EngineEvent>;
     try {
       cc = await this.subprocessSession();
@@ -3213,6 +3219,15 @@ export class Engine {
       }
     }
 
+    // ctrl+C ends the session, which is the only way to unask the question —
+    // and a session ended that way stops without a result. That silence was
+    // reported as "the session ended without answering", an error, with the
+    // transcript left holding the abandoned step and no `cancelled` in the
+    // journal: the HTTP path's cancel, told as a provider fault.
+    if (this.ccCancelled) {
+      this.ccCancelled = false;
+      return "cancelled";
+    }
     if (!done) {
       yield { kind: "error", text: `the ${this.backendLabel} session ended without answering` };
       await this.dropClaudeCode();
@@ -3937,6 +3952,13 @@ export class Engine {
           shown,
           answered,
         });
+        if (got === "cancelled") {
+          this.transcript.rollbackTo(turnStart);
+          const wrote = [...new Set(this.ledger.map((e) => e.path))];
+          log?.append("cancelled", { step, rolledBack: true, filesWritten: wrote });
+          yield { kind: "cancelled", filesWritten: wrote };
+          return;
+        }
         if (!got) return;
         msg = got.msg;
         usage = got.usage;
