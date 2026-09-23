@@ -61,6 +61,11 @@ go test — molt reads it:
 - **Failures the runner reported are refused**, whatever the exit code said.
   When the command has a pipe and no `pipefail`, the check is reported as
   broken (the runner's status was lost in the pipe) rather than as work to do.
+- **A known test runner feeding a pipe without `pipefail`** (`npm test | tee
+  log`, `node --test | tail -3`) is reported as broken unless its own summary
+  shows a clean run. The shell returns the last stage's status, and a `tail`
+  can cut the failure line too, so neither the exit code nor the output can
+  be trusted. Add `set -o pipefail;` or drop the pipe.
 - **A command ending in `|| true`, `|| :`, `; true` or `exit 0` cannot fail**,
   so its pass is refused as establishing nothing, unless the runner's own
   summary shows tests that ran and passed.

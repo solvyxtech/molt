@@ -25,7 +25,7 @@ import { after, describe, it } from "node:test";
 import { Archive } from "../src/archive.js";
 import { parseBar, runBar, selectChecks } from "../src/bar.js";
 import { Engine } from "../src/engine.js";
-import { judgePass, pipesWithoutPipefail, readSummary, swallowsExit } from "../src/evidence.js";
+import { judgePass, pipesWithoutPipefail, readSummary, runnerPipedAway, swallowsExit } from "../src/evidence.js";
 import { Receipts } from "../src/receipts.js";
 import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
@@ -107,6 +107,40 @@ describe("the command's own words", () => {
     assert.equal(pipesWithoutPipefail("set -o pipefail; npm test | tee out.log"), false);
     assert.equal(pipesWithoutPipefail("npm test || npm run test:retry"), false);
     assert.equal(pipesWithoutPipefail(`grep -E "a|b" src/x.ts`), false);
+  });
+});
+
+describe("a runner whose verdict a pipe threw away", () => {
+  it("names a known runner that is not the last stage of an unguarded pipe", () => {
+    assert.equal(runnerPipedAway("node --test --test-reporter=tap x.test.mjs | tail -3"),
+      "node --test --test-reporter=tap x.test.mjs");
+    assert.equal(runnerPipedAway("npm test 2>&1 | tee out.log"), "npm test 2>&1");
+    assert.equal(runnerPipedAway("cd pkg && CI=1 npx vitest run | cat"), "CI=1 npx vitest run");
+    assert.equal(runnerPipedAway("set -o pipefail; npm test | tee log"), null, "pipefail keeps it");
+    assert.equal(runnerPipedAway("grep -c TODO src/*.ts | wc -l"), null, "not a runner");
+    assert.equal(runnerPipedAway("echo x | npm test"), null, "the runner is the last stage");
+    assert.equal(runnerPipedAway(`grep -E "npm test|jest" ci.yml`), null, "a pipe inside quotes");
+  });
+
+  it("refuses the measured case: a failing node suite piped through tail passed", async () => {
+    // The exact shape found by trying it: `| tail -3` keeps TAP's last three
+    // lines, which do not include `# fail 1`, and exits 0.
+    const dir = ws();
+    writeFileSync(
+      join(dir, "bad.test.mjs"),
+      'import t from "node:test"; import a from "node:assert"; t("x", () => a.equal(1, 2));\n',
+    );
+    const bar = parseBar(`
+version: 1
+checks:
+  - name: piped
+    run: node --test --test-reporter=tap bad.test.mjs | tail -3
+`)!;
+    const r = (await runBar(bar, ctx(dir))).results[0]!;
+    assert.equal(r.exitCode, 0, "the shell really did say 0");
+    assert.equal(r.ok, false);
+    assert.equal(r.didNotRun, true);
+    assert.match(r.output, /pipefail/);
   });
 });
 

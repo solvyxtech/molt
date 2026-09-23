@@ -143,6 +143,40 @@ export function pipesWithoutPipefail(run: string): boolean {
   return /(^|[^|])\|(?!\|)/.test(run.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, "''"));
 }
 
+/**
+ * A test runner that is not the last stage of an unguarded pipe.
+ *
+ * `node --test | tail -3` exits with tail's status AND cuts the runner's
+ * failure line out of the output, so neither the exit code nor the summary
+ * can refuse it — measured, not supposed: a failing suite passed exactly this
+ * way. Recognised by the stage's first word, for runners common enough to
+ * name; anything else in a pipe is left alone, because `grep | wc -l` is an
+ * ordinary check and its status is the one that was meant.
+ */
+const RUNNER_STAGE =
+  /^(?:\S+=\S+\s+)*(?:npx\s+|pnpm\s+(?:exec\s+)?|yarn\s+|bunx?\s+)?(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b|node\s+(?:\S+\s+)*--test\b|jest\b|vitest\b|mocha\b|pytest\b|python3?\s+-m\s+(?:pytest|unittest)\b|go\s+test\b|cargo\s+(?:test|nextest)\b|deno\s+test\b|make\s+(?:test|check)\b)/;
+
+export function runnerPipedAway(run: string): string | null {
+  if (!pipesWithoutPipefail(run)) return null;
+  const masked = run.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, (m) => "_".repeat(m.length));
+  const stages: string[] = [];
+  let from = 0;
+  for (let i = 0; i < masked.length; i++) {
+    if (masked[i] === "|" && masked[i + 1] !== "|" && masked[i - 1] !== "|") {
+      stages.push(run.slice(from, i));
+      from = i + 1;
+    }
+  }
+  stages.push(run.slice(from));
+  for (const stage of stages.slice(0, -1)) {
+    // The stage's own command: after the last `;`/`&&` in it, so a setup step
+    // before the runner does not hide it.
+    const cmd = stage.split(/;|&&/).at(-1)!.trim();
+    if (RUNNER_STAGE.test(cmd)) return cmd;
+  }
+  return null;
+}
+
 export type PassJudgement =
   | { ok: true; summary: RunnerSummary | null }
   | { ok: false; summary: RunnerSummary | null; why: string; broken?: boolean };
@@ -181,6 +215,18 @@ export function judgePass(run: string, output: string, emptyAllowed = false): Pa
         `the command exited 0, but ${summary.runner} ran zero tests. A suite that executed ` +
         "nothing establishes nothing — check the test glob or filter, and that the tests " +
         "still exist. If this suite may legitimately be empty, set `empty: allow` on the check.",
+    };
+  }
+  const piped = runnerPipedAway(run);
+  if (piped && !(summary && summary.total && summary.failed === 0)) {
+    return {
+      ok: false,
+      summary,
+      broken: true,
+      why:
+        `\`${piped}\` feeds a pipe without pipefail, so this check exits with the LAST ` +
+        "stage's status and the runner's verdict is lost. Add `set -o pipefail;` to the " +
+        "check in .molt/done.yml, or drop the pipe.",
     };
   }
   const swallowed = swallowsExit(run);
