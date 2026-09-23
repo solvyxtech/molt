@@ -151,6 +151,10 @@ for (const root of roots) {
     let session = idx.session ?? null;
     if (!session) for (const [sid, es] of journals) if (es.some((e) => e.kind === "receipt" && basename(String(e.data.file ?? "")) === f)) { session = sid; break; }
     const turn = session && journals.has(session) ? turnOf(journals.get(session), f) : null;
+    // An undetermined receipt is not a verdict on the work: required checks
+    // never ran. Training a verdict predictor on it would teach "not accepted"
+    // for work nothing refused.
+    if ((r.verdict ?? idx.verdict) === "undetermined") continue;
     rows.set(id, {
       provenance: { roots: [basename(root)], receipt: f, receiptSha256: id, session, journal: turn ? { from: turn.from, to: turn.to } : null },
       model: r.meta["model"] ?? idx.model ?? null,

@@ -840,13 +840,9 @@ export function App({
       const rows = engine.receipts?.records() ?? [];
       const last = rows.at(-1);
       if (last) {
-        setProofHint(
-          last.verdict === "accepted"
-            ? "receipt accepted"
-            : last.verdict === "refused"
-              ? "receipt refused"
-              : "receipt exhausted",
-        );
+        // The verdict as written, not inferred from what it is not: an
+        // undetermined receipt read "receipt exhausted" here, in red.
+        setProofHint(`receipt ${last.verdict}`);
       } else {
         setProofHint(bar ? "bar sealed · no receipts yet" : undefined);
       }
@@ -2693,7 +2689,15 @@ export function App({
             {"  " + spineNames.join(" · ")}
           </Text>
           {proofHint ? (
-            <Text color={proofHint.includes("refused") || proofHint.includes("exhausted") ? theme.fail : theme.ok}>
+            <Text
+              color={
+                proofHint.includes("refused") || proofHint.includes("exhausted")
+                  ? theme.fail
+                  : proofHint.includes("undetermined")
+                    ? theme.dim
+                    : theme.ok
+              }
+            >
               {"  " + proofHint}
             </Text>
           ) : null}
