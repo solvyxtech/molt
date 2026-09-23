@@ -75,6 +75,15 @@ const POSITIVE: [string, string][] = [
       "```\n\n[Tool result: success]\n\nAll done; the constant is now 2.",
   ],
   [
+    "flat JSON with the tool's own parameters",
+    'Writing it now:\n\n```json\n{"tool": "write_file", "path": "a.txt", "content": "hello"}\n```',
+  ],
+  [
+    "ReAct Action / Action Input / Observation",
+    "Thought: I need to create the file.\nAction: write_file\nAction Input: " +
+      '{"path": "a.txt", "content": "hello"}\nObservation: wrote a.txt\nFinal Answer: done',
+  ],
+  [
     "a tool_call fence",
     "```tool_call\nwrite_file(path='a.txt', content='hello')\n```\nThe file has been written.",
   ],
@@ -117,6 +126,12 @@ const NEGATIVE: [string, string][] = [
       "```python\nsubprocess.run(['grep', '-rn', 'fetchFn', 'src'])\n```",
   ],
   ["the tools named in prose", "The `bash` tool runs a command with a 60 s timeout; `grep` is faster for search."],
+  [
+    "an answer describing a config object that happens to have a path",
+    "The loader reads a manifest like this:\n\n```json\n" +
+      '{"name": "molt", "path": "dist/cli.js"}\n```\n\nand resolves `path` against the package root.',
+  ],
+  ["a report that names the ReAct format", "Older agents used an Action: / Action Input: loop; molt does not."],
   ["an ordinary claim", "Done. src/a.ts now exports `parse`, and the new test covers the empty case."],
   ["empty", ""],
 ];

@@ -83,8 +83,14 @@ function callShaped(v: unknown, tools: ReadonlySet<string>): boolean {
   }
   const name = o.name ?? o.tool ?? o.tool_name ?? o.recipient_name;
   if (typeof name !== "string" || !tools.has(name.replace(/^functions\./, ""))) return false;
-  return ["arguments", "parameters", "args", "input"].some((k) => k in o);
+  // Nested arguments, or — the flat shape small models favour — the tool's
+  // own parameters beside its name: `{"tool": "write_file", "path": …}`.
+  return [...ARG_KEYS, ...PARAM_KEYS].some((k) => k in o);
 }
+
+const ARG_KEYS = ["arguments", "parameters", "args", "input"];
+/** Parameter names of molt's tools, as they appear in a flat call. */
+const PARAM_KEYS = ["path", "content", "command", "pattern", "old_text", "new_text"];
 
 function parseJson(body: string): unknown {
   try {
@@ -153,7 +159,7 @@ export function narratedCallIn(
   const jsonName = new RegExp(
     `"(?:name|tool|tool_name)"\\s*:\\s*"(?:functions\\.)?(${names})"`,
   );
-  const jsonArgs = /"(?:arguments|parameters|args|input)"\s*:/;
+  const jsonArgs = /"(?:arguments|parameters|args|input|path|content|command|pattern|old_text|new_text)"\s*:/;
   const nameHit = jsonName.exec(plain);
   if (nameHit) {
     const near = plain.slice(Math.max(0, nameHit.index - 400), nameHit.index + 400);
@@ -164,6 +170,12 @@ export function narratedCallIn(
   const callSyntax = new RegExp(`\\b(${names})\\(\\s*(?:\\{|["']|\\w+\\s*=)`);
   const syn = callSyntax.exec(plain);
   if (syn) return `it writes out a call to \`${syn[1]}(…)\` as text`;
+
+  // ReAct, which a model trained on agent transcripts falls back to:
+  // "Action: write_file" / "Action Input: {…}", and an "Observation:" it wrote.
+  const react = new RegExp(`^[ \\t]*Action:[ \\t]*\`?(${names})\`?[ \\t]*\\n[ \\t]*Action Input:`, "m");
+  const acted = react.exec(plain);
+  if (acted) return `it writes a ReAct "Action: ${acted[1]}" instead of calling it`;
 
   // Announced, in the present or future tense, and not made.
   const intent = new RegExp(
