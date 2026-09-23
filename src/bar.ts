@@ -879,8 +879,14 @@ async function mutationCheck(
   timeoutMs: number,
   allowEmpty = false,
 ): Promise<{ ok: boolean; output: string; established?: boolean }> {
+  // Source code only, and not the tests themselves. A live run mutated
+  // package.json — `&&` to `||` inside a JSON string — and reported the
+  // survivor as a line "nothing checks". A manifest, a doc or a config is not
+  // code the suite is meant to pin, and breaking a test's own line says
+  // nothing about the code under test.
   const files = ctx.ledger
     .filter((e) => e.changedLines && e.changedLines.length > 0)
+    .filter((e) => coverageCouldSpeak(e.path) && !isTestPath(e.path))
     .map((e) => {
       const abs = resolve(ctx.cwd, e.path);
       let text = "";
@@ -910,7 +916,7 @@ async function mutationCheck(
    * refuses it.
    */
   if (files.length === 0) {
-    return { ok: true, established: false, output: "No changed lines to mutate." };
+    return { ok: true, established: false, output: "No changed source lines to mutate." };
   }
 
   const plan = planMutations(files, sample) as (Mutation & { path: string })[];

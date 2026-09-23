@@ -171,6 +171,21 @@ export function detectChecks(cwd: string): Detected[] {
  * (types, tests). Builtins last, tagged `session`, because they are meaningful
  * inside a session and not from a standalone `molt prove`.
  */
+/**
+ * Does this project already produce `coverage/lcov.info`?
+ *
+ * The report on disk, or a test script that plainly asks for coverage. A
+ * guess either way costs something, so it errs toward off: an absent coverage
+ * check is a line to uncomment, and a present one nothing feeds fails every
+ * turn.
+ */
+function writesLcov(cwd: string): boolean {
+  if (existsSync(join(cwd, "coverage", "lcov.info"))) return true;
+  const pkg = readJson(join(cwd, "package.json"));
+  const scripts = Object.values((pkg?.scripts ?? {}) as Record<string, unknown>).join(" ");
+  return /\blcov\b|\bc8\b|\bnyc\b|--coverage\b|test-coverage/.test(scripts);
+}
+
 export function proposeBar(cwd: string): { yaml: string; detected: Detected[] } {
   const detected = detectChecks(cwd);
 
@@ -254,13 +269,26 @@ export function proposeBar(cwd: string): { yaml: string; detected: Detected[] } 
     detected.find((c) => c.name === "test") ??
     detected.find((c) => c.name === "check" || c.name === "ci");
   if (tests) {
+    // Only switched on when this project already writes an lcov report. It
+    // used to be proposed for any test command, pointed at a path nothing
+    // wrote, so the first turn on an ordinary project always failed
+    // `work-proven` — and a capable model, told to satisfy it, rewrote the
+    // project's test script to emit coverage. That is the bar causing scope
+    // creep, not catching it. Offered commented out otherwise, with how to
+    // turn it on.
+    const on = writesLcov(cwd);
+    const c = on ? "" : "# ";
     tail.push(
       "  # Every added line is executed by the suite. Point `lcov` at whatever",
-      "  # the test command actually writes; this is the conventional path.",
-      "  - name: work-proven",
-      "    builtin: diff-covered",
-      "    lcov: coverage/lcov.info",
-      "    tags: [session]",
+      on
+        ? "  # the test command actually writes; this is the conventional path."
+        : "  # the test command writes. Off: nothing here writes lcov yet — make the test\n" +
+          "  # command emit it (node --test --experimental-test-coverage --test-reporter=lcov,\n" +
+          "  # c8, nyc, jest --coverage) and uncomment.",
+      `  ${c}- name: work-proven`,
+      `  ${c}  builtin: diff-covered`,
+      `  ${c}  lcov: coverage/lcov.info`,
+      `  ${c}  tags: [session]`,
       "",
       `  # Break a sample of those lines; the suite must go red. ${tests.because}.`,
       "  - name: work-checked",

@@ -448,3 +448,18 @@ describe("spec-intact with no test file in scope", () => {
     assert.match(r?.output ?? "", /no test file was changed/);
   });
 });
+
+describe("mutation breaks source code, not manifests or the tests themselves", () => {
+  it("does not mutate package.json or a test file (a live run did, and called it unchecked code)", async () => {
+    const dir = ws();
+    mkdirSync(join(dir, "test"), { recursive: true });
+    writeFileSync(join(dir, "package.json"), '{ "scripts": { "test": "mkdir -p c && node --test" } }\n');
+    writeFileSync(join(dir, "test/a.test.js"), "assert.ok(1 > 0);\n");
+    // A run that would "survive" every mutation if one were ever made.
+    const BAR = parseBar("version: 1\nchecks:\n  - name: mutated\n    builtin: mutation\n    run: 'true'\n");
+    const [r] = (await runBar(BAR, ctxIn(dir, [wrote("package.json", [1]), wrote("test/a.test.js", [1])]))).results;
+    assert.equal(r?.ok, true);
+    assert.equal(r?.established, false, "nothing it is meant to judge was changed");
+    assert.match(r?.output ?? "", /No changed source lines/);
+  });
+});

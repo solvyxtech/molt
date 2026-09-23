@@ -188,13 +188,30 @@ describe("what molt proposes to a project it has never seen", () => {
     );
   });
 
-  it("adds coverage and mutation once a test command exists", async () => {
+  it("adds mutation for any test command, and leaves coverage off when nothing writes lcov", async () => {
+    // A live run on a fresh project: work-proven failed the first turn for a
+    // report nothing wrote, and the model rewrote package.json to emit one.
     const { proposeBar } = await import("../src/detect.js");
     const w = workspace();
     cleanups.push(w.cleanup);
     writeFileSync(
       join(w.dir, "package.json"),
       JSON.stringify({ name: "x", scripts: { test: "node --test" } }),
+    );
+    const { yaml } = proposeBar(w.dir);
+    const bar = parseBar(yaml);
+    assert.equal(bar.checks.some((c) => c.name === "work-proven"), false, "no active coverage check");
+    assert.match(yaml, /# - name: work-proven/, "offered, commented, with how to turn it on");
+    assert.ok(bar.checks.some((c) => c.kind === "builtin" && c.builtin === "mutation"));
+  });
+
+  it("adds coverage and mutation once the test command writes lcov", async () => {
+    const { proposeBar } = await import("../src/detect.js");
+    const w = workspace();
+    cleanups.push(w.cleanup);
+    writeFileSync(
+      join(w.dir, "package.json"),
+      JSON.stringify({ name: "x", scripts: { test: "c8 --reporter=lcov node --test" } }),
     );
     const { yaml } = proposeBar(w.dir);
     const bar = parseBar(yaml);
