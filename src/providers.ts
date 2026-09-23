@@ -11,6 +11,7 @@
  * tool whose whole pitch is an auditable record never writes a credential
  * into one.
  */
+import { probeSignal } from "./watchdog.js";
 import { ACP_AGENTS, isAcp } from "./acp.js";
 import { AGY_URL, isAgy } from "./agy.js";
 import { CLAUDE_CODE_URL, isClaudeCode } from "./claude-code.js";
@@ -342,7 +343,12 @@ export async function fetchPricing(
   if (!route) return null;
 
   try {
-    const res = await fetchFn(`${base}${route.path}`, { headers: authHeaders(base, apiKey) });
+    // Bounded: this runs before a turn starts, and a price list that never
+    // arrives must not be the reason a run never begins.
+    const res = await fetchFn(`${base}${route.path}`, {
+      headers: authHeaders(base, apiKey),
+      signal: probeSignal(),
+    });
     if (!res.ok) return null;
     return route.parse(await res.json(), model);
   } catch {

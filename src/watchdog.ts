@@ -160,3 +160,26 @@ export function waited(ms: number): string {
   const s = Math.round(ms / 1000);
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
 }
+
+/**
+ * How long a probe — a `/models` listing, a price lookup — may take.
+ *
+ * Twenty seconds. A probe is not a model request: any healthy server answers
+ * it at once, and nothing about it scales with a prompt. Without a bound, one
+ * saved endpoint that accepts connections and never answers held `/model`'s
+ * picker on "busy" for ever, because it asks every provider at once and waits
+ * for all of them, and `molt doctor` — the command for finding out what is
+ * wrong — hung on the very fault it exists to report.
+ */
+export const PROBE_TIMEOUT_MS = 20_000;
+
+/** A signal that ends a probe after `ms`, or none when `ms` is 0. */
+export function probeSignal(ms = PROBE_TIMEOUT_MS): AbortSignal | undefined {
+  return ms > 0 ? AbortSignal.timeout(ms) : undefined;
+}
+
+/** What a failed probe says: its own timeout named as such, anything else as it came. */
+export function probeError(e: unknown, url: string, ms = PROBE_TIMEOUT_MS): string {
+  const name = (e as { name?: string } | null)?.name;
+  return name === "TimeoutError" ? `no answer from ${url} in ${waited(ms)}` : String(e);
+}

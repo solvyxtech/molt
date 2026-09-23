@@ -43,7 +43,7 @@ import {
 import { errorText } from "./format.js";
 import { narratedCallIn, narratedCallNudge } from "./narrated.js";
 import { redact } from "./redact.js";
-import { Watchdog, firstByteMs, requestIdleMs, waited } from "./watchdog.js";
+import { Watchdog, firstByteMs, probeError, probeSignal, requestIdleMs, waited } from "./watchdog.js";
 import {
   SKIP_DIRS,
   WALK_DEADLINE_MS,
@@ -916,6 +916,8 @@ export type EngineConfig = {
    * For a server whose speed is known, and for tests.
    */
   requestFirstByteMs?: number;
+  /** How long `doctor` and `listModels` wait on `/models`. PROBE_TIMEOUT_MS unless set; 0 is none. */
+  probeTimeoutMs?: number;
   /**
    * A map of the repository, added to the system prompt. Built by the caller
    * (it walks the disk, which the constructor must not) and paid for once,
@@ -5210,8 +5212,12 @@ export class Engine {
      */
     const badEndpoint = endpointProblem(this.cfg.baseUrl);
     if (badEndpoint) return { ok: false, reachable: false, detail: badEndpoint };
+    const probeMs = this.cfg.probeTimeoutMs;
     try {
-      const res = await fetchFn(`${base}/models`, { headers: authHeaders(base, this.cfg.apiKey) });
+      const res = await fetchFn(`${base}/models`, {
+        headers: authHeaders(base, this.cfg.apiKey),
+        signal: probeSignal(probeMs),
+      });
       if (!res.ok) {
         return { ok: false, reachable: false, detail: `HTTP ${res.status} from ${base}/models` };
       }
@@ -5242,7 +5248,7 @@ export class Engine {
             : ` · ⚠ '${this.cfg.model}' NOT in list (try: ${ids.slice(0, 3).join(", ")})`),
       };
     } catch (e) {
-      return { ok: false, reachable: false, detail: `cannot reach ${base}: ${String(e)}` };
+      return { ok: false, reachable: false, detail: `cannot reach ${base}: ${probeError(e, `${base}/models`, probeMs)}` };
     }
   }
 
@@ -5261,14 +5267,18 @@ export class Engine {
     // The constant, not the live list: `/model` asks every provider it knows,
     // and a picker keystroke must not spawn a CLI. See AGY_MODELS.
     if (isAgy(baseUrl)) return { ok: true, ids: [...AGY_MODELS] };
+    const probeMs = this.cfg.probeTimeoutMs;
     try {
-      const res = await fetchFn(`${base}/models`, { headers: authHeaders(base, apiKey) });
+      const res = await fetchFn(`${base}/models`, {
+        headers: authHeaders(base, apiKey),
+        signal: probeSignal(probeMs),
+      });
       if (!res.ok) return { ok: false, error: `HTTP ${res.status} from ${base}/models` };
       const json = (await res.json().catch(() => null)) as { data?: { id?: string }[] } | null;
       const ids = (json?.data ?? []).map((m) => m.id).filter(Boolean) as string[];
       return { ok: true, ids };
     } catch (e) {
-      return { ok: false, error: String(e) };
+      return { ok: false, error: probeError(e, `${base}/models`, probeMs) };
     }
   }
 }

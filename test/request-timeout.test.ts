@@ -218,3 +218,30 @@ describe("the wall clock", () => {
     assert.equal(texts(events, "error").length, 0, "running out of time is not a provider error");
   });
 });
+
+describe("a probe that never answers", () => {
+  it("ends /model's listing and molt doctor instead of holding them for ever", async () => {
+    // `/model` asks every saved provider at once and waits for all of them,
+    // so one endpoint like this kept the picker busy for ever; doctor, the
+    // command for finding out what is wrong, hung on the fault itself.
+    const server = await serve(() => {});
+    const { engine } = engineAt(server.url, { probeTimeoutMs: 150 });
+    const t0 = Date.now();
+    const [listed, doc] = await Promise.all([engine.listModels(), engine.doctor()]);
+    assert.ok(Date.now() - t0 < 3_000);
+    assert.deepEqual(listed, { ok: false, error: `no answer from ${server.url}/models in 150ms` });
+    assert.equal(doc.ok, false);
+    assert.equal(doc.reachable, false);
+    assert.match(doc.detail, /no answer from .*\/models in 150ms/);
+  });
+
+  it("still lists the models of an endpoint that answers", async () => {
+    const server = await serve((_n, _req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ data: [{ id: "test-model" }] }));
+    });
+    const { engine } = engineAt(server.url, { probeTimeoutMs: 150 });
+    assert.deepEqual(await engine.listModels(), { ok: true, ids: ["test-model"] });
+    assert.equal((await engine.doctor()).ok, true);
+  });
+});
