@@ -341,6 +341,8 @@ export async function interviewTurn(opts: {
   const acp = acpAgentFor(opts.baseUrl);
   if (acp) {
     const asked = await acpAsk({
+      // The same limit an HTTP endpoint gets; this path had none.
+      timeoutMs: askTimeoutMs(800, opts.timeoutMs),
       spec: acp,
       model: opts.model,
       systemPrompt: SYSTEM,
@@ -354,6 +356,7 @@ export async function interviewTurn(opts: {
 
   if (isClaudeCode(opts.baseUrl)) {
     const asked = await claudeCodeAsk({
+      timeoutMs: askTimeoutMs(800, opts.timeoutMs),
       model: opts.model,
       systemPrompt: SYSTEM,
       prompt: context,

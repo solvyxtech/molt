@@ -140,7 +140,10 @@ export const ACP_AGENTS: readonly AcpAgentSpec[] = [
     // No `--always-approve`. See the header: the permission request is how
     // molt refuses a builtin, and approving everything throws that away.
     args: ["agent", "stdio"],
-    models: ["grok-4.6", "grok-4.5"],
+    // What the picker offers before a session exists. The live list comes
+    // from `session/new` and is what a session is checked against; this one
+    // was a model behind (no grok-4.7, Grok's own default) by 2026-09-23.
+    models: ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"],
     installHint: "curl -fsSL https://x.ai/cli/install.sh | bash",
     loginHint: "grok login",
     credentialPath: ".grok/auth.json",
@@ -782,6 +785,12 @@ export function mcpEntry(
   };
 }
 
+/** The `models` block ACP agents return from `session/new` (unstable in the spec). */
+type AcpModelState = {
+  currentModelId?: string;
+  availableModels?: { modelId: string; name?: string }[];
+};
+
 export type AcpOptions<H> = {
   spec: AcpAgentSpec;
   model: string;
@@ -908,9 +917,10 @@ export class AcpSession<H> {
       cwd,
       mcpServers: [mcpEntry(spec, endpoint)],
       _meta: spec.sessionMeta({ systemPrompt }),
-    })) as { sessionId?: string };
+    })) as { sessionId?: string; models?: AcpModelState };
     this.sessionId = res?.sessionId;
     if (!this.sessionId) throw new Error(`${spec.bin} opened no session`);
+    await this.chooseModel(conn, res.models);
 
     /**
      * An agent with no system-prompt override is told the same thing as a
@@ -928,6 +938,59 @@ export class AcpSession<H> {
   }
 
   private preface?: string;
+
+  /**
+   * The model that actually runs, as the agent confirmed it.
+   *
+   * molt never sent the model it was asked for. The agent ran its own
+   * default — Grok's is grok-4.7 — while every receipt recorded the one the
+   * person picked, grok-4.6: a record of evidence naming the wrong author.
+   * ACP carries the choice as `session/set_model`, checked against the
+   * `models` the agent returns from `session/new` (measured against grok
+   * 1.0.41: an unknown id is refused, a listed one confirmed).
+   *
+   * Three outcomes, none of them silent: the requested model is switched to
+   * and confirmed; it is not on offer, which refuses the session with the
+   * list that is; or the agent says nothing about models at all, in which
+   * case what ran is recorded as unconfirmed rather than asserted.
+   */
+  private ran?: string;
+
+  /** What molt can truthfully record as the model: confirmed, or marked unconfirmed. */
+  ranModel(): string | undefined {
+    return this.ran;
+  }
+
+  private async chooseModel(conn: AcpConnection, state: AcpModelState | undefined): Promise<void> {
+    const want = this.opts.model;
+    const offered = (state?.availableModels ?? []).map((m) => m.modelId).filter(Boolean);
+    if (state?.currentModelId && (!want || want === state.currentModelId)) {
+      this.ran = state.currentModelId;
+      return;
+    }
+    if (!want) {
+      this.ran = undefined;
+      return;
+    }
+    if (offered.length && !offered.includes(want)) {
+      throw new Error(
+        `${this.opts.spec.label} does not offer "${want}" on this account; it offers ` +
+          `${offered.join(", ")}. Pick one of those — molt will not run a different model ` +
+          `under the name you chose.`,
+      );
+    }
+    try {
+      await conn.request("session/set_model", { sessionId: this.sessionId, modelId: want });
+      this.ran = want;
+    } catch (e) {
+      if (offered.length) {
+        throw new Error(`${this.opts.spec.label} refused to switch to "${want}": ${String(e)}`);
+      }
+      // The agent names no models and cannot be told one. Recorded as what it
+      // is, so a receipt never states a model nobody confirmed.
+      this.ran = `${want} (unconfirmed: ${this.opts.spec.label} runs its own choice)`;
+    }
+  }
 
   /** Notifications: the streamed reply, thoughts, tool calls, plans. */
   private onNotify(method: string, params: unknown): void {
@@ -1144,6 +1207,12 @@ export type AcpAskOptions = {
   prompt: string;
   cwd?: string;
   spawnFn?: typeof spawn;
+  /**
+   * How long the whole question may take. It had no limit: an agent that
+   * accepted the session and never answered held criteria drafting — which
+   * the window runs before a turn — open for ever. 0 means no limit.
+   */
+  timeoutMs?: number;
 };
 
 /**
@@ -1177,7 +1246,20 @@ export async function acpAsk(
     onRequest: async () => ({ outcome: { outcome: "cancelled" } }),
   });
   let answer = "";
-  try {
+  const limit = opts.timeoutMs ?? 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired =
+    limit > 0
+      ? new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            const e = new Error(`${opts.spec.label} did not answer within ${Math.round(limit / 1000)}s`);
+            e.name = "TimeoutError";
+            reject(e);
+          }, limit);
+          timer.unref?.();
+        })
+      : undefined;
+  const exchange = async (): Promise<{ ok: true; text: string } | { ok: false; error: string }> => {
     await conn.start();
     await conn.request("initialize", {
       protocolVersion: 1,
@@ -1187,8 +1269,22 @@ export async function acpAsk(
       cwd: opts.cwd ?? process.cwd(),
       mcpServers: [],
       _meta: opts.spec.sessionMeta({ systemPrompt: opts.systemPrompt }),
-    })) as { sessionId?: string };
+    })) as { sessionId?: string; models?: AcpModelState };
     if (!res?.sessionId) return { ok: false, error: `${opts.spec.bin} opened no session` };
+    // The same choice the session makes, for the same reason: a draft written
+    // by a model nobody chose is recorded as written by the one they did.
+    const offered = (res.models?.availableModels ?? []).map((m) => m.modelId);
+    if (opts.model && res.models?.currentModelId !== opts.model) {
+      if (offered.length && !offered.includes(opts.model)) {
+        return {
+          ok: false,
+          error: `${opts.spec.label} does not offer "${opts.model}" on this account; it offers ${offered.join(", ")}`,
+        };
+      }
+      await conn.request("session/set_model", { sessionId: res.sessionId, modelId: opts.model }).catch((e) => {
+        if (offered.length) throw e;
+      });
+    }
     const prompt = ("systemPromptOverride" in opts.spec.sessionMeta({ systemPrompt: opts.systemPrompt })
       ? opts.prompt
       : `${opts.systemPrompt}\n\n${opts.prompt}`);
@@ -1198,11 +1294,15 @@ export async function acpAsk(
     });
     const text = answer.trim();
     return text ? { ok: true, text } : { ok: false, error: `${opts.spec.label} returned nothing` };
+  };
+  try {
+    return await (expired ? Promise.race([exchange(), expired]) : exchange());
   } catch (e) {
     return { ok: false, error: errorText(e) };
   } finally {
-    // The question is answered, whichever way it went; the subprocess should
-    // not outlive it.
+    if (timer) clearTimeout(timer);
+    // The question is answered, whichever way it went — including by the
+    // clock — and the subprocess should not outlive it.
     await conn.close();
   }
 }

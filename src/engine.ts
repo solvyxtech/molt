@@ -1247,6 +1247,15 @@ export class Engine {
    * 958 fresh ones, and a session per turn pays that back every time.
    */
   private cc?: BackendSession<EngineEvent>;
+
+  /**
+   * The model a receipt names: what the backend confirms ran, not what was
+   * asked for. An ACP agent that never received the choice ran its own
+   * default while every receipt recorded the requested one.
+   */
+  private modelOfRecord(): string {
+    return this.cc?.ranModel?.() ?? this.cfg.model;
+  }
   /** The system prompt the live session was started with. */
   private ccSystem = "";
   /**
@@ -2728,7 +2737,7 @@ export class Engine {
         result,
         attempt: attempts,
         verdict: "exhausted",
-        model: this.cfg.model,
+        model: this.modelOfRecord(),
         provider: this.provider,
         sessionTokens: this.sessionTokens,
         shedBatches: this.transcript.shedCount,
@@ -2885,7 +2894,7 @@ export class Engine {
         session: this.cfg.journal?.sessionId ?? null,
         receipt: basename(receiptPath),
         verdict,
-        model: this.cfg.model,
+        model: this.modelOfRecord(),
         provider: this.provider,
         task,
         claim,
@@ -5132,7 +5141,7 @@ export class Engine {
           attempt: proofAttempts,
           verdict,
           head,
-          model: this.cfg.model,
+          model: this.modelOfRecord(),
           provider: this.provider,
           sessionTokens: this.sessionTokens,
           session: this.cfg.journal?.sessionId,

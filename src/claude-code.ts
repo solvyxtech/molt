@@ -640,13 +640,34 @@ export type AskOptions = {
   /** How the SDK is found, and how the CLI is. Injected the same way. */
   load?: () => Promise<Sdk>;
   find?: () => Promise<string | undefined>;
+  /** How long the question may take; 0 or absent means no limit. */
+  timeoutMs?: number;
 };
 
 export type Answer = { ok: true; text: string } | { ok: false; error: string };
 
 export async function claudeCodeAsk(opts: AskOptions): Promise<Answer> {
   const controller = new AbortController();
-  const answer = await askOnce(controller, opts);
+  // Bounded like an HTTP question. It was not: a CLI that started and never
+  // answered held the pre-turn draft open for ever, and aborting is the one
+  // lever the SDK gives — it ends the subprocess too.
+  const limit = opts.timeoutMs ?? 0;
+  let timedOut = false;
+  const timer =
+    limit > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, limit)
+      : undefined;
+  timer?.unref?.();
+  const answer = await Promise.race([
+    askOnce(controller, opts),
+    new Promise<Answer>((resolve) => controller.signal.addEventListener("abort", () => {
+      if (timedOut) resolve({ ok: false, error: `Claude Code did not answer within ${Math.round(limit / 1000)}s` });
+    })),
+  ]);
+  if (timer) clearTimeout(timer);
   // The question is answered, whichever way it went; the subprocess should not
   // outlive it. Nothing here holds a session open for a second turn.
   controller.abort();
@@ -981,4 +1002,9 @@ export interface BackendSession<H> {
   send(messages: readonly string[]): AsyncGenerator<BackendEvent<H>>;
   close(): Promise<void>;
   costSoFarUsd(): number;
+  /**
+   * The model that actually ran, when the backend can say so and it may differ
+   * from the one requested. Receipts record this rather than the request.
+   */
+  ranModel?(): string | undefined;
 }

@@ -32,6 +32,8 @@ export type ScriptedAcpTurn = {
   stopReason?: string;
   /** Refuse the session outright, the way a signed-out CLI does. */
   authError?: boolean;
+  /** Accept the prompt and never answer it. */
+  hang?: boolean;
 };
 
 export type ScriptedAgent = {
@@ -44,6 +46,8 @@ export type ScriptedAgent = {
   permissions: { tool: string; outcome: string }[];
   /** Whether the agent was ever handed molt's tool list. */
   toolsSeen: () => string[];
+  /** The model ids molt asked to switch to, in order. */
+  modelsSet: string[];
 };
 
 /** POST one MCP call to molt's in-process server and return its result. */
@@ -65,10 +69,23 @@ async function mcpCall(
   return (await res.json()) as Record<string, unknown>;
 }
 
-export function scriptedAcpAgent(turns: ScriptedAcpTurn[]): ScriptedAgent {
+/**
+ * How the agent answers about models, shaped on grok 1.0.41: `session/new`
+ * returns `models`, and `session/set_model` refuses an id it does not list.
+ * `setModel: "unsupported"` answers method-not-found, as an agent without the
+ * (unstable) method would.
+ */
+export type AgentModels = {
+  current?: string;
+  available?: string[];
+  setModel?: "strict" | "unsupported";
+};
+
+export function scriptedAcpAgent(turns: ScriptedAcpTurn[], models: AgentModels = {}): ScriptedAgent {
   const sent: string[] = [];
   const permissions: { tool: string; outcome: string }[] = [];
   let sessionParams: Record<string, unknown> = {};
+  const modelsSet: string[] = [];
   let tools: string[] = [];
   let turn = 0;
 
@@ -165,7 +182,35 @@ export function scriptedAcpAgent(turns: ScriptedAcpTurn[]): ScriptedAgent {
             };
             tools = (listed.result?.tools ?? []).map((t) => t.name);
           }
-          write({ jsonrpc: "2.0", id, result: { sessionId: "s1" } });
+          write({
+            jsonrpc: "2.0",
+            id,
+            result: {
+              sessionId: "s1",
+              ...(models.current
+                ? {
+                    models: {
+                      currentModelId: models.current,
+                      availableModels: (models.available ?? [models.current]).map((m) => ({ modelId: m, name: m })),
+                    },
+                  }
+                : {}),
+            },
+          });
+          return;
+        }
+        if (method === "session/set_model") {
+          const want = String((msg.params as { modelId?: string })?.modelId ?? "");
+          if (models.setModel === "unsupported") {
+            write({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } });
+            return;
+          }
+          if (models.available && !models.available.includes(want)) {
+            write({ jsonrpc: "2.0", id, error: { code: -32602, message: "Invalid params", data: "unknown model id" } });
+            return;
+          }
+          modelsSet.push(want);
+          write({ jsonrpc: "2.0", id, result: { _meta: { model: { Ok: want } } } });
           return;
         }
         if (method === "session/prompt") {
@@ -173,6 +218,7 @@ export function scriptedAcpAgent(turns: ScriptedAcpTurn[]): ScriptedAgent {
           sent.push((p.prompt ?? []).map((b) => b.text ?? "").join(""));
           const script = turns[turn] ?? { text: "done" };
           turn += 1;
+          if (script.hang) return;
 
           for (const b of script.autoTools ?? []) {
             // Announced, then completed, with no permission request in
@@ -263,5 +309,6 @@ export function scriptedAcpAgent(turns: ScriptedAcpTurn[]): ScriptedAgent {
     sessionParams: () => sessionParams,
     permissions,
     toolsSeen: () => tools,
+    modelsSet,
   };
 }

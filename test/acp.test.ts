@@ -37,7 +37,7 @@ import { Engine } from "../src/engine.js";
 import { interviewTurn } from "../src/interview.js";
 import { isSelfHosted, PROVIDERS, providerName } from "../src/providers.js";
 import { Receipts } from "../src/receipts.js";
-import { scriptedAcpAgent, type ScriptedAcpTurn } from "./acp-agent.js";
+import { type AgentModels, scriptedAcpAgent, type ScriptedAcpTurn } from "./acp-agent.js";
 import { allowAll, denyAll, drain, workspace } from "./helpers.js";
 
 const BAR = parseBar(`
@@ -61,8 +61,8 @@ function ws(): string {
   return w.dir;
 }
 
-function engineIn(dir: string, turns: ScriptedAcpTurn[], url = GROK.url) {
-  const agent = scriptedAcpAgent(turns);
+function engineIn(dir: string, turns: ScriptedAcpTurn[], url = GROK.url, models?: AgentModels) {
+  const agent = scriptedAcpAgent(turns, models);
   const engine = new Engine({
     baseUrl: url,
     model: "grok-4.6",
@@ -724,5 +724,65 @@ describe("nothing on an ACP endpoint reaches for HTTP", () => {
     });
     const listed = await engine.listModels();
     assert.deepEqual(listed.ok ? listed.ids : [], [...GROK.models]);
+  });
+});
+
+
+describe("the model a receipt names is the one that ran", () => {
+  // grok 1.0.41 defaults to grok-4.7. molt never sent the model it was asked
+  // for, so every Grok Build turn ran 4.7 and its receipt said grok-4.6.
+  const GROK_MODELS: AgentModels = { current: "grok-4.7", available: ["grok-4.7", "grok-4.6"], setModel: "strict" };
+  const turns: ScriptedAcpTurn[] = [
+    { calls: [{ name: "mcp__molt__write_file", args: { path: "a.txt", content: "a\n" } }], text: "Done: wrote a.txt." },
+  ];
+
+  it("switches the agent to the requested model and records it", async () => {
+    const dir = ws();
+    const { engine, agent } = engineIn(dir, turns, GROK.url, GROK_MODELS);
+    await drain(engine.run("write a.txt", allowAll));
+    assert.deepEqual(agent.modelsSet, ["grok-4.6"], "molt asked for the model it was given");
+    const row = JSON.parse(readFileSync(join(dir, ".molt", "receipts", "index.jsonl"), "utf8").trim().split("\n")[0]!);
+    assert.equal(row.model, "grok-4.6");
+  });
+
+  it("refuses to run a model the account does not offer, instead of another under its name", async () => {
+    const dir = ws();
+    const { engine } = engineIn(dir, turns, GROK.url, { current: "grok-4.7", available: ["grok-4.7"], setModel: "strict" });
+    const events = await drain(engine.run("write a.txt", allowAll));
+    const err = events.find((e) => e.kind === "error");
+    assert.match(err && "text" in err ? err.text : "", /does not offer "grok-4\.6".*grok-4\.7/);
+  });
+
+  it("records a model it could not confirm as unconfirmed, never as fact", async () => {
+    const dir = ws();
+    const { engine } = engineIn(dir, turns, GROK.url, { setModel: "unsupported" });
+    await drain(engine.run("write a.txt", allowAll));
+    const row = JSON.parse(readFileSync(join(dir, ".molt", "receipts", "index.jsonl"), "utf8").trim().split("\n")[0]!);
+    assert.match(row.model, /grok-4\.6 \(unconfirmed/);
+  });
+});
+
+describe("a one-shot question to a subscription agent is bounded", () => {
+  it("gives up on an ACP agent that takes the prompt and never answers", async () => {
+    const { acpAsk } = await import("../src/acp.js");
+    const agent = scriptedAcpAgent([{ hang: true }]);
+    const t0 = Date.now();
+    const r = await acpAsk({ spec: GROK, model: "", systemPrompt: "s", prompt: "p", spawnFn: agent.spawnFn, timeoutMs: 200 });
+    assert.equal(r.ok, false);
+    assert.match(r.ok ? "" : r.error, /did not answer within/);
+    assert.ok(Date.now() - t0 < 5_000, "the limit, not for ever");
+  });
+
+  it("gives up on a Claude Code CLI that never answers", async () => {
+    const { claudeCodeAsk } = await import("../src/claude-code.js");
+    const sdk = {
+      query: () =>
+        (async function* () {
+          await new Promise(() => {});
+        })(),
+    } as unknown as Parameters<typeof claudeCodeAsk>[0]["sdk"];
+    const r = await claudeCodeAsk({ model: "sonnet", systemPrompt: "s", prompt: "p", sdk, timeoutMs: 200 });
+    assert.equal(r.ok, false);
+    assert.match(r.ok ? "" : r.error, /did not answer within/);
   });
 });
