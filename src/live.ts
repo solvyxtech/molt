@@ -16,14 +16,14 @@
  * So: a queue the callback pushes into and the generator drains.
  */
 
-export class Fragments {
-  private queue: string[] = [];
+export class Fragments<T = string> {
+  private queue: T[] = [];
   private wake?: () => void;
   private done = false;
 
-  push(text: string): void {
-    if (text.length === 0) return;
-    this.queue.push(text);
+  push(item: T): void {
+    if (typeof item === "string" && item.length === 0) return;
+    this.queue.push(item);
     this.wake?.();
     this.wake = undefined;
   }
@@ -35,7 +35,7 @@ export class Fragments {
     this.wake = undefined;
   }
 
-  async *drain(): AsyncGenerator<string> {
+  async *drain(): AsyncGenerator<T> {
     for (;;) {
       const next = this.queue.shift();
       if (next !== undefined) {
