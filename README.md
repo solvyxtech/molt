@@ -3,6 +3,8 @@
 **A coding agent that can't say "done" without proving it.**
 
 [![check](https://github.com/solvyxtech/molt/actions/workflows/check.yml/badge.svg)](https://github.com/solvyxtech/molt/actions/workflows/check.yml)
+[![npm](https://img.shields.io/npm/v/@solvyx/molt.svg)](https://www.npmjs.com/package/@solvyx/molt)
+[![npm downloads](https://img.shields.io/npm/dm/@solvyx/molt.svg)](https://www.npmjs.com/package/@solvyx/molt)
 [![licence: Apache 2.0](https://img.shields.io/badge/licence-Apache%202.0-blue.svg)](LICENSE)
 
 molt is an open source coding agent for developers. Terminal CLI and Electron desktop. Written in TypeScript. It runs any OpenAI compatible model and Anthropic’s native API. Then it refuses to accept done until every check in your project’s `.molt/done.yml` passes against the real state on disk. A completion is a claim. molt checks the claim and writes a receipt either way.
