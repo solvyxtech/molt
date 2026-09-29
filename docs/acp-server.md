@@ -31,7 +31,10 @@ Build it once with `npm run build`, then add this to Zed's `settings.json`
       "command": "/opt/homebrew/bin/node",
       "args": ["/absolute/path/to/molt-desktop/dist/cli.js", "acp"],
       "env": {},
-      "default_mode": "low"
+      "default_config_options": {
+        "autonomy": "low",
+        "model": "claude-code://subscription#sonnet"
+      }
     }
   }
 }
@@ -43,9 +46,14 @@ Build it once with `npm run build`, then add this to Zed's `settings.json`
 - `--acp` works in place of `acp`, for launchers that want a flag.
 - If the CLI package is installed (`npm run pack:cli`, `@solvyx/molt`),
   `"command": "molt", "args": ["acp"]` is the same thing.
-- `default_mode` is molt's autonomy level: `low`, `medium` or `high` (see
-  [autonomy.md](autonomy.md)). It can be changed per thread from the mode
-  picker. `--autonomy <level>` or `--yes` in `args` set the starting level too.
+- `default_config_options` sets what each new thread starts with — see
+  [The pickers](#the-pickers) for the ids and values. Zed only applies a
+  default whose value is in the list the session opened with, and logs a
+  warning otherwise.
+- `default_mode` is **not** used by Zed for molt: when an agent offers config
+  options, Zed shows those instead of the mode selector. Set
+  `default_config_options.autonomy` instead. (`--autonomy <level>` or `--yes`
+  in `args` still set the starting level.)
 
 ### Which model
 
@@ -60,8 +68,58 @@ editor, put the usual flags in `args`, and the key in `env`:
 
 Every `molt run` flag that shapes a session works here: `--attempts`, `--for`,
 `--budget`, `--commit`, `--revert`, `--map`, `--read`, `--price-in/--price-out`.
-With no model configured, opening a thread fails with a message saying how to
-set one.
+With no model configured, the thread opens with "No model selected" in the
+model picker, and a prompt is refused until one is chosen.
+
+## The pickers
+
+A molt thread in Zed has three pickers in the message box footer, sent as ACP
+session config options. Zed searches a list longer than five, shows the group
+names as section headers, and lets you star favourites.
+
+| id | category | values |
+|---|---|---|
+| `model` | `model` | `<endpoint url>#<model id>`, grouped (below) |
+| `autonomy` | `mode` | `low`, `medium`, `high` — the same setting as the ACP mode |
+| `effort` | `thought_level` | only for a model molt can send a reasoning effort to. **No molt backend takes one today, so this picker never appears yet.** |
+
+The model picker lists everything molt can run on this machine, in three
+groups:
+
+- **Subscriptions** — the CLIs molt drives on your own plan: Claude Code
+  (`claude-code://subscription#opus|sonnet|haiku`), Grok Build
+  (`grok-build://subscription#grok-4.7`, …), Gemini CLI, Antigravity. Listed
+  only when molt's own health check passes: installed, signed in, and (for
+  Grok) not set to approve everything. The check spawns each CLI once, in the
+  background, when the editor connects.
+- **API keys** — each provider `/login` stored a key for, with the models its
+  `/models` returns, plus any non-local endpoint molt has been pointed at.
+- **Local** — Ollama's default address, the endpoint in `config.json`, and
+  the servers the desktop window remembers, when they are private addresses
+  and answer `/models`.
+
+The model in use is always listed, whether or not its endpoint answered. A
+value is the endpoint URL and the model id joined by the first `#`, so it
+reads as what it is in `default_config_options`: `https://api.x.ai/v1#grok-4.6`,
+`http://127.0.0.1:8080/v1#qwen3-coder-30b-a3b`, `gemini-cli://subscription#gemini-3-pro`.
+
+What a choice does is what `/model` does in the terminal: the next turn runs
+on that model, `config.json` remembers it (so a bare `molt` starts there too),
+and molt re-prices for it. A different backend starts a fresh conversation —
+the model does not see the thread's earlier messages, and the next turn says
+so. A choice made while a turn is running is shown at once and takes effect
+when that turn ends; the running turn, and its receipt, keep the model they
+started with.
+
+Discovery starts when Zed connects, and the thread waits for it for at most
+one second (`MOLT_ACP_DISCOVERY_WAIT_MS` changes that; `0` never waits).
+Sources that answer later are added to the open picker. To skip the
+subscription health checks — say, on a machine where you know the answer —
+set `MOLT_ACP_SUBSCRIPTIONS` in `env` to the ones to list:
+`"claude-code,grok-build"`, or `""` for none.
+
+Subscriptions report plan usage, not dollars: their `usage_update` carries
+tokens and `_meta.molt.plan` (e.g. `Claude`), and no `cost`.
 
 ### The bar's commands and PATH
 
@@ -80,8 +138,9 @@ shows the protocol traffic and the agent's stderr.
 |---|---|
 | `initialize` | protocol version 1. Capabilities are stated as they are: `loadSession: false`; prompts take text and embedded context, not images or audio; no MCP. `authMethods` is empty. |
 | `authenticate` | refused: there is nothing to authenticate. molt reads keys from its own config or `MOLT_API_KEY`. |
-| `session/new` | `cwd` must be absolute. `mcpServers` are accepted and ignored (logged on stderr): molt does not connect to MCP servers. Returns molt's autonomy levels as the session's modes. |
-| `session/set_mode` | sets the autonomy level (`low` / `medium` / `high`). |
+| `session/new` | `cwd` must be absolute. `mcpServers` are accepted and ignored (logged on stderr): molt does not connect to MCP servers. Returns the config options above, and molt's autonomy levels as the session's modes for clients without config options. |
+| `session/set_mode` | sets the autonomy level (`low` / `medium` / `high`); the `autonomy` option follows. |
+| `session/set_config_option` | `model`, `autonomy`, `effort` as above; answers with the full option list. A value not on offer is refused. |
 | `session/prompt` | `text`, `resource_link` (named inline; the model reads the file if it needs it) and `resource` (the attached text is included). A leading `?` or `/ask` makes the turn a question, as in the terminal; `/ask` is advertised as a command. |
 | `session/cancel` | stops the turn wherever it is: the request, the running command (killed), the bar, or a permission question the editor has not answered. Files already written stay written and are named. |
 | `session/load`, `session/list`, fork/resume/close | not implemented (`Method not found`). A session lives as long as the process. |
@@ -96,6 +155,8 @@ Updates sent during a turn:
 | `plan` | the bar: one entry per check, `pending` → `in_progress` while the bar runs → `completed` when it passes. A check that failed goes back to `pending` (still to do) and says `FAILED`. Advisory checks are `low` priority. No bar, no plan. |
 | `usage_update` | after each step: `used` = the tokens that step sent and received (the size of the conversation), `size` = the context window the endpoint has named, or 0 until it names one — molt does not invent a window — and `cost` = the session's cost so far in USD when a price is known. `_meta.molt` says whether the numbers are estimated. |
 | `available_commands_update` | `ask` |
+| `config_option_update` | the option list changed: models discovered after the thread opened, an option appearing or going as the model changes, or the autonomy level moved by `set_mode` |
+| `current_mode_update` | the autonomy level moved by `set_config_option`, for clients that follow modes |
 
 The prompt response also carries `usage` (the turn's tokens, in the schema's
 unstable end-turn usage field) and `_meta.molt`:
