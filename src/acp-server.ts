@@ -35,7 +35,17 @@ import {
 } from "./autonomy.js";
 import type { Engine, FileAccess } from "./engine.js";
 import { applyEdit } from "./files.js";
+import {
+  type ConfigOption,
+  NO_MODEL,
+  decodeModelValue,
+  labelOf,
+  modelOption,
+  type ModelSource,
+  optionHas,
+} from "./acp-catalog.js";
 import { INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, RpcError, RpcPeer } from "./jsonrpc.js";
+import { planFor } from "./providers.js";
 import type { BarResult, CheckResult, ConfirmCall, EngineEvent, JobOutcome, Spend } from "./types.js";
 
 /** The ACP major version molt speaks. */
@@ -344,6 +354,26 @@ export function stopReasonFor(t: {
 
 export type NewEngine = (ctx: { cwd: string; sessionId: string; files?: FileAccess }) => Promise<Engine>;
 
+export type ModelChoices = {
+  /** Everything that can run here. Slow: it spawns CLIs and asks endpoints. */
+  discover: () => Promise<ModelSource[]>;
+  /**
+   * How long session/new waits for a discovery already under way, counted
+   * from when it began. The editor applies its saved defaults only to values
+   * the first option list contains, so a short wait buys a complete list for
+   * the common case; past it, the list grows by config_option_update.
+   */
+  waitMs?: number;
+  /** Point an engine at a model: key, price, and remembering it, as /model does. */
+  apply: (engine: Engine, url: string, model: string) => Promise<void>;
+  /**
+   * Reasoning-effort levels molt can send for this model, or null. No molt
+   * backend takes one today, so the real server passes nothing and the
+   * option never appears; the seam is here so it appears the day one does.
+   */
+  effortLevels?: (url: string, model: string) => string[] | null;
+};
+
 export type AcpServerOptions = {
   /** One complete frame to the client. The only thing allowed to reach stdout. */
   write: (line: string) => void;
@@ -351,7 +381,22 @@ export type AcpServerOptions = {
   /** Diagnostics. stderr in the real process. */
   log?: (line: string) => void;
   version: string;
+  /** The model picker. Without it, sessions offer autonomy and nothing else. */
+  models?: ModelChoices;
 };
+
+/** The autonomy level as a config option, the same three levels the modes offer. */
+export function autonomyOption(level: Autonomy): ConfigOption {
+  return {
+    id: "autonomy",
+    name: "Autonomy",
+    description: "What molt runs without asking you first",
+    category: "mode",
+    type: "select",
+    currentValue: level,
+    options: AUTONOMY_LEVELS.map((l) => ({ value: l, name: MODE_NAMES[l], description: AUTONOMY_SUMMARY[l] })),
+  };
+}
 
 type Turn = {
   cancelled: boolean;
@@ -369,6 +414,13 @@ type Session = {
   /** Tool calls the editor has been told about, so each is created once. */
   announced: Set<string>;
   asks: number;
+  /** A model chosen while a turn ran: it takes over when that turn ends. */
+  pending?: { url: string; model: string };
+  effort?: string;
+  /** The option list the editor holds, to tell a change from a repeat. */
+  sent?: string;
+  /** Said at the start of the next turn: what a model switch did. */
+  switchNote?: string;
 };
 
 const MODE_NAMES: Record<Autonomy, string> = {
@@ -382,6 +434,9 @@ export class AcpServer {
   private sessions = new Map<string, Session>();
   private caps: ClientCaps = { readTextFile: false, writeTextFile: false };
   private initialized = false;
+  private catalog: ModelSource[] = [];
+  private discovery?: Promise<void>;
+  private discoveryStarted = 0;
 
   constructor(private opts: AcpServerOptions) {
     this.peer = new RpcPeer({
@@ -427,6 +482,8 @@ export class AcpServer {
         return this.newSession(p);
       case "session/set_mode":
         return this.setMode(p);
+      case "session/set_config_option":
+        return this.setConfigOption(p);
       case "session/prompt":
         return this.prompt(p);
       default:
@@ -453,6 +510,8 @@ export class AcpServer {
     const fs = ((p.clientCapabilities as Record<string, unknown> | undefined)?.fs ?? {}) as Record<string, unknown>;
     this.caps = { readTextFile: fs.readTextFile === true, writeTextFile: fs.writeTextFile === true };
     this.initialized = true;
+    // Started now, so the answers are in by the time the first session asks.
+    this.startDiscovery();
     const info = p.clientInfo as { name?: string; version?: string } | undefined;
     this.log(
       `initialized by ${info?.name ?? "a client"}${info?.version ? ` ${info.version}` : ""} · ` +
@@ -508,14 +567,18 @@ export class AcpServer {
     } catch (e) {
       throw new RpcError(INTERNAL_ERROR, e instanceof Error ? e.message : String(e));
     }
-    this.sessions.set(sessionId, {
+    await this.awaitDiscovery();
+    const session: Session = {
       id: sessionId,
       cwd,
       engine,
       always: new Map(),
       announced: new Set(),
       asks: 0,
-    });
+    };
+    this.sessions.set(sessionId, session);
+    const configOptions = this.configOptions(session);
+    session.sent = JSON.stringify(configOptions);
     this.log(`session ${sessionId} in ${cwd} · ${engine.model} · autonomy ${engine.autonomy}`);
     // After the response, so the editor knows the session before it hears
     // about it.
@@ -534,6 +597,9 @@ export class AcpServer {
     );
     return {
       sessionId,
+      configOptions,
+      // Kept for clients that know modes and not config options. Zed shows
+      // the config options when both are present.
       modes: {
         currentModeId: engine.autonomy,
         availableModes: AUTONOMY_LEVELS.map((level) => ({
@@ -572,7 +638,162 @@ export class AcpServer {
     }
     s.engine.setAutonomy(mode);
     this.log(`session ${s.id} autonomy → ${mode}`);
+    // The same level is a config option too; both views must agree.
+    this.pushOptions(s);
     return {};
+  }
+
+  // ---- the model picker ----------------------------------------------------
+
+  private startDiscovery(): void {
+    const models = this.opts.models;
+    if (!models || this.discovery) return;
+    this.discoveryStarted = Date.now();
+    this.discovery = models
+      .discover()
+      .then((found) => {
+        this.catalog = found;
+        this.log(
+          `model picker: ${found.length} source(s) — ` +
+            (found.map((f) => `${f.label} (${f.models.length})`).join(", ") || "none answered"),
+        );
+        for (const s of this.sessions.values()) this.pushOptions(s);
+      })
+      .catch((e) => this.log(`model discovery failed: ${e instanceof Error ? e.message : String(e)}`));
+  }
+
+  private async awaitDiscovery(): Promise<void> {
+    this.startDiscovery();
+    if (!this.discovery) return;
+    const left = (this.opts.models?.waitMs ?? 1_000) - (Date.now() - this.discoveryStarted);
+    if (left <= 0) return;
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      this.discovery,
+      new Promise<void>((r) => {
+        timer = setTimeout(r, left);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+  }
+
+  /** The model this session will run next: a pending choice, or the engine's own. */
+  private selected(s: Session): { url: string; model: string } {
+    return s.pending ?? { url: s.engine.baseUrl, model: s.engine.model };
+  }
+
+  private effortLevels(s: Session): string[] | null {
+    const { url, model } = this.selected(s);
+    const levels = model ? (this.opts.models?.effortLevels?.(url, model) ?? null) : null;
+    return levels && levels.length ? levels : null;
+  }
+
+  configOptions(s: Session): ConfigOption[] {
+    const out: ConfigOption[] = [];
+    if (this.opts.models) out.push(modelOption(this.catalog, this.selected(s)));
+    out.push(autonomyOption(s.engine.autonomy));
+    const levels = this.effortLevels(s);
+    if (levels) {
+      if (!s.effort || !levels.includes(s.effort)) s.effort = levels.includes("medium") ? "medium" : levels[0]!;
+      out.push({
+        id: "effort",
+        name: "Reasoning effort",
+        category: "thought_level",
+        type: "select",
+        currentValue: s.effort,
+        options: levels.map((l) => ({ value: l, name: l })),
+      });
+    } else {
+      s.effort = undefined;
+    }
+    return out;
+  }
+
+  /** Tell the editor the options changed, when they did. */
+  private pushOptions(s: Session): ConfigOption[] {
+    const options = this.configOptions(s);
+    const json = JSON.stringify(options);
+    if (json !== s.sent) {
+      s.sent = json;
+      this.update(s.id, { sessionUpdate: "config_option_update", configOptions: options });
+    }
+    return options;
+  }
+
+  private async setConfigOption(p: Record<string, unknown>): Promise<unknown> {
+    const s = this.session(p);
+    const id = p.configId;
+    const value = p.value;
+    if (typeof id !== "string") throw new RpcError(INVALID_PARAMS, "configId is required");
+    if (typeof value !== "string") throw new RpcError(INVALID_PARAMS, `${id} takes a value id`);
+    switch (id) {
+      case "autonomy": {
+        if (!isAutonomy(value)) {
+          throw new RpcError(INVALID_PARAMS, `autonomy must be one of ${AUTONOMY_LEVELS.join(", ")}`);
+        }
+        s.engine.setAutonomy(value);
+        this.log(`session ${s.id} autonomy → ${value}`);
+        // For a client following modes rather than options.
+        this.update(s.id, { sessionUpdate: "current_mode_update", currentModeId: value });
+        break;
+      }
+      case "model": {
+        if (!this.opts.models) throw new RpcError(INVALID_PARAMS, "this server offers no model choice");
+        const offered = modelOption(this.catalog, this.selected(s));
+        const choice = decodeModelValue(value);
+        if (value === NO_MODEL || !choice || !optionHas(offered, value)) {
+          throw new RpcError(INVALID_PARAMS, `${value} is not one of the models this session offers`);
+        }
+        if (s.turn) {
+          // Never mid-turn: the turn in flight keeps the model it started
+          // with, and its receipt names that one. The choice waits.
+          s.pending = choice;
+          this.log(`session ${s.id} model → ${value} after the running turn`);
+        } else {
+          await this.applyModel(s, choice);
+        }
+        break;
+      }
+      case "effort": {
+        const levels = this.effortLevels(s);
+        if (!levels) throw new RpcError(INVALID_PARAMS, "the selected model takes no reasoning effort");
+        if (!levels.includes(value)) throw new RpcError(INVALID_PARAMS, `effort must be one of ${levels.join(", ")}`);
+        s.effort = value;
+        break;
+      }
+      default:
+        throw new RpcError(INVALID_PARAMS, `no such config option: ${id}`);
+    }
+    const before = s.sent ? (JSON.parse(s.sent) as ConfigOption[]).map((o) => o.id).join(",") : "";
+    const options = this.configOptions(s);
+    s.sent = JSON.stringify(options);
+    // The response carries the new list; an option that appeared or went
+    // away (effort, as the model changes) is announced as well, for a client
+    // that watches updates rather than responses.
+    if (options.map((o) => o.id).join(",") !== before) {
+      this.update(s.id, { sessionUpdate: "config_option_update", configOptions: options });
+    }
+    return { configOptions: options };
+  }
+
+  private async applyModel(s: Session, choice: { url: string; model: string }): Promise<void> {
+    const models = this.opts.models!;
+    const from = s.engine.baseUrl.replace(/\/+$/, "");
+    const to = choice.url.replace(/\/+$/, "");
+    try {
+      await models.apply(s.engine, choice.url, choice.model);
+    } catch (e) {
+      throw new RpcError(INTERNAL_ERROR, `could not switch to ${choice.model}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    s.pending = undefined;
+    this.log(`session ${s.id} model → ${labelOf(choice.url)} · ${choice.model}`);
+    if (from !== to) {
+      // What /model does in the terminal, said where the person will see it:
+      // a different backend is a different conversation.
+      s.switchNote =
+        `now running ${labelOf(choice.url)} · ${choice.model}. A different backend starts a fresh ` +
+        `conversation: earlier messages in this thread are not sent to it.`;
+    }
   }
 
   private update(sessionId: string, update: Record<string, unknown>): void {
@@ -582,6 +803,12 @@ export class AcpServer {
   private async prompt(p: Record<string, unknown>): Promise<unknown> {
     const s = this.session(p);
     if (s.turn) throw new RpcError(INVALID_REQUEST, "a turn is already running in this session");
+    if (!s.engine.model) {
+      throw new RpcError(
+        INVALID_REQUEST,
+        "no model selected — choose one in the model picker, or run `molt` in a terminal and use /login and /model",
+      );
+    }
     if (!Array.isArray(p.prompt)) throw new RpcError(INVALID_PARAMS, "prompt must be an array of content blocks");
     const raw = promptText(p.prompt as ContentBlock[], s.cwd);
     // A leading "?" or /ask marks a question, as it does in the terminal. It
@@ -607,6 +834,14 @@ export class AcpServer {
       return await this.runTurn(s, turn, text, asking);
     } finally {
       s.turn = undefined;
+      // A model chosen during the turn takes over now, before the next one.
+      if (s.pending) {
+        await this.applyModel(s, s.pending).catch((e) => {
+          s.pending = undefined;
+          this.log(e instanceof Error ? e.message : String(e));
+          this.pushOptions(s);
+        });
+      }
     }
   }
 
@@ -755,6 +990,12 @@ export class AcpServer {
       return more;
     };
 
+    if (s.switchNote) {
+      note(s.switchNote);
+      s.switchNote = undefined;
+    }
+    const plan_ = planFor(engine.baseUrl);
+
     const onEvent = (ev: EngineEvent) => {
       switch (ev.kind) {
         case "delta":
@@ -836,6 +1077,8 @@ export class AcpServer {
                 stepCostUsd: ev.spend.costUsd ?? null,
                 estimated: ev.spend.estimated,
                 billed: ev.spend.billed,
+                // A subscription is paid by its plan: tokens, not dollars.
+                ...(plan_ ? { plan: plan_ } : {}),
               },
             },
           });

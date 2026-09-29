@@ -125,19 +125,26 @@ export function scriptFetch(script: Script): { fetchFn: typeof fetch; requests: 
 /** Over a socket, for a molt running in a child process. */
 export async function scriptServer(
   script: Script,
-): Promise<{ url: string; requests: ScriptRequest[]; close: () => Promise<void> }> {
-  const requests: ScriptRequest[] = [];
+  opts: { models?: string[] } = {},
+): Promise<{ url: string; requests: (ScriptRequest & { model?: string })[]; close: () => Promise<void> }> {
+  const requests: (ScriptRequest & { model?: string })[] = [];
   const server: Server = createServer((req, res) => {
     const chunks: Buffer[] = [];
     req.on("data", (c: Buffer) => chunks.push(c));
     req.on("end", () => {
-      // Pricing and model listings are not part of any script.
+      if (req.method === "GET" && req.url?.endsWith("/models") && opts.models) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ data: opts.models.map((id) => ({ id })) }));
+        return;
+      }
+      // Pricing, and model listings nobody asked this server to serve.
       if (req.method !== "POST" || !req.url?.endsWith("/chat/completions")) {
         res.writeHead(404, { "content-type": "application/json" });
         res.end("{}");
         return;
       }
-      const r = describe(Buffer.concat(chunks).toString("utf8"));
+      const body = Buffer.concat(chunks).toString("utf8");
+      const r = { ...describe(body), model: (JSON.parse(body) as { model?: string }).model };
       requests.push(r);
       const reply = script(r);
       if (reply.hang) return; // held open until the client disconnects

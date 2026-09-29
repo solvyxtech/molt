@@ -7,9 +7,9 @@
  * bar is not met, so molt can sit in CI, in a script, or in a benchmark
  * harness without a human watching.
  */
-import { acpAgentFor } from "./acp.js";
-import { isAgy } from "./agy.js";
-import { isClaudeCode } from "./claude-code.js";
+import { acpAgentFor, acpHealth } from "./acp.js";
+import { agyHealth, isAgy } from "./agy.js";
+import { claudeCodeHealth, isClaudeCode } from "./claude-code.js";
 import { expandEndpointShorthand } from "./endpoint.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { formatWithOptions } from "node:util";
@@ -31,8 +31,13 @@ import {
   fetchPricing,
   isSelfHosted,
   keyForUrl,
+  defaultConfigDir,
   needsPriceLookup,
+  planFor,
+  PROVIDERS,
   providerName,
+  readAuth,
+  saveEndpoint,
   savePricing,
   storedEndpoint,
   type StoredEndpoint,
@@ -1023,17 +1028,67 @@ async function cmdAcp(args: Args): Promise<number> {
   console.debug = toLog;
 
   const { AcpServer } = await import("./acp-server.js");
+  const { discoverModels, readRememberedEndpoints } = await import(
+    "./acp-catalog.js"
+  );
+  const norm = (u: string) => u.trim().replace(/\/+$/, "");
+  /**
+   * `MOLT_ACP_SUBSCRIPTIONS=claude-code,grok-build` lists exactly those
+   * subscription backends without probing them. The probes spawn each CLI
+   * and open a session with it; this skips that, for a machine where the
+   * answer is known — and for tests, which must not depend on whose laptop
+   * has which CLI signed in.
+   */
+  const declared = process.env.MOLT_ACP_SUBSCRIPTIONS;
+  const subscriptionUsable = async (url: string): Promise<boolean> => {
+    if (declared !== undefined) {
+      const names = declared.split(",").map((n) => n.trim()).filter(Boolean);
+      return names.some((n) => PROVIDERS[n]?.url === url);
+    }
+    if (isClaudeCode(url)) return (await claudeCodeHealth()).ok;
+    if (isAgy(url)) return (await agyHealth()).ok;
+    const spec = acpAgentFor(url);
+    return spec ? (await acpHealth(spec)).ok : false;
+  };
+  const waitRaw = Number(process.env.MOLT_ACP_DISCOVERY_WAIT_MS);
   const server = new AcpServer({
+    models: {
+      discover: () =>
+        discoverModels({
+          auth: readAuth(),
+          stored: storedEndpoint(),
+          remembered: readRememberedEndpoints(defaultConfigDir()),
+          current: { url: args.url, key: args.key, model: args.model || undefined },
+          listModels: (url, key) => new Engine({ baseUrl: url, apiKey: key, model: "probe", bar: null }).listModels(url, key),
+          subscriptionUsable,
+          log: (line) => void toStderr(`molt acp: ${line}\n`),
+        }),
+      ...(Number.isFinite(waitRaw) && waitRaw >= 0 ? { waitMs: waitRaw } : {}),
+      // What /model does in the terminal: point the engine, remember the
+      // choice in config.json, and re-price for the model now running.
+      apply: async (engine, url, model) => {
+        const flagged = norm(url) === norm(args.url);
+        const key = keyForUrl(url, flagged ? args.key : undefined);
+        if (norm(engine.baseUrl) !== norm(url)) engine.setBaseUrl(url, key, providerName(url));
+        engine.setModel(model);
+        saveEndpoint(url, model);
+        if (flagged && model === args.model && args.priceSource === "set by hand") {
+          engine.setPricing({ in: args.priceIn, out: args.priceOut, source: "set by hand" });
+          return;
+        }
+        // A price belongs to a model, and a plan is not a price.
+        engine.setPricing({});
+        if (planFor(url)) return;
+        await priceEngine(engine, { ...args, url, model, key, priceIn: undefined, priceOut: undefined });
+      },
+    },
     write: (line) => void frame(line),
     version: VERSION,
     log: (line) => void toStderr(`${line}\n`),
+    // No model is not a reason to refuse the session any more: the editor's
+    // model picker can choose one, and a prompt without one is refused with
+    // a sentence saying so.
     newEngine: async ({ cwd, files }) => {
-      if (!args.model) {
-        throw new Error(
-          "molt has no model selected — run `molt` in a terminal and use /login and /model, " +
-            "or add --model (and --url, --key) to the agent's command in the editor's settings",
-        );
-      }
       const a: Args = { ...args, cwd };
       const engine = engineFor(a, true, { files });
       if (a.budget) engine.setBudget(a.budget);

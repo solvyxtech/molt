@@ -95,7 +95,12 @@ async function start() {
     // The raw bytes are tapped here, beside the connection's own reader, so
     // the test sees exactly what an editor would have to parse.
     spawnFn: ((bin: string, args: string[], opts: Record<string, unknown>) => {
-      child = spawn(bin, args, { ...opts, env: { ...process.env, MOLT_CONFIG_DIR: config } });
+      child = spawn(bin, args, {
+        ...opts,
+        // No subscription CLI is probed: which ones are signed in is a fact
+        // about the laptop, not about molt.
+        env: { ...process.env, MOLT_CONFIG_DIR: config, MOLT_ACP_SUBSCRIPTIONS: "" },
+      });
       child.stdout!.on("data", (d: Buffer | string) => (stdout += String(d)));
       child.stderr!.on("data", (d: Buffer | string) => (stderr += String(d)));
       return child;
