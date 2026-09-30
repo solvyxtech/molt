@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 — molt in the editor
 
 ### Changed
 
@@ -80,6 +80,8 @@
   permission questions, the bar as the plan, cost after every step — and the
   bar's verdict as the last line of every turn. Edits go through the
   editor's buffers when it offers them. See [docs/acp-server.md](docs/acp-server.md).
+  The editor's own pickers choose molt's model (grouped as subscriptions, API
+  keys and local), autonomy and reasoning effort.
 
 - **`tests-real` builtin (opt-in)**: refuses a test this turn added that
   cannot fail — a value compared with itself, no assertion, or a new test file

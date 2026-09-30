@@ -1,6 +1,6 @@
 {
   "name": "@solvyx/molt",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "molt — a coding agent that can't say done without proving it. Terminal CLI and TUI.",
   "license": "Apache-2.0",
   "repository": {
