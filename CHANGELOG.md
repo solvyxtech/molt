@@ -74,6 +74,13 @@
 
 ### Added
 
+- **`molt acp`: molt as an editor's agent.** Serves the Agent Client
+  Protocol (v1, as Zed builds it) on stdio. The editor sees streamed text and
+  reasoning, one row per tool call with a diff for every write, molt's own
+  permission questions, the bar as the plan, cost after every step — and the
+  bar's verdict as the last line of every turn. Edits go through the
+  editor's buffers when it offers them. See [docs/acp-server.md](docs/acp-server.md).
+
 - **`tests-real` builtin (opt-in)**: refuses a test this turn added that
   cannot fail — a value compared with itself, no assertion, or a new test file
   that never touches the change. In molt's own bar as `tests-meaningful`.

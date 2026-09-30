@@ -79,6 +79,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import { errorText } from "./format.js";
+import { RpcPeer, type RpcMessage } from "./jsonrpc.js";
 import type { BackendEvent, MoltTool, ToolRunner } from "./claude-code.js";
 import { GEMINI_CLI_URL, GROK_BUILD_URL } from "./endpoint.js";
 import { estTokens } from "./types.js";
@@ -348,15 +349,6 @@ async function probeAuth(spec: AcpAgentSpec): Promise<{ authenticated: boolean; 
 // The JSON-RPC connection
 // ---------------------------------------------------------------------------
 
-type RpcMessage = {
-  jsonrpc?: string;
-  id?: number | string;
-  method?: string;
-  params?: unknown;
-  result?: unknown;
-  error?: { code?: number; message?: string; data?: unknown };
-};
-
 /** A method the agent calls on molt, and what molt answers. */
 export type ClientHandler = (method: string, params: unknown) => Promise<unknown>;
 
@@ -369,12 +361,8 @@ export type ClientHandler = (method: string, params: unknown) => Promise<unknown
  */
 export class AcpConnection {
   private child?: ChildProcess;
-  private buf = "";
-  private nextId = 1;
-  private pending = new Map<number | string, { resolve: (v: unknown) => void; reject: (e: unknown) => void }>();
-  private onNotify?: (method: string, params: unknown) => void;
-  private onRequest?: ClientHandler;
-  private closed = false;
+  /** Framing and correlation, shared with molt's own ACP server (src/jsonrpc.ts). */
+  private peer: RpcPeer;
   /** Whatever the agent wrote to stderr, for an error that would else be bare. */
   private stderr = "";
 
@@ -387,8 +375,22 @@ export class AcpConnection {
       onRequest?: ClientHandler;
     } = {},
   ) {
-    this.onNotify = opts.onNotify;
-    this.onRequest = opts.onRequest;
+    const onRequest = opts.onRequest;
+    this.peer = new RpcPeer({
+      write: (line) => this.child?.stdin?.write(line),
+      onNotify: opts.onNotify,
+      // An unhandled method is refused rather than left hanging: an agent
+      // waiting forever on a reply molt will never send looks identical to a
+      // model that has stopped thinking.
+      onRequest: (method, params) =>
+        onRequest ? onRequest(method, params) : Promise.reject(new Error(`molt does not implement ${method}`)),
+      // A non-JSON line is the agent's own chatter (Grok prints update notices
+      // to stdout on first run). Ignoring it beats killing a session over a
+      // banner.
+      onGarbage: "ignore",
+      defaultErrorCode: -32000,
+      describeError: errorText,
+    });
   }
 
   async start(): Promise<void> {
@@ -429,83 +431,20 @@ export class AcpConnection {
 
   /** Every pending call fails together; a dead pipe answers nothing. */
   private fail(e: unknown): void {
-    if (this.closed) return;
-    this.closed = true;
-    for (const { reject } of this.pending.values()) reject(e);
-    this.pending.clear();
+    this.peer.fail(e);
   }
 
   private feed(chunk: string): void {
-    this.buf += chunk;
-    for (;;) {
-      const i = this.buf.indexOf("\n");
-      if (i < 0) break;
-      const line = this.buf.slice(0, i).trim();
-      this.buf = this.buf.slice(i + 1);
-      if (!line) continue;
-      let msg: RpcMessage;
-      try {
-        msg = JSON.parse(line) as RpcMessage;
-      } catch {
-        // A non-JSON line is the agent's own chatter (Grok prints update
-        // notices to stdout on first run). Ignoring it beats killing a
-        // session over a banner.
-        continue;
-      }
-      this.dispatch(msg);
-    }
-  }
-
-  private dispatch(msg: RpcMessage): void {
-    if (msg.method !== undefined && msg.id === undefined) {
-      this.onNotify?.(msg.method, msg.params);
-      return;
-    }
-    if (msg.method !== undefined) {
-      void this.answer(msg);
-      return;
-    }
-    if (msg.id === undefined) return;
-    const p = this.pending.get(msg.id);
-    if (!p) return;
-    this.pending.delete(msg.id);
-    if (msg.error) p.reject(new Error(msg.error.message ?? "agent error"));
-    else p.resolve(msg.result);
-  }
-
-  /** Answer a request the agent made of molt. */
-  private async answer(msg: RpcMessage): Promise<void> {
-    const id = msg.id!;
-    try {
-      const result = this.onRequest
-        ? await this.onRequest(msg.method!, msg.params)
-        : // An unhandled method is refused rather than left hanging: an agent
-          // waiting forever on a reply molt will never send looks identical to
-          // a model that has stopped thinking.
-          Promise.reject(new Error(`molt does not implement ${msg.method}`));
-      this.write({ jsonrpc: "2.0", id, result });
-    } catch (e) {
-      this.write({ jsonrpc: "2.0", id, error: { code: -32000, message: errorText(e) } });
-    }
-  }
-
-  private write(msg: Record<string, unknown>): void {
-    if (this.closed) return;
-    this.child?.stdin?.write(`${JSON.stringify(msg)}\n`);
+    this.peer.feed(chunk);
   }
 
   async request(method: string, params: unknown): Promise<unknown> {
-    if (this.closed) throw new Error(`${this.spec.bin} is not running`);
-    const id = this.nextId++;
-    const done = new Promise<unknown>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-    });
-    this.write({ jsonrpc: "2.0", id, method, params });
-    return done;
+    if (this.peer.closed) throw new Error(`${this.spec.bin} is not running`);
+    return this.peer.request(method, params);
   }
 
   notify(method: string, params: unknown): void {
-    this.write({ jsonrpc: "2.0", method, params });
+    this.peer.notify(method, params);
   }
 
   async close(): Promise<void> {

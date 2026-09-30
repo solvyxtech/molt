@@ -181,6 +181,7 @@ molt run "fix the failing test" --criterion "gate=npm test -- fmtDuration"
 molt ask "what does the bar check?"         # a question: write checks are not applied
 molt prove                                  # run the bar now, no model
 molt verify                                 # recompute every hash chain
+molt acp                                    # serve ACP on stdio, for an editor's agent panel
 ```
 
 Exit codes: `0` the bar was met · `1` it was not · `2` usage · `3` finished
@@ -351,6 +352,7 @@ small model that predicts the bar's verdict, `docs/` the design notes.
 - [transparency.md](docs/transparency.md) — the journal, receipts, cost accounting, the integrity chain
 - [shed.md](docs/shed.md) — mechanical context compaction and the archive
 - [autonomy.md](docs/autonomy.md) — what runs without asking, and what never does
+- [acp-server.md](docs/acp-server.md) — `molt acp`: running molt as an editor's agent (Zed) over the Agent Client Protocol
 - [testing-charter.md](docs/testing-charter.md) — how to find bugs in molt
 - [audit-2026-09-02.md](docs/audit-2026-09-02.md) — the latest audit, live-model evidence, open decisions
 - [prior-art.md](docs/prior-art.md), [receipts.md](docs/receipts.md), [metrics.md](docs/metrics.md)

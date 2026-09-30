@@ -17,6 +17,13 @@ import type { Msg, ToolCall } from "./types.js";
 
 export type StreamDelta = {
   content?: string;
+  /**
+   * The model's reasoning, where the server streams it apart from the answer.
+   * DeepSeek, llama.cpp and vLLM say `reasoning_content`; OpenRouter says
+   * `reasoning`. Neither is ever part of the message.
+   */
+  reasoning_content?: string;
+  reasoning?: string;
   tool_calls?: {
     index: number;
     id?: string;
@@ -83,6 +90,8 @@ export class StreamAccumulator {
   /** Names seen and not yet drained. */
   private pending: string[] = [];
   private calls = new Map<number, { id: string; name: string; args: string }>();
+  /** Reasoning fragments seen and not yet drained. Never part of the message. */
+  private thoughts: string[] = [];
   promptTokens?: number;
   completionTokens?: number;
   cachedTokens?: number;
@@ -122,6 +131,9 @@ export class StreamAccumulator {
 
     const delta = choice.delta;
     if (!delta) return "";
+
+    const thought = delta.reasoning_content ?? delta.reasoning;
+    if (typeof thought === "string" && thought.length > 0) this.thoughts.push(thought);
 
     let added = "";
     if (typeof delta.content === "string" && delta.content.length > 0) {
@@ -167,6 +179,14 @@ export class StreamAccumulator {
   }
 
   /** Text accumulated so far. */
+  /** Reasoning fragments since the last call, oldest first. */
+  drainThoughts(): string[] {
+    if (this.thoughts.length === 0) return [];
+    const out = this.thoughts;
+    this.thoughts = [];
+    return out;
+  }
+
   get text(): string {
     return this.content;
   }
@@ -281,6 +301,8 @@ export async function readStream(
    * merely talk.
    */
   onStart?: (acc: StreamAccumulator) => void,
+  /** Reasoning fragments, as they arrive. Absent, they are read and dropped. */
+  onThought?: (fragment: string) => void,
 ): Promise<StreamResult> {
   const acc = new StreamAccumulator();
   onStart?.(acc);
@@ -301,12 +323,14 @@ export async function readStream(
           continue;
         }
         const added = acc.push(chunk);
+        for (const t of acc.drainThoughts()) onThought?.(t);
         if (added) onText(added, acc.text);
       }
     }
     for (const raw of parser.flush()) {
       try {
         const added = acc.push(JSON.parse(raw) as StreamChunk);
+        for (const t of acc.drainThoughts()) onThought?.(t);
         if (added) onText(added, acc.text);
       } catch {
         /* ignore a truncated trailing frame */
