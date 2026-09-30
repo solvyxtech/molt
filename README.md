@@ -13,6 +13,8 @@ False done does not count. Acceptance lives outside the model. Every write gets 
 
 Studio page: [solvyx.xyz/work/molt](https://solvyx.xyz/work/molt).
 
+How this differs from Stop hooks, Aider, Cursor, and CI alone: [COMPARISONS.md](COMPARISONS.md).
+
 Support ongoing maintenance via [GitHub Sponsors](https://github.com/sponsors/solvyxtech) or [Polar](https://polar.sh/solvyx).
 
 <p align="center">
@@ -364,3 +366,7 @@ explicit about the list.
 ## Status
 
 Early and moving. The macOS build is unsigned. Apache 2.0 licence.
+
+## Star
+
+If molt caught a false done for you, starring the repo helps other builders find it.
