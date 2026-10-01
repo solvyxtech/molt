@@ -81,12 +81,35 @@ type MoltBridge = {
   receipts(): Promise<ReceiptRow[]>;
   receipt(file: string): Promise<string | null>;
   journal(): Promise<Record<string, unknown>[]>;
+  judgment(): Promise<CaseRow[]>;
+  judgmentStats(): Promise<JudgmentStats | null>;
+  rule(n: number, ruling: RulingName, note?: string): Promise<{ ok: boolean; error?: string; prompt?: string }>;
   stats(): Promise<Stats | null>;
   verify(): Promise<VerifyResult | null>;
   onEvent(fn: (ev: Ev) => void): () => void;
   onConfirm(fn: (r: ConfirmReq) => void): () => void;
   onIdle(fn: () => void): () => void;
 };
+
+type RulingName = "accepted" | "sent back" | "check wrong";
+/** One judgment case, as electron/main.ts sends it (src/judgment.ts). */
+type CaseRow = {
+  n: number;
+  iso: string;
+  task: string;
+  outcome: string;
+  reason: string;
+  /** The reason in plain words. */
+  why: string;
+  checks: { name: string; detail: string; output: string; drafted: boolean }[];
+  violations?: { quote: string; evidence: string }[];
+  receipt?: string;
+  files: string[];
+  restored?: boolean;
+  rulings: { iso: string; ruling: RulingName; note?: string; said: string }[];
+  ruling?: { ruling: RulingName };
+};
+type JudgmentStats = { cases: number; pending: number; ruled: number; sentBack: number; warningsTrue: number | null };
 
 type VerifyResult = {
   ok: boolean;
@@ -216,7 +239,7 @@ let pendingReceipt: string | null = null;
 
 // ── tabs ─────────────────────────────────────────────────────────────────────
 
-const TABS = ["session", "view", "receipts", "log", "settings"] as const;
+const TABS = ["session", "view", "judgment", "receipts", "log", "settings"] as const;
 
 function showTab(name: string): void {
   for (const t of document.querySelectorAll<HTMLElement>(".tab")) {
@@ -235,16 +258,17 @@ function showTab(name: string): void {
   $("composer").classList.toggle("hidden", name !== "session");
   if (name !== "session") closePalette();
   if (name === "receipts") void loadReceipts();
+  if (name === "judgment") void loadJudgment();
   if (name === "log") void loadJournal();
   if (name === "receipts") clearBadge("receipts");
 }
 
-function badge(which: "receipts", text: string, kind?: "ok" | "fail"): void {
+function badge(which: "receipts" | "judgment", text: string, kind?: "ok" | "fail"): void {
   const b = $(`badge-${which}`);
   b.textContent = text;
   b.className = `badge${kind ? " " + kind : ""}`;
 }
-function clearBadge(which: "receipts"): void {
+function clearBadge(which: "receipts" | "judgment"): void {
   $(`badge-${which}`).className = "badge hidden";
 }
 
@@ -672,6 +696,197 @@ async function openReceipt(file: string): Promise<void> {
   void loadReceipts();
 }
 
+// ── judgment tab ──────────────────────────────────────────────────────────────
+//
+// The claims the scale could not settle (src/judgment.ts). The person
+// presides: a ruling is theirs, recorded as theirs, and never relabels the
+// claim "verified". A "sent back" ruling puts the follow-up in the composer —
+// read before it is run, never sent on its own.
+
+let judgeFilter: "awaiting" | "all" = "awaiting";
+let activeCase: number | null = null;
+
+const RULED_CLASS: Record<RulingName, string> = { accepted: "accepted", "sent back": "refused", "check wrong": "undetermined" };
+
+/** The tab's count: cases awaiting judgment. Shown whatever tab is open. */
+async function refreshJudgeBadge(): Promise<void> {
+  const st = await molt.judgmentStats().catch(() => null);
+  if (st && st.pending > 0) badge("judgment", String(st.pending), "fail");
+  else clearBadge("judgment");
+  const line = $("judge-stats");
+  if (!st || !st.cases) line.textContent = "";
+  else if (!st.ruled) line.textContent = `${st.pending} awaiting · no rulings yet`;
+  else
+    line.textContent =
+      `${st.pending} awaiting · Maat's warnings were true ${Math.round((st.warningsTrue ?? 0) * 100)}% of the time ` +
+      `(${st.sentBack} sent back of ${st.ruled} ruled)`;
+}
+
+async function loadJudgment(): Promise<void> {
+  const all = await molt.judgment();
+  const rows = judgeFilter === "all" ? all : all.filter((c) => !c.ruling).reverse();
+  const list = $("judge-list");
+  list.textContent = "";
+  void refreshJudgeBadge();
+  if (!rows.length) {
+    list.appendChild(el("p", "muted pad", judgeFilter === "all" ? "No cases yet." : "Nothing awaits your judgment."));
+    const doc = $("judge-doc");
+    doc.textContent = "";
+    doc.appendChild(
+      el(
+        "p",
+        "muted pad",
+        judgeFilter === "all"
+          ? "Every claim so far was settled by the scale."
+          : "Nothing awaits your judgment. When a claim cannot be settled — a check refuses it, Maat's own checks disagree, nothing can check it, or reviewers dissent — it waits here for you.",
+      ),
+    );
+    activeCase = null;
+    return;
+  }
+  for (const c of rows) {
+    const b = el("button") as HTMLButtonElement;
+    b.appendChild(el("div", undefined, `case ${c.n}`));
+    b.appendChild(el("div", `vd ${c.ruling ? RULED_CLASS[c.ruling.ruling] : "awaiting"}`, c.ruling ? c.ruling.ruling : "awaiting"));
+    b.appendChild(el("div", "case-task", c.task.replace(/\s+/g, " ").slice(0, 70)));
+    if (c.n === activeCase) b.classList.add("active");
+    b.addEventListener("click", () => openCase(c));
+    list.appendChild(b);
+  }
+  const keep = rows.find((c) => c.n === activeCase);
+  openCase(keep ?? rows[0]);
+}
+
+function openCase(c: CaseRow): void {
+  activeCase = c.n;
+  for (const b of $("judge-list").querySelectorAll("button"))
+    b.classList.toggle("active", b.firstElementChild?.textContent === `case ${c.n}`);
+  const doc = $("judge-doc");
+  doc.textContent = "";
+  const last = c.rulings[c.rulings.length - 1];
+  doc.appendChild(el("h1", undefined, `Case ${c.n} — ${last ? last.said : "awaiting your judgment"}`));
+  doc.appendChild(el("p", "muted", `${c.iso.replace("T", " ").slice(0, 16)} · Maat said ${c.outcome}`));
+
+  doc.appendChild(el("h2", undefined, "The claim"));
+  doc.appendChild(el("p", "case-claim", c.task));
+
+  doc.appendChild(el("h2", undefined, "Why the scale did not settle it"));
+  doc.appendChild(el("p", undefined, c.why[0].toUpperCase() + c.why.slice(1) + "."));
+
+  if (c.checks.length) {
+    doc.appendChild(el("h2", undefined, c.checks.length === 1 ? "The check" : "The checks"));
+    for (const k of c.checks) {
+      const h = el("h3");
+      h.appendChild(el("code", undefined, k.name));
+      h.appendChild(document.createTextNode(k.drafted ? " · drafted by Maat" : " · yours"));
+      doc.appendChild(h);
+      const run = el("pre");
+      run.appendChild(el("code", undefined, k.detail));
+      doc.appendChild(run);
+      if (k.output.trim()) {
+        const out = el("pre", "case-out");
+        out.appendChild(el("code", undefined, k.output.trim()));
+        doc.appendChild(out);
+      }
+    }
+  }
+  if (c.violations?.length) {
+    doc.appendChild(el("h2", undefined, "What the reviewers found"));
+    for (const v of c.violations) {
+      const q = el("blockquote", undefined, `“${v.quote}”`);
+      doc.appendChild(q);
+      doc.appendChild(el("p", undefined, v.evidence));
+    }
+  }
+  doc.appendChild(el("h2", undefined, "What it changed"));
+  if (c.files.length) {
+    const ul = el("ul");
+    for (const f of c.files) {
+      const li = el("li");
+      li.appendChild(el("code", undefined, f));
+      ul.appendChild(li);
+    }
+    doc.appendChild(ul);
+  } else doc.appendChild(el("p", "muted", "Nothing was recorded as written."));
+  if (c.restored) doc.appendChild(el("p", "case-warn", "--revert put this work back. Accepting it records your ruling; it does not restore the files."));
+  if (c.receipt) {
+    const file = c.receipt.split("/").pop()!;
+    const open = el("button", "btn ghost sm", "open the receipt") as HTMLButtonElement;
+    open.addEventListener("click", () => {
+      showTab("receipts");
+      void openReceipt(file);
+    });
+    doc.appendChild(open);
+  }
+
+  if (c.rulings.length) {
+    doc.appendChild(el("h2", undefined, "Rulings"));
+    for (const r of c.rulings)
+      doc.appendChild(el("p", undefined, `${r.iso.replace("T", " ").slice(0, 16)} · ${r.said}${r.note ? ` — “${r.note}”` : ""}`));
+  }
+
+  doc.appendChild(el("h2", undefined, c.ruling ? "Change your ruling" : "Your ruling"));
+  const form = el("div", "ruling");
+  const note = el("textarea", "ruling-note") as HTMLTextAreaElement;
+  note.rows = 2;
+  note.placeholder = "What did you find? Sent back, this goes to the next run.";
+  note.setAttribute("aria-label", "your note on this ruling");
+  form.appendChild(note);
+  const buttons = el("div", "ruling-buttons");
+  const choices: [RulingName, string, string][] = [
+    ["accepted", "Accept — the work is right", "btn primary"],
+    ["sent back", "Send back — the work is wrong", "btn danger"],
+  ];
+  if (c.checks.length) choices.push(["check wrong", "The check was wrong", "btn ghost"]);
+  for (const [ruling, label, cls] of choices) {
+    const b = el("button", cls, label) as HTMLButtonElement;
+    b.addEventListener("click", () => void rule(c, ruling, note.value));
+    buttons.appendChild(b);
+  }
+  form.appendChild(buttons);
+  doc.appendChild(form);
+  doc.appendChild(
+    el(
+      "p",
+      "muted",
+      "Accepting records that you judged the work right. It stays unverified by Maat: you proved it, not the scale. " +
+        "“The check was wrong” also teaches Maat's check drafter in this project not to seal the same mistake again.",
+    ),
+  );
+}
+
+async function rule(c: CaseRow, ruling: RulingName, note: string): Promise<void> {
+  const r = await molt.rule(c.n, ruling, note.trim() || undefined);
+  if (!r.ok) {
+    say("", `case ${c.n}: ${r.error ?? "the ruling was not recorded"}`, "error");
+    return;
+  }
+  if (ruling === "sent back" && r.prompt) {
+    const box = $("prompt") as HTMLTextAreaElement;
+    box.value = r.prompt;
+    showTab("session");
+    box.focus();
+    box.dispatchEvent(new Event("input"));
+    say("", `case ${c.n} sent back — the follow-up is in the composer. Read it, then Run.`, "step");
+    void refreshJudgeBadge();
+    return;
+  }
+  await loadJudgment();
+}
+
+$("judge-filter").addEventListener("click", (e) => {
+  const b = (e.target as HTMLElement).closest<HTMLButtonElement>("button[data-filter]");
+  if (!b) return;
+  judgeFilter = b.dataset.filter === "all" ? "all" : "awaiting";
+  for (const x of $("judge-filter").querySelectorAll<HTMLButtonElement>("button")) {
+    const on = x === b;
+    x.classList.toggle("on", on);
+    x.setAttribute("aria-pressed", String(on));
+  }
+  activeCase = null;
+  void loadJudgment();
+});
+
 // ── verify the evidence chain ─────────────────────────────────────────────────
 
 /**
@@ -943,6 +1158,7 @@ molt.onEvent((ev) => {
         "step",
       );
       void refreshStats();
+      if (typeof ev.case === "number") void refreshJudgeBadge();
       break;
     }
 
@@ -2459,6 +2675,8 @@ function applyState(): void {
   }
   renderChecks();
   void refreshStats();
+  // A workspace opened with cases waiting says so on the tab strip.
+  if (state.cwd) void refreshJudgeBadge();
 }
 
 /**

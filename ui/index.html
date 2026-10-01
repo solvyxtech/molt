@@ -62,6 +62,7 @@
     <nav class="tabs" id="tabs" role="tablist">
       <button class="tab active" id="tab-session" data-tab="session" role="tab" aria-controls="panel-session" aria-selected="true" tabindex="0">Session</button>
       <button class="tab" id="tab-view" data-tab="view" role="tab" aria-controls="panel-view" aria-selected="false" tabindex="-1">View</button>
+      <button class="tab" id="tab-judgment" data-tab="judgment" role="tab" aria-controls="panel-judgment" aria-selected="false" tabindex="-1">Judgment<span class="badge hidden" id="badge-judgment"></span></button>
       <button class="tab" id="tab-receipts" data-tab="receipts" role="tab" aria-controls="panel-receipts" aria-selected="false" tabindex="-1">Receipts<span class="badge hidden" id="badge-receipts"></span></button>
       <button class="tab" id="tab-log" data-tab="log" role="tab" aria-controls="panel-log" aria-selected="false" tabindex="-1">Log</button>
       <button class="tab" id="tab-settings" data-tab="settings" role="tab" aria-controls="panel-settings" aria-selected="false" tabindex="-1">Settings</button>
@@ -115,6 +116,30 @@
           </div>
         </div>
         <div class="wire" id="wire"></div>
+      </section>
+
+      <section class="panel" id="panel-judgment" role="tabpanel" aria-labelledby="tab-judgment" tabindex="0">
+        <div class="panel-head">
+          <h2>Judgment</h2>
+          <p class="muted">
+            The claims the scale could not settle. You preside: accept the work, send it back,
+            or rule that the check was wrong. A ruling is recorded as yours — it never turns a
+            claim into “verified”.
+          </p>
+          <div class="controls">
+            <div class="seg" id="judge-filter" role="group" aria-label="which cases">
+              <button class="btn ghost on" data-filter="awaiting" aria-pressed="true">awaiting</button>
+              <button class="btn ghost" data-filter="all" aria-pressed="false">all</button>
+            </div>
+            <span class="muted judge-stats" id="judge-stats" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+        <div class="split">
+          <aside class="list" id="judge-list"></aside>
+          <article class="doc" id="judge-doc">
+            <p class="muted pad">Nothing awaits your judgment.</p>
+          </article>
+        </div>
       </section>
 
       <section class="panel" id="panel-receipts" role="tabpanel" aria-labelledby="tab-receipts" tabindex="0">

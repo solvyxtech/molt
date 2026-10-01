@@ -286,6 +286,28 @@ the same shape as a record that was curated, and is worth exactly as much.
 `molt stats` reports the false-claim rate and the cost per verified change over
 all of them, and says plainly what it does not count.
 
+## Judgment
+
+Some claims the scale cannot settle. A check you wrote refused the work, Maat's
+own drafted checks disagreed with it, nothing could check it, or it passed its
+checks and independent reviewers still found the task contradicted. Most of
+these turn out to be good work, so they are neither failures nor passes: each
+one opens a case and waits for you.
+
+```
+maat judge              step through the cases awaiting judgment
+maat judge stats        how often Maat's warnings were true, from your rulings
+```
+
+You rule one of three ways: **accept** (the work is right), **send back** (the
+work is wrong; your note becomes the next task), or **the check was wrong**
+(the work is right, and Maat's check drafter is told not to seal that mistake
+again in this project). The desktop has the same thing as the Judgment tab.
+
+A ruling never turns a claim into "verified". Maat did not prove the work; you
+judged it, and the record says so. Cases and rulings live in
+`.maat/judgment.jsonl`, hash-chained like the journal (`maat judge verify`).
+
 ## The desktop
 
 <p align="center">

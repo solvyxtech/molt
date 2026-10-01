@@ -21,6 +21,8 @@ import { BarError, hasBar, loadBar, selectChecks, writeDefaultBar } from "./bar.
 import { Engine } from "./engine.js";
 import { describeDrift, driftSince } from "./git.js";
 import { Journal } from "./journal.js";
+import { Judgments } from "./judgment.js";
+import { cmdJudge } from "./judge-cli.js";
 import { Integrity } from "./integrity.js";
 import { buildRepoMap, DEFAULT_MAP_TOKENS } from "./repomap.js";
 import { buildBrief, DEFAULT_BRIEF_TOKENS } from "./brief.js";
@@ -101,6 +103,9 @@ usage
   maat log                  what the model actually did, from the session log
   maat verify               recompute the log's hash chain
   maat attempts             one TSV row per attempt: verdict, tokens, cost, time
+  maat judge                rule on the claims the scale could not settle:
+                            accept · send back · the check was wrong
+                            (list, show <n>, stats — see maat judge help)
 
   maat mission plan "<goal>"   draft .maat/mission/ (contract + features) for you to edit
   maat mission run          a worker per feature, held to its assertions, until done
@@ -671,6 +676,8 @@ function buildEngine(args: Args, session = false): Engine {
     maxSteps: args.steps,
     batch: args.batch === true,
     ...(args.review ? { review: { votes: args.review, reasoningEffort: args.reasoningChecks ?? args.reasoning } } : {}),
+    // MAAT_JUDGMENT=0: no judgment cases (benchmarks, where no person will ever rule).
+    ...(env("JUDGMENT") === "0" ? { judgment: false } : {}),
     captureDir: args.capture ?? env("CAPTURE_DIR"),
     stream: args.stream,
     // --yes predates autonomy and means the same thing as its top level.
@@ -1051,6 +1058,7 @@ async function autoDraft(engine: Engine, args: Args): Promise<ReturnType<typeof 
   // nothing runs the deliverable is asked for once more. See criteria.ts.
   const r = await draftCriteriaCritiqued({
     commands: commandsHere(args.cwd),
+    lessons: new Judgments(args.cwd).lessons(),
     task: args.task ?? "",
     scripts: projectScripts(args.cwd),
     barChecks: (engine.cfg.bar?.checks ?? []).map((c) => c.name),
@@ -1658,6 +1666,36 @@ function cmdLog(args: Args): number {
   return check.ok ? 0 : 1;
 }
 
+/**
+ * `maat judge`. Interactive only on a terminal: piped, it lists, so a script
+ * can never sit waiting for a ruling nobody will type.
+ */
+async function judge(args: Args): Promise<number> {
+  const tty = process.stdin.isTTY && process.stdout.isTTY;
+  let rl: import("node:readline/promises").Interface | undefined;
+  try {
+    return await cmdJudge(
+      { cwd: args.cwd, task: args.task, notes: args.notes, json: args.json, version: VERSION },
+      {
+        out: (s) => process.stdout.write(s),
+        err: (s) => process.stderr.write(s),
+        ask: tty
+          ? async (prompt) => {
+              rl ??= (await import("node:readline/promises")).createInterface({ input: process.stdin, output: process.stdout });
+              try {
+                return await rl.question(prompt);
+              } catch {
+                return null;
+              }
+            }
+          : undefined,
+      },
+    );
+  } finally {
+    rl?.close();
+  }
+}
+
 function cmdVerify(args: Args): number {
   const files = Journal.sessions(args.cwd);
   // No logs is not the end of the question. It returned here, exit 0, before
@@ -1790,6 +1828,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return cmdLog(args);
     case "verify":
       return cmdVerify(args);
+    case "judge":
+      return await judge(args);
     case "attempts":
       return cmdAttempts(args);
     case "mission":

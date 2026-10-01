@@ -579,6 +579,8 @@ export type EngineEvent =
        * reviews found a violation quoted from the task text.
        */
       review?: { confirmed: boolean; votes: string; violations: { quote: string; evidence: string }[] };
+      /** The judgment case this job opened: the scale did not settle it, a person will (judgment.ts). */
+      case?: number;
     }
   | {
       kind: "step_summary";

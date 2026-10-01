@@ -1200,3 +1200,25 @@ input[type="checkbox"]:checked::after {
     animation: none;
   }
 }
+
+/* ── judgment ─────────────────────────────────────────────────────────────── */
+.list .vd.awaiting { color: var(--warn); }
+.list .case-task { font-size: 11px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+.seg { display: inline-flex; gap: 4px; }
+.seg .btn.on { border-color: var(--dim); color: var(--accent); background: var(--ghost); }
+.judge-stats { margin-left: 12px; font-size: 12px; }
+.case-claim { white-space: pre-wrap; }
+.case-out { max-height: 240px; overflow: auto; }
+.case-warn { color: var(--warn); }
+.ruling { display: grid; gap: 10px; margin: 10px 0 6px; }
+.ruling-note {
+  width: 100%;
+  resize: vertical;
+  background: var(--bg-sunken);
+  color: var(--text);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r);
+  padding: 8px 10px;
+  font: inherit;
+}
+.ruling-buttons { display: flex; flex-wrap: wrap; gap: 8px; }

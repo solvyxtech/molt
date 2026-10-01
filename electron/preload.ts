@@ -55,6 +55,9 @@ contextBridge.exposeInMainWorld("molt", {
   receipts: () => ipcRenderer.invoke("receipts:list"),
   receipt: (file: string) => ipcRenderer.invoke("receipts:read", file),
   journal: () => ipcRenderer.invoke("journal:read"),
+  judgment: () => ipcRenderer.invoke("judgment:list"),
+  judgmentStats: () => ipcRenderer.invoke("judgment:stats"),
+  rule: (n: number, ruling: string, note?: string) => ipcRenderer.invoke("judgment:rule", n, ruling, note),
   stats: () => ipcRenderer.invoke("session:stats"),
   verify: () => ipcRenderer.invoke("integrity:verify"),
 

@@ -33,7 +33,7 @@ def openrouter_key() -> str:
 
 
 def run_molt(d: Path, prompt: str, log: Path) -> dict:
-    env = os.environ | {"MOLT_API_KEY": openrouter_key()}
+    env = os.environ | {"MOLT_API_KEY": openrouter_key(), "MOLT_JUDGMENT": "0"}  # nobody rules on a benchmark run
     cmd = [
         "node", str(MOLT), "run", "--url", "https://openrouter.ai/api/v1", "--model", "stealth/space-bunny-alpha",
         "--reasoning", "low", "--yes", "--json", "--criteria", "auto", "--batch", "--review", "3", "--steps", "200", "--cwd", str(d), prompt,

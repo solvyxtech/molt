@@ -49,6 +49,7 @@ import { Engine, MAX_STEPS } from "../src/engine.js";
 import { Archive } from "../src/archive.js";
 import { Receipts, receiptName } from "../src/receipts.js";
 import { Journal } from "../src/journal.js";
+import { Judgments, isRuling, reasonText, rulingText, sendBackPrompt } from "../src/judgment.js";
 import { Integrity } from "../src/integrity.js";
 import { buildRepoMap } from "../src/repomap.js";
 import { buildBrief } from "../src/brief.js";
@@ -667,6 +668,37 @@ function createWindow(): void {
           return;
         }
       }
+      // MAAT_E2E_SHOT_JUDGMENT=<file.png>: open the Judgment tab after the turn
+      // and save what it shows. A turn refused by the bar must arrive there as
+      // a case; this is the only check that sees it on screen.
+      const judgeShot = env("E2E_SHOT_JUDGMENT");
+      if (judgeShot) {
+        await new Promise((r) => setTimeout(r, 600));
+        const badgeText = await win!.webContents.executeJavaScript(
+          `(document.getElementById("maat-splash")?.click(), document.querySelector('.tab[data-tab="judgment"]').click(), (document.getElementById("badge-judgment").classList.contains("hidden") ? "" : document.getElementById("badge-judgment").textContent))`,
+        );
+        await new Promise((r) => setTimeout(r, 800));
+        const listed = await win!.webContents.executeJavaScript(
+          `[...document.querySelectorAll("#judge-list button")].map((b) => b.textContent).join(" | ")`,
+        );
+        writeFileSync(judgeShot, (await win!.webContents.capturePage()).toPNG());
+        console.log(`[self-drive] judgment   badge ${JSON.stringify(badgeText)} · ${listed || "no cases listed"}`);
+        // Rule on it through the real buttons: "send back" must land in the
+        // composer, unsent, and close the case.
+        const ruled = await win!.webContents.executeJavaScript(`(async () => {
+          const note = document.querySelector("#judge-doc .ruling-note");
+          if (!note) return "no ruling form";
+          note.value = "the e2e sent this back";
+          [...document.querySelectorAll("#judge-doc .ruling-buttons button")].find((b) => /Send back/.test(b.textContent)).click();
+          for (let i = 0; i < 30; i++) {
+            const v = document.getElementById("prompt").value;
+            if (v) return (document.getElementById("stop").classList.contains("hidden") ? "unsent · " : "A TURN STARTED · ") + v.split("\\n")[0];
+            await new Promise((r) => setTimeout(r, 100));
+          }
+          return "composer stayed empty";
+        })()`);
+        console.log(`[self-drive] sent back  ${ruled}`);
+      }
       // Give the renderer a tick to paint what it was sent, then ask it what
       // it actually put on screen. Counting events proves delivery; reading the
       // DOM proves rendering, and they fail independently.
@@ -826,7 +858,7 @@ function createWindow(): void {
       void win!.webContents
         .executeJavaScript(
           `(async () => {
-             const need = ["tabs","panels","stream","wire","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","set-claude-code","set-agy","set-grok","claude-code-status","autonomy","interview","criteria","ck-rows","ck-draft","ck-auto","spine","spine-list","jump","ctx","ctx-fill","ctx-line"];
+             const need = ["tabs","panels","stream","wire","judge-list","judge-doc","badge-judgment","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","set-claude-code","set-agy","set-grok","claude-code-status","autonomy","interview","criteria","ck-rows","ck-draft","ck-auto","spine","spine-list","jump","ctx","ctx-fill","ctx-line"];
              const missing = need.filter((id) => !document.getElementById(id));
              const tabs = [...document.querySelectorAll(".tab")].map((t) => t.dataset.tab);
              const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
@@ -941,7 +973,7 @@ function createWindow(): void {
             Array.isArray(r.missing) &&
             r.missing.length === 0 &&
             Array.isArray(r.tabs) &&
-            r.tabs.length === 5 &&
+            r.tabs.length === 6 &&
             r.nulRoundTrip === true &&
             r.autonomyButtons === 3 &&
             String(r.autonomyOn).length > 0 &&
@@ -1510,6 +1542,7 @@ ipcMain.handle("criteria:draft", async (_e, task: string) => {
   // is redrafted once, and `python`/`pip` are fixed where only `python3` exists.
   return draftCriteriaCritiqued({
     commands: commandsHere(session.cwd),
+    lessons: new Judgments(session.cwd).lessons(),
     task,
     scripts: projectScripts(session.cwd),
     barChecks: session.bar?.checks.map((c: Check) => c.name) ?? [],
@@ -1748,6 +1781,43 @@ ipcMain.handle("receipts:read", (_e, file: string) => {
   const p = resolveReceipt(stateDir(session.cwd, "receipts"), file);
   if (p === null || !existsSync(p)) return null;
   return readFileSync(p, "utf8");
+});
+
+// ── Judgment: the claims the scale could not settle (src/judgment.ts) ──────────
+
+ipcMain.handle("judgment:list", () => {
+  if (!session) return [];
+  return new Judgments(session.cwd).all().map((c) => ({
+    ...c,
+    why: reasonText(c.reason),
+    rulings: c.rulings.map((r) => ({ ...r, said: rulingText(r.ruling) })),
+  }));
+});
+
+ipcMain.handle("judgment:stats", () => {
+  if (!session) return null;
+  return new Judgments(session.cwd).stats();
+});
+
+/**
+ * A person's ruling. Validated here, whatever the renderer sends: a known
+ * case, a known ruling, a string note. Written to the judgment record and to
+ * the session journal. A "sent back" ruling returns the follow-up task; the
+ * window puts it in the composer for the person to read and run — it is
+ * never sent on its own.
+ */
+ipcMain.handle("judgment:rule", (_e, n: unknown, ruling: unknown, note: unknown) => {
+  if (!session) return { ok: false, error: "no workspace is open" };
+  if (typeof n !== "number" || !Number.isInteger(n) || typeof ruling !== "string" || !isRuling(ruling)) {
+    return { ok: false, error: "not a ruling" };
+  }
+  const text = typeof note === "string" ? note.slice(0, 4000) : undefined;
+  const store = new Judgments(session.cwd);
+  const c = store.get(n);
+  if (!c) return { ok: false, error: `no case ${n}` };
+  const r = store.rule(n, ruling, { note: text });
+  session.journal?.append("judgment", { case: n, ruling, ...(r.note ? { note: r.note } : {}) });
+  return { ok: true, ...(ruling === "sent back" ? { prompt: sendBackPrompt(c, r.note) } : {}) };
 });
 
 ipcMain.handle("journal:read", () => {

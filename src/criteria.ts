@@ -362,6 +362,11 @@ export async function draftCriteria(opts: {
   reasoningEffort?: string;
   /** What is installed, so a check never calls a command that is not (see commandsHere). */
   commands?: { present: string[]; missing: string[] };
+  /**
+   * Drafted checks a person ruled wrong in this project (Judgments.lessons):
+   * the mistakes not to seal again.
+   */
+  lessons?: string[];
 }): Promise<{ ok: true; draft: Draft } | { ok: false; error: string }> {
   const context = [
     `Task: ${opts.task}`,
@@ -373,6 +378,9 @@ export async function draftCriteria(opts: {
       ? ["This is macOS: BSD tools, not GNU. No `find -printf`, no `stat -c`, no GNU `touch -d`, `sed -i ''` needs the empty argument. Prefer python3 for anything beyond plain shell."]
       : []),
     "`.maat/` is Maat's own folder in the project: a check that lists or counts files must ignore it.",
+    ...(opts.lessons?.length
+      ? ["", "A person ruled these earlier drafted checks wrong in this project. Do not make the same mistake:", ...opts.lessons.map((l) => `- ${l}`)]
+      : []),
     "",
     "Do not repeat what the project already checks. Add only what is specific to",
     "this task.",

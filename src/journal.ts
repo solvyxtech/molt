@@ -77,6 +77,8 @@ export type JournalKind =
   /** The independent review of a verified claim: a label, never a gate. */
   | "review"
   | "dispute"
+  /** A judgment case opened, or a person's ruling on one (judgment.ts). */
+  | "judgment"
   | "shed"
   | "elide"
   | "regrow"

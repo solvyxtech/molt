@@ -130,6 +130,7 @@ import {
 } from "./types.js";
 import { stateDir, stateDirName } from "./statedir.js";
 import { env } from "./env.js";
+import { Judgments, caseReason, reasonText } from "./judgment.js";
 
 /** A reading of the session meter, for measuring one job against. */
 type Meter = {
@@ -1163,6 +1164,12 @@ export type EngineConfig = {
    */
   review?: { votes?: number; reasoningEffort?: string };
   /**
+   * Open a judgment case for every job the scale could not settle
+   * (judgment.ts). On unless set to false — benchmark runs, where no person
+   * will ever rule, turn it off.
+   */
+  judgment?: boolean;
+  /**
    * The step ceiling for one turn, in place of MAX_STEPS. 0 means none.
    *
    * MAX_STEPS is a loop guard sized for a chat session. On Terminal-Bench a
@@ -1877,6 +1884,10 @@ export class Engine {
 
   /** Files this TURN wrote, with what was there before — what a revert acts on. */
   private turnWrites: LedgerLike[] = [];
+  /** Every check was retired by an upheld dispute this turn (judgment.ts). */
+  private turnAllRetired = false;
+  /** `--revert` put this turn's work back, so a person cannot accept it as it stands. */
+  private turnRestored = false;
   /** The pre-turn working tree, as a commit object nothing else can see. */
   private turnSnapshot: string | null = null;
   private turnSnapshotPaths = new Set<string>();
@@ -3473,6 +3484,7 @@ export class Engine {
     }
     const plan = revertPlan(this.turnWrites, (p) => this.turnSnapshotPaths.has(p));
     const done = await restoreFiles(this.cwd, this.turnSnapshot, plan);
+    this.turnRestored = done.restored.length + done.removed.length > 0;
     log?.append("git_restore", {
       restored: done.restored.length,
       removed: done.removed.length,
@@ -3620,6 +3632,8 @@ export class Engine {
     const before = this.meter();
     this.turnStartedAt = startedAt;
     this.turnWrites = [];
+    this.turnAllRetired = false;
+    this.turnRestored = false;
     this.refusedThisTurn = false;
     this.turnReview = undefined;
     this.sealedChecks = [];
@@ -3757,6 +3771,37 @@ export class Engine {
         };
       }
     }
+    // The scale did not settle this one: it goes to the person (judgment.ts).
+    const reason = caseReason({
+      outcome,
+      checksDisagree: checksDisagree ? failing.map((r) => r.name) : undefined,
+      review: review ?? undefined,
+      wrote: this.turnWrites.length > 0,
+      allRetired: this.turnAllRetired,
+    });
+    let opened: number | undefined;
+    if (reason && this.cfg.judgment !== false) {
+      try {
+        const c = new Judgments(this.cwd).open({
+          session: this.cfg.journal?.sessionId,
+          job,
+          model: this.cfg.model,
+          task: userText,
+          outcome,
+          reason,
+          checks: failing.map((r) => ({ name: r.name, detail: r.detail, output: r.output, drafted: r.hidden === true })),
+          ...(review && !review.confirmed ? { violations: review.violations } : {}),
+          ...(receiptPath ? { receipt: receiptPath } : {}),
+          files: this.turnWrites.map((w) => w.path),
+          ...(this.turnRestored ? { restored: true } : {}),
+        });
+        opened = c.n;
+        this.cfg.journal?.append("judgment", { case: c.n, opened: reason, outcome, checks: c.checks.map((k) => k.name), files: c.files.length });
+        yield { kind: "info", text: `awaiting your judgment: case ${c.n} — ${reasonText(reason)}.` };
+      } catch {
+        // The record of a case is never worth failing the turn over.
+      }
+    }
     yield {
       kind: "job_end",
       job,
@@ -3767,6 +3812,7 @@ export class Engine {
       ...(selfChecked ? { selfChecked: true } : {}),
       ...(checksDisagree ? { checksDisagree: failing.map((r) => r.name) } : {}),
       ...(review ? { review: { confirmed: review.confirmed, votes: review.votes, violations: review.violations } } : {}),
+      ...(opened !== undefined ? { case: opened } : {}),
     };
   }
 
@@ -5923,6 +5969,7 @@ export class Engine {
       // Every check was retired: nothing is left to judge the claim, so it is
       // reported the way an unchecked answer is — unverified.
       if (retiredNow > 0 && (barNow()?.checks.length ?? 0) === 0) {
+        this.turnAllRetired = true;
         yield { kind: "info", text: "every check was retired by dispute — this claim is unverified." };
         log?.append("session_end", { reason: "unverified: every check retired" });
         if (claim) yield { kind: "assistant_text", text: redact(claim, this.secrets()), streamed: streamedContent };

@@ -201,6 +201,8 @@ class Molt(BaseInstalledAgent):
         env: dict[str, str] = {
             "MOLT_BASE_URL": base_url,
             "MOLT_MODEL": model,
+            # No judgment cases: nobody rules on a benchmark trial.
+            "MOLT_JUDGMENT": "0",
             # The whole instruction as one variable, so no quoting can eat it.
             "MOLT_TASK": instruction,
             # A benchmark container has no config directory and must not

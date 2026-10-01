@@ -438,10 +438,10 @@ describe("the bar stays on screen while the work happens", () => {
     assert.match(css, /\.stage\.no-spine \.spine \{\s*display:\s*none/);
   });
 
-  it("ships five tabs and no copy of the bar", () => {
+  it("ships six tabs and no copy of the bar", () => {
     const html = readFileSync(path.join(repoRoot(), "ui", "index.html"), "utf8");
     const tabs = [...html.matchAll(/data-tab="([^"]+)"/g)].map((m) => m[1]);
-    assert.deepEqual(tabs, ["session", "view", "receipts", "log", "settings"]);
+    assert.deepEqual(tabs, ["session", "view", "judgment", "receipts", "log", "settings"]);
     assert.doesNotMatch(html, /id="checks"/);
     assert.doesNotMatch(html, /tab-checks/);
     assert.doesNotMatch(html, /st-usage/);
@@ -1783,5 +1783,41 @@ describe("a backend molt knows is dead is refused at the door", () => {
     const main = readFileSync(path.join(repoRoot(), "electron", "main.ts"), "utf8");
     const fn = main.slice(main.indexOf("async function backendRefusal"));
     assert.match(fn.slice(0, 1200), /catch\s*\{/, "a thrown probe must not close the door");
+  });
+});
+
+describe("the Judgment tab", () => {
+  const read = (...p: string[]) => readFileSync(path.join(repoRoot(), ...p), "utf8");
+
+  it("sits in the tab strip with its panel and a count badge", () => {
+    const html = read("ui", "index.html");
+    assert.match(html, /id="tab-judgment"[^>]*data-tab="judgment"/);
+    assert.match(html, /id="badge-judgment"/);
+    assert.match(html, /id="panel-judgment"/);
+    assert.match(read("ui", "app.ts"), /const TABS = \[[^\]]*"judgment"/);
+  });
+
+  it("reaches the main process only through named, validated operations", () => {
+    const pre = read("electron", "preload.ts");
+    for (const ch of ["judgment:list", "judgment:stats", "judgment:rule"]) assert.ok(pre.includes(ch), ch);
+    const main = read("electron", "main.ts");
+    const rule = main.slice(main.indexOf('ipcMain.handle("judgment:rule"'));
+    assert.match(rule.slice(0, 1200), /isRuling\(ruling\)/, "an unknown ruling is refused");
+    assert.match(rule.slice(0, 1200), /Number\.isInteger\(n\)/, "so is a case that is not a number");
+    assert.match(rule.slice(0, 1200), /session\.journal\?\.append\("judgment"/, "a ruling is journalled");
+  });
+
+  it("puts a sent-back case in the composer and never runs it on its own", () => {
+    const ui = read("ui", "app.ts");
+    const fn = ui.slice(ui.indexOf("async function rule("), ui.indexOf("async function rule(") + 1200);
+    assert.match(fn, /box\.value = r\.prompt/);
+    assert.doesNotMatch(fn, /molt\.run\(/, "a ruling must not start a turn");
+  });
+
+  it("never calls a person's ruling 'verified'", () => {
+    const ui = read("ui", "app.ts");
+    const section = ui.slice(ui.indexOf("// ── judgment tab"), ui.indexOf("// ── verify the evidence chain"));
+    const code = section.split("\n").filter((l) => !l.trim().startsWith("//")).join("\n");
+    assert.doesNotMatch(code, /["“]verified["”]/);
   });
 });

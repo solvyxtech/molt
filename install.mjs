@@ -17,14 +17,14 @@
 import { cpSync, existsSync, rmSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 
-const SRC = "release/mac-arm64/molt.app";
-const DEST = "/Applications/molt.app";
+const SRC = "release/mac-arm64/Maat Agent.app";
+const DEST = "/Applications/Maat Agent.app";
 const push = process.argv.includes("--push");
 
 if (push) {
   const into = join(DEST, "Contents/Resources/app/out");
   if (!existsSync(DEST)) {
-    console.error(`molt is not installed at ${DEST} — run \`npm run app:install\` first.`);
+    console.error(`Maat Agent is not installed at ${DEST} — run \`npm run app:install\` first.`);
     process.exit(1);
   }
   rmSync(into, { recursive: true, force: true });
