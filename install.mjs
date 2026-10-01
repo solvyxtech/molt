@@ -14,7 +14,7 @@
  * is under a megabyte. With `asar: false` those sit as plain files inside the
  * bundle, so a refresh is a copy.
  */
-import { cpSync, existsSync, rmSync, mkdirSync } from "node:fs";
+import { cpSync, existsSync, rmSync, mkdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 
 const SRC = "release/mac-arm64/Maat Agent.app";
@@ -37,7 +37,14 @@ if (push) {
     process.exit(1);
   }
   rmSync(DEST, { recursive: true, force: true });
-  cpSync(SRC, DEST, { recursive: true, dereference: false, verbatimSymlinks: true });
+  // Moved, not copied: a copy leaves the build in release/ as a second app
+  // that Spotlight and Launchpad list beside the installed one.
+  try {
+    renameSync(SRC, DEST);
+  } catch {
+    cpSync(SRC, DEST, { recursive: true, dereference: false, verbatimSymlinks: true });
+    rmSync(SRC, { recursive: true, force: true });
+  }
   console.log(`installed to ${DEST}`);
   console.log("Unsigned, so the first open needs: right-click the app → Open → Open.");
 }
