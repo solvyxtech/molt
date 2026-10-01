@@ -22,7 +22,8 @@
  *     autonomy on a machine that matters is the user's call to make, in the
  *     open, with the level on screen while it works.
  */
-import { existsSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export type Autonomy = "low" | "medium" | "high";
@@ -152,7 +153,7 @@ const NET_WRITE_FLAGS = [
  * The name must end there: `> /dev/nullx` is an ordinary file, and a pattern
  * without that boundary would wave it through.
  *
- * `ls -la .molt 2>/dev/null` is how everybody writes an exploratory command,
+ * `ls -la .maat 2>/dev/null` is how everybody writes an exploratory command,
  * and treating its `>` as a file write sent every such call to a prompt — in a
  * headless run, to a refusal. A model that cannot list a directory guesses
  * filenames instead, which is worse for everyone than allowing a discard.
@@ -182,6 +183,9 @@ const OPAQUE = /(\$\(|`|>|<|\bsudo\b|\bsu\b)/;
  * what cannot be undone" — an overclaim in the one file where an overclaim
  * matters most. Every entry below exists because probing found it missing.
  */
+/** Kept by identity so high autonomy can leave exactly this rule out. */
+const INLINE_PROGRAM_RULE = /\b(python[\d.]*|node|ruby|perl|php|deno|bun|osascript)\b[^|;&]*\s-(c|e|eval)\b/i;
+
 const IRREVERSIBLE = [
   // Deletion, in any form. No flag required: one named file is enough.
   /\brm\b/i,
@@ -220,7 +224,7 @@ const IRREVERSIBLE = [
   // which is not a gap in the list below — it is the reason a list cannot be
   // the whole answer. The effect of an -e/-c program is not readable from the
   // text, which is the same rule that already sends `$(...)` to a prompt.
-  /\b(python[\d.]*|node|ruby|perl|php|deno|bun|osascript)\b[^|;&]*\s-(c|e|eval)\b/i,
+  INLINE_PROGRAM_RULE,
   /\b(sh|bash|zsh|fish)\b[^|;&]*\s-c\b/i,
   /:\(\)\s*\{/, // fork bomb, and anything else that opens with a function trap
 ];
@@ -315,6 +319,124 @@ export function deletesOnlyCreated(
 }
 
 /** Would this command do something no later step could undo? */
+/**
+ * Does this command's only irreversible act write files that did not exist?
+ *
+ * `echo x > out.txt` is on the irreversible list because `>` replaces a
+ * file's contents, and a replaced file is gone. But a file that does not
+ * exist yet has no contents to lose — and "save the result to result.txt" is
+ * how a great deal of real work is phrased. A mission worker at high
+ * autonomy was refused `python3 cli.py > /tmp/out` twice and had to find
+ * another spelling; on a benchmark clock that is the task lost.
+ *
+ * So at high autonomy a redirect is allowed when every target is a path
+ * inside the project (or under the OS temp directory) that either does not
+ * exist or was created by this session, and nothing else in the command is
+ * irreversible. `write_file` already overwrites project files at high
+ * without asking, with the old contents in the ledger; this is narrower
+ * than that, because a shell write leaves no ledger entry — the bar's
+ * `tree-accounted` is what catches it, and only when a bar is present.
+ */
+export function overwritesOnlyNew(
+  command: string,
+  created: ReadonlySet<string>,
+  cwd: string,
+  tmp: string = tmpdir(),
+): boolean {
+  const bare = command.replace(HARMLESS_REDIRECT, " ");
+  // Every `> target` and `N> target`. `>>` never reached the list, and `>&2`
+  // style duplications are not files.
+  const re = /(?<![>&])\d?>(?![>&])\s*(\S+)/g;
+  const targets: string[] = [];
+  // Quotes off, and the shell punctuation a target can run into (`> out;`).
+  for (const m of bare.matchAll(re)) targets.push(m[1].replace(/[;&|)]+$/, "").replace(/^['"]|['"]$/g, ""));
+  if (!targets.length) return false;
+  // What is left must be reversible on its own: `rm a > log` is still an rm.
+  if (isIrreversible(bare.replace(re, " "))) return false;
+  for (const t of targets) {
+    if (/[*?$`{}]/.test(t)) return false; // a target that is not a path
+    const abs = resolve(cwd, t);
+    if (!insideProject(cwd, t)) {
+      // Scratch in the temp directory: fine while it is new. Checked second,
+      // because a project can itself live under the temp directory — every
+      // test workspace does — and a project file is judged as a project file.
+      if (realLocation(abs).startsWith(realLocation(tmp) + sep) && !existsSync(abs)) continue;
+      return false;
+    }
+    const rel = relative(cwd, abs);
+    // The project root itself, or any directory, is not a file waiting to be
+    // written; a directory cannot be new and the root is never a target.
+    if (rel === "") return false;
+    if (existsSync(abs) && (!created.has(rel) || statSync(abs).isDirectory())) return false;
+  }
+  return true;
+}
+
+/**
+ * The command with everything that only touches a folder it made itself
+ * with `mktemp` taken out.
+ *
+ * `d=$(mktemp -d); cat > $d/check.py <<EOF … EOF; python3 $d/check.py; rm -rf $d`
+ * is how a careful agent tests its work without leaving anything in the
+ * project, and it was refused at high autonomy for the `>` and the `rm`. A
+ * folder the same command just created holds nothing anyone else owns.
+ */
+export function withoutOwnTempWork(command: string): string {
+  const vars = [...command.matchAll(/\b([A-Za-z_]\w*)=["']?\$\(\s*mktemp\b[^)]*\)["']?/g)].map((m) => m[1]!);
+  if (!vars.length) return command;
+  // `$d/../..` climbs out of the folder: no exemption for this command at all.
+  if (new RegExp(`\\$\\{?(?:${vars.join("|")})\\}?/[^\\s;&|]*\\.\\.`).test(command)) return command;
+  const ref = `"?\\$\\{?(?:${vars.join("|")})\\}?(?:/[^\\s"';&|]*)?"?`;
+  return command
+    // Only an rm whose every operand is one of these folders: `rm -rf $d ~/x` stays.
+    .replace(new RegExp(`\\brm(\\s+-[a-zA-Z]+)*(\\s+${ref})+(?=[ \\t]*(;|&|\\||\\n|$))`, "g"), " ")
+    .replace(new RegExp(`(?<!>)>(?!>)\\s*${ref}`, "g"), " ");
+}
+
+/**
+ * Irreversible at high autonomy. The same list, with two differences that
+ * make high mean what it says.
+ *
+ * An inline program (`python3 -c`, `node -e`) runs here exactly as the same
+ * program in a file does — and a file program already ran at high, so asking
+ * about the inline one protected nothing; it only stopped the model checking
+ * its own work. Headless with --yes, every such check was refused, and the
+ * model claimed done without having tested anything. And work confined to a
+ * folder the command made with `mktemp` is not a loss (see above).
+ */
+export function isIrreversibleAtHigh(command: string): boolean {
+  const bare = withoutOwnTempWork(command).replace(HARMLESS_REDIRECT, " ");
+  const inlineOk = !MUTATING_API.test(command);
+  return IRREVERSIBLE.some((re) => !(re === INLINE_PROGRAM_RULE && inlineOk) && re.test(bare));
+}
+
+/**
+ * What an inline program must not contain to run at high autonomy: any call
+ * that deletes, moves, writes, spawns or reaches the network. A verification
+ * one-liner — import, compute, print, assert — has none of these, and those
+ * are the ones a careful model writes to test its work. The rule that sends
+ * `python -c "os.remove(x)"` to a person stands for everything else, and
+ * `sh -c` / `bash -c` always ask.
+ */
+const MUTATING_API = new RegExp(
+  [
+    "\\b(remove|unlink|rmdir|rmtree|removedirs|rename|replace|truncate|chmod|chown|symlink|link|makedirs|mkdir)\\s*\\(",
+    "\\b(shutil|subprocess|system|popen|spawn|exec|execSync|execFile|fork|kill)\\b",
+    "\\b(unlinkSync|rmSync|rmdirSync|writeFileSync|appendFileSync|renameSync|copyFileSync|writeFile|appendFile|createWriteStream|mkdirSync)\\b",
+    "\\b(write_text|write_bytes|touch)\\s*\\(",
+    // open() with a writing MODE — the mode argument, not any letter in the
+    // path: open('data/orders.csv') is a read, open('a.txt', 'w') a write.
+    "\\bopen\\s*\\([^)]*,\\s*(mode\\s*=\\s*)?['\"][rbt]*[wax+][rbtwax+]*['\"]",
+    "\\.open\\s*\\(\\s*(mode\\s*=\\s*)?['\"][rbt]*[wax+][rbtwax+]*['\"]",
+    "\\b(File|Dir|FileUtils)\\.(delete|unlink|rm|write|rename|mv)",
+    "\\bunlink\\b",
+    "\\b(urlopen|requests|fetch|http|socket)\\b",
+    "\\b(eval|exec)\\s*\\(",
+    "`",
+  ].join("|"),
+  "i",
+);
+
 export function isIrreversible(command: string): boolean {
   // A discard is not a write, so it must not read as one here either.
   const bare = command.replace(HARMLESS_REDIRECT, " ");
@@ -369,7 +491,14 @@ export function insideProject(cwd: string, p: unknown): boolean {
  * from a regex over a command line, which is a better kind of safety — there
  * is nothing to outsmart.
  */
-const READING_TOOLS = new Set(["read_file", "list_dir", "grep"]);
+const READING_TOOLS = new Set(["read_file", "list_dir", "grep", "inspect"]);
+
+/**
+ * Tools that touch nothing at all. `plan` writes a note into the model's own
+ * conversation and nowhere else; there is no disk, no process and no network
+ * on its code path, so no autonomy level has anything to say about it.
+ */
+const INERT_TOOLS = new Set(["plan"]);
 
 /** Tools that write, and are gated exactly like write_file. */
 const WRITING_TOOLS = new Set(["write_file", "edit_file"]);
@@ -383,7 +512,7 @@ const WRITING_TOOLS = new Set(["write_file", "edit_file"]);
  * deny-by-default rule at the top of this file, applied to itself. Found
  * missing by the probe suite, at high, where it mattered most.
  */
-const KNOWN_TOOLS = new Set([...READING_TOOLS, ...WRITING_TOOLS, "bash"]);
+const KNOWN_TOOLS = new Set([...READING_TOOLS, ...WRITING_TOOLS, ...INERT_TOOLS, "bash"]);
 
 export type Decision = {
   /** True when a human has to answer before this runs. */
@@ -407,9 +536,18 @@ export function gate(
     cwd: string;
     /** Project-relative paths this session created, for the delete exception. */
     created?: ReadonlySet<string>;
+    /**
+     * Where the boundary is. `project` (the default) asks about any path
+     * outside the working directory at every level. `machine` is a sandbox
+     * the person has declared disposable — a benchmark container, a throwaway
+     * VM — and the boundary is the machine. It never lowers what asks for any
+     * other reason.
+     */
+    boundary?: "project" | "machine";
   },
 ): Decision {
   const { name, args, cwd } = call;
+  const bounded = call.boundary !== "machine";
   const command = typeof args.command === "string" ? args.command : "";
   const path = args.path;
 
@@ -420,14 +558,14 @@ export function gate(
   const pathed = READING_TOOLS.has(name) || WRITING_TOOLS.has(name);
   const needsPath = name === "read_file" || WRITING_TOOLS.has(name);
   const hasPath = typeof path === "string" && path !== "";
-  if (pathed && (hasPath || needsPath) && !insideProject(cwd, path)) {
+  if (pathed && (hasPath || needsPath)) {
     // A missing path is not "outside the project", it is malformed — and a
     // model reading "undefined is outside this project" learns nothing about
-    // what it did wrong.
-    return {
-      ask: true,
-      why: hasPath ? `${String(path)} is outside this project` : `${name} was called with no path`,
-    };
+    // what it did wrong. Malformed is malformed whatever the boundary.
+    if (!hasPath) return { ask: true, why: `${name} was called with no path` };
+    if (bounded && !insideProject(cwd, path)) {
+      return { ask: true, why: `${String(path)} is outside this project` };
+    }
   }
 
   if (!KNOWN_TOOLS.has(name)) {
@@ -435,13 +573,17 @@ export function gate(
   }
 
   // A tool with no write in it needs no permission at any level.
-  if (READING_TOOLS.has(name)) return { ask: false };
+  if (READING_TOOLS.has(name) || INERT_TOOLS.has(name)) return { ask: false };
 
   if (level === "high") {
-    if (name === "bash" && isIrreversible(command)) {
+    if (name === "bash" && isIrreversibleAtHigh(command)) {
       // Removing only what this session created undoes molt's own work and
       // nobody else's, so at this level it does not need a person.
       if (call.created?.size && deletesOnlyCreated(command, call.created, cwd)) {
+        return { ask: false };
+      }
+      // Writing a file that did not exist loses nothing.
+      if (overwritesOnlyNew(command, call.created ?? new Set(), cwd)) {
         return { ask: false };
       }
       return { ask: true, why: "this cannot be undone" };

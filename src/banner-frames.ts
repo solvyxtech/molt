@@ -13,7 +13,7 @@
  * rather than two drawings of one idea.
  */
 
-export const WORD = "molt";
+export const WORD = "maat";
 
 export const FRAME_MS = 135;
 export const TOTAL_FRAMES = 26; // 26 × 135ms ≈ 3.5s

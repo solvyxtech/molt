@@ -214,9 +214,9 @@ describe("streaming through the engine", () => {
 
   it("yields deltas and still runs the proof gate", async () => {
     const dir = ws();
-    mkdirSync(join(dir, ".molt"), { recursive: true });
+    mkdirSync(join(dir, ".maat"), { recursive: true });
     writeFileSync(
-      join(dir, ".molt", "done.yml"),
+      join(dir, ".maat", "done.yml"),
       "version: 1\nchecks:\n  - name: landed\n    builtin: files-changed\n",
     );
 

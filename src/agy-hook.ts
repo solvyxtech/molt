@@ -31,6 +31,7 @@
  * of what an agent may do without going through molt. The listed few are
  * bookkeeping — they touch no file, run no command, and reach no network.
  */
+import { env } from "./env.js";
 const ALLOWED = new Set([
   // molt's own tools arrive through this one.
   "call_mcp_tool",
@@ -47,7 +48,7 @@ const ALLOWED = new Set([
 
 async function main(): Promise<void> {
   // No molt session on the other end: say nothing, decide nothing.
-  if (!process.env.MOLT_MCP_URL) return;
+  if (!env("MCP_URL")) return;
 
   let raw = "";
   process.stdin.setEncoding("utf8");
@@ -74,8 +75,8 @@ async function main(): Promise<void> {
     JSON.stringify({
       decision: "deny",
       reason:
-        `molt runs every tool in this session, so the work lands on its ledger and can be ` +
-        `checked. '${name}' is not available here. Use molt's tools instead — read_file, ` +
+        `maat runs every tool in this session, so the work lands on its ledger and can be ` +
+        `checked. '${name}' is not available here. Use Maat's tools instead — read_file, ` +
         `write_file, edit_file, list_dir, grep, bash — which do the same jobs.`,
     }),
   );

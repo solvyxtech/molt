@@ -72,34 +72,34 @@ function repoRoot(): string {
 
 describe("receipts:read containment", () => {
   it("accepts a receipt on POSIX", () => {
-    const dir = path.posix.resolve("/proj/.molt/receipts");
+    const dir = path.posix.resolve("/proj/.maat/receipts");
     const p = resolveReceipt(dir, "0001-accepted.md", path.posix);
-    assert.equal(p, "/proj/.molt/receipts/0001-accepted.md");
+    assert.equal(p, "/proj/.maat/receipts/0001-accepted.md");
   });
 
   it("accepts a receipt on Windows", () => {
     // The bug: startsWith(dir + "/") against a backslash path never matches,
     // so every legitimate read returns null and the Receipts tab is empty.
-    const dir = path.win32.resolve("C:\\proj\\.molt\\receipts");
+    const dir = path.win32.resolve("C:\\proj\\.maat\\receipts");
     const p = resolveReceipt(dir, "0001-accepted.md", path.win32);
     assert.equal(
       p,
-      "C:\\proj\\.molt\\receipts\\0001-accepted.md",
+      "C:\\proj\\.maat\\receipts\\0001-accepted.md",
       "a Windows receipt must resolve, not vanish behind a POSIX slash",
     );
   });
 
   it("refuses a climb on both platforms", () => {
     assert.equal(
-      resolveReceipt("/proj/.molt/receipts", "../secret.md", path.posix),
+      resolveReceipt("/proj/.maat/receipts", "../secret.md", path.posix),
       null,
     );
     assert.equal(
-      resolveReceipt("C:\\proj\\.molt\\receipts", "..\\secret.md", path.win32),
+      resolveReceipt("C:\\proj\\.maat\\receipts", "..\\secret.md", path.win32),
       null,
     );
     assert.equal(
-      resolveReceipt("C:\\proj\\.molt\\receipts", "C:\\Windows\\win.ini", path.win32),
+      resolveReceipt("C:\\proj\\.maat\\receipts", "C:\\Windows\\win.ini", path.win32),
       null,
     );
   });
@@ -107,17 +107,17 @@ describe("receipts:read containment", () => {
   it("refuses a sibling that only shares a prefix", () => {
     // startsWith(dir) without a separator would let receipts-evil through.
     assert.equal(
-      resolveReceipt("/proj/.molt/receipts", "../receipts-evil/x.md", path.posix),
+      resolveReceipt("/proj/.maat/receipts", "../receipts-evil/x.md", path.posix),
       null,
     );
     assert.equal(
-      resolveReceipt("C:\\proj\\.molt\\receipts", "..\\receipts-evil\\x.md", path.win32),
+      resolveReceipt("C:\\proj\\.maat\\receipts", "..\\receipts-evil\\x.md", path.win32),
       null,
     );
   });
 
   it("refuses the empty string, a non-string, and the directory itself", () => {
-    const dir = "/proj/.molt/receipts";
+    const dir = "/proj/.maat/receipts";
     assert.equal(resolveReceipt(dir, "", path.posix), null);
     assert.equal(resolveReceipt(dir, 1, path.posix), null);
     assert.equal(resolveReceipt(dir, undefined, path.posix), null);
@@ -125,8 +125,8 @@ describe("receipts:read containment", () => {
   });
 
   it("takes only the basename off a Windows receipt path", () => {
-    assert.equal(receiptBasename("C:\\proj\\.molt\\receipts\\0001-accepted.md"), "0001-accepted.md");
-    assert.equal(receiptBasename("/proj/.molt/receipts/0001-accepted.md"), "0001-accepted.md");
+    assert.equal(receiptBasename("C:\\proj\\.maat\\receipts\\0001-accepted.md"), "0001-accepted.md");
+    assert.equal(receiptBasename("/proj/.maat/receipts/0001-accepted.md"), "0001-accepted.md");
   });
 });
 
@@ -498,6 +498,9 @@ describe("session:run sanitizes renderer-supplied criteria", () => {
         { name: "num", run: 1 },
         { name: "blank", run: "   " },
         { name: "x".repeat(80), run: "echo " + "a".repeat(400) },
+        // Over CRITERIA_MAX_RUN: dropped, not cut. A cut command does not
+        // parse, and seven benchmark trials were "not proven" against one.
+        { name: "too-long", run: "echo " + "a".repeat(1200) },
         { name: "fifth", run: "true" },
         { name: "sixth", run: "true" },
         { name: "seventh", run: "true" },
@@ -509,7 +512,7 @@ describe("session:run sanitizes renderer-supplied criteria", () => {
     assert.equal(taskChecks[0]!.run, "true");
     assert.equal(taskChecks[0]!.kind, "command");
     assert.equal(taskChecks[1]!.name.length, 40);
-    assert.equal(taskChecks[1]!.run.length, 300);
+    assert.equal(taskChecks[1]!.run, "echo " + "a".repeat(400), "kept whole");
     assert.equal(taskChecks[2]!.name, "fifth");
     assert.equal(taskChecks[3]!.name, "sixth");
     assert.equal(taskNotes.length, 3);
@@ -755,17 +758,49 @@ describe("the key that reaches the endpoint", () => {
 });
 
 describe("one splash, two surfaces", () => {
-  it("draws the window's splash from the terminal's own frames", () => {
-    const src = readFileSync(path.join(repoRoot(), "ui", "splash.ts"), "utf8");
-    // The whole point of splitting `banner-frames.ts` out of `banner.tsx` was
-    // that the window could read it without dragging Ink into a browser
-    // bundle. If this import ever goes, the two surfaces have quietly become
-    // two animations, and they will drift the first time either is tuned.
-    assert.match(src, /from "\.\.\/src\/banner-frames\.js"/);
-    assert.match(src, /buildFrame\(/);
-    // And it must not have grown its own copy of the grid on the way.
-    assert.doesNotMatch(src, /SHED_AT\s*=\s*\[/);
-    assert.doesNotMatch(src, /const WORD\s*=/);
+  it("marks the window with Maat's feather, drawn as a vector, and ships every file it needs", () => {
+    const css = readFileSync(path.join(repoRoot(), "ui", "styles.css"), "utf8");
+    const build = readFileSync(path.join(repoRoot(), "build.mjs"), "utf8");
+    // The title bar uses the heavier small mark; the empty session the full one.
+    assert.match(css, /\.mark \{[^}]*url\("logo-small\.svg"\)/);
+    assert.match(css, /\.empty-mark \{[^}]*url\("logo\.svg"\)/);
+    for (const f of ["logo.svg", "logo-small.svg", "logo.png"]) {
+      assert.ok(existsSync(path.join(repoRoot(), "ui", f)), f);
+      assert.match(build, new RegExp(`cpSync\\("ui/${f.replace(".", "\\.")}", "out/ui/${f.replace(".", "\\.")}"\\)`), f);
+    }
+    for (const f of ["logo.svg", "logo-small.svg"]) {
+      assert.match(readFileSync(path.join(repoRoot(), "ui", f), "utf8"), /stroke="#C6A56E"/, `${f} is the site's gold`);
+    }
+  });
+
+  it("opens on the weighing: the Maat splash, in the site's cyan and gold, skippable, shipped with its assets", () => {
+    const html = readFileSync(path.join(repoRoot(), "ui", "index.html"), "utf8");
+    const css = readFileSync(path.join(repoRoot(), "ui", "styles.css"), "utf8");
+    const js = readFileSync(path.join(repoRoot(), "ui", "maat-splash.ts"), "utf8");
+    const build = readFileSync(path.join(repoRoot(), "build.mjs"), "utf8");
+    assert.match(html, /<button id="maat-splash"[^>]*aria-label="Skip the weighing"/);
+    assert.match(html, /src="maat-splash\/bust\.jpg"/);
+    // The website's cyan, and the splash's accents use it rather than a copy.
+    assert.match(css, /--maat-cyan: #7ec9d4;/);
+    for (const sel of ["kicker", "splash-word span"]) {
+      assert.match(css, new RegExp(`#maat-splash \\.${sel}[^}]*var\\(--maat-cyan\\)`), sel);
+    }
+    // The weighing itself — the beam and the feather — is the site's gold.
+    assert.match(css, /--maat-gold: #c6a56e;/);
+    for (const sel of ["splash-beam", "splash-feather"]) {
+      assert.match(css, new RegExp(`#maat-splash \\.${sel}[^}]*var\\(--maat-gold\\)`), sel);
+    }
+    // Ceremony is never a toll booth: a click, any key, or the settle ends it,
+    // and reduced motion skips the motion.
+    assert.match(js, /addEventListener\("click", finish\)/);
+    assert.match(js, /addEventListener\("keydown", finish, true\)/);
+    assert.match(js, /prefers-reduced-motion/);
+    assert.match(css, /prefers-reduced-motion: reduce/);
+    // Shipped: the bundle copies the bust and the fonts beside the page.
+    assert.match(build, /cpSync\("ui\/maat-splash", "out\/ui\/maat-splash", \{ recursive: true \}\)/);
+    for (const f of ["bust.jpg", "fonts/barlow-condensed-normal-300.woff2", "fonts/ibm-plex-mono-normal-400.woff2"]) {
+      assert.ok(existsSync(path.join(repoRoot(), "ui", "maat-splash", f)), f);
+    }
   });
 
   it("keeps banner.tsx's exports working for everything that imported them", () => {
@@ -784,10 +819,10 @@ describe("one splash, two surfaces", () => {
         .map((s) => s.text)
         .join("");
     // Husked at the start, one letter freed per SHED_AT entry, bare by 14.
-    assert.ok(row(0).startsWith("(m) (o) (l) (t)"), row(0));
-    assert.ok(row(2).startsWith(" m  (o) (l) (t)"), row(2));
-    assert.ok(row(6).startsWith(" m   o  (l) (t)"), row(6));
-    assert.ok(row(14).startsWith(" m   o   l   t"), row(14));
+    assert.ok(row(0).startsWith("(m) (a) (a) (t)"), row(0));
+    assert.ok(row(2).startsWith(" m  (a) (a) (t)"), row(2));
+    assert.ok(row(6).startsWith(" m   a  (a) (t)"), row(6));
+    assert.ok(row(14).startsWith(" m   a   a   t"), row(14));
   });
 
   it("casts a wavefront off past the word, never through it", () => {
@@ -1253,8 +1288,8 @@ describe("capture is wired on both surfaces", () => {
   it("gives the window's engine MOLT_CAPTURE_DIR, as the terminal's has", () => {
     const main = readFileSync(path.join(repoRoot(), "electron", "main.ts"), "utf8");
     const cli = readFileSync(path.join(repoRoot(), "src", "cli.tsx"), "utf8");
-    assert.match(cli, /captureDir: args\.capture \?\? process\.env\.MOLT_CAPTURE_DIR/);
-    assert.match(main, /captureDir: process\.env\.MOLT_CAPTURE_DIR/, "a window session never captures");
+    assert.match(cli, /captureDir: args\.capture \?\? env\("CAPTURE_DIR"\)/);
+    assert.match(main, /captureDir: env\("CAPTURE_DIR"\)/, "a window session never captures");
   });
 });
 
@@ -1356,7 +1391,7 @@ describe("interview replies become checks a person can run", () => {
       if (files?.kind === "builtin") assert.equal(files.builtin, "files-changed");
       assert.equal(added?.kind, "command");
       if (added?.kind === "command") assert.equal(added.run, "npx tsc --noEmit");
-      const yaml = readFileSync(path.join(d, ".molt", "done.yml"), "utf8");
+      const yaml = readFileSync(path.join(d, ".maat", "done.yml"), "utf8");
       assert.match(yaml, /name: typecheck/);
       assert.match(yaml, /run: npm run lint/);
       assert.doesNotMatch(yaml, /run: false/);
@@ -1383,7 +1418,7 @@ describe("interview replies become checks a person can run", () => {
       };
       const r = applyBarAdds(d, [{ name: "ok", run: "true" }], current);
       assert.equal(r.ok, false);
-      assert.equal(existsSync(path.join(d, ".molt", "done.yml")), false);
+      assert.equal(existsSync(path.join(d, ".maat", "done.yml")), false);
     } finally {
       rmSync(d, { recursive: true, force: true });
     }

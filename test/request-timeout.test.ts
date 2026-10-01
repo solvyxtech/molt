@@ -295,3 +295,31 @@ describe("a one-shot question that never answers", () => {
     assert.ok(askTimeoutMs(10_000) > REQUEST_IDLE_MS, "a long answer's allowance grows with it");
   });
 });
+
+describe("MOLT_REQUEST_FIRST_BYTE_MS", () => {
+  it("replaces the computed first-byte allowance, so an unstreamed stall is caught in time", async () => {
+    // Unstreamed, the computed allowance is the whole output ceiling at local
+    // speed — close to an hour. A benchmark lost five tasks waiting on it.
+    const { envFirstByteMs } = await import("../src/watchdog.js");
+    assert.equal(envFirstByteMs(undefined), undefined);
+    assert.equal(envFirstByteMs(""), undefined);
+    assert.equal(envFirstByteMs("abc"), undefined);
+    assert.equal(envFirstByteMs("0"), undefined);
+    assert.equal(envFirstByteMs("180000"), 180_000);
+    assert.ok(firstByteMs(REQUEST_IDLE_MS, { promptTokens: 20_000, maxTokens: 32_768, stream: false }) > 3_000_000);
+
+    const server = await serve(() => {});
+    const prior = process.env.MOLT_REQUEST_FIRST_BYTE_MS;
+    process.env.MOLT_REQUEST_FIRST_BYTE_MS = "100";
+    try {
+      const { engine } = engineAt(server.url, { requestIdleMs: 100, stream: false });
+      const t0 = Date.now();
+      const events = await drain(engine.run("hi", allowAll));
+      assert.ok(Date.now() - t0 < 5_000, "the stall was cut off by the env allowance");
+      assert.match(texts(events, "error")[0] ?? "", /no response from the provider for 100ms/);
+    } finally {
+      if (prior === undefined) delete process.env.MOLT_REQUEST_FIRST_BYTE_MS;
+      else process.env.MOLT_REQUEST_FIRST_BYTE_MS = prior;
+    }
+  });
+});

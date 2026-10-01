@@ -26,7 +26,7 @@ after(() => cleanups.forEach((c) => c()));
 function logDir(): { root: string; dir: string } {
   const w = workspace();
   cleanups.push(w.cleanup);
-  const dir = join(w.dir, ".molt", "log");
+  const dir = join(w.dir, ".maat", "log");
   mkdirSync(dir, { recursive: true });
   return { root: w.dir, dir };
 }

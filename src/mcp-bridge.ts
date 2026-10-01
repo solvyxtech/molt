@@ -18,8 +18,9 @@
  * (Electron with `ELECTRON_RUN_AS_NODE`), so anything it imported would have
  * to be resolvable from the packaged app's own layout.
  */
-const url = process.env.MOLT_MCP_URL;
-const token = process.env.MOLT_MCP_TOKEN;
+import { env } from "./env.js";
+const url = env("MCP_URL");
+const token = env("MCP_TOKEN");
 
 /** Written to stdout as one line, which is the framing MCP stdio uses. */
 function emit(msg: unknown): void {
@@ -79,7 +80,7 @@ async function main(): Promise<void> {
           emit({
             jsonrpc: "2.0",
             id: msg.id,
-            error: { code: -32000, message: `molt bridge: ${String(e)}` },
+            error: { code: -32000, message: `maat bridge: ${String(e)}` },
           });
         }
       }

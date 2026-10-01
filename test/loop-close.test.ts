@@ -49,8 +49,8 @@ function ws(): string {
 }
 
 function writeBar(dir: string, yaml: string): void {
-  mkdirSync(join(dir, ".molt"), { recursive: true });
-  writeFileSync(join(dir, ".molt", "done.yml"), yaml, "utf8");
+  mkdirSync(join(dir, ".maat"), { recursive: true });
+  writeFileSync(join(dir, ".maat", "done.yml"), yaml, "utf8");
 }
 
 const LANDED = "version: 1\nchecks:\n  - name: landed\n    builtin: files-changed\n";

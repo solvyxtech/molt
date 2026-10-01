@@ -40,8 +40,12 @@ const MUST_ASK = [
   "find . -type f -exec rm {} +",
   "truncate -s 0 notes.md",
   "tee notes.md",
-  "echo hi > notes.md",
-  "cat a > b",
+  // A redirect asks when its target exists (it would be replaced) or lies
+  // outside the project. A new file inside the project runs at high since
+  // 2026-09-29 — see overwritesOnlyNew — so the probe names targets that
+  // cannot be new: the project's own root, and a system file.
+  "echo hi > .",
+  "cat a > /etc/motd",
   "dd if=/dev/zero of=/dev/disk0",
   "mkfs.ext4 /dev/sda1",
   "sudo make install",
@@ -78,7 +82,7 @@ const MUST_ASK = [
  */
 const MUST_RUN = [
   "ls -la",
-  "ls -la .molt 2>/dev/null",
+  "ls -la .maat 2>/dev/null",
   "cat README.md",
   "head -40 src/app.tsx",
   "grep -rn verify src/",
@@ -105,6 +109,8 @@ const MEDIUM_ASKS_HIGH_RUNS = [
   "cp a b",
   "mv a b",
   "touch new.ts",
+  "echo hi > notes.md",
+  "python3 cli.py sample.txt > result.txt",
   "node script.js",
   "python3 tool.py",
   "sed -i '' s/a/b/ file",

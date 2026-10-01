@@ -73,7 +73,7 @@ describe("what counts as a verified change", () => {
     const receipts = new Receipts(dir);
     // Written the old way: no `changed`, no `ask`. Unknown is not zero.
     receipts.write({ claim: "x", result: bar(true), attempt: 1, verdict: "accepted", model: "m", provider: "p", sessionTokens: 700, shedBatches: 0 });
-    const idx = join(dir, ".molt", "receipts", "index.jsonl");
+    const idx = join(dir, ".maat", "receipts", "index.jsonl");
     const stripped = JSON.parse(require_line(idx)) as Record<string, unknown>;
     delete stripped.changed;
     writeFileSync(idx, JSON.stringify(stripped) + "\n");
@@ -113,7 +113,7 @@ describe("one receipt file, one row", () => {
     // filename onto a second row by writing with a fresh Receipts whose index
     // says nothing is used past -1 — simulated by rewriting the index seq.
     const again = row(receipts, { verdict: "refused", sessionTokens: 1082 });
-    const idx = join(dir, ".molt", "receipts", "index.jsonl");
+    const idx = join(dir, ".maat", "receipts", "index.jsonl");
     const lines = require_lines(idx);
     const older = JSON.parse(lines[0]!) as Record<string, unknown>;
     older.file = again.path.split("/").pop();
@@ -243,7 +243,7 @@ describe("repair backfills what the receipt body already says", () => {
       receipts: new Receipts(dir),
     });
     await drain(engine.run("is it fine?", allowAll, { ask: true }));
-    const idx = join(dir, ".molt", "receipts", "index.jsonl");
+    const idx = join(dir, ".maat", "receipts", "index.jsonl");
     // As the row looked before `changed` and `ask` were recorded.
     const old = JSON.parse(require_line(idx)) as Record<string, unknown>;
     delete old.changed;

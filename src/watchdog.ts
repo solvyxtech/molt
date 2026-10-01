@@ -28,6 +28,7 @@
  * clock limit, and ends the request so the turn can close the way every other
  * deadline closes. Neither exists unless its number is positive.
  */
+import { env as readEnv } from "./env.js";
 
 /**
  * Silence, in ms, after which a request is taken to be hung.
@@ -59,8 +60,25 @@ export function firstByteMs(
   return Math.max(idleMs, prefill + whole);
 }
 
+/**
+ * A fixed first-byte allowance from the environment, or undefined.
+ *
+ * The computed allowance assumes local hardware: 50 tokens/s to read the
+ * prompt and, for a request that is not streamed, 10 tokens/s to write the
+ * whole answer. Against a hosted model that is fifty minutes of silence
+ * before a request counts as hung. On Terminal-Bench, Space Bunny Alpha
+ * stalled a request now and then, and molt waited on it until the task's
+ * fifteen-minute clock killed the run — five tasks lost that way. A caller
+ * that knows its endpoint answers in seconds says so here.
+ */
+export function envFirstByteMs(env = readEnv("REQUEST_FIRST_BYTE_MS")): number | undefined {
+  if (env === undefined || env.trim() === "") return undefined;
+  const n = Number(env);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
 /** The idle allowance an engine runs with: its own setting, then the environment, then the default. */
-export function requestIdleMs(configured?: number, env = process.env.MOLT_REQUEST_IDLE_MS): number {
+export function requestIdleMs(configured?: number, env = readEnv("REQUEST_IDLE_MS")): number {
   if (configured !== undefined) return Math.max(0, configured);
   if (env !== undefined && env.trim() !== "") {
     const n = Number(env);

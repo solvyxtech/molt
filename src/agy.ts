@@ -610,8 +610,8 @@ export class AgySession<H> {
         this.events.push({
           kind: "info",
           text:
-            `installed molt's tool gate in ${agyHooksPath()} — it has no effect on ` +
-            `Antigravity sessions molt did not start`,
+            `installed Maat's tool gate in ${agyHooksPath()} — it has no effect on ` +
+            `Antigravity sessions Maat did not start`,
         });
       }
       if (added.length) {
@@ -752,7 +752,7 @@ export class AgySession<H> {
         this.unaccounted.add(name);
         this.events.push({
           kind: "info",
-          text: `Antigravity ran its own '${name}' without asking — not in molt's ledger`,
+          text: `Antigravity ran its own '${name}' without asking — not in Maat's ledger`,
         });
       }
       return;

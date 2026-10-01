@@ -20,6 +20,7 @@ import {
   cmdCommit,
   cmdFor,
   cmdMap,
+  cmdMission,
   cmdRead,
   cmdRevert,
   cmdUndo,
@@ -160,7 +161,7 @@ export async function runEngineCommand(
     case "/bar": {
       try {
         const bar = loadBar(engine.cwd);
-        if (!bar) return { kind: "info", text: "no .molt/done.yml — /init to create one" };
+        if (!bar) return { kind: "info", text: "no .maat/done.yml — /init to create one" };
         return {
           kind: "info",
           text: bar.checks
@@ -192,6 +193,9 @@ export async function runEngineCommand(
 
     case "/for":
       return cmdFor(engine, arg);
+
+    case "/mission":
+      return cmdMission(engine, arg);
 
     case "/attempts":
       return cmdAttempts(engine, arg);

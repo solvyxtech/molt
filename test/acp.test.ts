@@ -741,7 +741,7 @@ describe("the model a receipt names is the one that ran", () => {
     const { engine, agent } = engineIn(dir, turns, GROK.url, GROK_MODELS);
     await drain(engine.run("write a.txt", allowAll));
     assert.deepEqual(agent.modelsSet, ["grok-4.6"], "molt asked for the model it was given");
-    const row = JSON.parse(readFileSync(join(dir, ".molt", "receipts", "index.jsonl"), "utf8").trim().split("\n")[0]!);
+    const row = JSON.parse(readFileSync(join(dir, ".maat", "receipts", "index.jsonl"), "utf8").trim().split("\n")[0]!);
     assert.equal(row.model, "grok-4.6");
   });
 
@@ -757,7 +757,7 @@ describe("the model a receipt names is the one that ran", () => {
     const dir = ws();
     const { engine } = engineIn(dir, turns, GROK.url, { setModel: "unsupported" });
     await drain(engine.run("write a.txt", allowAll));
-    const row = JSON.parse(readFileSync(join(dir, ".molt", "receipts", "index.jsonl"), "utf8").trim().split("\n")[0]!);
+    const row = JSON.parse(readFileSync(join(dir, ".maat", "receipts", "index.jsonl"), "utf8").trim().split("\n")[0]!);
     assert.match(row.model, /grok-4\.6 \(unconfirmed/);
   });
 });

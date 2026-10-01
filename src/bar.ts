@@ -1,13 +1,14 @@
 /**
  * The bar: what "done" means, as a file.
  *
- * `.molt/done.yml` is a committed, versioned artifact listing the checks a
+ * `.maat/done.yml` is a committed, versioned artifact listing the checks a
  * task must satisfy before molt is allowed to emit a final answer. It is
  * ordinary shell commands plus a small number of builtins that only molt
  * can run, because only molt still has the full session record.
  *
  * Nothing here asks a model anything. A bar result is an exit code.
  */
+import { DISPUTE_HINT } from "./dispute.js";
 import { judgePass } from "./evidence.js";
 import { testsRealFor } from "./tests-real.js";
 import { runCommand } from "./run.js";
@@ -30,6 +31,7 @@ import type {
   LedgerEntry,
   Msg,
 } from "./types.js";
+import { stateDir, stateFile } from "./statedir.js";
 
 export const BAR_FILENAME = "done.yml";
 export const DEFAULT_TIMEOUT_MS = 120_000;
@@ -149,7 +151,7 @@ export type BarContext = {
 };
 
 export function barPath(cwd: string): string {
-  return join(cwd, ".molt", BAR_FILENAME);
+  return stateFile(cwd, BAR_FILENAME);
 }
 
 export function hasBar(cwd: string): boolean {
@@ -426,7 +428,7 @@ export function parseBar(source: string): Bar {
 
 /**
  * Fingerprint of the bar file as it sits on disk. The agent is told not to
- * edit .molt/done.yml — but an instruction is a hope, not a control. molt
+ * edit .maat/done.yml — but an instruction is a hope, not a control. molt
  * compares this before every run, so lowering the bar mid-task is itself a
  * failing check.
  */
@@ -524,7 +526,7 @@ export const FALLBACK_BAR = proposeBar("/nonexistent-so-nothing-is-detected").ya
  * file nobody can explain is a file people delete the first time it fails.
  */
 export function writeDefaultBar(cwd: string): { path: string; detected: Detected[]; existed: boolean } {
-  const dir = join(cwd, ".molt");
+  const dir = stateDir(cwd);
   mkdirSync(dir, { recursive: true });
   const p = barPath(cwd);
   if (existsSync(p)) return { path: p, detected: [], existed: true };
@@ -1296,7 +1298,7 @@ export function mutationVerdict(r: {
         `
 
 This check establishes that your tests would notice this code being broken, ` +
-        `and it did not break it once. Passing would be a claim molt has not earned. Re-run ` +
+        `and it did not break it once. Passing would be a claim Maat has not earned. Re-run ` +
         `after the tree settles, raise \`sample\`, or set \`empty: allow\` on this check if a ` +
         `turn like this legitimately has nothing to mutate.`,
     };
@@ -1371,7 +1373,7 @@ function diffCovered(
       ok: false,
       output:
         `No coverage report at ${lcovPath}. This check cannot establish anything without ` +
-        `one, and passing it would be a claim molt has not earned. Make the test command ` +
+        `one, and passing it would be a claim Maat has not earned. Make the test command ` +
         `write lcov there, or drop this check.`,
     };
   }
@@ -1428,7 +1430,7 @@ function diffCovered(
         ok: false,
         output:
           `${measurable.length} changed file(s) that coverage should speak about, and none of ` +
-          `them is in ${lcovPath}. Passing would be a claim molt has not earned — the same ` +
+          `them is in ${lcovPath}. Passing would be a claim Maat has not earned — the same ` +
           `green row as a missing report, reached by a report that does not mention the work. ` +
           `Point \`lcov\` at a report that includes these paths, or drop this check.`,
       };
@@ -1484,7 +1486,7 @@ function treeAccounted(ctx: BarContext, allowOutside: boolean): { ok: boolean; o
       ok: false,
       output:
         "tree-accounted needs a snapshot of the working tree taken when the turn began, and " +
-        "this run has none — `molt prove` has no turn. Nothing can be established here; " +
+        "this run has none — `maat prove` has no turn. Nothing can be established here; " +
         "`--skip session` runs the command checks on their own.",
     };
   }
@@ -1588,7 +1590,7 @@ function treeAccounted(ctx: BarContext, allowOutside: boolean): { ok: boolean; o
   }
   if (theirs.length) {
     parts.push(
-      `\nFiles this session has never read or written — molt cannot attribute these to this turn:\n` +
+      `\nFiles this session has never read or written — Maat cannot attribute these to this turn:\n` +
         list(theirs),
     );
   }
@@ -1611,7 +1613,7 @@ function treeAccounted(ctx: BarContext, allowOutside: boolean): { ok: boolean; o
         "writer and run again.",
     );
   }
-  parts.push("`outside: allow` on this check in .molt/done.yml turns the whole question off.");
+  parts.push("`outside: allow` on this check in .maat/done.yml turns the whole question off.");
 
   return { ok: false, output: parts.join("\n") };
 }
@@ -1741,7 +1743,7 @@ function runBuiltin(
               "No file was modified in this session. Nothing was done that can be shown.\n" +
               "If the task does require a change, make it. If it genuinely does not — a " +
               "question, a review, a file you were only asked to read — then say that " +
-              "plainly and stop. molt records an unfinished turn honestly; it cannot " +
+              "plainly and stop. Maat records an unfinished turn honestly; it cannot " +
               "record an invented one. Editing a file for no reason other than this " +
               "check is the worst of the three outcomes and will be refused."
             : `${attempted.length} write(s) appear in the record but none landed on disk ` +
@@ -1800,7 +1802,7 @@ function runBuiltin(
         continue;
       }
       if (now !== entry.after) {
-        problems.push(`${entry.path}: contents changed since molt wrote it`);
+        problems.push(`${entry.path}: contents changed since Maat wrote it`);
         continue;
       }
       if (entry.before === entry.after) {
@@ -1854,8 +1856,8 @@ function runBuiltin(
             "A comment added so this check would pass is not the task being done, and " +
             "writing one is a worse outcome than saying the work is unfinished.\n" +
             "If the task genuinely was documentation, set `comment-only: allow` under " +
-            "work-landed in .molt/done.yml. If it needed no file change at all, say so " +
-            "plainly and stop — molt reports that as an answer, not a failure.",
+            "work-landed in .maat/done.yml. If it needed no file change at all, say so " +
+            "plainly and stop — Maat reports that as an answer, not a failure.",
         };
       }
     }
@@ -1952,7 +1954,7 @@ function runBuiltin(
         `decision for a person, so say which assertion you believe is wrong and why, and ` +
         `stop. If it really is obsolete, set \`removals: allow\` on this check.` +
         (byDisk && !byTool
-          ? `\n\nNothing here was removed by a tool call, so molt cannot attribute it to this ` +
+          ? `\n\nNothing here was removed by a tool call, so Maat cannot attribute it to this ` +
             `turn. If another session or editor is writing to this checkout, say so and stop — ` +
             `working harder cannot clear a change this turn did not make.`
           : ""),
@@ -2215,6 +2217,7 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
   return {
     name: check.name,
     ...(check.advisory ? { advisory: true } : {}),
+    ...(check.hidden ? { hidden: true } : {}),
     ...(diagnosis.didNotRun ? { didNotRun: true } : {}),
     tags: check.tags,
     kind: "command",
@@ -2307,6 +2310,7 @@ export async function runBar(bar: Bar, ctx: BarContext): Promise<BarResult> {
       results.push({
         name: c.name,
         ...(c.advisory ? { advisory: true } : {}),
+        ...(c.hidden ? { hidden: true } : {}),
         tags: c.tags,
         kind: c.kind,
         detail: c.kind === "command" ? c.run : c.builtin,
@@ -2321,6 +2325,7 @@ export async function runBar(bar: Bar, ctx: BarContext): Promise<BarResult> {
       results.push({
         name: c.name,
         ...(c.advisory ? { advisory: true } : {}),
+        ...(c.hidden ? { hidden: true } : {}),
         tags: c.tags,
         kind: c.kind,
         detail: c.kind === "command" ? c.run : c.builtin,
@@ -2357,6 +2362,7 @@ export async function runBar(bar: Bar, ctx: BarContext): Promise<BarResult> {
     results.push({
       name: c.name,
       ...(c.advisory ? { advisory: true } : {}),
+      ...(c.hidden ? { hidden: true } : {}),
       tags: c.tags,
       kind: c.kind,
       detail: c.kind === "command" ? c.run : c.builtin,
@@ -2408,21 +2414,22 @@ export function formatBarFailure(result: BarResult, attempt: number, maxAttempts
   const failed = [...commands, ...builtins];
   const lines = [
     `[molt] You indicated the task is complete, but ${all.length} of ${result.results.length} ` +
-      `checks in .molt/done.yml did not pass. This is attempt ${attempt} of ${maxAttempts}.`,
+      `checks in .maat/done.yml did not pass. This is attempt ${attempt} of ${maxAttempts}.`,
     "",
     "Do not claim completion again until these pass. Fix the underlying problem;",
-    "do not modify .molt/done.yml to make the checks pass.",
+    "do not modify .maat/done.yml to make the checks pass.",
     "",
   ];
   if (commands.length && builtins.length) {
     lines.push(
       `Start with ${commands.map((r) => `\`${r.name}\``).join(", ")} — that is your project's own ` +
-        `output. The rest is molt's bookkeeping about this session and is usually downstream of it.`,
+        `output. The rest is Maat's bookkeeping about this session and is usually downstream of it.`,
       "",
     );
   }
+  if (failed.some((r) => r.hidden)) lines.push(DISPUTE_HINT, "");
   for (const r of failed) {
-    lines.push(`--- FAILED: ${r.name} (${r.detail})`);
+    lines.push(`--- FAILED: ${r.name} (${r.hidden ? "command withheld" : r.detail})`);
     if (r.exitCode !== undefined) lines.push(`exit code: ${r.exitCode}`);
     lines.push(r.output.trim() || "(no output)");
     lines.push("");
@@ -2436,7 +2443,7 @@ export function formatBarFailure(result: BarResult, attempt: number, maxAttempts
       "",
     );
     for (const r of broken) {
-      lines.push(`--- DID NOT RUN: ${r.name} (${r.detail})`);
+      lines.push(`--- DID NOT RUN: ${r.name} (${r.hidden ? "command withheld" : r.detail})`);
       if (r.exitCode !== undefined) lines.push(`exit code: ${r.exitCode}`);
       lines.push(r.output.trim() || "(no output)");
       lines.push("");

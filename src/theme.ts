@@ -28,6 +28,26 @@ export type Theme = {
 };
 
 export const THEMES: Record<string, Theme> = {
+  /**
+   * Maat: the website's colours (the Maat page — near-black ground, the
+   * faience cyan --color-cyan #7EC9D4, the feather's gold for warnings), so
+   * the window, the terminal and the page read as one product.
+   */
+  maat: {
+    accent: "#7EC9D4",
+    dim: "#3F7880",
+    ghost: "#1A2A2E",
+    warn: "#C6A56E",
+    ok: "#5FD3A0",
+    fail: "#E06C68",
+    text: "#D5E3E6",
+    surfaces: {
+      bg: "#0B0D10",
+      bgRaised: "#101416",
+      bgSunken: "#08090B",
+      lineSoft: "#14181C",
+    },
+  },
   tidepool: {
     accent: "#6FE9F7",
     dim: "#17677A",
@@ -72,7 +92,7 @@ export const THEMES: Record<string, Theme> = {
   },
 };
 
-export const DEFAULT_THEME = "tidepool";
+export const DEFAULT_THEME = "maat";
 
 export function themeNames(): string[] {
   return Object.keys(THEMES);

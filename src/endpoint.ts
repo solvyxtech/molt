@@ -138,7 +138,7 @@ export function endpointProblem(baseUrl: string): string | null {
   ];
   if (!allowed.includes(parsed.protocol)) {
     return (
-      `'${url}' uses the scheme '${parsed.protocol.replace(":", "")}', which molt cannot ` +
+      `'${url}' uses the scheme '${parsed.protocol.replace(":", "")}', which Maat cannot ` +
       `speak. Endpoints are http or https; ${Object.keys(SHORTHAND)
         .filter((k) => k !== "claude")
         .map((k) => `'${k}'`)

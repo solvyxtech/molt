@@ -29,6 +29,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { MIN_SECRET_CHARS, redactData } from "./redact.js";
+import { stateDir } from "./statedir.js";
 
 export const GENESIS = "0".repeat(64);
 
@@ -73,6 +74,9 @@ export type JournalKind =
    */
   | "loop_stop"
   | "salvage"
+  /** The independent review of a verified claim: a label, never a gate. */
+  | "review"
+  | "dispute"
   | "shed"
   | "elide"
   | "regrow"
@@ -144,7 +148,7 @@ export class Journal {
   private secrets: (string | undefined)[] = [];
 
   constructor(root: string, sessionId = randomUUID().slice(0, 8)) {
-    this.dir = join(root, ".molt", "log");
+    this.dir = stateDir(root, "log");
     mkdirSync(this.dir, { recursive: true });
     this.sessionId = sessionId;
     this.path = join(this.dir, `${sessionId}.jsonl`);
@@ -209,7 +213,7 @@ export class Journal {
    * when that cannot be read, and the name breaks ties so the order is stable.
    */
   static sessions(root: string): string[] {
-    const dir = join(root, ".molt", "log");
+    const dir = stateDir(root, "log");
     if (!existsSync(dir)) return [];
     return readdirSync(dir)
       .filter((f) => f.endsWith(".jsonl"))
@@ -306,7 +310,7 @@ export class Journal {
    * detectable too.
    */
   static expectedArchives(root: string): string[] {
-    const dir = join(root, ".molt", "log");
+    const dir = stateDir(root, "log");
     if (!existsSync(dir)) return [];
     const out = new Set<string>();
     for (const file of Journal.sessions(root)) {

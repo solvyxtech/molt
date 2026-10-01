@@ -116,5 +116,8 @@ cpSync("ui/styles.css", "out/ui/styles.css");
 // copied rather than inlined: a 120KB base64 blob in the stylesheet would hide
 // the one file in this app anyone can check by opening it.
 cpSync("ui/logo.png", "out/ui/logo.png");
+cpSync("ui/logo.svg", "out/ui/logo.svg");
+cpSync("ui/logo-small.svg", "out/ui/logo-small.svg");
+cpSync("ui/maat-splash", "out/ui/maat-splash", { recursive: true });
 cpSync("build/icon.png", "out/icon.png");
 console.log("built → out/");

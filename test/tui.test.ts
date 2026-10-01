@@ -523,7 +523,7 @@ describe("the transparency view", { concurrency: true }, () => {
       assert.match(frame, /\/price \[<in> <out>\|refresh\|off\]/, "the longest command was clipped");
       assert.match(frame, /what this model costs/, "/price's summary was swallowed by its args");
       assert.match(frame, /\/autonomy \[low\|medium\|high\]/);
-      assert.match(frame, /how much molt does without asking/);
+      assert.match(frame, /how much Maat does without asking/);
     } finally {
       t.cleanup();
     }
@@ -574,7 +574,7 @@ describe("the transparency view", { concurrency: true }, () => {
     try {
       t.stdin.press("A");
       await tick(60);
-      assert.match(t.stdout.lastFrame, /how much molt does without asking/);
+      assert.match(t.stdout.lastFrame, /how much Maat does without asking/);
       assert.match(t.stdout.lastFrame, /← now/, "never said which level is in force");
       assert.equal(t.engine.autonomy, "low", "moved the ceiling before it was confirmed");
 
@@ -1750,7 +1750,7 @@ describe("pointing molt at a model you host", () => {
       assert.equal(t.engine.baseUrl, was, "moved the endpoint anyway");
       await submit(t.stdin, "/endpoint file:///etc/passwd");
       await tick(120);
-      assert.match(t.stdout.text, /not a scheme molt can call/);
+      assert.match(t.stdout.text, /not a scheme Maat can call/);
       assert.equal(t.engine.baseUrl, was, "moved the endpoint anyway");
     } finally {
       t.cleanup();

@@ -33,7 +33,7 @@ function ws() {
 const LANDED = parseBar("version: 1\nchecks:\n  - name: landed\n    builtin: files-changed\n");
 
 function receiptsIn(dir: string): string[] {
-  const d = join(dir, ".molt", "receipts");
+  const d = join(dir, ".maat", "receipts");
   return existsSync(d) ? readdirSync(d).filter((f) => f.endsWith(".md")).sort() : [];
 }
 
@@ -97,7 +97,7 @@ describe("a completion claim is judged on the turn that made it", () => {
     writeFileSync(join(dir, "first.txt"), "tampered\n", "utf8");
     const second = await drain(engine.run("two", allowAll));
     const bar = second.find((e) => e.kind === "proof_exhausted") as { result: { results: { output: string }[] } };
-    assert.match(bar.result.results[0]!.output, /first\.txt: contents changed since molt wrote it/);
+    assert.match(bar.result.results[0]!.output, /first\.txt: contents changed since Maat wrote it/);
   });
 
   it("lists on a receipt only what this turn ran", async () => {
@@ -120,7 +120,7 @@ describe("a completion claim is judged on the turn that made it", () => {
     await drain(engine.run("one", allowAll));
     await drain(engine.run("two", allowAll));
     const [, second] = receiptsIn(dir);
-    const body = readFileSync(join(dir, ".molt", "receipts", second!), "utf8");
+    const body = readFileSync(join(dir, ".maat", "receipts", second!), "utf8");
     const ran = body.match(/## What the model ran\n\n([\s\S]*?)\n\n/)?.[1] ?? "";
     assert.match(ran, /write_file b\.txt/);
     assert.doesNotMatch(ran, /write_file a\.txt/, "receipt two lists turn one's call");
@@ -149,7 +149,7 @@ describe("a completion claim is judged on the turn that made it", () => {
     assert.equal(rows[0]?.changed, 1);
     assert.equal(rows[1]?.changed, 1, "turn two's receipt counted turn one's write as well");
     const [, second] = receiptsIn(dir);
-    const body = readFileSync(join(dir, ".molt", "receipts", second!), "utf8");
+    const body = readFileSync(join(dir, ".maat", "receipts", second!), "utf8");
     assert.match(body, /`b\.txt`/);
     assert.doesNotMatch(body, /`a\.txt`/, "the change table is the session, not the turn");
   });

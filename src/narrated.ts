@@ -37,6 +37,7 @@
 
 /** molt's own tools. Names outside this set only count inside harness markup. */
 export const MOLT_TOOL_NAMES = [
+  "inspect",
   "read_file",
   "write_file",
   "list_dir",

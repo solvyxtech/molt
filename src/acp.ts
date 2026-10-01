@@ -82,6 +82,7 @@ import { errorText } from "./format.js";
 import type { BackendEvent, MoltTool, ToolRunner } from "./claude-code.js";
 import { GEMINI_CLI_URL, GROK_BUILD_URL } from "./endpoint.js";
 import { estTokens } from "./types.js";
+import { env } from "./env.js";
 
 const exec = promisify(execFile);
 
@@ -129,7 +130,7 @@ export type AcpAgentSpec = {
  * the documented way to say "these builtins and no others". Empty means none:
  * everything the model can do arrives over molt's MCP server.
  */
-const GROK_MOLT_PROFILE = { name: "molt", description: "molt drives every tool", tools: "" };
+const GROK_MOLT_PROFILE = { name: "molt", description: "Maat drives every tool", tools: "" };
 
 export const ACP_AGENTS: readonly AcpAgentSpec[] = [
   {
@@ -306,11 +307,11 @@ export async function acpHealth(
     detail:
       `${spec.bin} ${version} · ` +
       (authenticated ? "signed in" : (detail ?? "not signed in")) +
-      (disarmed ? ` · ⚠ permission_mode = "${disarmed}" — molt cannot gate its tools` : ""),
+      (disarmed ? ` · ⚠ permission_mode = "${disarmed}" — Maat cannot gate its tools` : ""),
     ...(authenticated
       ? disarmed
         ? {
-            fix: `remove permission_mode = "${disarmed}" from ~/.grok/config.toml (molt needs to be asked)`,
+            fix: `remove permission_mode = "${disarmed}" from ~/.grok/config.toml (Maat needs to be asked)`,
           }
         : {}
       : { fix: spec.loginHint }),
@@ -482,7 +483,7 @@ export class AcpConnection {
         : // An unhandled method is refused rather than left hanging: an agent
           // waiting forever on a reply molt will never send looks identical to
           // a model that has stopped thinking.
-          Promise.reject(new Error(`molt does not implement ${msg.method}`));
+          Promise.reject(new Error(`maat does not implement ${msg.method}`));
       this.write({ jsonrpc: "2.0", id, result });
     } catch (e) {
       this.write({ jsonrpc: "2.0", id, error: { code: -32000, message: errorText(e) } });
@@ -754,7 +755,7 @@ export function shippedScript(name: string): string {
    * at one; it was a file path first, and both are honoured so the packaged
    * app's existing setting keeps working.
    */
-  const override = process.env.MOLT_MCP_BRIDGE?.trim();
+  const override = env("MCP_BRIDGE")?.trim();
   const candidates: string[] = [];
   if (override) {
     candidates.push(override.endsWith(".js") ? join(dirname(override), name) : join(override, name));
@@ -764,7 +765,7 @@ export function shippedScript(name: string): string {
   const found = candidates.find((c) => existsSync(c));
   if (!found) {
     throw new Error(
-      `molt cannot find ${name}` +
+      `maat cannot find ${name}` +
         (candidates.length ? ` (looked in ${candidates.join(", ")})` : "") +
         " — set MOLT_MCP_BRIDGE to the directory holding it",
     );
@@ -993,7 +994,7 @@ export class AcpSession<H> {
     if (offered.length && !offered.includes(want)) {
       throw new Error(
         `${this.opts.spec.label} does not offer "${want}" on this account; it offers ` +
-          `${offered.join(", ")}. Pick one of those — molt will not run a different model ` +
+          `${offered.join(", ")}. Pick one of those — Maat will not run a different model ` +
           `under the name you chose.`,
       );
     }
@@ -1069,7 +1070,7 @@ export class AcpSession<H> {
         this.unaccounted.add(called);
         this.events.push({
           kind: "info",
-          text: `${this.opts.spec.label} ran its own '${called}' without asking — not in molt's ledger`,
+          text: `${this.opts.spec.label} ran its own '${called}' without asking — not in Maat's ledger`,
         });
       }
     }
@@ -1085,7 +1086,7 @@ export class AcpSession<H> {
    */
   private async onRequest(method: string, params: unknown): Promise<unknown> {
     if (method !== "session/request_permission") {
-      throw new Error(`molt does not implement ${method}`);
+      throw new Error(`maat does not implement ${method}`);
     }
     const p = (params ?? {}) as {
       toolCall?: { toolCallId?: string; title?: string; toolName?: string };
@@ -1111,7 +1112,7 @@ export class AcpSession<H> {
         this.refused.add(called);
         this.events.push({
           kind: "info",
-          text: `refused ${this.opts.spec.label}'s own '${called}' — molt's tools are the only way to the disk`,
+          text: `refused ${this.opts.spec.label}'s own '${called}' — Maat's tools are the only way to the disk`,
         });
       }
     }

@@ -139,7 +139,7 @@ describe("spec-intact says which route the removal took", () => {
  * judged against it" — aimed on 2026-09-07 at a turn that had never touched
  * the file while a person armed a check in another window. It was then
  * softened to hedge in every case, which threw away something molt has: a
- * tool call that writes `.molt/done.yml` leaves a ledger entry naming it.
+ * tool call that writes `.maat/done.yml` leaves a ledger entry naming it.
  *
  * Blaming everywhere and hedging everywhere are the same mistake. The check
  * refuses either way — a bar that moved mid-session cannot judge the claim, by
@@ -150,15 +150,15 @@ describe("bar-unmodified says only what the ledger supports", () => {
 
   async function tamperOutput(edit: "tool" | "outside"): Promise<string> {
     const dir = ws();
-    mkdirSync(join(dir, ".molt"), { recursive: true });
-    writeFileSync(join(dir, ".molt", "done.yml"), BAR);
+    mkdirSync(join(dir, ".maat"), { recursive: true });
+    writeFileSync(join(dir, ".maat", "done.yml"), BAR);
     const provider = scriptedProvider([
       edit === "tool"
         ? {
             calls: [
               {
                 name: "write_file",
-                args: { path: ".molt/done.yml", content: BAR + "  - name: extra\n    run: exit 0\n" },
+                args: { path: ".maat/done.yml", content: BAR + "  - name: extra\n    run: exit 0\n" },
               },
             ],
           }
@@ -181,7 +181,7 @@ describe("bar-unmodified says only what the ledger supports", () => {
       // The other writer: after the turn's first write, change the bar by a
       // route no tool call of this turn took.
       if (edit === "outside" && ev.kind === "tool") {
-        writeFileSync(join(dir, ".molt", "done.yml"), BAR + "  - name: theirs\n    run: exit 0\n");
+        writeFileSync(join(dir, ".maat", "done.yml"), BAR + "  - name: theirs\n    run: exit 0\n");
       }
     }
     const end = events.find(
@@ -195,7 +195,7 @@ describe("bar-unmodified says only what the ledger supports", () => {
 
   it("names the turn when a tool call of this turn wrote the bar", async () => {
     const out = await tamperOutput("tool");
-    assert.match(out, /This turn wrote \.molt\/done\.yml/);
+    assert.match(out, /This turn wrote \.maat\/done\.yml/);
     assert.match(out, /always passes/, "and why that is refused");
     assert.doesNotMatch(out, /molt cannot tell/, "there is nothing here to be uncertain about");
   });

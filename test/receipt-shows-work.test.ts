@@ -81,7 +81,7 @@ describe("a receipt shows the lines the turn wrote", () => {
     const stale = sha("something molt wrote earlier");
     const text = receipt(dir, [{ path: "a.ts", before: null, after: stale, lines: [1, 2] }]);
 
-    assert.match(text, /changed since molt wrote it/);
+    assert.match(text, /changed since Maat wrote it/);
     assert.doesNotMatch(text, /const b = 2;/, "content that is not what molt wrote is not shown");
     assert.match(text, /hashes above are what can still be proven/);
   });

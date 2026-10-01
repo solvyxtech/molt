@@ -129,8 +129,8 @@ describe("read-only commands", () => {
   it("allows a discard, because that is how exploring is written", () => {
     // `2>/dev/null` is not a write, and treating it as one denied `ls` in a
     // real session — after which the model guessed filenames instead.
-    assert.ok(isReadOnlyCommand("ls -la .molt 2>/dev/null"));
-    assert.ok(isReadOnlyCommand("ls -la && ls -la .molt 2>/dev/null; find . -name '*.md'"));
+    assert.ok(isReadOnlyCommand("ls -la .maat 2>/dev/null"));
+    assert.ok(isReadOnlyCommand("ls -la && ls -la .maat 2>/dev/null; find . -name '*.md'"));
     assert.ok(isReadOnlyCommand("grep -rn x src/ 2>&1"));
     assert.ok(isReadOnlyCommand("find . -name '*.ts' > /dev/null"));
     // A redirection that lands bytes somewhere is still a write.
@@ -167,7 +167,6 @@ describe("things that cannot be undone", () => {
       "find . -delete",
       "truncate -s 0 notes.md",
       "tee notes.md",
-      "echo x > important.txt",
       "git checkout HEAD~1 -- .",
       "git restore src/",
       "git rebase -i main",
@@ -176,6 +175,12 @@ describe("things that cannot be undone", () => {
       assert.ok(isIrreversible(c), `slipped through: ${c}`);
       assert.ok(bash("high", c), `high ran it unattended: ${c}`);
     }
+    // A redirect is on the irreversible list — it replaces a file's contents.
+    // Since 2026-09-29 high autonomy lets it through when the target does not
+    // exist (nothing is replaced); see overwritesOnlyNew and test/harness.test.ts.
+    // The classifier itself still calls it irreversible, and a target that
+    // exists still asks.
+    assert.ok(isIrreversible("echo x > important.txt"));
   });
 
   it("asks about an interpreter handed a program on the command line", () => {

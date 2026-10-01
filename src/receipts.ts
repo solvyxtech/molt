@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { MIN_SECRET_CHARS, redact } from "./redact.js";
 import type { BarResult } from "./types.js";
+import { stateDir } from "./statedir.js";
 
 export type Receipt = {
   path: string;
@@ -215,7 +216,7 @@ function wroteSection(
      */
     if (sha256(text) !== c.after) {
       out.push(
-        `\`${c.path}\` — changed since molt wrote it, so its lines are not shown; the hashes ` +
+        `\`${c.path}\` — changed since Maat wrote it, so its lines are not shown; the hashes ` +
           "above are what can still be proven.",
         "",
       );
@@ -244,7 +245,7 @@ function wroteSection(
   }
   out.push(
     "Substantive lines only — blank and comment-only lines are not listed. These are the",
-    "lines molt's own tools wrote this turn, which is narrower than `git diff` and is the",
+    "lines Maat's own tools wrote this turn, which is narrower than `git diff` and is the",
     "only view that stays attributable when more than one thing is editing the tree.",
     "",
   );
@@ -265,7 +266,7 @@ export class Receipts {
   private secrets: (string | undefined)[] = [];
 
   constructor(root: string) {
-    this.dir = join(root, ".molt", "receipts");
+    this.dir = stateDir(root, "receipts");
     mkdirSync(this.dir, { recursive: true });
     this.indexPath = join(this.dir, "index.jsonl");
   }
@@ -336,17 +337,17 @@ export class Receipts {
     // and put the work itself nowhere at all.
     const verdictLine =
       args.verdict === "accepted" && args.ask
-        ? "molt recorded this answer. A question runs the bar advisory — a turn that wrote " +
+        ? "Maat recorded this answer. A question runs the bar advisory — a turn that wrote " +
           "nothing cannot have broken anything — so no check could refuse it, and nothing " +
           "here is a verified change."
         : args.verdict === "accepted"
-        ? "molt accepted this claim: every check that can block a completion passed."
+        ? "Maat accepted this claim: every check that can block a completion passed."
         : args.verdict === "refused"
-          ? "molt refused this claim and sent the failures back to the model."
+          ? "Maat refused this claim and sent the failures back to the model."
           : args.verdict === "undetermined"
-            ? "molt did not accept this claim: every check that ran passed, but checks " +
+            ? "Maat did not accept this claim: every check that ran passed, but checks " +
               "done.yml requires were not run. Nothing failed, and nothing established the rest."
-            : "molt reported failure: the attempt limit was reached with checks still failing.";
+            : "Maat reported failure: the attempt limit was reached with checks still failing.";
 
     const changed = args.changed ?? [];
     // The task's own criteria go above what changed, because they are what the
@@ -370,7 +371,7 @@ export class Receipts {
       if (task.notes.length) {
         asked.push(
           "**Recorded, not verified.** No machine checked these. They are stated here",
-          "because they were asked for, and molt will not report them as met:",
+          "because they were asked for, and Maat will not report them as met:",
           "",
         );
         for (const n of task.notes) asked.push(`- ${n}`);
@@ -391,7 +392,7 @@ export class Receipts {
       }
       work.push(
         "",
-        "Hashes are SHA-256, taken immediately before and after molt wrote the file.",
+        "Hashes are SHA-256, taken immediately before and after Maat wrote the file.",
         "`work-landed` re-reads each path and fails if what is there now does not match.",
         "",
       );
@@ -407,7 +408,7 @@ export class Receipts {
     }
 
     const head = [
-      `# molt receipt ${String(seq).padStart(4, "0")} — ${args.verdict}`,
+      `# Maat receipt ${String(seq).padStart(4, "0")} — ${args.verdict}`,
       "",
       verdictLine,
       "",
@@ -455,7 +456,7 @@ export class Receipts {
 
     const detail: string[] = ["", "## Output", ""];
     for (const r of args.result.results) {
-      // Plain key: value lines so a stranger can `rg "exit:" .molt/receipts`
+      // Plain key: value lines so a stranger can `rg "exit:" .maat/receipts`
       // and reconstruct the claim without parsing a markdown table.
       detail.push(
         `### ${r.name} — ${
@@ -525,10 +526,10 @@ export class Receipts {
       args.verdict === "accepted"
         ? "Every check passed. This is the evidence behind that claim."
         : args.verdict === "refused"
-          ? "molt refused the completion claim and returned the failures to the model."
+          ? "Maat refused the completion claim and returned the failures to the model."
           : args.verdict === "undetermined"
-            ? "Required checks were not run. molt neither accepted nor refused the claim."
-            : "The attempt limit was reached with checks still failing. molt reported failure rather than success.",
+            ? "Required checks were not run. Maat neither accepted nor refused the claim."
+            : "The attempt limit was reached with checks still failing. Maat reported failure rather than success.",
       "",
     ];
 
@@ -777,7 +778,7 @@ export class Receipts {
    * It used to be `count()` — how many receipt files exist *now* — which is
    * only the same thing while nobody deletes one. Delete `0000` and the next
    * write is numbered `0001` again, so two different receipts share a number
-   * and the index lists both under it. This project's own `.molt` reached 26
+   * and the index lists both under it. This project's own `.maat` reached 26
    * index rows over 9 files with sequences 0000–0008 each duplicated, and
    * `molt receipts --show 0000-refused.md` reported no match for something the
    * listing had just printed.

@@ -250,7 +250,7 @@ export async function claudeCodeHealth(
       version,
       authenticated: false,
       sdk,
-      detail: `claude ${version} · molt cannot load the Agent SDK`,
+      detail: `claude ${version} · Maat cannot load the Agent SDK`,
       fix: String(e).replace(/^Error: /u, "").replace(/ \(.*\)$/u, ""),
     };
   }
@@ -600,7 +600,7 @@ function check(mod: Record<string, unknown>, zod: Record<string, unknown>): Sdk 
   for (const name of ["query", "tool", "createSdkMcpServer"] as const) {
     if (typeof sdk[name] !== "function") {
       throw new Error(
-        `@anthropic-ai/claude-agent-sdk does not export ${name}() — molt needs a version ` +
+        `@anthropic-ai/claude-agent-sdk does not export ${name}() — Maat needs a version ` +
           `that does (0.3 or later)`,
       );
     }
@@ -818,7 +818,7 @@ export class ClaudeCodeSession<H> {
         mcpServers: { molt: server },
         allowedTools: names,
         // Your MCP servers and your CLAUDE.md are not part of this run. The
-        // work is judged against `.molt/done.yml`, and a second set of
+        // work is judged against `.maat/done.yml`, and a second set of
         // instructions molt cannot see is a second definition of done.
         strictMcpConfig: true,
         settingSources: [],
@@ -874,7 +874,7 @@ export class ClaudeCodeSession<H> {
       if (sub === "compact_boundary") {
         this.events.push({
           kind: "info",
-          text: "Claude Code compacted its own context — molt's transcript is unchanged",
+          text: "Claude Code compacted its own context — Maat's transcript is unchanged",
         });
       }
       return;

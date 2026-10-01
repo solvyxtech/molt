@@ -87,7 +87,7 @@ export type Spend = {
   billed: boolean;
 };
 
-/** A single verifiable condition from `.molt/done.yml`. */
+/** A single verifiable condition from `.maat/done.yml`. */
 /**
  * A check that reports but does not block.
  *
@@ -101,7 +101,21 @@ export type Spend = {
  * "fix these and claim again" — a check that does not gate has no business in
  * that list, or the model spends tokens fixing theatre.
  */
-export type Advisory = { advisory?: boolean };
+export type Advisory = {
+  advisory?: boolean;
+  /**
+   * The model is not shown this check's command — only its name.
+   *
+   * Set on criteria the model drafted itself. Shown the command, a model
+   * makes the work equal the check: on a benchmark a model copied the awk
+   * from its own "independent count" criterion into its solution, wrote
+   * "a diff against that command matches trivially", and both were wrong
+   * together. A check the model can see is a check it can copy. The command
+   * still runs, still appears on the receipt, and its output still comes
+   * back on failure; only the text of the command is withheld.
+   */
+  hidden?: boolean;
+};
 
 export type Check = Advisory &
   (
@@ -284,6 +298,8 @@ export type Bar = {
 
 export type CheckResult = {
   name: string;
+  /** Carried from the check: the command is withheld from the model. */
+  hidden?: boolean;
   /**
    * True when this result was reused rather than re-run.
    *
@@ -546,6 +562,23 @@ export type EngineEvent =
       spend: Spend;
       durationMs: number;
       outcome: JobOutcome;
+      /**
+       * Every check that judged this turn was one the model drafted itself:
+       * no project bar, no criterion a person chose. "verified" then means
+       * "passed its own checks", and a surface should say so.
+       */
+      selfChecked?: boolean;
+      /**
+       * The turn was refused only by checks the model drafted itself, and is
+       * reported unverified rather than "not proven": names of those checks.
+       */
+      checksDisagree?: string[];
+      /**
+       * The independent review of a verified claim, when one ran. Not
+       * confirmed means "passed its checks, unconfirmed": a majority of
+       * reviews found a violation quoted from the task text.
+       */
+      review?: { confirmed: boolean; votes: string; violations: { quote: string; evidence: string }[] };
     }
   | {
       kind: "step_summary";

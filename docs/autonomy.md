@@ -80,7 +80,9 @@ At **every** level, including high:
   beyond it.
 - **A named list of destructive commands.** Deletion in any form (`rm` with or
   without flags, `rmdir`, `unlink`, `shred`, `find -delete`, `find -exec`),
-  emptying a file in place (`truncate`, `tee`, `>` redirection to a path),
+  emptying a file in place (`truncate`, `tee`, `>` redirection to a path —
+  at high, a redirect to a file that does not exist yet, inside the project
+  or the temp directory, runs unattended: nothing is replaced),
   history and published state (`git push`, `git reset --hard`, `git clean -f`,
   `git checkout -- `, `git restore`, `git rebase`, `git stash drop`,
   `npm publish`), machine state (`sudo`, `shutdown`, `pkill`, `chmod 777`,
@@ -126,3 +128,15 @@ session record that does not say when the level changed cannot explain why a
 command ran unattended.
 
 See [transparency.md](transparency.md) for the log itself.
+
+## `--sandbox`: the machine is disposable
+
+For a container or a throwaway VM, never for a machine you keep. It implies
+`--yes`, moves the boundary from the project to the machine (a task that says
+"write it to /etc/nginx/conf.d" is done there), and in a headless run
+approves what high autonomy would still have asked about — `rm`, `sudo`,
+`python -c`, a redirect over an existing file — printing `sandbox ran …` for
+each. The classifier is unchanged: it still says those calls would ask, and
+the journal still records every one of them at the level that let it through.
+The benchmark adapter in `bench/harbor/` is what this exists for.
+

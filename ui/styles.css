@@ -1,9 +1,9 @@
 /*
  * Tidepool, at desktop scale.
  *
- * The palette is molt's own — the same seven colours the terminal uses, lifted
- * from src/theme.ts rather than reinvented, so the two surfaces are recognisably
- * one tool. Everything else here is restraint: 1px rules instead of shadows,
+ * The palette is Maat's — the accent is the website's cyan, the rest the same
+ * colours the terminal uses, lifted from src/theme.ts rather than reinvented,
+ * so the surfaces are recognisably one tool. Everything else here is restraint: 1px rules instead of shadows,
  * flat fills instead of gradients, one accent used sparingly enough that when
  * something is cyan it means something.
  *
@@ -13,7 +13,12 @@
  */
 
 :root {
-  --accent: #6fe9f7;
+  /* The site's cyan (solvyx Maat page, --color-cyan), so the window and the
+     page are one product. */
+  --maat-cyan: #7ec9d4;
+  /* The site's gold (--color-gold): the feather and the beam, the weighing itself. */
+  --maat-gold: #c6a56e;
+  --accent: var(--maat-cyan);
   --dim: #17677a;
   --ghost: #0e3744;
   --warn: #d89a3f;
@@ -89,92 +94,177 @@ body {
   color: var(--accent);
 }
 /*
- * The mark.
+ * The mark: Maat's feather.
  *
- * It was ▚ (U+259A) — which renders as a solid pair of quadrants on macOS, as
- * a different weight on Windows, and as a tofu box wherever the font lacks it.
- * A logo that depends on the user's font stack is not a logo. Then it was a
- * CSS gradient standing in for the icon; now it is the icon itself, shipped
- * beside the page as `logo.png`, so the tile in the title bar, the mark on the
- * empty session, and the app in the dock are one image rather than three
- * approximations of each other.
- *
- * The corner radius is 22% of the box on both, which is the proportion the
- * icon's own squircle is cut at — so the art keeps its shape at every size.
+ * It was the nautilus, painted as a photo-tile. Now it is the feather itself,
+ * drawn as a vector (`logo.svg`, the same strokes as the splash and the app
+ * icon), so it is sharp at 16 px in the title bar and at 64 px on an empty
+ * session, and it sits on the page rather than in a box. The app icon
+ * (`build/icon.png`) puts the same feather on a dark tile for the dock.
  */
 .mark {
   display: inline-block;
-  width: 16px; height: 16px;
-  vertical-align: -3px;
-  margin-right: 6px;
-  border-radius: 4px;
-  background: url("logo.png") center / cover no-repeat;
+  width: 10px; height: 20px;
+  vertical-align: -5px;
+  margin-right: 9px;
+  /* A heavier stroke at this size: the large mark's hairlines vanish at 20 px. */
+  background: url("logo-small.svg") center / contain no-repeat;
 }
 .empty-mark {
   display: block;
-  width: 96px; height: 96px;
-  border-radius: 21px;
-  background: url("logo.png") center / cover no-repeat;
+  width: 32px; height: 64px;
+  margin: 0 auto;
+  background: url("logo.svg") center / contain no-repeat;
 }
 
 /* ── the splash ────────────────────────────────────────────────────────── */
 /*
- * The window molts on launch, from the same frames the terminal does. The
- * stage is exactly the mark's box; the grid and the shell are drawn over it
- * and overflow it, so the tagline below never moves — it is only held back
- * with opacity while the water is going, and fades in when it settles.
+ * The weighing, once per launch: a claim on one side of the beam, Maat's
+ * feather on the other, the beam settling level. Drawn by Grok for the site
+ * and lifted here so the window opens on the same picture the page does —
+ * the same bust, the same faces, the same cyan, and the feather's gold. Any click or key, or the
+ * scale settling, lets you in; prefers-reduced-motion skips the motion.
  */
-.mark-stage { position: relative; width: 96px; height: 96px; }
-
-.empty.splashing .empty-mark,
-.empty.splashing p { opacity: 0; }
-/* After, not before: the two rules have equal specificity, and the reveal has
-   to be the one that wins once both classes are on the block. */
-.empty.revealing .empty-mark { opacity: 1; transition: opacity 620ms ease-out; }
-.empty.revealing p { opacity: 1; transition: opacity 560ms ease-out 200ms; }
-
-.splash-grid {
-  position: absolute;
-  left: 50%; top: 50%;
-  transform: translate(-50%, -50%);
-  margin: 0;
-  /* Tighter than the body's 1.55: seven rows of waterline want to read as one
-     picture, and the terminal's rows are square-ish. */
-  font: 13px/1.22 var(--mono);
-  white-space: pre;
-  pointer-events: none;
-  user-select: none;
-}
-.splash-grid .t-accent { color: var(--accent); font-weight: 600; }
-.splash-grid .t-mid { color: var(--accent); }
-.splash-grid .t-dim { color: var(--dim); }
-.splash-grid .t-ghost { color: var(--ghost); }
-.empty.revealing .splash-grid { opacity: 0; transition: opacity 400ms ease-out; }
-
-/* The shell the cast husks build: one `)` per chamber, the same glyph the
-   wavefronts are drawn with, laid on a logarithmic spiral. */
-.splash-shell { position: absolute; inset: 0; pointer-events: none; user-select: none; }
-.arc {
-  position: absolute;
-  left: 50%; top: 50%;
-  font-family: var(--mono);
+@font-face {
+  font-family: "Barlow Condensed";
+  src: url("maat-splash/fonts/barlow-condensed-normal-300.woff2") format("woff2");
+  font-weight: 300;
   font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("maat-splash/fonts/ibm-plex-mono-normal-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+.mark-stage { position: relative; width: 96px; height: 72px; margin-bottom: 14px; display: flex; align-items: center; justify-content: center; }
+
+#maat-splash {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  cursor: pointer;
+  overflow: hidden;
+  background: #0b0d10;
+  color: #d5e3e6;
+  text-align: left;
+  font: inherit;
+  transition: opacity 420ms ease-out;
+}
+#maat-splash.is-leaving { opacity: 0; pointer-events: none; }
+#maat-splash.is-gone { display: none; }
+
+#maat-splash .splash-bust {
+  position: absolute;
+  top: 50%;
+  right: -8%;
+  height: 92%;
+  width: auto;
+  max-width: none;
+  transform: translateY(-50%);
+  pointer-events: none;
+  animation: maat-bust-rise 2.4s ease-out both;
+  /* The photograph's own ground is a shade lighter than the window's; on a
+     large screen its rectangle showed. Its edges fade into the dark instead. */
+  -webkit-mask-image: radial-gradient(ellipse 58% 54% at 58% 50%, #000 62%, transparent 100%);
+  mask-image: radial-gradient(ellipse 58% 54% at 58% 50%, #000 62%, transparent 100%);
+}
+#maat-splash .veil {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(90deg, #0b0d10 0%, rgba(11, 13, 16, 0.8) 42%, transparent 72%);
+}
+#maat-splash .stage {
+  position: relative;
+  display: flex;
+  height: 100%;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 0 1.5rem;
+}
+#maat-splash .kicker,
+#maat-splash .claim,
+#maat-splash .hint { font-family: "IBM Plex Mono", var(--mono); }
+#maat-splash .kicker { margin: 0; color: var(--maat-cyan); font-size: 0.875rem; }
+#maat-splash .scale { position: relative; width: 18rem; height: 11rem; margin-top: 2.5rem; }
+#maat-splash .splash-beam {
+  position: absolute;
+  top: 2.5rem;
+  right: 0;
+  left: 0;
+  height: 1px;
+  background: var(--maat-gold);
+  transform-origin: 50% 50%;
+  animation: maat-scale-settle 1.7s cubic-bezier(0.2, 0.8, 0.2, 1) 0.45s both;
+}
+#maat-splash .claim {
+  position: absolute;
+  top: 4rem;
+  left: 0.5rem;
+  color: rgba(213, 227, 230, 0.8);
+  font-size: 0.875rem;
+}
+#maat-splash .splash-feather {
+  position: absolute;
+  top: 0;
+  right: 1.5rem;
+  width: 2.5rem;
+  height: 7rem;
+  color: var(--maat-gold);
+  animation: maat-feather-drop 1s ease-out both;
+}
+#maat-splash .splash-word {
+  margin: 0;
+  font-family: "Barlow Condensed", "Arial Narrow", sans-serif;
+  font-size: clamp(3rem, 8vw, 4.5rem);
+  font-weight: 300;
   line-height: 1;
-  color: var(--dim);
-  opacity: 0;
-  transition: opacity 300ms ease-out, color 500ms linear;
+  letter-spacing: -0.02em;
+  text-transform: uppercase;
+  animation: maat-word-in 0.7s ease-out 1.45s both;
 }
-.arc > b {
-  display: block;
-  font-weight: inherit;
-  transform: scale(1.4);
-  transition: transform 320ms cubic-bezier(0.2, 0.8, 0.3, 1);
+#maat-splash .splash-word span { color: var(--maat-cyan); }
+#maat-splash .hint { margin: 1.5rem 0 0; color: rgba(213, 227, 230, 0.5); font-size: 0.75rem; }
+
+@keyframes maat-scale-settle {
+  0% { transform: rotate(-8deg); }
+  62% { transform: rotate(1.6deg); }
+  100% { transform: rotate(0deg); }
 }
-.arc.in { opacity: 1; }
-.arc.in > b { transform: scale(1); }
-/* A chamber arrives lit and cools, the way the wavefront that left it does. */
-.arc.hot { color: var(--accent); }
-.empty.revealing .splash-shell { opacity: 0; transition: opacity 540ms ease-out 140ms; }
+@keyframes maat-feather-drop {
+  0% { opacity: 0; transform: translateY(-32px); }
+  50% { opacity: 1; transform: translateY(0); }
+}
+@keyframes maat-bust-rise {
+  0%, 35% { opacity: 0; }
+  100% { opacity: 0.88; }
+}
+@keyframes maat-word-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+#maat-splash.is-settled .splash-bust,
+#maat-splash.is-settled .splash-beam,
+#maat-splash.is-settled .splash-feather,
+#maat-splash.is-settled .splash-word { animation: none; opacity: 1; transform: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  #maat-splash .splash-beam,
+  #maat-splash .splash-feather,
+  #maat-splash .splash-bust,
+  #maat-splash .splash-word { animation: none; }
+  #maat-splash { transition: none; }
+}
 
 .crumbs { display: flex; align-items: center; gap: 0; min-width: 0; }
 .crumb {

@@ -1,7 +1,7 @@
 /**
  * What `molt run` tells CI, in one number.
  *
- * With no `.molt/done.yml`, a run exited 0: the one case where nothing was
+ * With no `.maat/done.yml`, a run exited 0: the one case where nothing was
  * checked read to CI exactly like the case where everything was — under a
  * comment saying "an unverified answer is not a success". And a bar that was
  * only partly run exited 1, as though the work had failed something it was
@@ -51,12 +51,46 @@ async function provider(): Promise<string> {
   return `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}/v1`;
 }
 
+/**
+ * Like `provider`, but it also answers molt's own pre-turn questions: the
+ * criteria drafter gets one check that the work satisfies, and the critic
+ * judges it a real run of the deliverable.
+ */
+async function draftingProvider(): Promise<string> {
+  let n = 0;
+  const server: Server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const reply = (content: unknown) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ choices: [{ message: content, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 5 } }));
+      };
+      if (body.includes("You draft acceptance criteria")) {
+        return reply({ role: "assistant", content: JSON.stringify({ checks: [{ name: "made", run: "test -f a.txt" }], notes: [] }) });
+      }
+      if (body.includes("You review acceptance checks")) {
+        return reply({ role: "assistant", content: JSON.stringify({ checks: [{ name: "made", verdict: "runs", quote: "" }] }) });
+      }
+      reply(
+        n++ % 2 === 0
+          ? { role: "assistant", content: null, tool_calls: [{ id: `call_${n}`, type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "a.txt", content: "a\n" }) } }] }
+          : { role: "assistant", content: "Done: wrote a.txt." },
+      );
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  cleanups.push(() => new Promise<void>((r) => server.close(() => r())));
+  const addr = server.address();
+  return `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}/v1`;
+}
+
 function project(bar?: string): string {
   const w = workspace();
   cleanups.push(w.cleanup);
   if (bar !== undefined) {
-    mkdirSync(join(w.dir, ".molt"), { recursive: true });
-    writeFileSync(join(w.dir, ".molt", "done.yml"), bar);
+    mkdirSync(join(w.dir, ".maat"), { recursive: true });
+    writeFileSync(join(w.dir, ".maat", "done.yml"), bar);
   }
   return w.dir;
 }
@@ -103,6 +137,23 @@ describe("molt run's exit code", () => {
 
   it("is 3 when there was no bar to meet — not the same answer as verified", async () => {
     assert.equal(await run(project()), 3);
+  });
+
+  it("is 0 with no bar when sealed task criteria were met: those are a verdict", async () => {
+    // A benchmark trial read exit 3 on a turn molt had verified against the
+    // criteria it drafted, because the check above did not look at them.
+    assert.equal(await run(project(), "--criterion", "made=test -f a.txt"), 0);
+    assert.equal(await run(project(), "--criterion", "made=test -f b.txt", "--attempts", "1"), 1);
+  });
+
+  it("is 0 when checks drafted while the model read were met (--criteria auto)", async () => {
+    // Drafted criteria arrive while the model reads, so none are passed in up
+    // front. The exit code read that as "no criteria" and a verified turn
+    // exited 3. It is decided by the turn's own outcome now.
+    const url = await draftingProvider();
+    const code = await molt(["run", "write a.txt", "--url", url, "--model", "m", "--key", "k",
+      "--cwd", project(), "--no-stream", "--yes", "--criteria", "auto"]);
+    assert.equal(code, 0);
   });
 
   it("is 3 when required checks were left out, not 1 as though something failed", async () => {

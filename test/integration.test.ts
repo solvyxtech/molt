@@ -28,10 +28,10 @@ function ws() {
   return w.dir;
 }
 
-/** Write a project bar, creating .molt/ if it does not exist yet. */
+/** Write a project bar, creating .maat/ if it does not exist yet. */
 function writeBar(dir: string, yaml: string): void {
-  mkdirSync(join(dir, ".molt"), { recursive: true });
-  writeFileSync(join(dir, ".molt", "done.yml"), yaml, "utf8");
+  mkdirSync(join(dir, ".maat"), { recursive: true });
+  writeFileSync(join(dir, ".maat", "done.yml"), yaml, "utf8");
 }
 
 /** A provider that replays scripted turns and records what it was sent. */
@@ -165,7 +165,8 @@ describe("over a real socket", () => {
     }[]) {
       assert.equal(body.model, "mock-model");
       assert.equal(body.tool_choice, "auto");
-      assert.equal(body.tools.length, 6);
+      // inspect, read_file, write_file, list_dir, grep, edit_file, bash, plan.
+      assert.equal(body.tools.length, 8);
       for (const m of body.messages) {
         assert.ok(!("molt" in m), "internal metadata must never reach a provider");
         assert.ok(["system", "user", "assistant", "tool"].includes(String(m.role)));

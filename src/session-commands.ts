@@ -16,6 +16,7 @@
 import type { Engine } from "./engine.js";
 import { buildRepoMap, DEFAULT_MAP_TOKENS } from "./repomap.js";
 import { isRepo, lastCommit, undoLast } from "./git.js";
+import { missionStatus } from "./mission.js";
 
 export type CommandReply = { kind: "info" | "error"; text: string };
 
@@ -271,7 +272,7 @@ export function cmdBudget(engine: Engine, arg: string): CommandReply {
   if (s === "off") {
     engine.setBudget(undefined);
     return ok(
-      "budget cleared — no session budget and no per-turn ceiling. molt will now run a turn to " +
+      "budget cleared — no session budget and no per-turn ceiling. Maat will now run a turn to " +
         "the 32-step guard, which on a large codebase is a real bill.",
     );
   }
@@ -285,4 +286,15 @@ export function cmdBudget(engine: Engine, arg: string): CommandReply {
   if (!Number.isFinite(n) || n <= 0) return bad(`not a token budget: ${arg} — /budget <tokens|$usd|off>`);
   engine.setBudget(n);
   return ok(`budget: ${n} tokens — for the session, and for any single turn`);
+}
+
+/**
+ * `/mission` — the mission's queue, milestones and contract, as the files say.
+ *
+ * Status only, on both surfaces. Running a mission is `molt mission run` in
+ * a terminal: it starts a worker per feature and can go for hours, which is
+ * not something a chat prompt should kick off by accident.
+ */
+export function cmdMission(engine: Engine, _arg: string): CommandReply {
+  return ok(missionStatus(engine.cwd));
 }

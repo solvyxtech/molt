@@ -289,7 +289,7 @@ checks:
     const dir = ws();
     writeDefaultBar(dir);
     const mine = "version: 1\nchecks:\n  - name: mine\n    run: true\n";
-    writeFileSync(join(dir, ".molt", "done.yml"), mine);
+    writeFileSync(join(dir, ".maat", "done.yml"), mine);
     writeDefaultBar(dir);
     assert.equal(loadBar(dir)!.checks[0].name, "mine");
   });
@@ -394,9 +394,9 @@ describe("builtin: record-intact", () => {
 describe("tamper detection", () => {
   it("fails the bar when done.yml is edited through a tool call mid-session", async () => {
     const dir = ws();
-    mkdirSync(join(dir, ".molt"), { recursive: true });
+    mkdirSync(join(dir, ".maat"), { recursive: true });
     writeFileSync(
-      join(dir, ".molt", "done.yml"),
+      join(dir, ".maat", "done.yml"),
       "version: 1\nchecks:\n  - name: suite\n    run: exit 1\n",
     );
 
@@ -406,7 +406,7 @@ describe("tamper detection", () => {
           {
             name: "write_file",
             args: {
-              path: ".molt/done.yml",
+              path: ".maat/done.yml",
               content: "version: 1\nchecks:\n  - name: suite\n    run: exit 0\n",
             },
           },
@@ -436,7 +436,7 @@ describe("tamper detection", () => {
     const tamper = exhausted.result.results.find((r) => r.name === "bar-unmodified");
     assert.ok(tamper, "tamper check must be present");
     /**
-     * Here molt is not guessing. A tool call that writes `.molt/done.yml`
+     * Here molt is not guessing. A tool call that writes `.maat/done.yml`
      * leaves a ledger entry naming it, like any other write — so this is the
      * one case where the check knows who moved the bar, and it is also the
      * case the check exists for: a model editing its own passing conditions.
@@ -446,7 +446,7 @@ describe("tamper detection", () => {
      * everywhere was an over-correction for blaming everywhere; both threw
      * away evidence molt had.
      */
-    assert.match(tamper.output, /This turn wrote \.molt\/done\.yml/);
+    assert.match(tamper.output, /This turn wrote \.maat\/done\.yml/);
     assert.match(tamper.output, /always passes/, "say why it is refused, not just that it is");
     assert.doesNotMatch(
       tamper.output,
@@ -463,9 +463,9 @@ describe("tamper detection", () => {
     // file, so it must say only what it knows (the fingerprint moved) and
     // that retrying will not help, rather than accusing the turn.
     const dir = ws();
-    mkdirSync(join(dir, ".molt"), { recursive: true });
+    mkdirSync(join(dir, ".maat"), { recursive: true });
     writeFileSync(
-      join(dir, ".molt", "done.yml"),
+      join(dir, ".maat", "done.yml"),
       "version: 1\nchecks:\n  - name: suite\n    run: exit 0\n",
     );
 
@@ -489,7 +489,7 @@ describe("tamper detection", () => {
     // engine has taken its fingerprint (in the constructor) and before the
     // bar is ever run — no tool call in the transcript ever names the file.
     writeFileSync(
-      join(dir, ".molt", "done.yml"),
+      join(dir, ".maat", "done.yml"),
       "version: 1\nchecks:\n  - name: suite\n    run: exit 1\n",
     );
 
@@ -503,12 +503,12 @@ describe("tamper detection", () => {
     assert.match(tamper.output, /no longer matches the fingerprint/);
     assert.doesNotMatch(tamper.output, /[Rr]evert the file/);
     assert.match(tamper.output, /[Rr]etrying will not clear this/);
-    assert.match(tamper.output, /settle \.molt\/done\.yml/);
+    assert.match(tamper.output, /settle \.maat\/done\.yml/);
     // Regression pin: the old wording asserted the turn's own work edited the
     // file outright, with no hedge at all — that sentence must never come back.
     assert.doesNotMatch(
       tamper.output,
-      /^\.molt\/done\.yml changed during this session\. The definition of done cannot be/,
+      /^\.maat\/done\.yml changed during this session\. The definition of done cannot be/,
     );
   });
 

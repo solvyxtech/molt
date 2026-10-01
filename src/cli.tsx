@@ -12,7 +12,7 @@ import { isAgy } from "./agy.js";
 import { isClaudeCode } from "./claude-code.js";
 import { expandEndpointShorthand } from "./endpoint.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { Archive } from "./archive.js";
 import { isAutonomy, type Autonomy } from "./autonomy.js";
 import { fmtCost, fmtDuration } from "./banner.js";
@@ -23,8 +23,12 @@ import { describeDrift, driftSince } from "./git.js";
 import { Journal } from "./journal.js";
 import { Integrity } from "./integrity.js";
 import { buildRepoMap, DEFAULT_MAP_TOKENS } from "./repomap.js";
+import { buildBrief, DEFAULT_BRIEF_TOKENS } from "./brief.js";
+import { draftMission, missionStatus, runMission, writePlan, type MissionSummary } from "./mission.js";
 import { parseDuration } from "./session-commands.js";
-import { taskChecksFrom } from "./criteria.js";
+import { commandsHere, draftCriteriaCritiqued, preflightCriteria, taskChecksFrom } from "./criteria.js";
+import { listProject, removeNew } from "./leftovers.js";
+import { projectScripts } from "./interview.js";
 import {
   endpointProblem,
   fetchPricing,
@@ -38,6 +42,8 @@ import {
 } from "./providers.js";
 import { Receipts } from "./receipts.js";
 import type { BarResult, EngineEvent } from "./types.js";
+import { stateDir } from "./statedir.js";
+import { env } from "./env.js";
 
 /**
  * The version, from the manifest that npm actually publishes.
@@ -78,26 +84,31 @@ function buildStamp(): string | undefined {
   }
 }
 
-const USAGE = `molt ${VERSION} — a coding agent that can't say "done" without proving it.
+const USAGE = `Maat Agent ${VERSION} — a coding agent that can't say "done" without proving it.
+(Built on the molt engine; the older "molt" command still works.)
 
 usage
-  molt                      interactive session
-  molt run "<task>"         headless; exit 0 verified · 1 not met · 3 no verdict
-  molt ask "<question>"     a question, not a change — no work-landed check
-  molt prove                run .molt/done.yml now and exit
-  molt init                 write a starter .molt/done.yml
-  molt doctor               check the endpoint and model
+  maat                      interactive session
+  maat run "<task>"         headless; exit 0 verified · 1 not met · 3 no verdict
+  maat ask "<question>"     a question, not a change — no work-landed check
+  maat prove                run .maat/done.yml now and exit
+  maat init                 write a starter .maat/done.yml
+  maat doctor               check the endpoint and model
 
-  molt receipts             list completion attempts (--grep, --show <file>, --repair)
-  molt archive              list shed batches (--grep, --show <n>, --explain)
-  molt stats                false-claim rate and tokens per verified change
-  molt log                  what the model actually did, from the session log
-  molt verify               recompute the log's hash chain
-  molt attempts             one TSV row per attempt: verdict, tokens, cost, time
-  molt --help
+  maat receipts             list completion attempts (--grep, --show <file>, --repair)
+  maat archive              list shed batches (--grep, --show <n>, --explain)
+  maat stats                false-claim rate and tokens per verified change
+  maat log                  what the model actually did, from the session log
+  maat verify               recompute the log's hash chain
+  maat attempts             one TSV row per attempt: verdict, tokens, cost, time
+
+  maat mission plan "<goal>"   draft .maat/mission/ (contract + features) for you to edit
+  maat mission run          a worker per feature, held to its assertions, until done
+  maat mission status       where the mission stands
+  maat --help
 
 first run
-  molt → /login (pick a provider, paste the key) → /model (pick one) → go
+  maat → /login (pick a provider, paste the key) → /model (pick one) → go
   the choice is remembered, so later runs start where you left off
 
 options
@@ -110,18 +121,36 @@ options
   --model <id>       model id                     (MOLT_MODEL)
                      no default — /model or --model picks one
   --key <secret>     api key, if the endpoint needs one   (MOLT_API_KEY)
-                     /login stores keys in ~/.config/molt/auth.json (0600)
+                     /login stores keys in ~/.config/maat/auth.json (0600)
   --price-in <n>     USD per 1M prompt tokens      (MOLT_PRICE_IN)
   --price-out <n>    USD per 1M completion tokens  (MOLT_PRICE_OUT)
-                     omit both and molt reads the price from the provider
+                     omit both and Maat reads the price from the provider
   --verbose          show every call, argument, and result (press v in the TUI)
   --provider <name>  label shown in the status line
   --cwd <dir>        project directory (default: current)
   --budget <n>       hard token ceiling for the session
+  --review [n]       after a verified claim, n independent reviews (default 3) read
+                     the task and the receipt; a majority-backed violation quoted
+                     from the task labels the work "passed its checks,
+                     unconfirmed". A label only: nothing is refused or redone.
+  --batch            batch mode: every reply is one act call carrying a plan and
+                     a list of actions, for models that make one tool call per
+                     reply. Each action is still approved, recorded and checked
+                     as its own call. HTTP endpoints only.
+  --reasoning-checks <e>  effort for drafting checks and planning a mission only
+                     (single calls outside the work loop). Defaults to --reasoning.
+  --reasoning-retry <e>   effort for every step after the checks refuse a claim.
+                     Defaults to --reasoning.
+  --steps <n>        tool-call steps one turn may take before the loop guard
+                     stops it (default 32; 0 for none). A long task bounded by
+                     --budget or --for does not need the guard.
+  --reasoning <e>    a reasoning model's effort: none, low, medium, high. Sent
+                     only when set. A model that thinks to its ceiling and never
+                     answers (Space Bunny Alpha at default) answers at low.
   --max-tokens <n>   most tokens the model may write in one reply (default
                      32768, or the model's own maximum if it is lower)
   --auto-shed <n>    shed once history exceeds n tokens (default 60000, 0 off)
-  --attempts <n>     completion attempts before molt reports failure (default 4)
+  --attempts <n>     completion attempts before Maat reports failure (default 4)
   --for <5m>         wall-clock ceiling for one turn; then the bar runs on
                      whatever exists. 30s, 5m, 1h, or off
   --commit           when the bar is met, commit the files this turn wrote,
@@ -132,6 +161,8 @@ options
                      (default 900, and off for self-hosted endpoints: it helps
                      a frontier model and distracts a small local one).
                      --no-map leaves it out entirely.
+  --no-brief         leave out the environment brief (tools, manifests, git
+                     state) that is gathered once and put in the system prompt
   --read <path,...>  files the model may read and never write; a write to one
                      is refused at the tool. Repeatable.
   --criterion <name=command>
@@ -139,17 +170,24 @@ options
                      bar: a command that must exit 0. Sealed before the work
                      starts, run with the bar, named task:<name> on the receipt.
                      Repeatable. (The window's criteria panel, headless.)
+  --criteria auto    let the model draft criteria for the task and seal them
+                     before the work starts; it is then held to them. They can
+                     only add to the project's bar, never replace it.
   --note <text>      a criterion in words. Recorded on the receipt as stated
                      intent, shown to the model, never reported as verified.
   --capture <dir>    write one JSON per completion attempt — the full wire
                      transcript, ledger, bar result and receipt name — for
-                     training molt's safeguard model. Redacted. Off by
+                     training Maat's safeguard model. Redacted. Off by
                      default. (MOLT_CAPTURE_DIR)
   --autonomy <level> low | medium | high — how much runs without asking
                      low asks about every command and write (default)
                      medium runs reads, read-only commands, project writes
                      high runs everything except what cannot be undone
   --yes              auto-approve every tool call (same as --autonomy high)
+  --sandbox          the machine is disposable: --yes, no project boundary, and
+                     what high autonomy would still ask about runs (rm, sudo,
+                     python -c, a write outside the directory). For a container
+                     or a throwaway VM, never for a machine you keep.
   --json             machine-readable output (run/prove/stats/receipts)
   --version          print the version and exit
   --no-stream        disable token streaming (default: streaming on)
@@ -160,8 +198,8 @@ options
   --raw              print the log as raw JSONL rather than a summary
   --show <id>        print one receipt file or exuvia index
 
-molt reads .molt/done.yml for what "done" means in this project.
-Without it, completions are unverified and molt will say so.`;
+maat reads .maat/done.yml for what "done" means in this project.
+Without it, completions are unverified and Maat will say so.`;
 
 type Args = {
   cmd: string;
@@ -179,6 +217,18 @@ type Args = {
   budget?: number;
   autoShed?: number;
   maxTokens?: number;
+  /** `--reasoning low`: a reasoning model's effort, sent only when set. */
+  reasoning?: string;
+  /** `--reasoning-checks high`: effort for drafting checks and planning only. */
+  reasoningChecks?: string;
+  /** `--reasoning-retry high`: effort after the checks refuse a claim. */
+  reasoningRetry?: string;
+  /** `--steps n`: the per-turn step ceiling; 0 is none. */
+  steps?: number;
+  /** `--batch`: the model's only tool is act — a plan and a list of actions per reply. */
+  batch?: boolean;
+  /** `--review [n]`: independent review of a verified claim, n votes (default 3). A label, not a gate. */
+  review?: number;
   attempts?: number;
   /** Wall-clock ceiling for one turn, in ms. `--for 5m`. */
   forMs?: number;
@@ -188,10 +238,27 @@ type Args = {
   revert?: boolean;
   /** Token budget for the repository map; 0 turns it off. `--map`/`--no-map`. */
   mapTokens?: number;
+  /** 0 leaves the environment brief out. */
+  briefTokens?: number;
+  /** `molt mission plan --force`: replace an existing mission. */
+  force?: boolean;
+  /**
+   * `--sandbox`: the machine is disposable. Implies --yes, lifts the project
+   * boundary, and approves every gated call instead of refusing it.
+   */
+  sandbox?: boolean;
+  /** `molt mission run --features n`: stop after n worker runs. */
+  features?: number;
   /** Files the model may read and never write. `--read`, repeatable. */
   readOnly?: string[];
   /** Task criteria as commands. `--criterion name=cmd`, repeatable. */
   criteria?: { name: string; run: string }[];
+  /**
+   * `--criteria auto`: have the model draft criteria for the task before the
+   * work, seal them, and hold the work to them. Headless only — nobody is
+   * there to approve, and a drafted criterion can only make the bar stricter.
+   */
+  autoCriteria?: boolean;
   /** Task criteria in words. `--note`, repeatable. */
   notes?: string[];
   /** Directory for per-attempt capture files. `--capture`, or MOLT_CAPTURE_DIR. */
@@ -255,11 +322,11 @@ function positiveNum(flag: string, raw: string | undefined): number {
 export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
   const out: Args = {
     cmd: "",
-    url: process.env.MOLT_BASE_URL ?? stored.baseUrl ?? "http://localhost:11434/v1",
-    model: process.env.MOLT_MODEL ?? stored.model ?? "",
-    key: process.env.MOLT_API_KEY ?? stored.apiKey,
-    priceIn: num(process.env.MOLT_PRICE_IN),
-    priceOut: num(process.env.MOLT_PRICE_OUT),
+    url: env("BASE_URL") ?? stored.baseUrl ?? "http://localhost:11434/v1",
+    model: env("MODEL") ?? stored.model ?? "",
+    key: env("API_KEY") ?? stored.apiKey,
+    priceIn: num(env("PRICE_IN")),
+    priceOut: num(env("PRICE_OUT")),
     cwd: process.cwd(),
     explain: false,
     raw: false,
@@ -324,7 +391,7 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
          */
         const wrong = endpointProblem(out.url);
         if (wrong) {
-          process.stderr.write(`molt: ${wrong}\n`);
+          process.stderr.write(`maat: ${wrong}\n`);
           process.exit(2);
         }
         break;
@@ -358,6 +425,45 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
       case "--max-tokens":
         out.maxTokens = positiveInt("--max-tokens", next());
         break;
+      case "--batch":
+        out.batch = true;
+        break;
+      case "--review": {
+        // Optional count: `--review` alone is three votes.
+        const peek = argv[i + 1];
+        if (peek !== undefined && /^\d+$/.test(peek)) {
+          out.review = Math.max(1, Number(peek));
+          i += 1;
+        } else {
+          out.review = 3;
+        }
+        break;
+      }
+      case "--steps": {
+        const raw = next();
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n < 0) throw new Error(`--steps takes a whole number (0 for none); got ${raw}`);
+        out.steps = n;
+        break;
+      }
+      case "--reasoning-checks":
+      case "--reasoning-retry": {
+        const effort = next();
+        if (!REASONING_EFFORTS.includes(effort)) {
+          throw new Error(`${a} takes one of ${REASONING_EFFORTS.join(", ")}; got ${effort}`);
+        }
+        if (a === "--reasoning-checks") out.reasoningChecks = effort;
+        else out.reasoningRetry = effort;
+        break;
+      }
+      case "--reasoning": {
+        const effort = next();
+        if (!REASONING_EFFORTS.includes(effort)) {
+          throw new Error(`--reasoning takes one of ${REASONING_EFFORTS.join(", ")}; got ${effort}`);
+        }
+        out.reasoning = effort;
+        break;
+      }
       case "--attempts":
         out.attempts = positiveInt("--attempts", next());
         break;
@@ -382,6 +488,15 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
       case "--no-map":
         out.mapTokens = 0;
         break;
+      case "--no-brief":
+        out.briefTokens = 0;
+        break;
+      case "--force":
+        out.force = true;
+        break;
+      case "--features":
+        out.features = positiveInt("--features", next());
+        break;
       case "--read":
         // Repeatable, and comma-separable: a CI job pinning six files should
         // not have to choose which spelling this flag prefers.
@@ -399,6 +514,12 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         const run = (eq > 0 ? raw.slice(eq + 1) : raw).trim();
         if (!run) throw new Error(`--criterion needs name=command, got "${raw}"`);
         out.criteria = [...(out.criteria ?? []), { name, run }];
+        break;
+      }
+      case "--criteria": {
+        const mode = next();
+        if (mode !== "auto") throw new Error(`--criteria takes "auto"; got ${mode}`);
+        out.autoCriteria = true;
         break;
       }
       case "--note":
@@ -448,6 +569,10 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
       case "-y":
         out.yes = true;
         break;
+      case "--sandbox":
+        out.sandbox = true;
+        out.yes = true;
+        break;
       case "--json":
         out.json = true;
         break;
@@ -490,7 +615,7 @@ function buildEngine(args: Args, session = false): Engine {
     bar = loadBar(args.cwd);
   } catch (e) {
     if (e instanceof BarError) {
-      process.stderr.write(`molt: ${e.message}\n`);
+      process.stderr.write(`maat: ${e.message}\n`);
       process.exit(2);
     }
     throw e;
@@ -498,7 +623,7 @@ function buildEngine(args: Args, session = false): Engine {
   if (bar && (args.only?.length || args.skip?.length)) {
     bar = selectChecks(bar, { only: args.only, skip: args.skip });
     if (bar.checks.length === 0) {
-      process.stderr.write("molt: tag selection left no checks — refusing to run an empty bar\n");
+      process.stderr.write("maat: tag selection left no checks — refusing to run an empty bar\n");
       process.exit(2);
     }
   }
@@ -541,10 +666,17 @@ function buildEngine(args: Args, session = false): Engine {
     git: { commitOnPass: args.commit === true, restoreOnFail: args.revert === true },
     autoShedAtTokens: args.autoShed,
     maxTokens: args.maxTokens,
-    captureDir: args.capture ?? process.env.MOLT_CAPTURE_DIR,
+    reasoningEffort: args.reasoning,
+    retryReasoningEffort: args.reasoningRetry,
+    maxSteps: args.steps,
+    batch: args.batch === true,
+    ...(args.review ? { review: { votes: args.review, reasoningEffort: args.reasoningChecks ?? args.reasoning } } : {}),
+    captureDir: args.capture ?? env("CAPTURE_DIR"),
     stream: args.stream,
     // --yes predates autonomy and means the same thing as its top level.
     autonomy: args.yes ? "high" : args.autonomy,
+    unattended: session,
+    sandbox: args.sandbox === true,
   });
 }
 
@@ -643,13 +775,13 @@ function printBar(result: BarResult, from: "run" | "prove"): void {
   if (onlyWorkLanded) {
     process.stdout.write(
       from === "prove"
-        ? "\nwork-landed requires a file to have changed in this session. `molt prove` runs\n" +
+        ? "\nwork-landed requires a file to have changed in this session. `maat prove` runs\n" +
             "standalone, so there is no session and no write for it to find — it fails here by\n" +
             "definition, not because anything is wrong. Once a turn has run it has one to read.\n"
         : "\neverything else passed. work-landed requires this turn to have changed a file, so a\n" +
-            "question, a lookup, or an explanation can never satisfy it — and molt would rather\n" +
+            "question, a lookup, or an explanation can never satisfy it — and Maat would rather\n" +
             "refuse an honest answer than accept an invented file edit.\n" +
-            'ask questions with `molt ask "<question>"`, which runs the rest of the bar and drops\n' +
+            'ask questions with `maat ask "<question>"`, which runs the rest of the bar and drops\n' +
             "that one check for the turn. (--skip session would leave the turn undetermined.)\n",
     );
   }
@@ -683,6 +815,24 @@ export function defaultMapTokens(url: string): number {
  * window. Failure is deliberately silent: a map is a hint, and no session
  * should fail to start because a hint could not be assembled.
  */
+/**
+ * The environment brief, on by default for every model.
+ *
+ * Unlike the map it is not gated on self-hosting: a small model is the one
+ * most likely to spend six steps asking which tools exist, and the brief is a
+ * few hundred tokens that answer that once.
+ */
+async function primeBrief(engine: Engine, args: Args): Promise<void> {
+  const budget = args.briefTokens ?? DEFAULT_BRIEF_TOKENS;
+  if (budget <= 0) return;
+  try {
+    const brief = await buildBrief({ cwd: args.cwd, budgetTokens: budget });
+    if (brief.text) engine.setBrief(brief.text);
+  } catch {
+    /* a brief that could not be built is not a reason to refuse to start */
+  }
+}
+
 async function primeRepoMap(engine: Engine, args: Args): Promise<void> {
   const budget = args.mapTokens ?? defaultMapTokens(args.url);
   if (budget <= 0) return;
@@ -706,7 +856,7 @@ async function primeRepoMap(engine: Engine, args: Args): Promise<void> {
 function cmdAttempts(args: Args): number {
   const rows = new Receipts(args.cwd).records();
   if (!rows.length) {
-    process.stdout.write("no attempts yet — .molt/receipts is empty\n");
+    process.stdout.write("no attempts yet — .maat/receipts is empty\n");
     return 0;
   }
   const head = ["seq", "iso", "verdict", "attempt", "model", "tokens", "usd", "bar_ms", "failed", "file"];
@@ -758,13 +908,188 @@ export function criteriaFromArgs(args: Pick<Args, "criteria" | "notes">): {
 
 /** Finished, but nothing established a verdict: no bar, or required checks not run. */
 const EXIT_NO_VERDICT = 3;
+const REASONING_EFFORTS = ["none", "low", "medium", "high"];
+
+/**
+ * `molt mission plan|run|status`.
+ *
+ * plan asks the model once and writes files for a person to edit. run is a
+ * loop with no model in it: a fresh worker engine per feature, built exactly
+ * as `molt run` builds one, held to the assertions the feature claims. status
+ * reads the files. Nothing here judges work; the assertions do.
+ */
+async function cmdMission(args: Args): Promise<number> {
+  const [sub, ...rest] = (args.task ?? "").split(" ");
+  const goal = rest.join(" ").trim();
+  switch (sub) {
+    case "status":
+      process.stdout.write(missionStatus(args.cwd) + "\n");
+      return 0;
+    case "plan": {
+      if (!goal) {
+        process.stderr.write('maat: mission plan needs a goal, e.g. Maat mission plan "a CLI that ..."\n');
+        return 2;
+      }
+      if (!args.model) {
+        process.stderr.write("maat: no model selected — pass --model <id> or set MOLT_MODEL\n");
+        return 2;
+      }
+      const brief = await buildBrief({ cwd: args.cwd }).catch(() => ({ text: "" }));
+      const r = await draftMission({
+        goal,
+        context: brief.text,
+        scripts: projectScripts(args.cwd),
+        ask: { baseUrl: args.url, apiKey: keyForUrl(args.url, args.key), model: args.model, cwd: args.cwd, reasoningEffort: args.reasoningChecks ?? args.reasoning },
+      });
+      if (!r.ok) {
+        process.stderr.write(`maat: ${r.error}\n`);
+        return 1;
+      }
+      let written: string[];
+      try {
+        written = writePlan(args.cwd, r.plan, { force: args.force });
+      } catch (e) {
+        process.stderr.write(`maat: ${(e as Error).message}\n`);
+        return 2;
+      }
+      process.stdout.write(
+        `wrote ${written.join(", ")}\n` +
+          `${r.plan.features.features.length} feature(s), ${r.plan.contract.assertions.length} assertion(s)\n`,
+      );
+      if (r.problems.length) {
+        process.stdout.write(`fix before running:\n${r.problems.map((p) => `  - ${p}`).join("\n")}\n`);
+      }
+      process.stdout.write(`read and edit them, then: Maat mission run\n`);
+      return r.problems.length ? 1 : 0;
+    }
+    case "run": {
+      if (!args.model) {
+        process.stderr.write("maat: no model selected — pass --model <id> or set MOLT_MODEL\n");
+        return 2;
+      }
+      const confirm = async (name: string, detail: string) => {
+        process.stderr.write(`maat: refusing ${name} (${detail}) — raise --autonomy, or pass --yes, for a mission\n`);
+        return false;
+      };
+      const brief = await buildBrief({ cwd: args.cwd }).catch(() => ({ text: "" }));
+      const t0 = Date.now();
+      let summary: MissionSummary;
+      try {
+        summary = await runMission({
+          cwd: args.cwd,
+          maxAttempts: args.attempts,
+          maxRuns: args.features,
+          confirm,
+          makeWorker: async (feature) => {
+            const engine = buildEngine(args, true);
+            if (brief.text) engine.setBrief(brief.text);
+            await primeRepoMap(engine, args);
+            await priceEngine(engine, args);
+            process.stdout.write(`\n== ${feature.id} ${feature.title} ==\n`);
+            return engine;
+          },
+          events: {
+            featureEnd: (f, h) => {
+              process.stdout.write(
+                `== ${f.id} ${h.outcome}` +
+                  (h.failed.length ? ` · failed ${h.failed.join(", ")}` : "") +
+                  (h.receipt ? ` · ${h.receipt}` : "") +
+                  ` · ${fmtDuration(h.durationMs)}\n`,
+              );
+            },
+            milestone: (name, ok, results) => {
+              process.stdout.write(
+                `== milestone ${name} ${ok ? "sealed" : "NOT sealed"} · ` +
+                  `${results.filter((r) => r.ok).length}/${results.length} assertion(s) pass together\n`,
+              );
+            },
+            worker: args.json
+              ? (_f, ev) => process.stdout.write(JSON.stringify(ev) + "\n")
+              : (_f, ev) => {
+                  if (ev.kind === "tool") process.stdout.write(`  ${ev.name} ${ev.detail}\n`);
+                  else if (ev.kind === "proof_result" || ev.kind === "proof_refused") {
+                    process.stdout.write(`  bar: ${ev.result.ok ? "met" : "not met"} (attempt ${ev.attempt})\n`);
+                  }
+                },
+          },
+        });
+      } catch (e) {
+        process.stderr.write(`maat: ${(e as Error).message}\n`);
+        return 2;
+      }
+      process.stdout.write(
+        `\nmission ${summary.stopped} · ${summary.runs} run(s) · ${fmtDuration(Date.now() - t0)}\n` +
+          `done ${summary.done.length} · blocked ${summary.blocked.length} · pending ${summary.pending.length}\n` +
+          `sealed: ${summary.sealed.join(", ") || "none"}` +
+          (summary.unsealed.length ? ` · not sealed: ${summary.unsealed.join(", ")}` : "") +
+          "\n",
+      );
+      return summary.stopped === "complete" && summary.unsealed.length === 0 ? 0 : summary.stopped === "contract moved" ? 2 : 1;
+    }
+    default:
+      process.stderr.write(`maat: mission takes plan "<goal>", run, or status\n`);
+      return 2;
+  }
+}
+
+/**
+ * `--criteria auto`: the model writes the exam, and is then held to it.
+ *
+ * In the window a person edits and approves the draft. Headless there is
+ * nobody, so the draft is sealed as written — which is safe for the same
+ * reason drafting is safe at all: criteria only ever ADD to the project's
+ * bar. A model cannot lower the bar by drafting; it can only give itself
+ * more to satisfy. What it buys is the thing a long unattended run most
+ * lacks: a checkable definition of done for THIS task, decided before any
+ * work exists to be judged. A check that cannot run at all is dropped and
+ * said, so a hallucinated command does not fail the turn for the wrong reason.
+ */
+async function autoDraft(engine: Engine, args: Args): Promise<ReturnType<typeof taskChecksFrom>> {
+  const none: ReturnType<typeof taskChecksFrom> = { taskChecks: [], taskNotes: [] };
+  // Drafted, then read cold by a critic against the task text: a check that
+  // invents or guesses is dropped (with a task quote), and a draft where
+  // nothing runs the deliverable is asked for once more. See criteria.ts.
+  const r = await draftCriteriaCritiqued({
+    commands: commandsHere(args.cwd),
+    task: args.task ?? "",
+    scripts: projectScripts(args.cwd),
+    barChecks: (engine.cfg.bar?.checks ?? []).map((c) => c.name),
+    baseUrl: args.url,
+    apiKey: args.key,
+    model: args.model,
+    cwd: args.cwd,
+    reasoningEffort: args.reasoningChecks ?? args.reasoning,
+  });
+  if (!r.ok) {
+    process.stderr.write(`maat: criteria not drafted — ${r.error}; running against the project bar only\n`);
+    return none;
+  }
+  for (const line of r.critique) process.stderr.write(`maat: criteria review — ${line}\n`);
+  // Hidden: the model wrote these, and a model shown its own exam makes the
+  // work equal the check. It gets the names, and the output on failure.
+  const sealed = taskChecksFrom(r.draft, { hidden: true });
+  // Headless, the checks' own side effects are cleaned up (src/leftovers.ts).
+  const beforeTry = listProject(args.cwd);
+  const broken = await preflightCriteria(sealed.taskChecks, { cwd: args.cwd });
+  removeNew(args.cwd, beforeTry);
+  const drop = new Set(broken.map((b) => b.name));
+  for (const b of broken) {
+    process.stderr.write(`maat: dropped drafted criterion ${b.name} (${b.run}) — ${b.why}\n`);
+  }
+  const taskChecks = sealed.taskChecks.filter((c) => !drop.has(c.name));
+  if (!args.json) {
+    for (const c of taskChecks) process.stdout.write(`· criterion ${c.name}: ${c.run}\n`);
+    for (const n of sealed.taskNotes) process.stdout.write(`· note ${n}\n`);
+  }
+  return { taskChecks, taskNotes: sealed.taskNotes };
+}
 
 async function cmdRun(args: Args, ask = false): Promise<number> {
   if (!args.task) {
     process.stderr.write(
       ask
-        ? 'molt: ask needs a question, e.g. molt ask "what does the bar check?"\n'
-        : 'molt: run needs a task, e.g. molt run "fix the failing test"\n',
+        ? 'maat: ask needs a question, e.g. Maat ask "what does the bar check?"\n'
+        : 'maat: run needs a task, e.g. Maat run "fix the failing test"\n',
     );
     return 2;
   }
@@ -772,14 +1097,15 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   // CI run fires a request with an empty model and fails inside the provider.
   if (!args.model) {
     process.stderr.write(
-      "molt: no model selected — pass --model <id>, set MOLT_MODEL, or run molt and use /login\n",
+      "maat: no model selected — pass --model <id>, set MOLT_MODEL, or run maat and use /login\n",
     );
     return 2;
   }
   const engine = buildEngine(args, true);
   if (args.budget) engine.setBudget(args.budget);
-  await primeRepoMap(engine, args);
-  await priceEngine(engine, args);
+  // Independent: the brief probes tools, the map walks files, the price asks
+  // the endpoint. In a row they cost the sum; together, the slowest.
+  await Promise.all([primeBrief(engine, args), primeRepoMap(engine, args), priceEngine(engine, args)]);
 
   let failed = false;
   let sawAnswer = false;
@@ -846,8 +1172,18 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         // the same books.
         const sp = ev.spend;
         const cached = sp.cachedTokens > 0 ? ` (${sp.cachedTokens} cached)` : "";
+        const said =
+          ev.outcome === "verified" && ev.review && !ev.review.confirmed
+            ? "passed its checks, unconfirmed"
+            : ev.outcome === "verified" && ev.review?.confirmed
+              ? "verified, independently reviewed"
+              : ev.outcome === "verified" && ev.selfChecked
+                ? "passed its own checks"
+                : ev.outcome === "unverified" && ev.checksDisagree?.length
+                  ? "unverified, its own drafted checks disagree"
+                  : ev.outcome;
         process.stdout.write(
-          `· job ${ev.outcome} · ${ev.steps} step(s) · ${sp.promptTokens} in${cached} · ` +
+          `· job ${said} · ${ev.steps} step(s) · ${sp.promptTokens} in${cached} · ` +
             `${sp.completionTokens} out · ${fmtDuration(ev.durationMs)}` +
             (sp.costUsd === undefined ? "" : ` · ${sp.estimated ? "~" : ""}${fmtCost(sp.costUsd)}`) +
             "\n",
@@ -879,7 +1215,7 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
       }
       case "proof_start":
         process.stdout.write(
-          `\nchecking ${ev.checks} condition(s) from .molt/done.yml: ${ev.names.join(", ")}\n`,
+          `\nchecking ${ev.checks} condition(s) from .maat/done.yml: ${ev.names.join(", ")}\n`,
         );
         break;
       case "proof_refused":
@@ -907,7 +1243,7 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         process.stdout.write(`· ${ev.text}\n`);
         break;
       case "error":
-        process.stderr.write(`molt: ${ev.text}\n`);
+        process.stderr.write(`maat: ${ev.text}\n`);
         break;
     }
   };
@@ -916,21 +1252,33 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   // refused rather than waited on. Autonomy decides which calls those are:
   // the engine only asks about what the level does not cover.
   const confirm = async (name: string, detail: string) => {
+    if (args.sandbox) {
+      // Said, not hidden: the journal records every call as approved at
+      // this level, and the log says which ones only ran because of the flag.
+      process.stderr.write(`maat: sandbox ran ${name} (${detail})\n`);
+      return true;
+    }
     process.stderr.write(
-      `molt: refusing ${name} (${detail}) — raise --autonomy, or pass --yes, for headless work\n`,
+      `maat: refusing ${name} (${detail}) — raise --autonomy, or pass --yes, for headless work\n`,
     );
     return false;
   };
 
   const { taskChecks, taskNotes } = criteriaFromArgs(args);
+  // Drafted while the model starts reading: the engine seals them before the
+  // first change or claim, so they still predate the work (see RunOptions).
+  const pendingCriteria = args.autoCriteria && !ask ? autoDraft(engine, args) : undefined;
   let undetermined = false;
-  for await (const ev of engine.run(args.task, confirm, { ask, taskChecks, taskNotes })) {
+  /** The turn's own verdict, from job_end. */
+  let outcome: string | undefined;
+  for await (const ev of engine.run(args.task, confirm, { ask, taskChecks, taskNotes, pendingCriteria })) {
     emit(ev);
     if (ev.kind === "proof_exhausted" && ev.result.undetermined?.length) undetermined = true;
     // The sentence that explains an undetermined bar arrives as an error, so
     // it is read, but it is not a failure of the work.
     else if (ev.kind === "proof_exhausted" || (ev.kind === "error" && !undetermined)) failed = true;
     if (ev.kind === "assistant_text") sawAnswer = true;
+    if (ev.kind === "job_end") outcome = ev.outcome;
   }
 
   // What the run cost, said once at the end, in the same terms the step
@@ -973,13 +1321,23 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   // judged — it just could not be settled — so there is no answer event to wait for.
   if (undetermined) return EXIT_NO_VERDICT;
   if (!sawAnswer) return 1;
-  if (!ask && !engine.cfg.bar) return EXIT_NO_VERDICT;
+  // No project bar and no task criteria: nothing judged the claim, so there
+  // is no verdict. With task criteria there is one — a turn that met the
+  // criteria it was sealed with is verified, bar or no bar. A benchmark
+  // trial read exit 3 on a turn molt had verified, because of this line.
+  //
+  // Decided by the turn's own outcome, not by counting the criteria passed
+  // in: drafted criteria now arrive while the model reads (pendingCriteria),
+  // so that count was zero on turns they judged, and a verified turn exited 3.
+  if (outcome === "verified" || outcome === "answered") return 0;
+  if (!ask && outcome === "unverified") return EXIT_NO_VERDICT;
+  if (!ask && !engine.cfg.bar && taskChecks.length === 0 && outcome === undefined) return EXIT_NO_VERDICT;
   return 0;
 }
 
 async function cmdProve(args: Args): Promise<number> {
   if (!hasBar(args.cwd)) {
-    process.stderr.write("molt: no .molt/done.yml here. run `molt init` first.\n");
+    process.stderr.write("maat: no .maat/done.yml here. run `maat init` first.\n");
     return 2;
   }
   const engine = buildEngine(args);
@@ -998,13 +1356,13 @@ async function cmdProve(args: Args): Promise<number> {
 function cmdInit(args: Args): number {
   const { path, detected, existed } = writeDefaultBar(args.cwd);
   if (existed) {
-    process.stdout.write(`molt: ${path} already exists, left alone\n`);
+    process.stdout.write(`maat: ${path} already exists, left alone\n`);
     return 0;
   }
-  process.stdout.write(`molt: wrote ${path}\n\n`);
+  process.stdout.write(`maat: wrote ${path}\n\n`);
   if (detected.length === 0) {
     process.stdout.write(
-      "molt found no build or test commands in this project, so the bar only proves\n" +
+      "Maat found no build or test commands in this project, so the bar only proves\n" +
         "that work landed. Add your own commands — that is where a bar gets its value.\n",
     );
     return 0;
@@ -1015,7 +1373,7 @@ function cmdInit(args: Args): number {
   for (const c of detected) {
     process.stdout.write(`  ${c.name.padEnd(8)} ${c.run.padEnd(28)} ${c.because}\n`);
   }
-  process.stdout.write("\nCheck it over — it is your file, and molt only wrote a first draft.\n");
+  process.stdout.write("\nCheck it over — it is your file, and Maat only wrote a first draft.\n");
   return 0;
 }
 
@@ -1024,7 +1382,7 @@ async function cmdDoctor(args: Args): Promise<number> {
   const d = await engine.doctor();
   process.stdout.write(`endpoint: ${args.url}\n`);
   process.stdout.write(`model:    ${args.model}\n`);
-  process.stdout.write(`bar:      ${hasBar(args.cwd) ? ".molt/done.yml" : "MISSING — completions unverified"}\n`);
+  process.stdout.write(`bar:      ${hasBar(args.cwd) ? ".maat/done.yml" : "MISSING — completions unverified"}\n`);
   process.stdout.write(`${d.ok ? "ok" : "FAIL"}: ${d.detail}\n`);
   return d.ok && hasBar(args.cwd) ? 0 : 1;
 }
@@ -1066,13 +1424,13 @@ async function cmdReceipts(args: Args): Promise<number> {
         .find((r) => r.file === args.show || String(r.file ?? "").startsWith(args.show!));
       if (indexed) {
         process.stderr.write(
-          `molt: "${indexed.file}" is in the receipts index but its file is missing from ` +
-            `${join(args.cwd, ".molt", "receipts")}. The record of it survives; the receipt ` +
+          `maat: "${indexed.file}" is in the receipts index but its file is missing from ` +
+            `${stateDir(args.cwd, "receipts")}. The record of it survives; the receipt ` +
             `itself does not.\n`,
         );
         return 2;
       }
-      process.stderr.write(`molt: no receipt matching "${args.show}"\n`);
+      process.stderr.write(`maat: no receipt matching "${args.show}"\n`);
       return 2;
     }
     process.stdout.write(receipts.read(file));
@@ -1144,14 +1502,14 @@ function cmdArchive(args: Args): number {
   if (args.show !== undefined) {
     const n = Number(args.show);
     if (!Number.isInteger(n)) {
-      process.stderr.write("molt: --show takes an exuvia index, e.g. --show 0\n");
+      process.stderr.write("maat: --show takes an exuvia index, e.g. --show 0\n");
       return 2;
     }
     try {
       process.stdout.write(archive.read(n));
       return 0;
     } catch (e) {
-      process.stderr.write(`molt: ${String(e)}\n`);
+      process.stderr.write(`maat: ${String(e)}\n`);
       return 2;
     }
   }
@@ -1254,7 +1612,7 @@ function resolveSession(args: Args): { file: string } | { miss: "empty" | "unkno
     ? files.find((f) => f.startsWith(args.session!))
     : files[files.length - 1];
   if (!pick) return { miss: "unknown", count: files.length };
-  return { file: join(args.cwd, ".molt", "log", pick) };
+  return { file: stateDir(args.cwd, "log", pick) };
 }
 
 function cmdLog(args: Args): number {
@@ -1265,8 +1623,8 @@ function cmdLog(args: Args): number {
       return 0;
     }
     process.stderr.write(
-      `molt: no session log starting "${args.session}" — ${found.count} session(s) in ` +
-        `${join(args.cwd, ".molt", "log")}. \`molt log\` alone reads the most recent.\n`,
+      `maat: no session log starting "${args.session}" — ${found.count} session(s) in ` +
+        `${stateDir(args.cwd, "log")}. \`maat log\` alone reads the most recent.\n`,
     );
     return 2;
   }
@@ -1295,7 +1653,7 @@ function cmdLog(args: Args): number {
   process.stdout.write(
     "\nEvery line above is recomputed from the log, not narrated. Values marked ~ are\n" +
       "estimates (chars/4) because the provider did not report usage; everything else\n" +
-      "is measured. `molt verify` recomputes the hash chain. `--raw` prints the JSONL.\n",
+      "is measured. `maat verify` recomputes the hash chain. `--raw` prints the JSONL.\n",
   );
   return check.ok ? 0 : 1;
 }
@@ -1310,7 +1668,7 @@ function cmdVerify(args: Args): number {
   let bad = 0;
   let empty = 0;
   for (const f of files) {
-    const path = join(args.cwd, ".molt", "log", f);
+    const path = stateDir(args.cwd, "log", f);
     const r = Journal.verify(path);
     // A log with nothing in it is not a log that verified. "ok  0 entries"
     // was printed for a zero-byte file and counted among the logs verified —
@@ -1320,7 +1678,7 @@ function cmdVerify(args: Args): number {
       process.stdout.write(`none  ${f}  0 entries — nothing to verify\n`);
       continue;
     }
-    const open = r.ok ? Journal.unfinished(Journal.read(join(args.cwd, ".molt", "log", f))) : null;
+    const open = r.ok ? Journal.unfinished(Journal.read(stateDir(args.cwd, "log", f))) : null;
     process.stdout.write(
       `${r.ok ? "ok  " : "FAIL"}  ${f}  ${r.entries} entries` +
         (open ? `  · no recorded end (stops at ${open.kind})` : "") +
@@ -1394,7 +1752,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   try {
     args = parseArgs(argv, storedEndpoint());
   } catch (e) {
-    process.stderr.write(`molt: ${(e as Error).message}\n\n${USAGE}\n`);
+    process.stderr.write(`maat: ${(e as Error).message}\n\n${USAGE}\n`);
     return 2;
   }
 
@@ -1407,7 +1765,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     return 0;
   }
   if (!existsSync(args.cwd)) {
-    process.stderr.write(`molt: no such directory: ${args.cwd}\n`);
+    process.stderr.write(`maat: no such directory: ${args.cwd}\n`);
     return 2;
   }
 
@@ -1434,21 +1792,24 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       return cmdVerify(args);
     case "attempts":
       return cmdAttempts(args);
+    case "mission":
+      return await cmdMission(args);
     case "":
       break;
     default:
-      process.stderr.write(`molt: unknown command "${args.cmd}"\n\n${USAGE}\n`);
+      process.stderr.write(`maat: unknown command "${args.cmd}"\n\n${USAGE}\n`);
       return 2;
   }
 
   if (!process.stdout.isTTY) {
-    process.stderr.write('molt: not a terminal. use `molt run "<task>"` for headless work.\n');
+    process.stderr.write('maat: not a terminal. use `maat run "<task>"` for headless work.\n');
     return 2;
   }
 
   const engine = buildEngine(args);
   if (args.budget) engine.setBudget(args.budget);
   // Before the window opens, so the first request already knows what is here.
+  await primeBrief(engine, args);
   await primeRepoMap(engine, args);
 
   // Ink and React are loaded only here. Importing them at module top made
@@ -1470,13 +1831,13 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
 }
 
 const invokedDirectly =
-  process.argv[1] && (process.argv[1].endsWith("cli.js") || process.argv[1].endsWith("molt"));
+  process.argv[1] && (process.argv[1].endsWith("cli.js") || process.argv[1].endsWith("maat") || process.argv[1].endsWith("molt"));
 
 if (invokedDirectly) {
   main().then(
     (code) => process.exit(code),
     (e) => {
-      process.stderr.write(`molt: ${String(e)}\n`);
+      process.stderr.write(`maat: ${String(e)}\n`);
       process.exit(1);
     },
   );

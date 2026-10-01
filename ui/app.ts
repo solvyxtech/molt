@@ -14,7 +14,7 @@
 
 import { renderMarkdown } from "./markdown.js";
 import { nextWaitWord } from "./wait-words.js";
-import { playSplash } from "./splash.js";
+import { playMaatSplash } from "./maat-splash.js";
 import { fmtCost, spendLine, stepDid } from "../src/format.js";
 import { expandEndpointShorthand, typedEndpointProblem } from "../src/endpoint.js";
 import { matchCommands } from "../src/commands.js";
@@ -96,7 +96,7 @@ type VerifyResult = {
   reason: string | null;
   drift: { kind: string; file: string; bound: string }[];
   unbound: { kind: string; file: string }[];
-  /** Every session log's own chain, recomputed — half of what `molt verify` checks. */
+  /** Every session log's own chain, recomputed — half of what `Maat verify` checks. */
   journals?: { file: string; ok: boolean; entries: number; reason: string | null; unfinished?: string | null }[];
   root: string | null;
   generatedAt: string;
@@ -234,13 +234,6 @@ function showTab(name: string): void {
   // type a task into a screen that will not run one.
   $("composer").classList.toggle("hidden", name !== "session");
   if (name !== "session") closePalette();
-  // Not at boot: with no workspace open the window lands on Settings, and a
-  // splash that molts behind a form nobody is looking at has been spent. It
-  // plays the first time the session is actually on screen.
-  if (name === "session") {
-    const empty = document.getElementById("stream-empty");
-    if (empty) playSplash(empty);
-  }
   if (name === "receipts") void loadReceipts();
   if (name === "log") void loadJournal();
   if (name === "receipts") clearBadge("receipts");
@@ -395,7 +388,7 @@ function say(who: string, text: string, cls = ""): HTMLElement {
 function delta(text: string): void {
   const was = atBottom();
   if (!openSaid) {
-    openSaid = say("molt", "");
+    openSaid = say("Maat", "");
   }
   const what = openSaid.querySelector(".what")!;
   what.textContent = (what.textContent ?? "") + text;
@@ -582,7 +575,7 @@ function paintSpine(result?: Ev): void {
     sub.textContent = "What \"done\" means. Stays on screen while the model works.";
     list.textContent = "";
     list.appendChild(
-      el("li", "empty", "Open a workspace — checks from .molt/done.yml land here."),
+      el("li", "empty", "Open a workspace — checks from .maat/done.yml land here."),
     );
     return;
   }
@@ -590,7 +583,7 @@ function paintSpine(result?: Ev): void {
     sub.textContent = "No bar — completions here are unverified.";
     list.textContent = "";
     list.appendChild(
-      el("li", "empty", "No .molt/done.yml. /init writes one. Until then, claims are unverified."),
+      el("li", "empty", "No .maat/done.yml. /init writes one. Until then, claims are unverified."),
     );
     return;
   }
@@ -844,7 +837,7 @@ molt.onEvent((ev) => {
       // again is how the CLI printed every final answer twice.
       if (!ev.streamed) {
         endMessage();
-        say("molt", ev.text);
+        say("Maat", ev.text);
       }
       endMessage();
       break;
@@ -931,14 +924,27 @@ molt.onEvent((ev) => {
       );
       break;
 
-    case "job_end":
+    case "job_end": {
+      // The same words the terminal uses for the verdict (cli.tsx).
+      const review = ev.review as { confirmed?: boolean } | undefined;
+      const said =
+        ev.outcome === "verified" && review && review.confirmed === false
+          ? "passed its checks, unconfirmed"
+          : ev.outcome === "verified" && review?.confirmed
+            ? "verified, independently reviewed"
+            : ev.outcome === "verified" && ev.selfChecked
+              ? "passed its own checks"
+              : ev.outcome === "unverified" && Array.isArray(ev.checksDisagree) && ev.checksDisagree.length
+                ? "unverified, its own drafted checks disagree"
+                : String(ev.outcome);
       say(
         "",
-        `job ${ev.outcome} · ${ev.steps} step(s) · ${spendLine(ev.spend)} · ${fmtMs(Number(ev.durationMs) || 0)}`,
+        `job ${said} · ${ev.steps} step(s) · ${spendLine(ev.spend)} · ${fmtMs(Number(ev.durationMs) || 0)}`,
         "step",
       );
       void refreshStats();
       break;
+    }
 
     case "usage":
       wire(
@@ -1783,7 +1789,7 @@ $("set-savekey").addEventListener("click", async () => {
   const ok = await molt.saveKey(provider, key);
   ($("set-key") as HTMLInputElement).value = "";
   $("set-status").textContent = ok
-    ? `Stored for ${provider} in ~/.config/molt/auth.json (0600).`
+    ? `Stored for ${provider} in ~/.config/maat/auth.json (0600).`
     : "Could not write the key file.";
 });
 
@@ -1867,7 +1873,7 @@ $("set-theme").addEventListener("change", async () => {
     const prop = k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
     document.documentElement.style.setProperty(`--${prop}`, v);
   }
-  localStorage.setItem("molt.theme", name);
+  localStorage.setItem("maat.theme", name);
 });
 
 // ── model picker ─────────────────────────────────────────────────────────────
@@ -2411,7 +2417,7 @@ $("ck-seal").addEventListener("click", async () => {
   }
   pendingBarAdds = [];
   $("ck-seal").classList.add("hidden");
-  $("ck-state").textContent = "wrote into .molt/done.yml — task criteria still need Run to seal";
+  $("ck-state").textContent = "wrote into .maat/done.yml — task criteria still need Run to seal";
   setSpineOpen(true);
 });
 
@@ -2446,7 +2452,7 @@ function applyState(): void {
   if (state.cwd && document.activeElement !== cwdBox) cwdBox.value = state.cwd;
   renderAutonomy();
   $("local-hint").textContent = state.selfHosted
-    ? "Self-hosted: no spending ceiling applies, and molt will not warn about caching it cannot see."
+    ? "Self-hosted: no spending ceiling applies, and Maat will not warn about caching it cannot see."
     : "";
   if (state.barError) {
     say("bar", `done.yml could not be read: ${state.barError}`, "error");
@@ -2504,11 +2510,15 @@ async function refreshStats(): Promise<void> {
 }
 
 async function boot(): Promise<void> {
+  // First thing on screen: the weighing plays while the session loads behind it.
+  playMaatSplash();
   state = await molt.state();
 
   const themeSel = $("set-theme") as HTMLSelectElement;
   for (const t of state.themes) themeSel.appendChild(new Option(t, t));
-  const saved = localStorage.getItem("molt.theme") ?? state.themes[0]!;
+  // "maat.theme", not "molt.theme": the rename starts everyone once on the
+  // Maat theme (the website's colours); a choice made after that sticks.
+  const saved = localStorage.getItem("maat.theme") ?? "maat";
   themeSel.value = saved;
   themeSel.dispatchEvent(new Event("change"));
 

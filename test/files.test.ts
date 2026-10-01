@@ -94,16 +94,16 @@ describe("listing", () => {
     // record of looking for it.
     const p = project();
     try {
-      mkdirSync(join(p.dir, ".molt", "log"), { recursive: true });
-      writeFileSync(join(p.dir, ".molt", "done.yml"), "version: 1\nchecks: []\n");
-      writeFileSync(join(p.dir, ".molt", "log", "s.jsonl"), '{"text":"verify"}\n');
+      mkdirSync(join(p.dir, ".maat", "log"), { recursive: true });
+      writeFileSync(join(p.dir, ".maat", "done.yml"), "version: 1\nchecks: []\n");
+      writeFileSync(join(p.dir, ".maat", "log", "s.jsonl"), '{"text":"verify"}\n');
 
       const listed = walk(p.dir, { depth: 2 }).entries.map((e) => e.path);
-      assert.ok(listed.includes(".molt/"), "hid the project's own bar directory");
-      assert.ok(listed.includes(".molt/done.yml"));
+      assert.ok(listed.includes(".maat/"), "hid the project's own bar directory");
+      assert.ok(listed.includes(".maat/done.yml"));
 
       const hits = (await grepFiles(p.dir, "verify")).matches.map((m) => m.path);
-      assert.ok(!hits.some((h) => h.startsWith(".molt")), "searched molt's own logs");
+      assert.ok(!hits.some((h) => h.startsWith(".maat")), "searched molt's own logs");
     } finally {
       p.cleanup();
     }

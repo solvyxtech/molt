@@ -300,15 +300,15 @@ checks:
       maxProofAttempts: 4,
     });
     const events = await drain(engine.run("write a.txt", allowAll));
-    const receipts = readdirSync(join(dir, ".molt", "receipts")).filter((f) => f.endsWith(".md"));
+    const receipts = readdirSync(join(dir, ".maat", "receipts")).filter((f) => f.endsWith(".md"));
     assert.deepEqual(receipts, ["0000-undetermined.md"], "one attempt, and not called accepted");
-    const body = readFileSync(join(dir, ".molt", "receipts", receipts[0]!), "utf8");
+    const body = readFileSync(join(dir, ".maat", "receipts", receipts[0]!), "utf8");
     assert.match(body, /\| suite \| \*\*not run\*\* \|/);
     assert.equal(provider.calls, 2, "no retry was spent on a check the model cannot run");
     assert.ok(events.some((e) => e.kind === "error" && /undetermined/.test(e.text)));
     assert.ok(!events.some((e) => e.kind === "proof_result"), "never reported as a met bar");
     assert.equal(readFileSync(join(dir, "a.txt"), "utf8"), "hello\n");
-    const row = JSON.parse(readFileSync(join(dir, ".molt", "receipts", "index.jsonl"), "utf8").trim());
+    const row = JSON.parse(readFileSync(join(dir, ".maat", "receipts", "index.jsonl"), "utf8").trim());
     assert.deepEqual(row.notRun, ["suite"]);
     assert.deepEqual(row.failed, [], "an unasked check is not a failed one");
     const stats = new Receipts(dir).stats();
@@ -340,10 +340,10 @@ describe("a receipt names the tree it judged", () => {
       receipts: new Receipts(dir),
     });
     await drain(engine.run("write a.txt", allowAll));
-    const [file] = readdirSync(join(dir, ".molt", "receipts")).filter((f) => f.endsWith(".md"));
-    const body = readFileSync(join(dir, ".molt", "receipts", file!), "utf8");
+    const [file] = readdirSync(join(dir, ".maat", "receipts")).filter((f) => f.endsWith(".md"));
+    const body = readFileSync(join(dir, ".maat", "receipts", file!), "utf8");
     assert.match(body, new RegExp(`judged tree: ${sha} \\+ uncommitted changes`));
-    const row = JSON.parse(readFileSync(join(dir, ".molt", "receipts", "index.jsonl"), "utf8").trim());
+    const row = JSON.parse(readFileSync(join(dir, ".maat", "receipts", "index.jsonl"), "utf8").trim());
     assert.equal(row.head, sha);
     assert.equal(row.dirty, true);
   });
@@ -364,9 +364,9 @@ describe("a receipt names the tree it judged", () => {
       receipts: new Receipts(dir),
     });
     await drain(engine.run("write a.txt", allowAll));
-    const [file] = readdirSync(join(dir, ".molt", "receipts")).filter((f) => f.endsWith(".md"));
+    const [file] = readdirSync(join(dir, ".maat", "receipts")).filter((f) => f.endsWith(".md"));
     assert.match(
-      readFileSync(join(dir, ".molt", "receipts", file!), "utf8"),
+      readFileSync(join(dir, ".maat", "receipts", file!), "utf8"),
       /judged tree: not a git commit/,
     );
   });
@@ -417,8 +417,8 @@ describe("the receipt outranks the summary", () => {
     execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "s"], {
       cwd: dir,
     });
-    new Receipts(dir); // creates .molt/receipts
-    writeFileSync(join(dir, ".molt", "note.json"), "{}\n");
+    new Receipts(dir); // creates .maat/receipts
+    writeFileSync(join(dir, ".maat", "note.json"), "{}\n");
     assert.equal((await treeState(dir))?.dirty, false, "every judged tree would read dirty otherwise");
   });
 });
@@ -449,9 +449,9 @@ describe("a criterion that passed before the work", () => {
         ],
       }),
     );
-    const [file] = readdirSync(join(dir, ".molt", "receipts")).filter((f) => f.endsWith(".md"));
+    const [file] = readdirSync(join(dir, ".maat", "receipts")).filter((f) => f.endsWith(".md"));
     assert.match(file!, /accepted/, "a guard is not a reason to refuse — a person sealed it");
-    const body = readFileSync(join(dir, ".molt", "receipts", file!), "utf8");
+    const body = readFileSync(join(dir, ".maat", "receipts", file!), "utf8");
     assert.match(body, /\| task:guard \| pass \(nothing to establish\) \| passed before the work began/);
     assert.match(body, /\| task:made \| pass \|/, "the criterion that discriminated is proof");
   });

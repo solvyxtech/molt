@@ -23,8 +23,8 @@ function ws() {
   return w.dir;
 }
 function writeBar(dir: string, yaml: string): void {
-  mkdirSync(join(dir, ".molt"), { recursive: true });
-  writeFileSync(join(dir, ".molt", "done.yml"), yaml, "utf8");
+  mkdirSync(join(dir, ".maat"), { recursive: true });
+  writeFileSync(join(dir, ".maat", "done.yml"), yaml, "utf8");
 }
 
 describe("switching endpoints", () => {
@@ -326,7 +326,7 @@ describe("receipt numbers are not reused", () => {
     // `count()` is only the same as "next number" while nobody deletes one.
     // Delete 0000 and the next write is numbered 0001 again, so two different
     // receipts share a number and the index lists both under it. This project's
-    // own .molt reached 26 index rows over 9 files with 0000-0008 each
+    // own .maat reached 26 index rows over 9 files with 0000-0008 each
     // duplicated. A receipt is the document you hand to someone who does not
     // trust you; reusing its number is not cosmetic.
     const dir = ws();
@@ -401,7 +401,7 @@ describe("receipts --repair", () => {
     const receipts = new Receipts(dir);
     receipts.write({ claim: "one", verdict: "accepted", ...base });
     receipts.write({ claim: "two", verdict: "refused", ...base });
-    const index = join(dir, ".molt", "receipts", "index.jsonl");
+    const index = join(dir, ".maat", "receipts", "index.jsonl");
     const before = readFileSync(index);
 
     const report = receipts.repair();
@@ -420,7 +420,7 @@ describe("receipts --repair", () => {
     const receipts = new Receipts(dir);
     const kept = receipts.write({ claim: "stays", verdict: "accepted", ...base });
     const ghost = receipts.write({ claim: "gone", verdict: "refused", ...base });
-    const index = join(dir, ".molt", "receipts", "index.jsonl");
+    const index = join(dir, ".maat", "receipts", "index.jsonl");
     const keptLine = readFileSync(index, "utf8")
       .split("\n")
       .find((l) => l.includes(kept.path.slice(kept.path.lastIndexOf("/") + 1)));
@@ -446,7 +446,7 @@ describe("receipts --repair", () => {
     const ghost = receipts.write({ claim: "gone", verdict: "refused", ...base });
     rmSync(ghost.path);
     receipts.repair();
-    const index = join(dir, ".molt", "receipts", "index.jsonl");
+    const index = join(dir, ".maat", "receipts", "index.jsonl");
     const afterFirst = readFileSync(index);
     const rowsFirst = receipts.records();
 

@@ -220,7 +220,7 @@ describe("a change made outside the tools", () => {
 
   it("ships in the default bar and molt's own", () => {
     const dir = ws();
-    mkdirSync(join(dir, ".molt"), { recursive: true });
+    mkdirSync(join(dir, ".maat"), { recursive: true });
     writeDefaultBar(dir);
     const builtins = loadBar(dir)!.checks.map((c) => (c.kind === "builtin" ? c.builtin : ""));
     assert.ok(builtins.includes("tree-accounted"));

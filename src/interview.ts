@@ -6,7 +6,7 @@
  * non-obvious questions, a person answers, and what comes back is editable
  * checks — never a spec the model later grades itself against.
  *
- * Separate from the work transcript. The model never writes `.molt/done.yml`;
+ * Separate from the work transcript. The model never writes `.maat/done.yml`;
  * Seal does, after parseBar accepts the YAML.
  */
 import { stringify } from "yaml";
@@ -67,7 +67,7 @@ const SYSTEM = [
   "script that does not exist — a criterion that fails because the command is",
   "missing teaches people to ignore criteria.",
   "",
-  "`bar` is additions to .molt/done.yml, the project's standing gate. Only propose",
+  "`bar` is additions to .maat/done.yml, the project's standing gate. Only propose",
   "bar additions when the project has no bar, or when a check belongs on every",
   "future task, not this one. `checks` and `notes` are for this task only.",
   "notes are recorded as stated intent and never reported as verified.",

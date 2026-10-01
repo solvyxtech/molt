@@ -222,7 +222,7 @@ describe("receipts", () => {
       const text = readFileSync(r.path, "utf8");
       assert.ok(!text.includes(KEY), "a receipt is handed to strangers; it leaked the key");
       assert.match(text, /session cost: \$0\.0123/);
-      assert.ok(!readFileSync(join(ws.dir, ".molt", "receipts", "index.jsonl"), "utf8").includes(KEY));
+      assert.ok(!readFileSync(join(ws.dir, ".maat", "receipts", "index.jsonl"), "utf8").includes(KEY));
     } finally {
       ws.cleanup();
     }

@@ -255,9 +255,9 @@ describe("molt while it works", () => {
     // The longer freeze of the two: a bar check's default timeout is two
     // minutes, and `npm test` is exactly the kind of thing that uses it.
     const dir = ws();
-    mkdirSync(join(dir, ".molt"), { recursive: true });
+    mkdirSync(join(dir, ".maat"), { recursive: true });
     writeFileSync(
-      join(dir, ".molt", "done.yml"),
+      join(dir, ".maat", "done.yml"),
       "version: 1\nchecks:\n  - name: slow\n    run: sleep 1\n    expect_exit: 0\n",
       "utf8",
     );

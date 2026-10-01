@@ -7,7 +7,7 @@
  * What makes it molt rather than one more harness is the proof gate. When
  * the model stops calling tools and produces a final answer, that answer
  * is treated as a CLAIM, not a result. molt runs the project's bar
- * (.molt/done.yml). If any check fails, the claim is refused, the exact
+ * (.maat/done.yml). If any check fails, the claim is refused, the exact
  * failures go back to the model, and the loop continues. The model does
  * not get to decide when it is finished.
  *
@@ -19,8 +19,13 @@
  *  - Nothing is summarized by a model, ever.
  */
 import { runCommand } from "./run.js";
+import { describeStart, listBackground, startBackground, stopBackground } from "./background.js";
+import { reviewClaim, type Review } from "./review.js";
+import { arbitrate, parseDisputes, type Ruling } from "./dispute.js";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
+import { excludeMoltFromGit, listProject, removeNew, type ProjectListing } from "./leftovers.js";
+import { inspectDir, inspectFile, namedInputs, profileLine } from "./inspect.js";
 import { basename, dirname, resolve, relative, isAbsolute, join } from "node:path";
 import type { ArchiveLike } from "./archive.js";
 import {
@@ -31,6 +36,7 @@ import {
   formatBarFailure,
   runBar,
   type BarContext,
+  barPath,
 } from "./bar.js";
 import { preflightCriteria } from "./criteria.js";
 import {
@@ -39,11 +45,12 @@ import {
   gate,
   insideProject,
   type Autonomy,
+  isReadOnlyCommand,
 } from "./autonomy.js";
 import { errorText } from "./format.js";
 import { narratedCallIn, narratedCallNudge } from "./narrated.js";
 import { redact } from "./redact.js";
-import { Watchdog, firstByteMs, probeError, probeSignal, requestIdleMs, waited } from "./watchdog.js";
+import { Watchdog, envFirstByteMs, firstByteMs, probeError, probeSignal, requestIdleMs, waited } from "./watchdog.js";
 import {
   SKIP_DIRS,
   WALK_DEADLINE_MS,
@@ -121,6 +128,8 @@ import {
   type Msg,
   type Spend,
 } from "./types.js";
+import { stateDir, stateDirName } from "./statedir.js";
+import { env } from "./env.js";
 
 /** A reading of the session meter, for measuring one job against. */
 type Meter = {
@@ -134,7 +143,7 @@ type Meter = {
 };
 
 export const SYSTEM_PROMPT = [
-  "You are molt, a coding agent working in the current directory.",
+  "You are Maat, a coding agent working in the current directory.",
   "Read only what you need. Be terse.",
   "",
   "Relative paths resolve against the working directory named below. Never guess",
@@ -145,10 +154,10 @@ export const SYSTEM_PROMPT = [
   "it — scroll up. If you want a file you already have, you are done gathering: answer,",
   "or say what is blocking you.",
   "",
-  "This project defines what 'done' means in .molt/done.yml. When you finish,",
+  "This project defines what 'done' means in .maat/done.yml. When you finish,",
   "those checks run automatically. If any fail you will be told exactly which,",
   "with their output, and you must fix the underlying problem and continue.",
-  "Do not edit .molt/done.yml to make checks pass. Do not claim work you have",
+  "Do not edit .maat/done.yml to make checks pass. Do not claim work you have",
   "not done — it will be checked against the full session record.",
   "",
   "Changing what code does makes the tests that pinned the old behaviour wrong.",
@@ -159,9 +168,48 @@ export const SYSTEM_PROMPT = [
   "the code so it meets the test. If you believe the test itself is wrong, say",
   "which assertion and why, and stop — that is a decision for a person.",
   "",
+  "Work in batches. Every reply is a round trip that resends this whole",
+  "conversation, so when reads, searches or commands do not depend on each other,",
+  "make all of those tool calls in the same reply, and give bash a list of",
+  "commands rather than calling it once per command. One tool call per reply is",
+  "the slow way to work.",
+  "",
+  "Any checks this task has run by themselves when you say you are done. While",
+  "you work, run only the narrowest test that covers what you just changed; do not",
+  "rebuild or rerun the whole suite after every edit.",
+  "",
   "If you are unsure whether something worked, say so and check it rather than",
   "asserting it. An unverified claim costs the same as a false one.",
 ].join("\n");
+
+/**
+ * What a headless run is told that an interactive one is not.
+ *
+ * Every sentence here was bought by a run that ended early. "Which of these
+ * would you like?" ended a CI run with no work and exit 3. "I have described
+ * the approach; let me know if you want me to implement it" ended another.
+ * The last line is the one that moves a terminal benchmark: the grader reads
+ * the file the task named, at the path it named, and nothing else.
+ */
+export const UNATTENDED_PROMPT = [
+  "Nobody is watching this run and nobody will reply. A question ends the job",
+  "with nothing done, so do not ask one: choose the reasonable reading, say in",
+  "one line what you assumed, and continue. Do the work rather than describing",
+  "it. When the task names a file, a path, a command or an output format,",
+  "produce exactly that, there. Check your result the way a grader would — run",
+  "the thing, read the output — before you say it is done.",
+  "",
+  "Do scratch work outside the task's directories: helper scripts, copies of the",
+  "input, experiments and snapshots (a `git init` to diff against, a trial run on a",
+  "copy) go in $(mktemp -d). Try a change that rewrites files on a copy first, then",
+  "apply it. Before you finish, remove anything you still left in the task's",
+  "directories that it did not ask for — build outputs, test binaries, scratch files.",
+].join("\n");
+
+/** What a project with no .maat/done.yml is told, so nobody goes looking for one. */
+export const NO_BAR_PROMPT =
+  "This project has no .maat/done.yml, so do not look for one. Done is judged by the " +
+  "acceptance criteria stated in this conversation, if any, and by the task itself.";
 
 /**
  * The system prompt, with the one fact only the process knows.
@@ -246,7 +294,7 @@ const CEILING_WARNINGS = [0.5, 0.8];
  * Safe as a default because of where verification reads from: the bar checks
  * the ledger, the disk, and the archive, never the transcript. Shedding costs
  * the model some working memory and costs molt's proof nothing, the full
- * original is preserved in `.molt/exuviae/`, `record-intact` fails if it is
+ * original is preserved in `.maat/exuviae/`, `record-intact` fails if it is
  * not, and `/regrow` pulls it back by pattern.
  */
 export const DEFAULT_AUTO_SHED_TOKENS = 60_000;
@@ -551,6 +599,27 @@ const TOOLS = [
   {
     type: "function",
     function: {
+      name: "inspect",
+      description:
+        "Look at a file as bytes before writing code against it: encoding and BOM, line endings " +
+        "(CRLF/LF/mixed), final newline, trailing whitespace, non-ASCII and control characters, a hex " +
+        "dump, and for CSV/TSV/JSON/logs the oddities a grader checks — rows with a different field " +
+        "count, empty or padded values, values that differ only by case, mixed types, rare line shapes. " +
+        "On a directory, one line per file. Read-only.",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          offset: { type: "number", description: "First byte of the hex dump (default 0)." },
+          length: { type: "number", description: "Bytes to dump (default 128 for text, 256 for binary; at most 4096)." },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "read_file",
       description:
         "Read a text file. A long file arrives in parts; the result gives the offset that " +
@@ -633,17 +702,188 @@ const TOOLS = [
     type: "function",
     function: {
       name: "bash",
-      description: "Run a shell command here. Use list_dir and grep instead of ls/grep/find.",
+      description:
+        "Run a shell command. It already starts in the project directory — never cd " +
+        "there first. Use list_dir and grep instead of ls/grep/find. Never change a " +
+        "file through the shell (sed -i, perl -pi, cat >, a python or node script that " +
+        "writes files): use edit_file or write_file, which Maat records and can check; " +
+        "a change made through the shell is invisible to the record and asks for " +
+        "approval every time. " +
+        "Waits for exit; the result reports how long it took. A command that needs " +
+        "longer than the default timeout must say so with timeout_s. To start a server " +
+        "or watcher and keep working, set background=true: it runs in its own process " +
+        "group, its output goes to a log file you can read_file, and the call returns " +
+        "at once.",
       parameters: {
         type: "object",
-        properties: { command: { type: "string" } },
-        required: ["command"],
+        properties: {
+          command: { type: "string" },
+          commands: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Several commands to run in order, stopping at the first that fails — " +
+              "use this instead of one call per command whenever you do not need to " +
+              "read one command's output before writing the next.",
+          },
+          timeout_s: {
+            type: "number",
+            description: "Seconds before the command is killed. Default 60; at most 1800.",
+          },
+          background: {
+            type: "boolean",
+            description: "Start it and return immediately. Output goes to .maat/bg/<job>.log.",
+          },
+          stop_job: {
+            type: "number",
+            description: "Stop a background job by its number instead of running command.",
+          },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "plan",
+      description:
+        "Keep a short numbered plan. Send the whole list each time; `current` is the " +
+        "0-based step you are on (earlier steps are done). Costs nothing and runs nothing; " +
+        "it is a note to yourself that survives long work. Use it for tasks of more than " +
+        "three steps, and update it as you finish each one.",
+      parameters: {
+        type: "object",
+        properties: {
+          steps: { type: "array", items: { type: "string" } },
+          current: { type: "number", description: "Index of the step in progress." },
+        },
+        required: ["steps"],
       },
     },
   },
 ] as const;
 
+/** The most a single `bash` call may ask to wait. Longer is a background job. */
+export const MAX_BASH_TIMEOUT_MS = 30 * 60_000;
+
+/**
+ * A plan, as the model reads it back.
+ *
+ * Done steps are crossed off, the current one is marked, the rest are
+ * pending. The marking exploits the same recency bias Factory's write-up
+ * describes: the last thing in the result is the next thing to do.
+ */
+export function renderPlan(steps: string[], current: number): string {
+  const cur = Number.isFinite(current) ? Math.max(0, Math.min(steps.length, Math.floor(current))) : 0;
+  const lines = steps.map((s, i) => {
+    const mark = i < cur ? "[x]" : i === cur ? "[>]" : "[ ]";
+    return `${mark} ${i + 1}. ${s}`;
+  });
+  const done = Math.min(cur, steps.length);
+  const tail =
+    done >= steps.length
+      ? "all steps done — verify, then answer"
+      : `${done}/${steps.length} done · now: ${steps[cur]}`;
+  return `${lines.join("\n")}\n${tail}`;
+}
+
 const TOOL_SCHEMA_JSON = JSON.stringify(TOOLS);
+
+/**
+ * Batch mode's one tool: a plan and a list of actions, every reply.
+ *
+ * The reference Terminal-Bench agent never offers native one-at-a-time tool
+ * calls: every reply must be a JSON object with an analysis, a plan and a
+ * list of commands, so a batch is the only thing a model can send. molt took
+ * a median 22-30 model round trips per task where it took 9, and asking the
+ * model to batch — in the prompt, in the tool descriptions, with a list form
+ * of bash — did not change that at all. The shape of the only tool does.
+ *
+ * Each action is one of molt's ordinary tools with its ordinary arguments,
+ * expanded into ordinary calls when the reply arrives: the approval gate, the
+ * ledger, repeat detection and the checks see exactly what they always see.
+ * The model gets one combined result back for its one call.
+ */
+export const ACT_TOOL = {
+  type: "function",
+  function: {
+    name: "act",
+    description:
+      "Your only tool. Each reply: say what you know, your plan, and every action you can " +
+      "take before you need to see a result — a batch, run in order. Actions use Maat's " +
+      "tools: read_file, write_file, edit_file, list_dir, grep, bash, plan, with those " +
+      "tools' usual arguments. Send an empty actions list when the work is finished, with " +
+      "your answer in analysis.",
+    parameters: {
+      type: "object",
+      properties: {
+        analysis: { type: "string", description: "What you know now, from the results so far." },
+        plan: { type: "string", description: "What these actions are for, and what comes next." },
+        actions: {
+          type: "array",
+          description:
+            'In order. Each is {"tool": name, "args": {...}}, e.g. {"tool":"bash","args":{"command":"ls"}}.',
+          items: {
+            type: "object",
+            properties: { tool: { type: "string" }, args: { type: "object" } },
+            required: ["tool", "args"],
+          },
+        },
+      },
+      required: ["analysis", "actions"],
+    },
+  },
+} as const;
+
+/** Said in the system prompt in batch mode. */
+export const BATCH_PROMPT = [
+  "Batch mode: you have one tool, act. Every reply calls it once with ALL the",
+  "actions you can take before you need to see a result — read the three files,",
+  "run the build and the test, write both files — not one action per reply. Each",
+  "reply is a round trip that resends the whole conversation. When the work is",
+  "finished, call act with an empty actions list and your answer in analysis.",
+  "",
+  "A first reply usually looks like this — several actions, one call:",
+  'act({"analysis": "Nothing inspected yet.", "plan": "See what is here and how it builds.",',
+  '     "actions": [{"tool": "list_dir", "args": {"path": ".", "depth": 2}},',
+  '                 {"tool": "read_file", "args": {"path": "README.md"}},',
+  '                 {"tool": "bash", "args": {"command": "git log --oneline -5; python3 --version"}}]})',
+  "and a later one: edit two files and run the test that covers them, in one call.",
+].join("\n");
+
+type ActSub = { id: string; name: string; rawArgs: string; label: string };
+
+/**
+ * An `act` call as the ordinary calls it stands for, or null when it is not
+ * one (a malformed act falls through and is reported as malformed).
+ */
+export function expandAct(call: { id: string; function?: { name?: string; arguments?: string } }):
+  | { analysis: string; subs: ActSub[] }
+  | null {
+  if (call.function?.name !== "act") return null;
+  let a: { analysis?: unknown; plan?: unknown; actions?: unknown };
+  try {
+    a = JSON.parse(call.function.arguments || "{}");
+  } catch {
+    return null;
+  }
+  const analysis = [a.analysis, a.plan].filter((x) => typeof x === "string" && x.trim()).join("\n\n");
+  const list = Array.isArray(a.actions) ? a.actions : [];
+  const subs: ActSub[] = [];
+  list.forEach((x, k) => {
+    if (!x || typeof x !== "object") return;
+    const o = x as { tool?: unknown; args?: unknown };
+    if (typeof o.tool !== "string") return;
+    const args = o.args && typeof o.args === "object" ? (o.args as Record<string, unknown>) : {};
+    subs.push({
+      id: `${call.id}~${k}`,
+      name: o.tool,
+      rawArgs: JSON.stringify(args),
+      label: `${o.tool} ${toolDetail(o.tool, args)}`.slice(0, 160),
+    });
+  });
+  return { analysis, subs };
+}
 
 const SECRET_ENV = [
   "MOLT_API_KEY",
@@ -675,7 +915,7 @@ export type RunOptions = {
   /**
    * What "done" means for THIS task, on top of what it means for the project.
    *
-   * `.molt/done.yml` is deliberately per-project and deliberately not read
+   * `.maat/done.yml` is deliberately per-project and deliberately not read
    * from the prompt: a bar the model can define is not a bar. But that makes it
    * blind in one direction — it verifies that the project is healthy, not that
    * the task was done. A comment added to a file passes `work-landed` and a
@@ -688,6 +928,15 @@ export type RunOptions = {
    * approval happens before any work exists to be judged.
    */
   taskChecks?: Check[];
+  /**
+   * More criteria, still being drafted when the turn starts. The model may
+   * read (read_file, list_dir, grep, inspect, read-only bash) while they are
+   * drafted; the first call that changes anything — and the first claim —
+   * waits until they are sealed, so they still predate every change. The
+   * drafter sees only the task text, never the transcript. Drafting took a
+   * median 17 s of every local task, all of it before the first step.
+   */
+  pendingCriteria?: Promise<{ taskChecks: Check[]; taskNotes: string[] }>;
   /**
    * Criteria stated in words rather than as commands.
    *
@@ -764,6 +1013,26 @@ export function sealOf(checks: Check[], notes: string[]): string {
     notes,
   });
   return createHash("sha256").update(canon, "utf8").digest("hex").slice(0, 16);
+}
+
+/**
+ * Would this call change anything? Reading tools never do; a bash command
+ * does unless it is plainly read-only. Used to let a model read while its
+ * task's checks are still being drafted, and to seal them before its first
+ * change.
+ */
+export function changesSomething(name: string, rawArgs: string): boolean {
+  if (name === "read_file" || name === "list_dir" || name === "grep" || name === "inspect" || name === "plan") return false;
+  if (name !== "bash") return true;
+  let a: Record<string, unknown> = {};
+  try {
+    a = JSON.parse(rawArgs || "{}") as Record<string, unknown>;
+  } catch {
+    return true;
+  }
+  if (a.background === true || a.stop_job !== undefined) return true;
+  const cmds = typeof a.command === "string" ? [a.command] : Array.isArray(a.commands) ? a.commands.map(String) : [];
+  return cmds.length === 0 || !cmds.every((c) => isReadOnlyCommand(c));
 }
 
 export function withTaskChecks(bar: Bar | null | undefined, task: Check[]): Bar | null {
@@ -864,6 +1133,52 @@ export type EngineConfig = {
    */
   maxTokens?: number;
   /**
+   * How hard a reasoning model may think before it answers: `none`, `low`,
+   * `medium`, `high`. Sent as OpenRouter's `reasoning: { effort }` on the
+   * OpenAI-shaped request, and only when set — a server that does not know the
+   * field may refuse the request, so it is never sent unasked.
+   *
+   * Exists because of Space Bunny Alpha: at its default effort it spent 8,000
+   * tokens reasoning about three shell checks and never wrote them, and the
+   * OpenAI-shaped request carries no `max_tokens`, so a turn could think to
+   * the model's 524k ceiling. At `low` it answered in 716 tokens.
+   */
+  reasoningEffort?: string;
+  /**
+   * The effort for every request after the checks refused a claim this turn.
+   *
+   * A refusal is the point where more thinking is known to be needed: the
+   * cheap first try did not do it. Raising effort for the whole turn slows
+   * every step and turns hard tasks into timeouts (LangChain measured maximum
+   * reasoning scoring 10 points under "high" on Terminal-Bench 2.0 for exactly
+   * that reason); raising it only after a refusal spends it where it pays.
+   */
+  retryReasoningEffort?: string;
+  /**
+   * Review a verified claim independently and label it (src/review.ts):
+   * `votes` reviews of the task text and the receipt; a majority-backed,
+   * task-quoted violation makes the claim "passed its checks, unconfirmed".
+   * A label, never a gate — the turn's outcome and the work are untouched.
+   * Off unless set.
+   */
+  review?: { votes?: number; reasoningEffort?: string };
+  /**
+   * The step ceiling for one turn, in place of MAX_STEPS. 0 means none.
+   *
+   * MAX_STEPS is a loop guard sized for a chat session. On Terminal-Bench a
+   * task that needed forty tool calls was stopped at thirty-two with the work
+   * half done, at 350k tokens — money spent for nothing, which is what a
+   * ceiling in the wrong place does. A benchmark bounds a turn by tokens and
+   * by wall clock and sets this high; nobody else needs to touch it.
+   */
+  maxSteps?: number;
+  /**
+   * Batch mode: the model's only tool is `act`, a plan and a list of actions
+   * every reply (ACT_TOOL). For models that will not batch on request. HTTP
+   * endpoints only — a subscription CLI brings its own loop.
+   */
+  batch?: boolean;
+  /**
    * Backoff between retries, in ms per attempt. Injectable so tests can prove
    * the retry policy without sitting through it — the real waits add half a
    * minute to a suite that runs on every proof, which is molt's own bar
@@ -927,6 +1242,12 @@ export type EngineConfig = {
   repoMap?: string;
   /** Paths the model may read but must never write. */
   readOnly?: string[];
+  /**
+   * The environment brief (src/brief.ts), added to the system prompt beside
+   * the map. Built by the caller for the same reason the map is: it probes
+   * the machine, which the constructor must not.
+   */
+  brief?: string;
   maxProofAttempts?: number;
   /**
    * Shed automatically once working history exceeds this many tokens.
@@ -942,6 +1263,26 @@ export type EngineConfig = {
   /** How much molt may do without asking. Defaults to asking about everything. */
   autonomy?: Autonomy;
   /**
+   * Nobody is watching. Adds one paragraph to the system prompt saying so.
+   *
+   * A headless run has no one to answer a question, and a model that ends
+   * its turn on "which would you prefer?" has ended the job with nothing
+   * done. Told up front, it decides, states the assumption, and continues —
+   * which is what a person running `molt run` in CI, or a benchmark harness
+   * with a fifteen-minute clock, actually wants.
+   */
+  unattended?: boolean;
+  /**
+   * The machine is disposable.
+   *
+   * `--sandbox`. The project boundary becomes the machine: a task that says
+   * "write the config to /etc/nginx/conf.d" or "save it to /tmp/out" is done
+   * where it says. Nothing else changes here — what asks still asks, and the
+   * caller decides what to do with the question. A benchmark container is the
+   * case this exists for, and it is off everywhere else.
+   */
+  sandbox?: boolean;
+  /**
    * Where to write one JSON file per completion attempt holding the whole
    * turn: the wire transcript, the ledger, the bar's result, the receipt name.
    *
@@ -954,6 +1295,52 @@ export type EngineConfig = {
    */
   captureDir?: string;
 };
+
+/**
+ * `bash {commands: [...]}` as one script: each command on its own line under
+ * `set -e`, so they run in order and stop at the first failure — what a person
+ * typing them one after another would see, in one round trip instead of one
+ * per command. The reference Terminal-Bench agent's protocol is a list of
+ * commands per turn, and that shape, not the model, is why it needed a third
+ * of molt's round trips. Every line is still a line the autonomy gate reads.
+ */
+export function foldCommands(args: Record<string, unknown>, cwd: string): void {
+  if (Array.isArray(args.commands)) {
+    const list = args.commands
+      .filter((c): c is string => typeof c === "string" && c.trim().length > 0)
+      .map((c) => stripCwdPrefix(c, cwd));
+    if (list.length && typeof args.command !== "string") {
+      args.command = list.length === 1 ? list[0] : ["set -e", ...list].join("\n");
+    }
+    delete args.commands;
+  }
+  if (typeof args.command === "string") args.command = stripCwdPrefix(args.command, cwd);
+}
+
+/**
+ * A command without a leading `cd` into the directory it already runs in.
+ *
+ * Only an exact match of the working directory, quoted or not, followed by
+ * `&&` or `;`, is removed. `cd` anywhere else, into anything else, is left.
+ */
+export function stripCwdPrefix(command: string, cwd: string): string {
+  const esc = cwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\/+$/, "");
+  const re = new RegExp(`^\\s*cd\\s+(?:"${esc}/?"|'${esc}/?'|${esc}/?)\\s*(?:&&|;)\\s*`);
+  const out = command.replace(re, "");
+  return out.trim() ? out : command;
+}
+
+/** A command shorter than this reports no duration; nobody plans around 300ms. */
+export const SLOW_COMMAND_MS = 2_000;
+
+function fmtSeconds(ms: number): string {
+  const s = ms / 1000;
+  return s >= 60 ? `${(s / 60).toFixed(1)}m` : `${s < 10 ? s.toFixed(1) : Math.round(s)}s`;
+}
+
+function exitWord(e: { code: number | null; signal: string | null }): string {
+  return e.code !== null ? `with exit ${e.code}` : `on ${e.signal ?? "a signal"}`;
+}
 
 function scrubbedEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
@@ -1369,6 +1756,11 @@ export class Engine {
     return acpAgentFor(this.cfg.baseUrl)?.label ?? "Claude Code";
   }
 
+  /** The tools this session offers the model. */
+  private get offeredTools(): readonly unknown[] {
+    return this.cfg.batch && !this.subprocess ? [ACT_TOOL] : TOOLS;
+  }
+
   private get subprocess(): boolean {
     return isClaudeCode(this.cfg.baseUrl) || isAcp(this.cfg.baseUrl) || isAgy(this.cfg.baseUrl);
   }
@@ -1440,7 +1832,7 @@ export class Engine {
   budgetTokens?: number;
   /** Exact JSON body of the most recent request — the wire, unhidden. */
   lastRequestBody?: string;
-  /** sha256 of .molt/done.yml as it stood when the session began. */
+  /** sha256 of .maat/done.yml as it stood when the session began. */
   /**
    * Task criteria that already passed when tried before the work began.
    *
@@ -1490,19 +1882,21 @@ export class Engine {
   private turnSnapshotPaths = new Set<string>();
   private turnStartedAt = 0;
   private repoMapText = "";
+  private briefText = "";
   private readOnlyPaths = new Set<string>();
 
   constructor(cfg: EngineConfig) {
     this.cfg = cfg;
-    // Both go into the system message, so they must exist before it is built.
+    // All three go into the system message, so they must exist before it is built.
     this.repoMapText = cfg.repoMap ?? "";
+    this.briefText = cfg.brief ?? "";
     for (const p of cfg.readOnly ?? []) this.readOnlyPaths.add(p);
     this.transcript = new Transcript(this.systemPrompt());
     this.barHash = barFingerprint(this.cwd);
     // The key molt was handed is the one secret it can mask exactly.
-    cfg.journal?.protect(cfg.apiKey, process.env.MOLT_API_KEY);
-    cfg.receipts?.protect(cfg.apiKey, process.env.MOLT_API_KEY);
-    cfg.integrity?.protect(cfg.apiKey, process.env.MOLT_API_KEY);
+    cfg.journal?.protect(cfg.apiKey, env("API_KEY"));
+    cfg.receipts?.protect(cfg.apiKey, env("API_KEY"));
+    cfg.integrity?.protect(cfg.apiKey, env("API_KEY"));
     // Bind the session's opening to the journal's genesis state, so the
     // integrity chain can prove a session began from the record we shipped.
     if (cfg.integrity && cfg.journal) {
@@ -1686,6 +2080,14 @@ export class Engine {
    */
   private systemPrompt(): string {
     const parts: string[] = [];
+    // The constant prompt names .maat/done.yml as where "done" is defined.
+    // In a project without one, a model reads that and spends its first step
+    // opening a file that is not there — one step on every task of a
+    // benchmark. Said plainly instead, once, inside the cached prefix.
+    if (!this.cfg.bar) parts.push(NO_BAR_PROMPT);
+    if (this.cfg.batch) parts.push(BATCH_PROMPT);
+    if (this.cfg.unattended) parts.push(UNATTENDED_PROMPT);
+    if (this.briefText) parts.push(this.briefText);
     if (this.repoMapText) parts.push(this.repoMapText);
     if (this.readOnlyPaths.size) {
       parts.push(
@@ -1709,6 +2111,45 @@ export class Engine {
    */
   setRepoMap(text: string): void {
     this.repoMapText = text;
+    this.transcript.setSystem(this.systemPrompt());
+  }
+
+  /** The environment brief in force, as the model sees it. */
+  get brief(): string {
+    return this.briefText;
+  }
+
+  /** The reasoning effort sent with each request, or undefined for the model's own. */
+  /** Set when the checks refused a claim this turn; see retryReasoningEffort. */
+  private refusedThisTurn = false;
+  /**
+   * The review of this turn's passed claim, when it was made inside the turn
+   * and stands for the final state (no nudge followed it). runSealed reuses it
+   * rather than asking again.
+   */
+  private turnReview: Review | null | undefined = undefined;
+  /** The task checks this turn sealed (set when they are sealed, which may be after the first reads). */
+  private sealedChecks: readonly Check[] = [];
+
+  /** The effort the next request carries. */
+  private get effortNow(): string | undefined {
+    return this.refusedThisTurn && this.cfg.retryReasoningEffort
+      ? this.cfg.retryReasoningEffort
+      : this.cfg.reasoningEffort;
+  }
+
+  get reasoningEffort(): string | undefined {
+    return this.cfg.reasoningEffort;
+  }
+
+  /** Set or clear the reasoning effort. Takes effect on the next request. */
+  setReasoningEffort(effort?: string): void {
+    this.cfg.reasoningEffort = effort || undefined;
+  }
+
+  /** Replace the brief. Same cost as `setRepoMap`: the cached prefix resets. */
+  setBrief(text: string): void {
+    this.briefText = text;
     this.transcript.setSystem(this.systemPrompt());
   }
 
@@ -1786,6 +2227,36 @@ export class Engine {
     return ms > 0 && this.turnStartedAt > 0 ? this.turnStartedAt + ms : undefined;
   }
 
+  /** Milliseconds left before this turn's deadline, or undefined for none. */
+  private timeLeftMs(): number | undefined {
+    const at = this.deadlineAt();
+    return at === undefined ? undefined : Math.max(0, at - Date.now());
+  }
+
+  /**
+   * The clock, as the model reads it after each step of a timed turn.
+   *
+   * On Terminal-Bench 18 of 89 molt trials ran out the task's clock, and the
+   * grader judged whatever was on disk then: five had spent 130+ steps and
+   * never put a deliverable in place, others started a build longer than the
+   * time left. A model that is never told the time cannot pace itself.
+   */
+  private clockNote(): string | undefined {
+    const total = this.turnDeadlineMs;
+    const left = this.timeLeftMs();
+    if (!total || left === undefined) return undefined;
+    const min = (ms: number) =>
+      total < 120_000 ? `${Math.max(0, Math.round(ms / 1000))}s` : `${Math.max(0, Math.round(ms / 60_000))}m`;
+    const used = total - left;
+    const base = `[molt: ${min(used)} of ${min(total)} used]`;
+    if (left > total / 4) return base;
+    return (
+      `${base} Less than a quarter of the time is left. Put the deliverable in its ` +
+      `final place and form now, working or not, then finish it or say done; ` +
+      `do not start anything that cannot finish in ${min(left)}.`
+    );
+  }
+
   /** Has this turn run past its wall-clock ceiling? */
   private pastDeadline(): boolean {
     const ms = this.turnDeadlineMs;
@@ -1794,7 +2265,7 @@ export class Engine {
 
   /** Values that must not appear on screen or in a file molt writes. */
   private secrets(): (string | undefined)[] {
-    return [this.cfg.apiKey, process.env.MOLT_API_KEY, process.env.OPENAI_API_KEY];
+    return [this.cfg.apiKey, env("API_KEY"), process.env.OPENAI_API_KEY];
   }
 
   get autonomy(): Autonomy {
@@ -1888,19 +2359,55 @@ export class Engine {
    * a few hundred tokens that survive every compaction, so a shed costs the
    * model its notes and not its purpose.
    */
-  private pinTask(request: string, lastFailure?: string): void {
+  /**
+   * Write the standing note of what this turn is for.
+   *
+   * The note is the second message on the wire, right after the system
+   * prompt, so changing it throws away the provider's cache for the whole
+   * conversation behind it. It used to be rewritten after every new file and
+   * every refusal, to keep a "files you have changed" list current; in one
+   * Zed session nine of fourteen cache misses followed a file edit, each one
+   * re-billing the whole conversation at full price. So during work the note
+   * is only recorded (`now` false) and goes onto the wire at the next point
+   * the cache is lost anyway — a shed, which is also the only time the list
+   * matters, because the history that showed those writes is what was shed.
+   */
+  private pinTask(request: string, lastFailure?: string, now = false): void {
     const written = [...new Set(this.ledger.map((e) => e.path))];
-    this.transcript.pin(
-      [
-        "[molt] What this turn is for. This note is never compacted away.",
-        `Request: ${request.replace(/\s+/g, " ").slice(0, 400)}`,
-        written.length ? `Files you have changed: ${written.join(", ")}` : "Files changed so far: none",
-        lastFailure ? `The bar last refused this claim: ${lastFailure}` : "",
-      ]
-        .filter(Boolean)
-        .join("\n"),
-    );
+    const text = [
+      "[molt] What this turn is for. This note is never compacted away.",
+      `Request: ${request.replace(/\s+/g, " ").slice(0, 400)}`,
+      written.length ? `Files you have changed: ${written.join(", ")}` : "Files changed so far: none",
+      lastFailure ? `The bar last refused this claim: ${lastFailure}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+    if (now) {
+      this.transcript.pin(text);
+      this.pendingPin = undefined;
+    } else {
+      this.pendingPin = text;
+    }
   }
+
+  /**
+   * Save a tool's whole output under `.maat/out/`, redacted like everything
+   * else molt writes, and return the path the model should read. Null if it
+   * could not be written — the preview still stands on its own.
+   */
+  private spill(text: string, callId: string): string | null {
+    try {
+      const rel = `${stateDirName(this.cwd)}/out/${callId.replace(/[^\w-]/g, "_")}.txt`;
+      mkdirSync(stateDir(this.cwd, "out"), { recursive: true });
+      writeFileSync(join(this.cwd, rel), redact(text, this.secrets()), "utf8");
+      return rel;
+    } catch {
+      return null;
+    }
+  }
+
+  /** A pinned note recorded during work, put on the wire at the next shed. */
+  private pendingPin?: string;
 
   /** Everything the meter is made of, at this instant. */
   private meter(): Meter {
@@ -2052,6 +2559,12 @@ export class Engine {
   ): { before: number; after: number; dropped: number; path: string } | null {
     const plan = this.transcript.planShed(keepExchanges, keepRecent);
     if (!plan) return null;
+    // The cache is lost here anyway, and the history that showed this turn's
+    // writes is about to go: now is when the pinned note must be current.
+    if (this.pendingPin) {
+      this.transcript.pin(this.pendingPin);
+      this.pendingPin = undefined;
+    }
 
     // Writes performed during the messages being shed travel with them. After
     // this, the only record of that work is the archive — which is what makes
@@ -2175,6 +2688,19 @@ export class Engine {
     callId: string,
   ): Promise<string> {
     switch (name) {
+      case "inspect": {
+        const rel = String(args.path ?? ".");
+        const abs = resolve(this.cwd, rel);
+        if (!existsSync(abs)) return `${rel} does not exist`;
+        try {
+          return statSync(abs).isDirectory()
+            ? inspectDir(abs, rel)
+            : inspectFile(abs, rel, { offset: num(args.offset, 0), length: num(args.length, 0) || undefined });
+        } catch (e) {
+          return `could not inspect ${rel}: ${e instanceof Error ? e.message : String(e)}`;
+        }
+      }
+
       case "read_file":
         this.readPaths.add(String(args.path ?? ""));
         return readPart(
@@ -2306,9 +2832,50 @@ export class Engine {
       }
 
       case "bash": {
-        const r = await runCommand(String(args.command ?? ""), {
+        // Folded and stripped where the arguments were parsed; again here for
+        // a caller that reaches runTool directly (a subscription backend).
+        foldCommands(args, this.cwd);
+        const command = String(args.command ?? "");
+        if (!command.trim() && args.stop_job === undefined) {
+          return "bash needs a command, or commands: a list to run in order";
+        }
+        // Stopping a job is a verb of its own, carried on the same tool so the
+        // repertoire stays small; the command is ignored when it is present.
+        if (args.stop_job !== undefined) {
+          const id = Number(args.stop_job);
+          const p = listBackground().find((e) => e.id === id);
+          if (!p) return `no background job ${String(args.stop_job)} — jobs started this session: ${
+            listBackground().map((e) => e.id).join(", ") || "none"
+          }`;
+          if (p.exit) return `job ${id} had already exited (${exitWord(p.exit)}); its log is ${p.log}`;
+          stopBackground(id);
+          return `stopping job ${id} (pid ${p.pid}, "${p.command}"); its log is ${p.log}`;
+        }
+        if (args.background === true) {
+          const p = startBackground(command, { cwd: this.cwd, env: scrubbedEnv() });
+          // A process that died before the result was even composed is the
+          // common failure — a typo in the command, a port already bound. Give
+          // it a moment so that case is reported as what it is, not as a
+          // running server the model then waits on.
+          await sleepUnlessAborted(150, this.running?.signal ?? new AbortController().signal);
+          if (p.exit) {
+            return `job ${p.id} exited ${exitWord(p.exit)} straight away. Its output is in ${p.log}.`;
+          }
+          return describeStart(p);
+        }
+        const asked = Number(args.timeout_s);
+        const wanted =
+          Number.isFinite(asked) && asked > 0
+            ? Math.min(asked * 1000, MAX_BASH_TIMEOUT_MS)
+            : (this.cfg.bashTimeoutMs ?? DEFAULT_BASH_TIMEOUT_MS);
+        // Never past the turn's own deadline: a command still running when
+        // the time is up is killed anyway, and so is everything after it.
+        const left = this.timeLeftMs();
+        const timeoutMs = left !== undefined ? Math.max(5_000, Math.min(wanted, left - 10_000)) : wanted;
+        const t0 = Date.now();
+        const r = await runCommand(command, {
           cwd: this.cwd,
-          timeoutMs: this.cfg.bashTimeoutMs ?? DEFAULT_BASH_TIMEOUT_MS,
+          timeoutMs,
           maxBuffer: 1024 * 1024,
           env: scrubbedEnv(),
           // A cancelled turn kills the command it is waiting on. Leaving a
@@ -2316,11 +2883,34 @@ export class Engine {
           // the machine doing work nobody is going to read.
           signal: this.running?.signal,
         });
+        const took = Date.now() - t0;
         // Same shape execSync produced: bare stdout when it worked, and a
-        // tagged dump of both streams when it did not.
-        if (r.code === 0 && !r.timedOut) return r.stdout;
-        const tag = r.timedOut ? "timeout" : `exit ${r.code ?? r.signal ?? "?"}`;
-        return `${tag}\n${r.stdout}${r.stderr}`;
+        // tagged dump of both streams when it did not — plus how long it
+        // took, once it took long enough to matter. A model that knows the
+        // suite is forty seconds stops re-running it to "double check", and
+        // sets timeout_s before the next slow thing rather than after.
+        const ran = took >= SLOW_COMMAND_MS ? `\n[molt: ran ${fmtSeconds(took)}]` : "";
+        // One trailing newline is folded into the note so the result does not
+        // end in a blank line; the model reads "slow\n[molt: ran 2.2s]".
+        const body = (out: string) => (ran ? out.replace(/\n$/, "") : out);
+        if (r.code === 0 && !r.timedOut) return `${body(r.stdout)}${ran}`;
+        if (r.timedOut) {
+          return (
+            `timeout after ${fmtSeconds(timeoutMs)}\n${r.stdout}${r.stderr}` +
+            `\n[molt: killed at the ${fmtSeconds(timeoutMs)} limit. If it genuinely needs longer, ` +
+            `call again with timeout_s (up to ${MAX_BASH_TIMEOUT_MS / 1000}); if it is a server ` +
+            `or watcher, start it with background=true instead.]`
+          );
+        }
+        return `exit ${r.code ?? r.signal ?? "?"}\n${body(`${r.stdout}${r.stderr}`)}${ran}`;
+      }
+
+      case "plan": {
+        const steps = Array.isArray(args.steps)
+          ? args.steps.map((s) => String(s).trim()).filter((s) => s.length > 0).slice(0, 20)
+          : [];
+        if (!steps.length) return "a plan needs at least one step";
+        return renderPlan(steps, Number(args.current ?? 0));
       }
 
       default:
@@ -2331,7 +2921,7 @@ export class Engine {
   /**
    * Run the bar, with tamper detection in front of it.
    *
-   * All this check can see is that the fingerprint of .molt/done.yml no
+   * All this check can see is that the fingerprint of .maat/done.yml no
    * longer matches the one taken when the turn began — not who changed it.
    * The wording used to say "the work being judged against it" edited the
    * file, which is a claim about the agent. On 2026-09-07 the file changed
@@ -2355,14 +2945,43 @@ export class Engine {
    * can end up somewhere the gate never saw.
    */
   private mustBeInside(abs: string, shown: string): void {
+    if (this.cfg.sandbox) return;
     if (!insideProject(this.cwd, abs)) {
-      throw new Error(`${shown} is outside this project; molt will not walk there`);
+      throw new Error(`${shown} is outside this project; Maat will not walk there`);
     }
+  }
+
+  /** Files the last bar run left in the project that were not there before it. */
+  checkLeftovers: string[] = [];
+
+  /**
+   * The input files the task names, one line each, as bytes — appended to the
+   * task when the turn starts. A careful person looks at the exact input
+   * before writing code against it; a model that is shown "CRLF, 2 values
+   * differ only by case" does not have to think of looking. See inspect.ts.
+   */
+  private inputProfile(task: string): string {
+    try {
+      const files = namedInputs(task, this.cwd);
+      if (!files.length) return "";
+      const lines = files.map((p) => `- ${profileLine(p, relative(this.cwd, p).startsWith("..") ? p : relative(this.cwd, p))}`);
+      let body = lines.join("\n");
+      if (body.length > 2_000) body = `${body.slice(0, 2_000)}\n…`;
+      return `\n\n[molt] The input files this task names, as bytes (inspect a file for more):\n${body}`;
+    } catch {
+      return "";
+    }
+  }
+
+  /** Remove what a bar run created in the project; see src/leftovers.ts. */
+  private removeCheckLeftovers(before: ProjectListing | null): void {
+    this.checkLeftovers = removeNew(this.cwd, before);
   }
 
   private async runBarGuarded(claim?: string, override?: Bar | null): Promise<BarResult> {
     const bar = override ?? this.cfg.bar!;
     const t0 = Date.now();
+    const before = this.cfg.unattended ? listProject(this.cwd) : null;
     // The bar is the longest-running thing molt does. It gets the same
     // cancellation handle a tool call gets, for the same reason.
     this.running = new AbortController();
@@ -2370,6 +2989,7 @@ export class Engine {
       return await this.runBarInner(bar, claim, t0);
     } finally {
       this.running = undefined;
+      if (this.cfg.unattended) this.removeCheckLeftovers(before);
     }
   }
 
@@ -2386,7 +3006,7 @@ export class Engine {
        * while a person armed a check in another window. It was then softened
        * to hedge in every case, which gave away something molt actually has.
        *
-       * A tool call that writes `.molt/done.yml` leaves a ledger entry naming
+       * A tool call that writes `.maat/done.yml` leaves a ledger entry naming
        * it, exactly like any other write. Where that entry exists there is no
        * uncertainty to be humble about — and this is the case the check was
        * built for, a model editing its own passing conditions, which is the
@@ -2398,7 +3018,7 @@ export class Engine {
        * and with it what the model is told to do about it.
        */
       /** As the ledger spells it: project-relative, always this. */
-      const BAR_PATH = `.molt/${BAR_FILENAME}`;
+      const BAR_PATH = relative(this.cwd, barPath(this.cwd)).replace(/\\/g, "/");
       const editedHere = this.turnLedger()
         .some((e) => e.path === BAR_PATH || e.path.endsWith(`/${BAR_FILENAME}`));
       const tamper: CheckResult = {
@@ -2413,7 +3033,7 @@ export class Engine {
             "Revert it and satisfy the original checks, or stop and tell the user why the bar " +
             "is wrong; changing it is their decision, not yours."
           : `${BAR_PATH} no longer matches the fingerprint taken when this turn began, and no ` +
-            "tool call in this turn wrote it. molt cannot tell from here whether another " +
+            "tool call in this turn wrote it. Maat cannot tell from here whether another " +
             "session did, an editor did, or a person arming a check did — only that the bar " +
             "moved while it was being judged against, and a bar that moved mid-session cannot " +
             "judge this claim either way. Retrying will not clear this: no amount of further " +
@@ -2510,6 +3130,7 @@ export class Engine {
     const watch = new Watchdog(controller.signal, {
       firstByteMs:
         this.cfg.requestFirstByteMs ??
+              envFirstByteMs() ??
         firstByteMs(idle, {
           promptTokens: Math.round(this.bom().requestTotalEst * this.tokenScale),
           maxTokens: this.maxTokensFor(),
@@ -2548,7 +3169,7 @@ export class Engine {
             : {
                 model: this.cfg.model,
                 messages: withCaching(wire, this.cacheStyle, !this.cachingUnsupported),
-                tools: TOOLS,
+                tools: this.offeredTools,
                 tool_choice: "none",
               },
         ),
@@ -2583,7 +3204,7 @@ export class Engine {
       yield {
         kind: "info",
         text:
-          "the answer below was written after molt stopped the turn. It was NOT checked " +
+          "the answer below was written after Maat stopped the turn. It was NOT checked " +
           "against the bar — treat it as notes, not as a completed task.",
       };
       yield { kind: "assistant_text", text: redact(text, this.secrets()) };
@@ -2713,7 +3334,7 @@ export class Engine {
     yield {
       kind: "info",
       text:
-        "the answer below was written after molt stopped the turn. It was NOT checked " +
+        "the answer below was written after Maat stopped the turn. It was NOT checked " +
         "against the bar — treat it as notes, not as a completed task.",
     };
     yield { kind: "assistant_text", text: redact(text, this.secrets()) };
@@ -2755,11 +3376,11 @@ export class Engine {
       kind: "error",
       text: onlyWrites
         ? `bar not met: ${onlyWrites} requires this turn to have changed a file, and none ` +
-          `changed. molt is reporting failure rather than success. Either the work was not ` +
+          `changed. Maat is reporting failure rather than success. Either the work was not ` +
           `done, or this was a question — ask questions with /ask, or a leading "?", which ` +
           `runs the rest of the bar and drops that one check.`
-        : `bar not met after ${attempts} attempt${attempts === 1 ? "" : "s"}. molt is reporting failure rather ` +
-          `than success. See .molt/receipts/ for what was checked.`,
+        : `bar not met after ${attempts} attempt${attempts === 1 ? "" : "s"}. Maat is reporting failure rather ` +
+          `than success. See .maat/receipts/ for what was checked.`,
     };
     yield* this.settleFailed(log);
   }
@@ -2834,7 +3455,7 @@ export class Engine {
    * The bar was not met: put the tree back where the turn found it.
    *
    * The evidence is deliberately untouched — receipts, the journal and the
-   * integrity ledger live under `.molt/`, which no turn writes through the
+   * integrity ledger live under `.maat/`, which no turn writes through the
    * tools, so what happened survives the code being reverted. Undoing the
    * work must never undo the record of it.
    */
@@ -2927,13 +3548,13 @@ export class Engine {
   private bindReceipt(file: string, verdict: string): void {
     if (!this.cfg.integrity || !this.cfg.journal) return;
     // `Receipts.write` returns the receipt's FULL path. Joining it onto
-    // `.molt/receipts` again produced a path that does not exist, so the sha
+    // `.maat/receipts` again produced a path that does not exist, so the sha
     // came out empty and was bound as empty — and an empty bound hash was
     // skipped by the verifier, which is how a receipt could be rewritten
     // afterwards and still verify clean. Hash the file that is really there,
     // and record the bare name, which is what the receipts index uses and
     // what survives the project being moved.
-    const path = isAbsolute(file) ? file : join(this.cwd, ".molt", "receipts", file);
+    const path = isAbsolute(file) ? file : stateDir(this.cwd, "receipts", file);
     const sha = existsSync(path) ? sha256Of(path) ?? "" : "";
     this.cfg.integrity.append({
       kind: "receipt",
@@ -2999,7 +3620,12 @@ export class Engine {
     const before = this.meter();
     this.turnStartedAt = startedAt;
     this.turnWrites = [];
+    this.refusedThisTurn = false;
+    this.turnReview = undefined;
+    this.sealedChecks = [];
     this.turnCalls = new Set();
+    // molt's records stay out of the project's `git status` (leftovers.ts).
+    excludeMoltFromGit(this.cwd);
     // Per turn, or receipt five lists what turn one ran. It did: receipts
     // 0043–0047 of this project each open with the same three reads.
     this.did = [];
@@ -3013,10 +3639,15 @@ export class Engine {
     let answered = false;
 
     yield { kind: "job_start", job, text: userText };
-    this.pinTask(userText);
+    this.pinTask(userText, undefined, true);
 
+    let receiptPath: string | undefined;
+    let exhaustedResult: BarResult | undefined;
     for await (const ev of this.runTurn(userText, confirm, job, opts)) {
       switch (ev.kind) {
+        case "receipt":
+          receiptPath = ev.path;
+          break;
         case "step_summary":
           steps += 1;
           break;
@@ -3028,6 +3659,7 @@ export class Engine {
           break;
         case "proof_exhausted":
           exhausted = true;
+          exhaustedResult = ev.result;
           break;
         case "proof_result":
           proven = true;
@@ -3042,7 +3674,7 @@ export class Engine {
     // Order matters: a bar that was never met is "not proven" even though an
     // error event follows it, and an answer nothing checked is never
     // "verified" — the distinction molt exists to make.
-    const outcome: JobOutcome = cancelled
+    let outcome: JobOutcome = cancelled
       ? "cancelled"
       : exhausted
         ? "not proven"
@@ -3056,6 +3688,75 @@ export class Engine {
               ? "unverified"
               : "stopped";
 
+    // Refused only by checks the model drafted for itself. On the local suite
+    // such a refusal was right about one time in five: 19 of 23 "not proven"
+    // runs had passed the grader, the checks having miscounted, misread a
+    // rule or broken on macOS. "Not proven" says the work failed; what is
+    // known is that molt's own checks disagree with it. Said as that, so
+    // "not proven" keeps its meaning for checks a person wrote. The exit
+    // code is unchanged: the work is not accepted either way.
+    const failing = exhaustedResult?.results.filter((r) => !r.ok && !r.advisory && !r.skipped) ?? [];
+    const checksDisagree =
+      outcome === "not proven" && failing.length > 0 && failing.every((r) => r.hidden === true);
+    if (checksDisagree) {
+      outcome = "unverified";
+      yield {
+        kind: "info",
+        text:
+          `unverified: Maat's own drafted checks (${failing.map((r) => r.name).join(", ")}) disagree with ` +
+          `the work. Drafted checks are often wrong; nothing here shows the work is.`,
+      };
+    }
+
+    // "verified" against checks the model drafted for itself, with no project
+    // bar and no check a person chose, is a weaker claim than it sounds. On
+    // Terminal-Bench one in three such "verified" turns failed the hidden
+    // tests. The outcome keeps its name so every surface still works; this
+    // says what stood behind it.
+    const selfChecked =
+      !this.cfg.bar &&
+      this.sealedChecks.length > 0 &&
+      this.sealedChecks.every((c) => c.hidden === true);
+    // The independent review: a label on a verified claim, never a gate.
+    let review: Review | null = null;
+    // Set by runTurn (TypeScript cannot see that through the generator).
+    const inTurn = this.turnReview as Review | null | undefined;
+    if (outcome === "verified" && this.cfg.review && inTurn !== undefined) {
+      // Reviewed inside the turn, and nothing changed after.
+      review = inTurn;
+      this.cfg.journal?.append("review", review ? { confirmed: review.confirmed, votes: review.votes, violations: review.violations.length } : { ran: false });
+      if (review && !review.confirmed) {
+        yield { kind: "info", text: `passed its checks, unconfirmed: the reviewer (${review.votes}) found ` + review.violations.map((v) => `"${v.quote}" — ${v.evidence}`).join("; ") };
+      }
+    } else if (outcome === "verified" && this.cfg.review && receiptPath && existsSync(receiptPath)) {
+      yield { kind: "info", text: "reviewing the claim independently against the task text" };
+      review = await reviewClaim({
+        task: userText,
+        receipt: readFileSync(receiptPath, "utf8"),
+        votes: this.cfg.review.votes,
+        ask: {
+          baseUrl: this.cfg.baseUrl,
+          apiKey: this.cfg.apiKey,
+          model: this.cfg.model,
+          cwd: this.cwd,
+          reasoningEffort: this.cfg.review.reasoningEffort ?? this.cfg.reasoningEffort,
+          fetchFn: this.cfg.fetchFn,
+          claudeCodeSdk: this.cfg.claudeCodeSdk,
+          acpSpawn: this.cfg.acpSpawn,
+        },
+      }).catch(() => null);
+      this.cfg.journal?.append("review", review ? { confirmed: review.confirmed, votes: review.votes, violations: review.violations.length } : { ran: false });
+      if (!review) {
+        yield { kind: "info", text: "the independent review could not be run; the claim stands as checked" };
+      } else if (!review.confirmed) {
+        yield {
+          kind: "info",
+          text:
+            `passed its checks, unconfirmed: the reviewer (${review.votes}) found ` +
+            review.violations.map((v) => `"${v.quote}" — ${v.evidence}`).join("; "),
+        };
+      }
+    }
     yield {
       kind: "job_end",
       job,
@@ -3063,6 +3764,9 @@ export class Engine {
       spend: this.spendSince(before),
       durationMs: Date.now() - startedAt,
       outcome,
+      ...(selfChecked ? { selfChecked: true } : {}),
+      ...(checksDisagree ? { checksDisagree: failing.map((r) => r.name) } : {}),
+      ...(review ? { review: { confirmed: review.confirmed, votes: review.votes, violations: review.violations } } : {}),
     };
   }
 
@@ -3380,6 +4084,7 @@ export class Engine {
     let malformed = false;
     try {
       args = JSON.parse(call.rawArgs || "{}") as Record<string, unknown>;
+      if (name === "bash") foldCommands(args, this.cwd);
     } catch {
       // Running with empty arguments produced a misleading error — a
       // malformed read_file became "EISDIR: illegal operation on a
@@ -3400,6 +4105,7 @@ export class Engine {
       // What molt itself put on disk this session. Lets a model tidy
       // away its own scratch files without waking anyone.
       created: this.createdThisSession(),
+      boundary: this.cfg.sandbox ? "machine" : "project",
     });
     // The prompt shows the command in full. You are being asked to judge
     // it, and a redacted command is one you cannot judge.
@@ -3483,6 +4189,17 @@ export class Engine {
               );
         result = t.text;
         note = t.note;
+        // What was cut is kept, not lost: the whole output goes to a file and
+        // the model is told where. The conversation carries the preview only,
+        // and every later request resends the preview, not the whole thing.
+        if (t.note?.startsWith("capped")) {
+          const kept = this.spill(raw, callId);
+          if (kept) {
+            result +=
+              `\n[molt: the full output (${Buffer.byteLength(raw, "utf8")} bytes) is in ${kept} — ` +
+              `read_file it, with an offset, for the part you need]`;
+          }
+        }
       } catch (e) {
         result = `tool error: ${String(e)}`;
         note = "error";
@@ -3614,11 +4331,26 @@ export class Engine {
      * "these were set before the work existed" is a fact about the code rather
      * than a promise about behaviour.
      */
-    const taskChecks: Check[] = (opts.taskChecks ?? []).map((c) => Object.freeze({ ...c }));
-    const taskNotes: string[] = [...(opts.taskNotes ?? [])];
+    let taskChecks: Check[] = [];
+    let taskNotes: string[] = [];
+    let taskSeal = "";
+    /**
+     * Criteria still being drafted when the turn began (see RunOptions
+     * .pendingCriteria). The model may read while they are drafted; its first
+     * change, or its first claim, waits for them to be sealed.
+     */
+    let pendingCriteria = opts.pendingCriteria;
+    /** Sealed mid-step: tell the model once this step's tool results are in. */
+    let announceAfterTools = false;
+    const self = this;
+    /** Freeze, seal, journal and try the criteria — all before any change. */
+    async function* sealCriteria(checks: Check[], notes: string[]): AsyncGenerator<EngineEvent> {
+    taskChecks = checks.map((c) => Object.freeze({ ...c }));
+    taskNotes = [...notes];
     Object.freeze(taskChecks);
     Object.freeze(taskNotes);
-    const taskSeal = taskChecks.length || taskNotes.length ? sealOf(taskChecks, taskNotes) : "";
+    taskSeal = taskChecks.length || taskNotes.length ? sealOf(taskChecks, taskNotes) : "";
+    self.sealedChecks = taskChecks;
     if (taskSeal) {
       // Journalled before the first request, so the record shows the criteria
       // predating the work rather than merely claiming to.
@@ -3641,20 +4373,25 @@ export class Engine {
       if (taskChecks.length) {
         // Through `running`, so ctrl+C at the very start of a turn kills the
         // preflight rather than waiting it out.
-        this.running = new AbortController();
+        self.running = new AbortController();
         let broken: Awaited<ReturnType<typeof preflightCriteria>> = [];
         const passed: string[] = [];
+        const beforeTry = self.cfg.unattended ? listProject(self.cwd) : null;
         try {
           broken = await preflightCriteria(taskChecks, {
-            cwd: this.cwd,
-            signal: this.running.signal,
+            cwd: self.cwd,
+            signal: self.running.signal,
             passed,
           });
-          this.passedBeforeWork = new Set(
+          self.passedBeforeWork = new Set(
             passed.map((n) => (n.startsWith("task:") ? n : `task:${n}`)),
           );
         } finally {
-          this.running = undefined;
+          self.running = undefined;
+          if (self.cfg.unattended) {
+            const gone = removeNew(self.cwd, beforeTry);
+            if (gone.length) log?.append("note", { text: `removed what the checks created before the work: ${gone.join(", ")}` });
+          }
         }
         if (broken.length) {
           log?.append("note", {
@@ -3678,8 +4415,10 @@ export class Engine {
         }
       }
     }
+    }
 
-    this.transcript.push({ role: "user", content: userText });
+    /** Tell the model what was sealed: a gate it does not know about is a trap. */
+    const announceCriteria = (): void => {
     if (taskChecks.length || taskNotes.length) {
       // Stated to the model, because a gate it does not know about is a trap
       // rather than a specification — and the point is for the work to satisfy
@@ -3689,9 +4428,11 @@ export class Engine {
       const lines = [
         "Acceptance criteria for this task, fixed before you began and unchangeable:",
         ...taskChecks.map((c) =>
-          c.kind === "command"
-            ? `  [checked] ${c.name}: ${c.run}`
-            : `  [checked] ${c.name}: builtin ${c.builtin}`,
+          c.hidden
+            ? `  [checked] ${c.name} — the command is withheld; a check you can see is a check you can copy`
+            : c.kind === "command"
+              ? `  [checked] ${c.name}: ${c.run}`
+              : `  [checked] ${c.name}: builtin ${c.builtin}`,
         ),
         ...taskNotes.map((n) => `  [recorded, not machine-checked] ${n}`),
         "",
@@ -3702,6 +4443,10 @@ export class Engine {
       ];
       this.transcript.push({ role: "user", content: lines.join("\n") });
     }
+    };
+    if (!pendingCriteria) yield* sealCriteria(opts.taskChecks ?? [], opts.taskNotes ?? []);
+    this.transcript.push({ role: "user", content: userText + this.inputProfile(userText) });
+    if (!pendingCriteria) announceCriteria();
     log?.append("user_message", {
       chars: userText.length,
       preview: userText.replace(/\s+/g, " ").slice(0, 120),
@@ -3715,6 +4460,9 @@ export class Engine {
     /** The previous attempt's failures, to notice a bar going nowhere. */
     let lastFailure = "";
     let lastReceipt: string | undefined;
+    let lastReceiptPath: string | undefined;
+    /** The reviewers' findings have been put to the model once this turn. */
+    let reviewNudged = false;
     this.actsSinceBar = 0;
 
     /**
@@ -3754,13 +4502,41 @@ export class Engine {
     // Narrowed here for the announcement below and for proof_start's names;
     // re-derived at each proof attempt, because whether this turn wrote
     // anything is not known until it has had the chance to.
-    const bar = opts.ask
+    let bar = opts.ask
       ? withoutWriteChecks(withTaskChecks(this.cfg.bar, taskChecks))
       : withTaskChecks(this.cfg.bar, taskChecks);
+    /**
+     * Seal criteria that were still being drafted. Called before the first
+     * call that changes anything and before the first claim, so the checks
+     * still predate every change; only the reading overlapped their drafting.
+     */
+    async function* settleCriteria(announce = true): AsyncGenerator<EngineEvent> {
+      if (!pendingCriteria) return;
+      const p = pendingCriteria;
+      pendingCriteria = undefined;
+      const ready = await Promise.race([p.then(() => true, () => true), new Promise<boolean>((r) => setTimeout(() => r(false), 50))]);
+      if (!ready) yield { kind: "info", text: "waiting for this task's checks to be sealed before the first change" };
+      const got = await p.catch(() => ({ taskChecks: [] as Check[], taskNotes: [] as string[] }));
+      yield* sealCriteria([...(opts.taskChecks ?? []), ...got.taskChecks], [...(opts.taskNotes ?? []), ...got.taskNotes]);
+      // Mid-step, the announcement waits for this step's tool results: a
+      // message between a tool call and its result is a malformed
+      // conversation, and providers answer one with an empty turn.
+      if (announce) announceCriteria();
+      else announceAfterTools = true;
+      bar = opts.ask
+        ? withoutWriteChecks(withTaskChecks(self.cfg.bar, taskChecks))
+        : withTaskChecks(self.cfg.bar, taskChecks);
+    }
+    // Drafted checks retired by an upheld dispute this turn (src/dispute.ts),
+    // and every check already disputed once, by bare name.
+    const retired = new Map<string, Ruling>();
+    const disputed = new Set<string>();
+    const bare = (name: string) => name.replace(/^task:/, "");
+    const liveTaskChecks = () => taskChecks.filter((c) => !retired.has(bare(c.name)));
     const barNow = (): Bar | null =>
       opts.ask
-        ? asQuestion(withTaskChecks(this.cfg.bar, taskChecks), this.turnLedger().length === 0)
-        : withTaskChecks(this.cfg.bar, taskChecks);
+        ? asQuestion(withTaskChecks(this.cfg.bar, liveTaskChecks()), this.turnLedger().length === 0)
+        : withTaskChecks(this.cfg.bar, liveTaskChecks());
     if (opts.ask) {
       const dropped = (this.cfg.bar?.checks.length ?? 0) - (bar?.checks.length ?? 0);
       log?.append("note", { text: `ask turn — ${dropped} write-dependent check(s) not run` });
@@ -3781,7 +4557,8 @@ export class Engine {
     // money is gone either way — ending there is what makes it worth nothing.
     // So the cap is extensible on the same terms: asked once per cap, stopping
     // the default, and only where somebody is watching.
-    let stepCap = MAX_STEPS;
+    const stepUnit = this.cfg.maxSteps === 0 ? Infinity : (this.cfg.maxSteps ?? MAX_STEPS);
+    let stepCap = stepUnit;
     /**
      * The deadline fired while a request was in flight. The timer and the
      * clock agree to the millisecond at best, so the check below is told
@@ -3795,11 +4572,11 @@ export class Engine {
           `${step} steps · ${this.sessionTokens} tokens` +
           (this.costUsd() === undefined ? "" : ` · ${fmtUsd(this.costUsd() ?? 0)}`);
         if (!(await opts.onCeiling(spent))) break;
-        stepCap += MAX_STEPS;
+        stepCap += stepUnit;
         log?.append("note", { text: `step guard raised at ${spent} — turn continues` });
         yield {
           kind: "info",
-          text: `carrying on past ${spent}. Another ${MAX_STEPS} steps before molt asks again.`,
+          text: `carrying on past ${spent}. Another ${stepUnit} steps before Maat asks again.`,
         };
       }
       // The wall clock, checked where the other ceilings are. This is
@@ -4074,7 +4851,7 @@ export class Engine {
         const send = (withUsage: boolean, withCache = !this.cachingUnsupported): Promise<Response> => {
           const marks = withCache && this.cacheStyle === "explicit" ? new Set(breakpoints(wire)) : undefined;
           const body = this.native
-            ? toRequest(wire, TOOLS, {
+            ? toRequest(wire, this.offeredTools as typeof TOOLS, {
                 model: this.cfg.model,
                 maxTokens: this.maxTokensFor(),
                 stream,
@@ -4086,8 +4863,9 @@ export class Engine {
                 // Breakpoints on providers that need them, nothing on providers
                 // that cache by themselves. Never a change to the text.
                 messages: withCaching(wire, this.cacheStyle, withCache),
-                tools: TOOLS,
+                tools: this.offeredTools,
                 tool_choice: "auto",
+                ...(this.effortNow ? { reasoning: { effort: this.effortNow } } : {}),
                 ...(stream ? { stream: true } : {}),
                 ...(withUsage ? { stream_options: { include_usage: true } } : {}),
               };
@@ -4152,6 +4930,7 @@ export class Engine {
           watch = new Watchdog(controller.signal, {
             firstByteMs:
               this.cfg.requestFirstByteMs ??
+              envFirstByteMs() ??
               firstByteMs(idle, {
                 promptTokens: Math.round(requestEst * this.tokenScale),
                 maxTokens: this.maxTokensFor(),
@@ -4173,7 +4952,7 @@ export class Engine {
               if (retry.ok) {
                 this.streamUsageUnsupported = true;
                 log?.append("note", {
-                  text: "provider rejected stream_options — token counts fall back to molt's estimate",
+                  text: "provider rejected stream_options — token counts fall back to Maat's estimate",
                 });
               }
               res = retry;
@@ -4259,14 +5038,14 @@ export class Engine {
                 log?.append("note", {
                   text:
                     `context window ${over.window || "unknown"}; server counted ${over.sent} where ` +
-                    `molt estimated ${bom.requestTotalEst} (x${this.tokenScale.toFixed(2)}) — ` +
+                    `maat estimated ${bom.requestTotalEst} (x${this.tokenScale.toFixed(2)}) — ` +
                     `round ${overflowRounds}, history target ${target || "unknown"}`,
                 });
                 yield {
                   kind: "info",
                   text: over.window
                     ? `this endpoint serves ${over.window} tokens and counted ${over.sent} in that ` +
-                      `request — about ${this.tokenScale.toFixed(1)}x molt's estimate. Carrying less ` +
+                      `request — about ${this.tokenScale.toFixed(1)}x Maat's estimate. Carrying less ` +
                       `and trying again` +
                       (target > 0 && overflowRounds === 1
                         ? ` — start with --auto-shed ${target} to skip this.`
@@ -4288,7 +5067,7 @@ export class Engine {
                     path: shed.path,
                   };
                   failure = {
-                    text: "context window too small for what molt was carrying",
+                    text: "context window too small for what Maat was carrying",
                     why: "The endpoint could not hold the conversation.",
                     retryable: true,
                   };
@@ -4324,7 +5103,7 @@ export class Engine {
                         `on disk; re-read a narrower range to see what was cut.`,
                     };
                     failure = {
-                      text: "context window too small for what molt was carrying",
+                      text: "context window too small for what Maat was carrying",
                       why: "The endpoint could not hold the conversation.",
                       retryable: true,
                     };
@@ -4340,7 +5119,7 @@ export class Engine {
                 failure = {
                   text: over.window
                     ? `this endpoint serves ${over.window} tokens of context and there is nothing ` +
-                      `left to shed — molt's system prompt and tool definitions alone are about ` +
+                      `left to shed — Maat's system prompt and tool definitions alone are about ` +
                       `${fixedReal} as it counts them. Restart the server with a larger context ` +
                       `(-c ${need} or more), or use an endpoint that serves one.`
                     : "the endpoint refused the request as too large and there is nothing left to shed.",
@@ -4509,7 +5288,7 @@ export class Engine {
             failure = badEndpoint
               ? {
                   text: badEndpoint,
-                  why: "The endpoint molt was pointed at is not a usable address.",
+                  why: "The endpoint Maat was pointed at is not a usable address.",
                   retryable: false,
                 }
               : {
@@ -4772,6 +5551,18 @@ export class Engine {
         finishReason,
       });
 
+      // Batch mode: an act with no actions is the model saying it is done,
+      // with its answer in the analysis. It becomes exactly that — a reply
+      // with text and no tool call — so the claim path is the ordinary one.
+      if (this.cfg.batch && msg.tool_calls?.length) {
+        const acts = msg.tool_calls.map((c) => expandAct(c));
+        if (acts.every((a) => a !== null && a.subs.length === 0)) {
+          const said = acts.map((a) => a!.analysis).filter(Boolean).join("\n\n");
+          msg = { ...msg, content: [msg.content, said].filter((x) => x && x.trim()).join("\n\n") };
+          delete (msg as { tool_calls?: unknown }).tool_calls;
+        }
+      }
+
       this.transcript.push({
         role: "assistant",
         content: msg.content ?? null,
@@ -4830,20 +5621,42 @@ export class Engine {
         const called: string[] = [];
         let autoRan = 0;
         let repeated = 0;
+        // Batch mode: each act is run as the ordinary calls it holds, then
+        // their results fold back into one result for the act.
+        type Planned = { id: string; name: string; rawArgs: string; truncated: boolean };
+        const planned: Planned[] = [];
+        const folds: { id: string; parts: { id: string; label: string }[] }[] = [];
         for (const [i, call] of msg.tool_calls.entries()) {
-          const outcome = yield* this.invokeTool(
-            {
+          const last = finishReason === "length" && i === msg.tool_calls.length - 1;
+          const act = this.cfg.batch ? expandAct(call) : null;
+          if (act && act.subs.length) {
+            act.subs.forEach((sub, k) =>
+              planned.push({ id: sub.id, name: sub.name, rawArgs: sub.rawArgs, truncated: last && k === act.subs.length - 1 }),
+            );
+            folds.push({ id: call.id, parts: act.subs.map((sub) => ({ id: sub.id, label: sub.label })) });
+          } else {
+            planned.push({
               id: call.id,
               name: call.function?.name ?? "unknown",
               rawArgs: call.function?.arguments ?? "",
               // Only the last one can be the one that ran out of room.
-              truncated: finishReason === "length" && i === msg.tool_calls.length - 1,
-            },
-            { step, userText, confirm, log, shown, answered },
-          );
+              truncated: last,
+            });
+          }
+        }
+        if (pendingCriteria && planned.some((p) => changesSomething(p.name, p.rawArgs))) yield* settleCriteria(false);
+        for (const p of planned) {
+          const outcome = yield* this.invokeTool(p, { step, userText, confirm, log, shown, answered });
           called.push(outcome.name);
           if (outcome.repeated) repeated += 1;
           if (outcome.auto) autoRan += 1;
+        }
+        for (const f of folds) this.transcript.combineToolResults(f.id, f.parts);
+        const clock = this.clockNote();
+        if (clock) this.transcript.noteOnLastToolResult(clock);
+        if (announceAfterTools) {
+          announceAfterTools = false;
+          announceCriteria();
         }
         yield summary(called, "tools");
 
@@ -4882,7 +5695,7 @@ export class Engine {
           yield {
             kind: "info",
             text:
-              `${repeated} of ${called.length} calls that step were things molt had already ` +
+              `${repeated} of ${called.length} calls that step were things Maat had already ` +
               `answered — little or nothing new came back` +
               (dryStreak >= 2
                 ? `. That is ${dryStreak} steps in a row; it is spending against ` +
@@ -4909,10 +5722,10 @@ export class Engine {
               role: "user",
               content:
                 `[molt: ${dryStreak} steps in a row have now returned things you had already ` +
-                `been given. Re-reading a file molt has already shown you, or re-running a ` +
+                `been given. Re-reading a file Maat has already shown you, or re-running a ` +
                 `search you have already run, cannot tell you anything new — the answers are ` +
                 `above in this conversation. If you know what to change, change it. If you do ` +
-                `not, say plainly what is blocking you and stop; molt records an unfinished ` +
+                `not, say plainly what is blocking you and stop; Maat records an unfinished ` +
                 `turn honestly. Do not keep looking.]`,
               molt: { nudge: true },
             });
@@ -5017,13 +5830,14 @@ export class Engine {
 
       // ---- The model believes it is finished. That is a claim. ----
       const claim = msg.content ?? "";
+      if (pendingCriteria) yield* settleCriteria();
 
       if (!bar || bar.checks.length === 0) {
         yield {
           kind: "info",
           text: opts.ask
             ? "nothing left in the bar to check a question against — this answer is unverified."
-            : "no .molt/done.yml — completion is unverified. run `molt init` to add a bar.",
+            : "no .maat/done.yml — completion is unverified. run `maat init` to add a bar.",
         };
         // The turn is over, and the record says so. Without this a turn with
         // no bar ended on its last `response`, which is exactly what a turn
@@ -5043,10 +5857,98 @@ export class Engine {
         return;
       }
 
+      // A dispute of a drafted check that failed last time: ruled on by
+      // independent reviews before the bar runs again (src/dispute.ts).
+      let retiredNow = 0;
+      let rejectedNow = 0;
+      if (lastResult !== null) {
+        for (const d of parseDisputes(claim)) {
+          const failed = lastResult.results.find((r) => !r.ok && r.hidden === true && bare(r.name) === d.name);
+          const check = taskChecks.find((c) => bare(c.name) === d.name && c.hidden === true);
+          if (!failed || !check || check.kind !== "command" || disputed.has(d.name)) {
+            yield {
+              kind: "info",
+              text: disputed.has(d.name)
+                ? `${d.name} was already disputed once; the ruling stands`
+                : `no failing drafted check is named ${d.name}; only those can be disputed`,
+            };
+            continue;
+          }
+          disputed.add(d.name);
+          yield { kind: "info", text: `reviewing the dispute of ${d.name} against the task text` };
+          const ruling = await arbitrate({
+            task: userText,
+            check: { name: d.name, run: check.run },
+            output: failed.output,
+            dispute: d,
+            votes: 3,
+            ask: {
+              baseUrl: this.cfg.baseUrl,
+              apiKey: this.cfg.apiKey,
+              model: this.cfg.model,
+              cwd: this.cwd,
+              reasoningEffort: this.cfg.review?.reasoningEffort ?? this.cfg.reasoningEffort,
+              fetchFn: this.cfg.fetchFn,
+              claudeCodeSdk: this.cfg.claudeCodeSdk,
+              acpSpawn: this.cfg.acpSpawn,
+            },
+          }).catch(() => null);
+          log?.append("dispute", {
+            check: d.name,
+            quote: d.quote,
+            why: d.why,
+            ...(ruling ? { upheld: ruling.upheld, votes: ruling.votes, ...(ruling.quote ? { taskQuote: ruling.quote } : {}) } : { ran: false }),
+          });
+          if (ruling?.upheld) {
+            retired.set(d.name, ruling);
+            retiredNow += 1;
+            yield {
+              kind: "info",
+              text: `check ${d.name} retired (${ruling.votes} reviews): it contradicts the task — "${ruling.quote}"`,
+            };
+          } else {
+            const why = ruling ? `rejected (${ruling.votes} reviews found a contradiction)` : "could not be reviewed";
+            rejectedNow += 1;
+            yield { kind: "info", text: `the dispute of ${d.name} was ${why}; the check stands` };
+            this.transcript.push({
+              role: "user",
+              content:
+                `[molt] Your dispute of ${d.name} was ${why}. The check stands: it is a fair reading ` +
+                `of the task. Change the work so it passes.`,
+            });
+          }
+        }
+      }
+
+      // Every check was retired: nothing is left to judge the claim, so it is
+      // reported the way an unchecked answer is — unverified.
+      if (retiredNow > 0 && (barNow()?.checks.length ?? 0) === 0) {
+        yield { kind: "info", text: "every check was retired by dispute — this claim is unverified." };
+        log?.append("session_end", { reason: "unverified: every check retired" });
+        if (claim) yield { kind: "assistant_text", text: redact(claim, this.secrets()), streamed: streamedContent };
+        return;
+      }
+
+      // A rejected dispute and nothing else: the model has been told the
+      // check stands, and gets its turn to change the work before the bar
+      // runs again — not a stop for "nothing changed".
+      if (rejectedNow > 0 && retiredNow === 0 && this.actsSinceBar === 0) continue;
+
       // Nothing has happened since the last bar run, so the bar cannot
       // answer differently. Say so and stop, rather than spending another
       // suite — and another turn's tokens — proving it.
-      if (lastResult !== null && this.actsSinceBar === 0) {
+      // After a review nudge the model may answer that the reviewers are
+      // wrong and change nothing. The bar it passed still stands: a nudge
+      // never turns a pass into a refusal.
+      if (lastResult !== null && lastResult.ok && reviewNudged && this.actsSinceBar === 0) {
+        log?.append("session_end", { reason: "bar met", attempts: proofAttempts });
+        yield { kind: "proof_result", result: lastResult, attempt: proofAttempts };
+        yield* this.settlePassed(userText, proofAttempts, lastResult.results.map((r) => r.name), lastReceipt, log);
+        if (claim) yield { kind: "assistant_text", text: redact(claim, this.secrets()), streamed: streamedContent };
+        return;
+      }
+
+      if (lastResult !== null && this.actsSinceBar === 0 && retiredNow === 0) {
         log?.append("bar_skipped", {
           attempt: proofAttempts,
           reason: "no tool calls since the last bar run; state is unchanged",
@@ -5063,12 +5965,17 @@ export class Engine {
       }
 
       proofAttempts += 1;
+      const barThis = barNow() ?? bar;
       yield {
         kind: "proof_start",
-        checks: bar.checks.length,
-        names: bar.checks.map((c) => c.name),
+        checks: barThis.checks.length,
+        names: barThis.checks.map((c) => c.name),
       };
-      const result = await this.runBarGuarded(claim, barNow());
+      const result = await this.runBarGuarded(claim, barThis);
+      if (this.checkLeftovers.length) {
+        log?.append("note", { text: `removed what the checks created: ${this.checkLeftovers.join(", ")}` });
+        yield { kind: "info", text: `removed what the checks created in the project: ${this.checkLeftovers.join(", ")}` };
+      }
       if (result.cancelled) {
         // ctrl+C landed while a check was running. This used to fall through:
         // the killed check read as red, a refused receipt was written, the
@@ -5191,7 +6098,56 @@ export class Engine {
         this.bindReceipt(receipt.path, verdict);
         this.capture(receipt.path, verdict, userText, result, claim);
         lastReceipt = basename(receipt.path);
+        lastReceiptPath = receipt.path;
         yield { kind: "receipt", path: receipt.path };
+      }
+
+      // The verification nudge, with evidence. A claim that passed its checks
+      // is read by independent reviewers here, inside the turn. When a
+      // majority find the task text contradicted, the model is told what
+      // they found — once — and gets its turn to fix it or say why they are
+      // wrong. Afterwards it was only a label: on the local comparison the
+      // reviewers named the missing user and the uppercase email, and both
+      // tasks were still lost because the turn had already ended.
+      if (result.ok && this.cfg.review && !reviewNudged && !opts.ask && lastReceiptPath && existsSync(lastReceiptPath)) {
+        yield { kind: "info", text: "reviewing the claim independently against the task text" };
+        const review = await reviewClaim({
+          task: userText,
+          receipt: readFileSync(lastReceiptPath, "utf8"),
+          votes: this.cfg.review.votes,
+          ask: {
+            baseUrl: this.cfg.baseUrl,
+            apiKey: this.cfg.apiKey,
+            model: this.cfg.model,
+            cwd: this.cwd,
+            reasoningEffort: this.cfg.review.reasoningEffort ?? this.cfg.reasoningEffort,
+            fetchFn: this.cfg.fetchFn,
+            claudeCodeSdk: this.cfg.claudeCodeSdk,
+            acpSpawn: this.cfg.acpSpawn,
+          },
+        }).catch(() => null);
+        if (review && !review.confirmed && review.violations.length) {
+          reviewNudged = true;
+          this.turnReview = undefined;
+          log?.append("review", { confirmed: false, votes: review.votes, violations: review.violations.length, nudged: true });
+          yield {
+            kind: "info",
+            text:
+              `the checks passed, but ${review.votes} independent reviews found the task contradicted — ` +
+              `giving the model one chance to answer it`,
+          };
+          this.transcript.push({
+            role: "user",
+            content:
+              `[molt] Your checks passed, but independent reviewers who read only the task and your ` +
+              `receipt found the work contradicts the task:\n` +
+              review.violations.map((v) => `- the task says "${v.quote}" — ${v.evidence}`).join("\n") +
+              `\nIf they are right, fix it and say done again. If they are wrong, say in one line why, ` +
+              `and say done again without changing anything.`,
+          });
+          continue;
+        }
+        this.turnReview = review;
       }
 
       if (result.ok) {
@@ -5232,7 +6188,7 @@ export class Engine {
             text:
               `undetermined: every check that ran passed, but ${names} did not run — this ` +
               `run's tag selection left ${result.undetermined!.length === 1 ? "it" : "them"} out. ` +
-              `A claim is accepted against the whole of .molt/done.yml, not the part that was ` +
+              `A claim is accepted against the whole of .maat/done.yml, not the part that was ` +
               `asked. Nothing was refused and the work is left as it is; run without the ` +
               `selection to settle it.`,
           };
@@ -5246,7 +6202,7 @@ export class Engine {
               `the bar was not met, but nothing failed: ${names} did not run. ` +
               `The command was not found or could not be executed, so no verdict was ` +
               `reached either way, and no change to the work could produce one. ` +
-              `Repair the check in .molt/done.yml — molt will not spend more attempts on it.`,
+              `Repair the check in .maat/done.yml — Maat will not spend more attempts on it.`,
           };
           yield* this.settleFailed(log);
           return;
@@ -5265,17 +6221,21 @@ export class Engine {
           kind: "error",
           text: onlyWrites
             ? `bar not met: ${onlyWrites} requires this turn to have changed a file, and ` +
-              `none changed. molt is reporting failure rather than success. Either the work ` +
+              `none changed. Maat is reporting failure rather than success. Either the work ` +
               `was not done, or this was a question — ask questions with /ask, or a leading ` +
               `"?", which runs the rest of the bar and drops that one check.`
-            : `bar not met after ${proofAttempts} attempt${proofAttempts === 1 ? "" : "s"}. molt is reporting failure rather ` +
-              `than success. See .molt/receipts/ for what was checked.`,
+            : `bar not met after ${proofAttempts} attempt${proofAttempts === 1 ? "" : "s"}. Maat is reporting failure rather ` +
+              `than success. See .maat/receipts/ for what was checked.`,
         };
         yield* this.settleFailed(log);
         return;
       }
 
       yield { kind: "proof_refused", result, attempt: proofAttempts };
+      if (this.cfg.retryReasoningEffort && !this.refusedThisTurn) {
+        this.refusedThisTurn = true;
+        yield { kind: "info", text: `reasoning effort raised to ${this.cfg.retryReasoningEffort} for the retry` };
+      }
       this.pinTask(
         userText,
         result.results.filter((r) => !r.ok && !r.advisory).map((r) => r.name).join(", "),
@@ -5286,12 +6246,12 @@ export class Engine {
     yield {
       kind: "error",
       text:
-        `stopped after ${MAX_STEPS} steps (loop guard) · ${this.sessionTokens} tokens` +
+        `stopped after ${stepCap} steps (loop guard) · ${this.sessionTokens} tokens` +
         (this.costUsd() === undefined ? "" : ` · ${fmtUsd(this.costUsd() ?? 0)}`) +
         `. Nothing was verified. Narrow the request, or set /budget to put a ceiling on a ` +
         `turn like this.`,
     };
-    yield* this.salvage(`You have used all ${MAX_STEPS} steps available for this turn.`, fetchFn, log);
+    yield* this.salvage(`You have used all ${stepCap} steps available for this turn.`, fetchFn, log);
   }
 
   /** Preflight: is the endpoint reachable, and is the model actually there? */

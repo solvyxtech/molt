@@ -806,7 +806,7 @@ describe("autonomy classifier stress", () => {
   });
 
   it("allows 2>/dev/null redirects", () => {
-    assert.ok(isReadOnlyCommand("ls -la .molt 2>/dev/null"));
+    assert.ok(isReadOnlyCommand("ls -la .maat 2>/dev/null"));
   });
 
   it("rejects command substitution", () => {

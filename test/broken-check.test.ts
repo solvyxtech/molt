@@ -2,8 +2,8 @@
  * A check that failed and a check that never ran are not the same fact.
  *
  * This suite exists because of one real session. A local 8B model drafted the
- * criterion `grep -q "database" .molt/done.yml` for a project that had no
- * `.molt/done.yml`. grep exited 2 with `No such file or directory`, the bar
+ * criterion `grep -q "database" .maat/done.yml` for a project that had no
+ * `.maat/done.yml`. grep exited 2 with `No such file or directory`, the bar
  * printed FAIL beside it like any other failure, and the model — correctly
  * reading FAIL as "there is work to do" — set about creating the file so the
  * error would stop. It burned every attempt satisfying a typo, and the run
@@ -62,7 +62,7 @@ describe("telling a broken command from a failing one", () => {
     // The exact shape of the session that prompted this suite. grep's exit 2
     // is not a reliable "did not run" signal the way 127 is — some tools use
     // 2 for a genuine failure — so this stays a failure and gains a sentence.
-    const d = diagnoseFailure(2, "", "grep: .molt/done.yml: No such file or directory\n");
+    const d = diagnoseFailure(2, "", "grep: .maat/done.yml: No such file or directory\n");
     assert.equal(d.didNotRun, false, "exit 2 is not proof that nothing ran");
     assert.match(d.hint ?? "", /command failing rather than the work/);
     assert.match(d.hint ?? "", /No such file or directory/, "quotes what the command actually said");
@@ -172,7 +172,7 @@ describe("what the model is told", () => {
       1,
       3,
     );
-    assert.match(text, /2 of 2 checks in \.molt\/done\.yml did not pass/);
+    assert.match(text, /2 of 2 checks in \.maat\/done\.yml did not pass/);
   });
 
   it("does not send the model to the project's output when the only failure is broken", () => {

@@ -23,8 +23,8 @@ function ws() {
   return w.dir;
 }
 function writeBar(dir: string, yaml: string): void {
-  mkdirSync(join(dir, ".molt"), { recursive: true });
-  writeFileSync(join(dir, ".molt", "done.yml"), yaml, "utf8");
+  mkdirSync(join(dir, ".maat"), { recursive: true });
+  writeFileSync(join(dir, ".maat", "done.yml"), yaml, "utf8");
 }
 function rewrite(file: string, rows: JournalEntry[]): void {
   writeFileSync(file, rows.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");

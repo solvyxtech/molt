@@ -5,7 +5,7 @@
 # node_modules ships, which keeps the bundle honest — what you audit in out/ is
 # what runs on the customer's machine.
 appId: xyz.solvyx.molt
-productName: molt
+productName: Maat Agent
 copyright: © 2026 Solvyx
 
 directories:

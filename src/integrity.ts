@@ -40,6 +40,7 @@ import {
 import { join } from "node:path";
 import { redactData } from "./redact.js";
 import { GENESIS, Journal, type VerifyResult } from "./journal.js";
+import { stateDir } from "./statedir.js";
 
 export const INTEGRITY_GENESIS = "0".repeat(64);
 
@@ -115,7 +116,7 @@ export class Integrity {
   private secrets: (string | undefined)[] = [];
 
   constructor(root: string) {
-    this.dir = join(root, ".molt", "integrity");
+    this.dir = stateDir(root, "integrity");
     mkdirSync(this.dir, { recursive: true });
     this.path = join(this.dir, "ledger.jsonl");
     if (existsSync(this.path)) {
@@ -202,7 +203,7 @@ export class Integrity {
    * that was edited; drift is an artifact that changed after it was sealed.
    */
   static verify(root: string): IntegrityVerify {
-    const path = join(root, ".molt", "integrity", "ledger.jsonl");
+    const path = stateDir(root, "integrity", "ledger.jsonl");
     const records = Integrity.read(path);
     const out: IntegrityVerify = {
       ok: true,
@@ -257,7 +258,7 @@ export class Integrity {
           out.drift.push({ kind: "receipt", file, bound: "(never hashed)" });
           continue;
         }
-        const actual = sha256FileSync(join(root, ".molt", "receipts", file));
+        const actual = sha256FileSync(stateDir(root, "receipts", file));
         if (actual && actual !== bound) {
           out.drift.push({ kind: "receipt", file, bound: bound.slice(0, 12) });
         } else if (!actual) {
@@ -271,7 +272,7 @@ export class Integrity {
           out.drift.push({ kind: "exuvia", file, bound: "(never hashed)" });
           continue;
         }
-        const actual = sha256FileSync(join(root, ".molt", "exuviae", file));
+        const actual = sha256FileSync(stateDir(root, "exuviae", file));
         if (actual && actual !== bound) {
           out.drift.push({ kind: "exuvia", file, bound: bound.slice(0, 12) });
         } else if (!actual) {
@@ -297,11 +298,11 @@ export class Integrity {
       const file = `${session}.jsonl`;
       let heads = journals.get(file);
       if (!heads) {
-        const path = join(root, ".molt", "log", file);
+        const path = stateDir(root, "log", file);
         heads = existsSync(path) ? new Set(Journal.read(path).map((e) => e.hash)) : new Set();
         journals.set(file, heads);
       }
-      if (!existsSync(join(root, ".molt", "log", file))) {
+      if (!existsSync(stateDir(root, "log", file))) {
         out.drift.push({ kind: "journal", file, bound: "(missing)" });
       } else if (!heads.has(bound)) {
         out.drift.push({ kind: "journal", file, bound: bound.slice(0, 12) });
@@ -333,7 +334,7 @@ export class Integrity {
     root: string | null;
   } {
     const journals = Journal.sessions(root).map((file) => {
-      const path = join(root, ".molt", "log", file);
+      const path = stateDir(root, "log", file);
       return {
         file,
         ...Journal.verify(path),
@@ -360,7 +361,7 @@ export class Integrity {
    * and that looks exactly like a real one to whoever files it away.
    */
   static exportRoot(root: string): { root: string | null; records: number; generatedAt: string } {
-    const path = join(root, ".molt", "integrity", "ledger.jsonl");
+    const path = stateDir(root, "integrity", "ledger.jsonl");
     const records = Integrity.read(path);
     return {
       root: records.length ? records[records.length - 1]!.hash : null,
@@ -399,8 +400,8 @@ function unboundArtifacts(
   ] as const) {
     let files: string[] = [];
     try {
-      files = readdirSync(join(root, ".molt", dir)).filter(
-        // `.molt/exuviae/index.md` is the archive's own browsable index, not
+      files = readdirSync(stateDir(root, dir)).filter(
+        // `.maat/exuviae/index.md` is the archive's own browsable index, not
         // a shed batch — nothing binds it and nothing should report it.
         (f) => f.endsWith(".md") && f !== "index.md",
       );

@@ -30,7 +30,7 @@ import {
 import { ACP_AGENTS, acpAgentFor, acpHealth } from "../src/acp.js";
 import { AGY_URL, agyHealth, agyModels, isAgy } from "../src/agy.js";
 import { keyFor } from "./endpoint-key.js";
-import { draftCriteria, type Draft } from "./criteria.js";
+import { commandsHere, draftCriteriaCritiqued, type Draft } from "./criteria.js";
 import {
   applyBarAdds,
   interviewTurn,
@@ -51,6 +51,7 @@ import { Receipts, receiptName } from "../src/receipts.js";
 import { Journal } from "../src/journal.js";
 import { Integrity } from "../src/integrity.js";
 import { buildRepoMap } from "../src/repomap.js";
+import { buildBrief } from "../src/brief.js";
 import { loadBar, BarError, writeDefaultBar, BAR_FILENAME } from "../src/bar.js";
 import type { Bar, Check } from "../src/types.js";
 import { AUTONOMY_LEVELS, AUTONOMY_SUMMARY, isAutonomy, type Autonomy } from "../src/autonomy.js";
@@ -78,6 +79,8 @@ import {
   normalizeUrl,
   configDir,
 } from "./endpoints.js";
+import { stateDir } from "../src/statedir.js";
+import { env } from "../src/env.js";
 
 /**
  * Where this bundle sits on disk.
@@ -107,11 +110,11 @@ let win: BrowserWindow | null = null;
  * that was given it.
  */
 const SHOT = {
-  path: process.env.MOLT_SHOT,
-  tab: process.env.MOLT_SHOT_TAB,
-  scroll: process.env.MOLT_SHOT_SCROLL,
-  picker: process.env.MOLT_SHOT_PICKER === "1",
-  palette: process.env.MOLT_SHOT_PALETTE === "1",
+  path: env("SHOT"),
+  tab: env("SHOT_TAB"),
+  scroll: env("SHOT_SCROLL"),
+  picker: env("SHOT_PICKER") === "1",
+  palette: env("SHOT_PALETTE") === "1",
 };
 for (const k of ["MOLT_SHOT", "MOLT_SHOT_TAB", "MOLT_SHOT_SCROLL", "MOLT_SHOT_PICKER", "MOLT_SHOT_PALETTE"]) {
   delete process.env[k];
@@ -220,7 +223,12 @@ function openSession(cwd: string, model: string, baseUrl: string, apiKey?: strin
     // for the fine-tuning set. The terminal read the variable; the window
     // never did, so a desktop session launched with it set captured nothing
     // and said nothing about it.
-    captureDir: process.env.MOLT_CAPTURE_DIR || undefined,
+    captureDir: env("CAPTURE_DIR") || undefined,
+    // Independent review of every passed claim (src/review.ts), as the editor
+    // and the terminal have it: three fresh reviews read the task and the
+    // receipt; a real violation is put back to the model once while it can
+    // still fix it, and the verdict is labelled reviewed or unconfirmed.
+    review: { votes: 3 },
   });
 
   return { engine, cwd, model, baseUrl, provider, bar, barError, journal, receipts };
@@ -328,12 +336,12 @@ function createWindow(): void {
   // the part that a screenshot cannot tell you is broken.
   if (process.argv.includes("--self-drive")) {
     win.webContents.once("did-finish-load", async () => {
-      const cwd = process.env.MOLT_E2E_CWD ?? "";
-      const model = process.env.MOLT_E2E_MODEL ?? "stub";
-      const baseUrl = process.env.MOLT_E2E_URL ?? "";
+      const cwd = env("E2E_CWD") ?? "";
+      const model = env("E2E_MODEL") ?? "stub";
+      const baseUrl = env("E2E_URL") ?? "";
       const seen: string[] = [];
 
-      if (process.env.MOLT_E2E_VIA_UI === "1") {
+      if (env("E2E_VIA_UI") === "1") {
         // `did-finish-load` means the page parsed, not that the app booted —
         // the same trap --self-check documents. boot() awaits several IPC
         // round trips before it wires the buttons, and against a real provider
@@ -429,7 +437,7 @@ function createWindow(): void {
         // scheme "localhost", which is the mistake this is standing in for.
         const refusedOk =
           refused.status.includes(`'${badUrl}' uses the scheme 'localhost'`) &&
-          refused.status.includes("which molt cannot speak") &&
+          refused.status.includes("which Maat cannot speak") &&
           refused.left === badUrl &&
           refused.tab === "settings";
         if (!refusedOk) {
@@ -473,7 +481,7 @@ function createWindow(): void {
         })()`);
         // Criteria set through the real panel, so the path under test is the
         // one a person uses — not a shortcut into the IPC handler.
-        if (process.env.MOLT_E2E_CRITERION && process.env.MOLT_E2E_AUTO !== "1") {
+        if (env("E2E_CRITERION") && env("E2E_AUTO") !== "1") {
           await win!.webContents.executeJavaScript(`(() => {
             document.getElementById("criteria").classList.remove("hidden");
             document.getElementById("ck-add").click();
@@ -481,7 +489,7 @@ function createWindow(): void {
             const ins = row.querySelectorAll("input");
             ins[0].value = "task-gate";
             ins[0].dispatchEvent(new Event("input"));
-            ins[1].value = ${JSON.stringify(process.env.MOLT_E2E_CRITERION)};
+            ins[1].value = ${JSON.stringify(env("E2E_CRITERION"))};
             ins[1].dispatchEvent(new Event("input"));
             return 0;
           })()`);
@@ -489,9 +497,9 @@ function createWindow(): void {
         // A real provider runs commands, and at the default level the window
         // asks before each one — with nobody to answer. MOLT_E2E_AUTONOMY sets
         // the level through the control a person would use.
-        if (process.env.MOLT_E2E_AUTONOMY) {
+        if (env("E2E_AUTONOMY")) {
           await win!.webContents.executeJavaScript(`(() => {
-            const want = ${JSON.stringify(process.env.MOLT_E2E_AUTONOMY)};
+            const want = ${JSON.stringify(env("E2E_AUTONOMY"))};
             const bars = [...document.querySelectorAll("#autonomy .au")];
             const idx = ["low", "medium", "high"].indexOf(want);
             if (idx >= 0 && bars[idx]) bars[idx].click();
@@ -501,7 +509,7 @@ function createWindow(): void {
         }
         // The spec-first path is opt-in now, so the drive opts in the way a
         // person does: by ticking the box.
-        if (process.env.MOLT_E2E_AUTO === "1") {
+        if (env("E2E_AUTO") === "1") {
           await win!.webContents.executeJavaScript(`(() => {
             const box = document.getElementById("ck-auto");
             if (!box.checked) box.click();
@@ -509,16 +517,16 @@ function createWindow(): void {
           })()`);
         }
         await win!.webContents.executeJavaScript(`(() => {
-          const task = ${JSON.stringify(process.env.MOLT_E2E_TASK ?? "say hello")};
+          const task = ${JSON.stringify(env("E2E_TASK") ?? "say hello")};
           document.getElementById("prompt").value = ${
-            process.env.MOLT_E2E_ASK === "1" ? '"? " + task' : "task"
+            env("E2E_ASK") === "1" ? '"? " + task' : "task"
           };
           document.getElementById("send").click();
           return 0;
         })()`);
         // Auto-draft holds for review. The first click filled the panel; a
         // second click is the person's approval and the one that starts work.
-        if (process.env.MOLT_E2E_AUTO === "1") {
+        if (env("E2E_AUTO") === "1") {
           let held = false;
           for (let i = 0; i < 100; i++) {
             held = await win!.webContents.executeJavaScript(
@@ -537,7 +545,7 @@ function createWindow(): void {
           // received and waiting rather than a Run that did nothing — and the
           // second click below therefore starts a turn from an empty box,
           // which is the path that used to need the text retyped.
-          const task = process.env.MOLT_E2E_TASK ?? "say hello";
+          const task = env("E2E_TASK") ?? "say hello";
           const composer = await win!.webContents.executeJavaScript(
             `({ box: document.getElementById("prompt").value,
                 echoed: document.getElementById("stream").textContent.includes(${JSON.stringify(
@@ -628,7 +636,7 @@ function createWindow(): void {
         // MOLT_E2E_WAIT_MS lengthens the wait for a real provider and a real
         // bar, which take minutes where the stub takes seconds.
         let done = false;
-        const waitMs = Number(process.env.MOLT_E2E_WAIT_MS) || 30_000;
+        const waitMs = Number(env("E2E_WAIT_MS")) || 30_000;
         for (let i = 0; i < waitMs / 100; i++) {
           done = await win!.webContents.executeJavaScript(
             `window.__turnDone === true && document.getElementById("send").classList.contains("hidden") === false`,
@@ -646,7 +654,7 @@ function createWindow(): void {
         session = opened;
         try {
           for await (const ev of opened.engine.run(
-            process.env.MOLT_E2E_TASK ?? "say hello",
+            env("E2E_TASK") ?? "say hello",
             async () => true,
             {},
           )) {
@@ -707,7 +715,7 @@ function createWindow(): void {
             console.log(`[self-drive] picker     ${r.pickerRows} model(s) in ${r.pickerGroups} group(s)`);
             console.log(
               `[self-drive] remembered ${
-                String(r.pickerText).includes(process.env.MOLT_E2E_EXPECT_MODEL ?? "\u0000")
+                String(r.pickerText).includes(env("E2E_EXPECT_MODEL") ?? "\u0000")
                   ? "second server listed"
                   : "MISSING"
               }`,
@@ -719,28 +727,29 @@ function createWindow(): void {
             const text = String(r.text);
             const ok =
               Number(r.rows) > 0 &&
-              text.includes(process.env.MOLT_E2E_EXPECT ?? "") &&
+              text.includes(env("E2E_EXPECT") ?? "") &&
               /step \d+ · \d+ messages/.test(String(r.wireRequest)) &&
               // Each step's cost, and how the job ended, on the window too.
               (r.stepLines as string[]).some((t) => /^step \d+ · /.test(t)) &&
-              (r.stepLines as string[]).some((t) => /^job \w+ · \d+ step/.test(t)) &&
+              // The verdict can be a phrase ("verified, independently reviewed").
+              (r.stepLines as string[]).some((t) => /^job [^·]+ · \d+ step/.test(t)) &&
               Number(r.pickerRows) >= 2 &&
               // A server the app was never pointed at, only remembered, must
               // still be asked — that is the whole of the reported bug.
-              (!process.env.MOLT_E2E_EXPECT_MODEL ||
-                String(r.pickerText).includes(process.env.MOLT_E2E_EXPECT_MODEL)) &&
+              (!env("E2E_EXPECT_MODEL") ||
+                String(r.pickerText).includes(env("E2E_EXPECT_MODEL") ?? "")) &&
               // The window must say it is working while it works, and must
               // stop saying it afterwards. Both halves, or the indicator is
               // either invisible or permanent.
-              (process.env.MOLT_E2E_VIA_UI !== "1" || r.sawActivity === true) &&
+              (env("E2E_VIA_UI") !== "1" || r.sawActivity === true) &&
               Number(r.activityLeft) === 0 &&
               // The seal has to be visible where the work is, and the check has
               // to have actually run under its namespaced name.
-              (!process.env.MOLT_E2E_CRITERION ||
+              (!env("E2E_CRITERION") ||
                 (Number(r.sealedShown) === 1 &&
                   (r.checkNamesRun as string[]).some((n) => n.startsWith("task:")))) &&
-              (!process.env.MOLT_E2E_WANT_PROOF ||
-                String(r.proofHead).includes(process.env.MOLT_E2E_WANT_PROOF));
+              (!env("E2E_WANT_PROOF") ||
+                String(r.proofHead).includes(env("E2E_WANT_PROOF") ?? ""));
             console.log(ok ? "[self-drive] PASS" : "[self-drive] FAIL");
             if (!ok) console.log(`[self-drive] screen was: ${text.slice(0, 400)}`);
             const shot = SHOT.path;
@@ -1073,6 +1082,15 @@ if (process.argv.includes("--self-check") || process.argv.includes("--self-drive
   app.setPath("userData", mkdtempSync(join(tmpdir(), "molt-driven-")));
 }
 
+// The app is Maat Agent now, and Electron names its profile folder after the
+// product. Someone who used it as molt keeps their profile — remembered
+// settings, window state — rather than starting from nothing. Before ready.
+else {
+  const legacy = join(app.getPath("appData"), "molt");
+  const current = join(app.getPath("appData"), "Maat Agent");
+  if (!existsSync(current) && existsSync(legacy)) app.setPath("userData", legacy);
+}
+
 app.whenReady().then(() => {
   if (pathFix.outcome === "already-usable") {
     console.log("[molt] PATH already resolves node");
@@ -1141,7 +1159,7 @@ async function backendRefusal(baseUrl: string): Promise<string | null> {
 ipcMain.handle("workspace:pick", async () => {
   const r = await dialog.showOpenDialog({
     properties: ["openDirectory", "createDirectory"],
-    message: "Choose the project molt will work in",
+    message: "Choose the project Maat will work in",
   });
   if (r.canceled || !r.filePaths[0]) return null;
   return r.filePaths[0];
@@ -1173,6 +1191,7 @@ ipcMain.handle(
       rememberEndpoint(opts.baseUrl, opts.model);
       // The map of this workspace, so the first turn does not spend four
       // steps discovering what is here. Quietly, and off the open path.
+      void primeBrief(session);
       void primeRepoMap(session);
       // Quietly at open: the endpoint is already named in the title bar, and
       // an unprompted price line is not what you are looking at just then.
@@ -1192,6 +1211,16 @@ ipcMain.handle(
  * system message is the cached prefix, and rewriting it mid-turn throws away
  * the cache that turn is in the middle of using.
  */
+/** The environment brief, for every endpoint. See primeBrief in src/cli.tsx. */
+async function primeBrief(target: Session): Promise<void> {
+  try {
+    const brief = await buildBrief({ cwd: target.cwd });
+    if (session === target && running === null && brief.text) target.engine.setBrief(brief.text);
+  } catch {
+    /* a brief is a hint; the session is fine without one */
+  }
+}
+
 async function primeRepoMap(target: Session): Promise<void> {
   // Same rule as the terminal: a model you are hosting yourself is, today, a
   // small one, and a repo map makes a small model browse rather than work.
@@ -1476,7 +1505,11 @@ ipcMain.handle("bar:init", () => {
 ipcMain.handle("criteria:draft", async (_e, task: string) => {
   if (!session) return { ok: false, error: "no workspace is open" };
   if (!task.trim()) return { ok: false, error: "nothing to draft from" };
-  return draftCriteria({
+  // Read cold by the critic before you see it (criteria.ts): a check that
+  // invents or guesses is dropped with a task quote, a draft that only looks
+  // is redrafted once, and `python`/`pip` are fixed where only `python3` exists.
+  return draftCriteriaCritiqued({
+    commands: commandsHere(session.cwd),
     task,
     scripts: projectScripts(session.cwd),
     barChecks: session.bar?.checks.map((c: Check) => c.name) ?? [],
@@ -1530,7 +1563,7 @@ ipcMain.handle(
 );
 
 /**
- * Write proposed command checks into `.molt/done.yml` after a person seals.
+ * Write proposed command checks into `.maat/done.yml` after a person seals.
  * parseBar is the authority; a malformed proposal writes nothing.
  */
 ipcMain.handle("bar:apply", (_e, adds: unknown) => {
@@ -1697,7 +1730,7 @@ ipcMain.handle("session:run", async (_e, text: string, ask: boolean, criteria?: 
 
 ipcMain.handle("receipts:list", () => {
   if (!session) return [];
-  const dir = join(session.cwd, ".molt", "receipts");
+  const dir = stateDir(session.cwd, "receipts");
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
     .filter((f) => f.endsWith(".md"))
@@ -1712,7 +1745,7 @@ ipcMain.handle("receipts:list", () => {
 ipcMain.handle("receipts:read", (_e, file: string) => {
   if (!session) return null;
   // Never leaves the receipts directory, whatever the renderer asks for.
-  const p = resolveReceipt(join(session.cwd, ".molt", "receipts"), file);
+  const p = resolveReceipt(stateDir(session.cwd, "receipts"), file);
   if (p === null || !existsSync(p)) return null;
   return readFileSync(p, "utf8");
 });

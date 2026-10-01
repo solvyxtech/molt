@@ -1,13 +1,19 @@
-# molt
+# Maat Agent
 
 **A coding agent that can't say "done" without proving it.**
+
+> Maat (MAH-aht), the Egyptian goddess of truth: in the Weighing of the Heart, a
+> claim is weighed against her feather before it may pass. Maat Agent weighs a
+> model's "done" against checks set before the work began, on the real disk, and
+> writes the verdict down. It is built on the **molt** engine; the npm package is
+> still `@solvyx/molt` and both the `maat` and `molt` commands work.
 
 [![check](https://github.com/solvyxtech/molt/actions/workflows/check.yml/badge.svg)](https://github.com/solvyxtech/molt/actions/workflows/check.yml)
 [![licence: Apache 2.0](https://img.shields.io/badge/licence-Apache%202.0-blue.svg)](LICENSE)
 
-molt is an open source coding agent for developers. Terminal CLI and Electron desktop. Written in TypeScript. It runs any OpenAI compatible model and Anthropic’s native API. Then it refuses to accept done until every check in your project’s `.molt/done.yml` passes against the real state on disk. A completion is a claim. molt checks the claim and writes a receipt either way.
+Maat Agent is an open source coding agent for developers. Terminal CLI and Electron desktop. Written in TypeScript. It runs any OpenAI compatible model and Anthropic’s native API. Then it refuses to accept done until every check in your project’s `.maat/done.yml` passes (projects that already have `.molt/` keep using it) against the real state on disk. A completion is a claim. Maat checks the claim and writes a receipt either way.
 
-False done does not count. Acceptance lives outside the model. Every write gets before and after hashes. One receipt per attempt including refusals. A hash chained journal you can recompute with `molt verify`.
+False done does not count. Acceptance lives outside the model. Every write gets before and after hashes. One receipt per attempt including refusals. A hash chained journal you can recompute with `maat verify`.
 
 Studio page: [solvyx.xyz/work/molt](https://solvyx.xyz/work/molt).
 
@@ -338,6 +344,31 @@ Layout: `src/` the engine (shared, unmodified), `electron/` the main process
 and preload bridge, `ui/` one HTML file, one stylesheet, one renderer,
 `test/` the suite, `finetune/` a dataset extractor and training recipe for a
 small model that predicts the bar's verdict, `docs/` the design notes.
+
+## Missions
+
+Work that runs for hours against a contract nobody can edit.
+
+```
+molt mission plan "a CLI that turns a CSV of orders into printable labels"
+# read and edit .molt/mission/contract.yml and features.json
+molt mission run --yes --commit
+```
+
+A contract is a list of assertions, each a command whose exit 0 establishes
+it. A feature list claims them. A fresh worker session runs per feature, held
+to exactly the assertions it claims; when a milestone's features are all done
+its assertions run again together and the milestone seals only if they still
+pass. There is no orchestrator model and no validator model: the loop is a
+loop, and the judge is the commands. `docs/missions.md` has the whole thing.
+
+## Terminal-Bench
+
+`bench/harbor/molt_agent.py` runs molt under harbor on Terminal-Bench 2.0,
+installing this tree's CLI into each task container. `bench/harbor/README.md`
+has the recipe. Headless runs get `--criteria auto`: the model drafts
+acceptance checks for the task before the work, they are sealed, and it is
+held to them.
 
 ## Docs
 

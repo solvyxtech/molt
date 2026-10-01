@@ -162,7 +162,7 @@ describe("undo", () => {
 
     const r = await undoLast(dir);
     assert.equal(r.ok, false, "rewound someone else's commit");
-    assert.match(r.ok === false ? r.reason : "", /not molt's/);
+    assert.match(r.ok === false ? r.reason : "", /not Maat's/);
     assert.equal(log(dir, "%s"), "a human commit");
   });
 

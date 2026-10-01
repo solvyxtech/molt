@@ -149,7 +149,7 @@ describe("what coverage can speak about", () => {
   it("does not include the files lcov never lists", () => {
     assert.equal(coverageCouldSpeak("ui/styles.css"), false);
     assert.equal(coverageCouldSpeak("README.md"), false);
-    assert.equal(coverageCouldSpeak(".molt/done.yml"), false);
+    assert.equal(coverageCouldSpeak(".maat/done.yml"), false);
     assert.equal(coverageCouldSpeak("docs/why.md"), false);
   });
 });

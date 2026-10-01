@@ -7,13 +7,14 @@
  * context with it, and the only way to know is to break the disk on demand.
  *
  * Layout:
- *   .molt/exuviae/0000-<iso>.md   full unabridged shed batches
- *   .molt/exuviae/index.md        one line each, so the archive is browsable
+ *   .maat/exuviae/0000-<iso>.md   full unabridged shed batches
+ *   .maat/exuviae/index.md        one line each, so the archive is browsable
  */
 import { createHash } from "node:crypto";
 import type { LedgerEntry } from "./types.js";
 import { mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { stateDir } from "./statedir.js";
 
 export type ArchiveEntry = {
   index: number;
@@ -68,7 +69,7 @@ export class Archive implements ArchiveLike {
   private seq = 0;
 
   constructor(root: string) {
-    this.dir = join(root, ".molt", "exuviae");
+    this.dir = stateDir(root, "exuviae");
     this.indexPath = join(this.dir, "index.md");
     mkdirSync(this.dir, { recursive: true });
     // Not `.length`: an exuvia deleted out of the middle (the exact tamper
@@ -82,7 +83,7 @@ export class Archive implements ArchiveLike {
     if (!existsSync(this.indexPath)) {
       writeFileSync(
         this.indexPath,
-        "# molt exuviae index\n\nEvery batch of context shed in this project. Nothing here was summarized.\n\n" +
+        "# Maat exuviae index\n\nEvery batch of context shed in this project. Nothing here was summarized.\n\n" +
           "| # | when | msgs | bytes | sha256 | first ask |\n|---|---|---|---|---|---|\n",
         "utf8",
       );
@@ -93,8 +94,8 @@ export class Archive implements ArchiveLike {
     if (ledger.length > 0) {
       exuvia +=
         `\n\n## write evidence\n\n` +
-        `Files molt wrote during the messages above, with the hash before the\n` +
-        `write and the hash molt observed after it. Completion checks read this.\n\n` +
+        `Files Maat wrote during the messages above, with the hash before the\n` +
+        `write and the hash Maat observed after it. Completion checks read this.\n\n` +
         "```" + LEDGER_MARKER + "\n" +
         JSON.stringify(ledger, null, 2) +
         "\n```\n";

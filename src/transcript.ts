@@ -79,6 +79,43 @@ export class Transcript {
   }
 
   /**
+   * Fold the tool results for `parts` into one result for the call `id`.
+   *
+   * Batch mode (see ACT_TOOL in engine.ts) runs each action of one `act` call
+   * as an ordinary call, so the approval gate, the ledger and repeat detection
+   * see every action — then the model gets back what it asked for: one result
+   * for its one call, each action's output under its own heading, in order.
+   * A part whose result is missing leaves everything as it was.
+   */
+  combineToolResults(id: string, parts: { id: string; label: string }[]): void {
+    const at = parts.map((p) => this.working.findIndex((m) => m.role === "tool" && m.tool_call_id === p.id));
+    if (!parts.length || at.some((i) => i < 0)) return;
+    const content = parts
+      .map((p, k) => `### ${k + 1}. ${p.label}\n${this.working[at[k]!]!.content ?? ""}`)
+      .join("\n\n");
+    const first = Math.min(...at);
+    const drop = new Set(at);
+    const out: Msg[] = [];
+    this.working.forEach((m, i) => {
+      if (i === first) out.push({ role: "tool", tool_call_id: id, content });
+      else if (!drop.has(i)) out.push(m);
+    });
+    this.working = out;
+  }
+
+  /**
+   * Add a line to the end of the newest tool result, if the newest message is
+   * one. For facts about the moment (the clock), not about the call: they
+   * ride on content that is new anyway, so the cached prefix is untouched.
+   */
+  noteOnLastToolResult(line: string): boolean {
+    const last = this.working[this.working.length - 1];
+    if (!last || last.role !== "tool") return false;
+    last.content = `${last.content ?? ""}\n${line}`;
+    return true;
+  }
+
+  /**
    * Replace the system message in place.
    *
    * Everything before the first user message is the cached prefix, so this
@@ -518,7 +555,7 @@ export function buildDigest(dropped: Msg[]): string {
 
 export function buildExuvia(dropped: Msg[], index: number): string {
   const head = [
-    `# molt exuvia ${String(index).padStart(4, "0")} — ${new Date().toISOString()}`,
+    `# Maat exuvia ${String(index).padStart(4, "0")} — ${new Date().toISOString()}`,
     "",
     `Full, unabridged history shed from context. ${dropped.length} messages.`,
     "Re-attach any part with `/regrow`. Nothing here was summarized.",
@@ -548,8 +585,12 @@ export function toolDetail(name: string, args: Record<string, unknown>): string 
   const glob = args.glob ? ` ${String(args.glob)}` : "";
   const raw =
     name === "bash"
-      ? String(args.command ?? "")
-      : name === "grep"
+      ? args.stop_job !== undefined
+        ? `stop job ${String(args.stop_job)}`
+        : `${args.background === true ? "& " : ""}${String(args.command ?? "")}`
+      : name === "plan"
+        ? `${Array.isArray(args.steps) ? args.steps.length : 0} steps, on #${Number(args.current ?? 0) + 1}`
+        : name === "grep"
         ? `/${String(args.pattern ?? "")}/${where ? ` in ${where}` : ""}${glob}`
         : name === "list_dir"
           ? `${where || "."}${glob}`

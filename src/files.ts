@@ -23,6 +23,7 @@
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
+import { STATE_DIRS } from "./statedir.js";
 
 /**
  * How long a search may run, and how much of a line it may examine.
@@ -51,12 +52,12 @@ export const SKIP_DIRS = new Set([
 /**
  * molt's own artifacts: listed, but not searched.
  *
- * `.molt/done.yml` is the most relevant file in the project — hiding it from a
+ * `.maat/done.yml` is the most relevant file in the project — hiding it from a
  * listing means the agent cannot discover the bar it is being judged against.
- * But `.molt/log/` holds session logs full of prose, and a content search that
+ * But `.maat/log/` holds session logs full of prose, and a content search that
  * walks them buries the answer in molt's own record of looking for it.
  */
-export const SEARCH_SKIP_DIRS = new Set([...SKIP_DIRS, ".molt"]);
+export const SEARCH_SKIP_DIRS = new Set([...SKIP_DIRS, ...STATE_DIRS]);
 
 /** How many entries or matches a single result may carry. */
 export const MAX_ENTRIES = 400;
@@ -517,7 +518,7 @@ export type TreeSnapshot = {
 };
 
 /** Never part of the work: molt's own record, build output, dependencies. */
-export const TREE_SKIP = new Set([...SKIP_DIRS, ".molt", "dist-test", "release"]);
+export const TREE_SKIP = new Set([...SKIP_DIRS, ...STATE_DIRS, "dist-test", "release"]);
 /** Past this size a file is identified by size and mtime rather than hashed. */
 const TREE_HASH_CAP = 8 * 1024 * 1024;
 /** Past this size a test file's text is not kept in the snapshot. */
@@ -798,7 +799,7 @@ export function holdsDiffText(text: string): boolean {
 /** What to tell a model that sent a diff where file content belongs. */
 export function diffSyntaxRefusal(field: string, why: string): string {
   return (
-    `${field} looks like a unified diff, not file content: ${why}. molt writes what you ` +
+    `${field} looks like a unified diff, not file content: ${why}. Maat writes what you ` +
     `send, byte for byte — those markers would go into the file and break it. Send the ` +
     `literal lines as they should appear on disk, with no leading \`+\`, \`-\` or diff headers.`
   );
@@ -837,7 +838,7 @@ export function applyEdit(
       ok: false,
       why:
         "old_text does not appear in the file. Read the file again and copy the exact " +
-        "text, including indentation — molt will not guess at a near match",
+        "text, including indentation — Maat will not guess at a near match",
     };
   }
   if (found > 1 && !replaceAll) {

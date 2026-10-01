@@ -30,8 +30,8 @@ function ws() {
   return w.dir;
 }
 function writeBar(dir: string, yaml: string): void {
-  mkdirSync(join(dir, ".molt"), { recursive: true });
-  writeFileSync(join(dir, ".molt", "done.yml"), yaml, "utf8");
+  mkdirSync(join(dir, ".maat"), { recursive: true });
+  writeFileSync(join(dir, ".maat", "done.yml"), yaml, "utf8");
 }
 const FILLER = "z".repeat(1500);
 
@@ -365,7 +365,7 @@ describe("deleting the archive changes an outcome", () => {
 
     // Delete the exuviae. Nothing else changes — same files on disk, same
     // session in memory.
-    const exuviae = join(dir, ".molt", "exuviae");
+    const exuviae = join(dir, ".maat", "exuviae");
     for (const f of readdirSync(exuviae)) {
       if (f.endsWith(".md") && f !== "index.md") rmSync(join(exuviae, f));
     }
@@ -385,7 +385,7 @@ describe("deleting the archive changes an outcome", () => {
     const { engine } = await sessionWithShedWrite(dir);
     assert.equal((await engine.proveNow())!.ok, true, "clean to begin with");
 
-    const exuviae = join(dir, ".molt", "exuviae");
+    const exuviae = join(dir, ".maat", "exuviae");
     let stripped = 0;
     for (const f of readdirSync(exuviae)) {
       if (!f.endsWith(".md") || f === "index.md") continue;
@@ -407,7 +407,7 @@ describe("deleting the archive changes an outcome", () => {
     writeBar(dir, "version: 1\nchecks:\n  - name: intact\n    builtin: record-intact\n");
     const { engine } = await sessionWithShedWrite(dir);
 
-    const exuviae = join(dir, ".molt", "exuviae");
+    const exuviae = join(dir, ".maat", "exuviae");
     for (const f of readdirSync(exuviae)) {
       if (!f.endsWith(".md") || f === "index.md") continue;
       const p = join(exuviae, f);
@@ -438,7 +438,7 @@ describe("corrupted evidence in a later session", () => {
     writeBar(dir, "version: 1\nchecks:\n  - name: intact\n    builtin: record-intact\n");
     await sessionWithShedWrite(dir);
 
-    const exuviae = join(dir, ".molt", "exuviae");
+    const exuviae = join(dir, ".maat", "exuviae");
     let corrupted = 0;
     for (const f of readdirSync(exuviae)) {
       if (!f.endsWith(".md") || f === "index.md") continue;
@@ -577,7 +577,7 @@ describe("mentionedPaths", () => {
 describe("the default bar", () => {
   it("ships all three builtins and they all parse", () => {
     const dir = ws();
-    mkdirSync(join(dir, ".molt"), { recursive: true });
+    mkdirSync(join(dir, ".maat"), { recursive: true });
     writeDefaultBar(dir);
     const bar = loadBar(dir)!;
     const builtins = bar.checks
@@ -586,7 +586,7 @@ describe("the default bar", () => {
     assert.ok(builtins.includes("files-changed"));
     assert.ok(builtins.includes("record-intact"));
     assert.ok(builtins.includes("claims-grounded"));
-    assert.ok(existsSync(join(dir, ".molt", "done.yml")));
+    assert.ok(existsSync(join(dir, ".maat", "done.yml")));
   });
 });
 
@@ -631,7 +631,7 @@ describe("cross-session archive integrity", () => {
 
     // Delete one exuvia. In-memory expectation is gone with the old process;
     // only the journal remembers.
-    const exuviae = join(dir, ".molt", "exuviae");
+    const exuviae = join(dir, ".maat", "exuviae");
     const victim = readdirSync(exuviae).find((f) => /^\d{4}-.*\.md$/.test(f))!;
     rmSync(join(exuviae, victim));
 
@@ -681,7 +681,7 @@ describe("integrity when a shed batch held no writes", () => {
     assert.equal(engine.mergedLedger().length, 0, "and no writes in it");
     assert.equal((await engine.proveNow())!.ok, true, "clean to begin with");
 
-    const exuviae = join(dir, ".molt", "exuviae");
+    const exuviae = join(dir, ".maat", "exuviae");
     for (const f of readdirSync(exuviae)) {
       if (/^\d{4}-.*\.md$/.test(f)) rmSync(join(exuviae, f));
     }
@@ -719,7 +719,7 @@ describe("integrity without a journal", () => {
     assert.equal((await engine.proveNow())!.ok, true, "clean to begin with");
     assert.deepEqual(Journal.expectedArchives(dir), [], "and no journal expectation exists");
 
-    const exuviae = join(dir, ".molt", "exuviae");
+    const exuviae = join(dir, ".maat", "exuviae");
     const victim = readdirSync(exuviae).find((f) => /^\d{4}-.*\.md$/.test(f))!;
     rmSync(join(exuviae, victim));
 

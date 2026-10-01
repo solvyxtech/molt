@@ -55,7 +55,7 @@ for (const banned of ["out", "electron", "ui", "release"]) {
 process.stdout.write(
   `staged ${out}\n` +
     `  name: ${manifest.name}@${manifest.version}\n` +
-    `  bin:  molt → dist/cli.js\n` +
+    `  bin:  maat, molt → dist/cli.js\n` +
     `next:  npm pack ./out-cli   # dry-run\n` +
     `       npm publish ./out-cli --access public   # COO only\n`,
 );

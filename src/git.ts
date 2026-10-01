@@ -75,7 +75,7 @@ export async function headSha(cwd: string): Promise<string | null> {
 /**
  * The commit the working tree sits on, and whether the tree differs from it.
  *
- * What a receipt binds itself to. `.molt/` is left out of the comparison:
+ * What a receipt binds itself to. `.maat/` is left out of the comparison:
  * molt writes its own journal and receipts there on every turn, so counting
  * them would mark every judged tree dirty and the flag would mean nothing.
  * `null` outside a repository or before the first commit.
@@ -83,7 +83,7 @@ export async function headSha(cwd: string): Promise<string | null> {
 export async function treeState(cwd: string): Promise<{ sha: string; dirty: boolean } | null> {
   const sha = await headSha(cwd);
   if (!sha) return null;
-  const r = await git(cwd, ["status", "--porcelain", "--", ".", ":(exclude).molt"]);
+  const r = await git(cwd, ["status", "--porcelain", "--", ".", ":(exclude).molt", ":(exclude).maat"]);
   // Unknown is not clean: a status that could not be read says "dirty".
   return { sha, dirty: !r.ok || r.stdout.length > 0 };
 }
@@ -338,7 +338,7 @@ export async function undoLast(cwd: string): Promise<UndoResult> {
   if (!last.isMolt) {
     return {
       ok: false,
-      reason: `the last commit is not molt's (${last.sha.slice(0, 8)} ${last.subject}) — refusing to rewind someone else's work`,
+      reason: `the last commit is not Maat's (${last.sha.slice(0, 8)} ${last.subject}) — refusing to rewind someone else's work`,
     };
   }
   const parent = await git(cwd, ["rev-parse", "--verify", "HEAD~1"]);

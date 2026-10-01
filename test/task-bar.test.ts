@@ -1,7 +1,7 @@
 /**
  * What "done" means for one task, on top of what it means for the project.
  *
- * `.molt/done.yml` is per-project on purpose and is never read from the prompt:
+ * `.maat/done.yml` is per-project on purpose and is never read from the prompt:
  * a bar the model can define is not a bar, it is the model marking its own
  * homework with extra steps. But that leaves it blind in one direction — it
  * proves the project is healthy, not that the task was done. A comment added to
@@ -247,3 +247,46 @@ describe("criteria cannot move once the turn has started", () => {
     }
   });
 });
+
+describe("a hidden criterion", () => {
+  it("is named to the model but its command is withheld, before and after it fails, while the receipt keeps it", async () => {
+    const { Engine } = await import("../src/engine.js");
+    const { Receipts } = await import("../src/receipts.js");
+    const { readFileSync } = await import("node:fs");
+    const { scriptedProvider, allowAll, drain, workspace } = await import("./helpers.js");
+    const ws = workspace();
+    try {
+      const provider = scriptedProvider([{ text: "done, I think" }, { text: "still done" }]);
+      const engine = new Engine({
+        baseUrl: "http://provider.test/v1",
+        model: "m",
+        cwd: ws.dir,
+        fetchFn: provider.fetchFn,
+        bar: null,
+        receipts: new Receipts(ws.dir),
+        stream: false,
+        autonomy: "high",
+        maxProofAttempts: 2,
+      });
+      const secret = "test -f /nonexistent-the-secret-command";
+      const events = await drain(
+        engine.run("do it", allowAll, {
+          taskChecks: [
+            { name: "secret", kind: "command", run: secret, timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true },
+          ],
+        }),
+      );
+      const everything = provider.bodies.join("\n");
+      assert.match(everything, /\[checked\] secret — the command is withheld/);
+      assert.match(everything, /FAILED: task:secret \(command withheld\)/);
+      assert.doesNotMatch(everything, /the-secret-command/, "the model never sees the command");
+      const receipt = events.find((e) => e.kind === "receipt");
+      assert.ok(receipt && "path" in receipt);
+      const text = readFileSync(receipt.path, "utf8");
+      assert.match(text, /the-secret-command/, "a person reading the receipt does");
+    } finally {
+      ws.cleanup();
+    }
+  });
+});
+

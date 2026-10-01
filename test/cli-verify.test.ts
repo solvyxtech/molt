@@ -31,7 +31,7 @@ describe("molt verify with no session logs", () => {
     new Integrity(w.dir).append({ kind: "session_start", session: "s1", journalRoot: journal.chainRoot() });
     assert.equal(verify(w.dir).code, 0, "intact before anything is removed");
 
-    rmSync(join(w.dir, ".molt", "log"), { recursive: true, force: true });
+    rmSync(join(w.dir, ".maat", "log"), { recursive: true, force: true });
     const r = verify(w.dir);
     assert.equal(r.code, 1, r.out);
     assert.match(r.out, /journal s1\.jsonl no longer matches its bound hash \(\(missing\)\)/);

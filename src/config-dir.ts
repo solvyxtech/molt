@@ -9,8 +9,10 @@
  * really one in the import graph. `providers.ts` re-exports it, so every
  * existing caller is unchanged.
  */
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { env } from "./env.js";
 
 export function defaultConfigDir(): string {
   // `MOLT_CONFIG_DIR` relocates the whole of molt's config: keys, endpoint,
@@ -20,8 +22,13 @@ export function defaultConfigDir(): string {
   // developer's stored endpoint and left `priceModel: "test-model"` behind.
   // A test that edits the machine it runs on is not a test you can trust
   // twice, and this was doing it on every run.
-  const override = process.env.MOLT_CONFIG_DIR?.trim();
+  const override = env("CONFIG_DIR")?.trim();
   if (override) return override;
-  return join(homedir(), ".config", "molt");
+  // Maat Agent keeps its config in ~/.config/maat. Someone who set molt up
+  // before the rename keeps theirs where it is — keys, endpoint and prices
+  // are not moved under them.
+  const maat = join(homedir(), ".config", "maat");
+  const molt = join(homedir(), ".config", "molt");
+  return !existsSync(maat) && existsSync(molt) ? molt : maat;
 }
 

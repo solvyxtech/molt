@@ -105,6 +105,19 @@ The gate that demands a change is the gate that teaches a model to fabricate
 one. Every refusal here names the honest exit, and ranks fabrication below
 finding nothing.
 
+### 9. The model never sees the exam it wrote
+*Tier 1 — `hidden` on a check; the engine withholds the command.*
+
+On Terminal-Bench, a model drafted an "independent count" criterion, then
+generated its output with the same awk command and wrote "a diff against that
+command matches trivially". The check and the work were one command, and both
+were wrong together. A check the model can see is a check it can copy. A
+criterion the model drafted is sealed **hidden**: the model is told its name,
+and on failure gets its output, and never the command. A person reading the
+receipt gets all of it. Mission assertions are hidden from workers for the
+same reason. Criteria a person wrote by hand are shown — the person chose
+them, and a model satisfying them literally is what was asked.
+
 ## What is still only asked, not checked
 
 - **Rule 5** — no mechanical form yet.

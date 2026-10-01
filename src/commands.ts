@@ -46,7 +46,7 @@ export const COMMANDS: Command[] = [
   },
   { name: "/prove", summary: "run the bar now, without the model" },
   { name: "/bar", summary: "show the checks this project requires" },
-  { name: "/init", summary: "write a starter .molt/done.yml" },
+  { name: "/init", summary: "write a starter .maat/done.yml" },
   {
     name: "/commit",
     args: "[on|off]",
@@ -61,7 +61,7 @@ export const COMMANDS: Command[] = [
   },
   {
     name: "/undo",
-    summary: "take back molt's last commit, keep the work",
+    summary: "take back Maat's last commit, keep the work",
     aliases: ["uncommit", "git"],
   },
   {
@@ -69,6 +69,12 @@ export const COMMANDS: Command[] = [
     args: "<5m|off>",
     summary: "wall-clock ceiling for one turn",
     aliases: ["time", "deadline", "clock", "minutes"],
+  },
+  {
+    name: "/mission",
+    args: "",
+    summary: "where the mission in .maat/mission stands",
+    aliases: ["features", "milestones", "contract", "queue"],
   },
   {
     name: "/map",
@@ -121,7 +127,7 @@ export const COMMANDS: Command[] = [
   {
     name: "/autonomy",
     args: "[low|medium|high]",
-    summary: "how much molt does without asking (shift+A)",
+    summary: "how much Maat does without asking (shift+A)",
     aliases: ["auto", "permissions", "yes", "approve"],
   },
   {
@@ -144,7 +150,7 @@ export const COMMANDS: Command[] = [
   {
     name: "/endpoint",
     args: "<url>",
-    summary: "point molt at any OpenAI-compatible server, local or on your network",
+    summary: "point Maat at any OpenAI-compatible server, local or on your network",
     aliases: ["url", "host", "local", "ollama", "server"],
   },
   { name: "/model", args: "[id]", summary: "browse models across your keys, or switch by id" },

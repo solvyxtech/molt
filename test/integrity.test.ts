@@ -31,8 +31,8 @@ function ws() {
   return w.dir;
 }
 function writeBar(dir: string, yaml: string): void {
-  mkdirSync(join(dir, ".molt"), { recursive: true });
-  writeFileSync(join(dir, ".molt", "done.yml"), yaml, "utf8");
+  mkdirSync(join(dir, ".maat"), { recursive: true });
+  writeFileSync(join(dir, ".maat", "done.yml"), yaml, "utf8");
 }
 
 describe("the integrity chain", () => {
@@ -55,7 +55,7 @@ describe("the integrity chain", () => {
     i.append({ kind: "session_start", session: "s1", journalRoot: "aa" });
     i.append({ kind: "receipt", session: "s1", receiptFile: "0000.md", receiptSha: "bb", journalRoot: "aa", verdict: "accepted" });
 
-    const path = join(dir, ".molt", "integrity", "ledger.jsonl");
+    const path = join(dir, ".maat", "integrity", "ledger.jsonl");
     const rows = Integrity.read(path);
     (rows[1].data as { receiptFile: string }).receiptFile = "9999.md";
     writeFileSync(path, rows.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
@@ -67,8 +67,8 @@ describe("the integrity chain", () => {
 
   it("detects an artifact that drifted after it was sealed", () => {
     const dir = ws();
-    mkdirSync(join(dir, ".molt", "receipts"), { recursive: true });
-    writeFileSync(join(dir, ".molt", "receipts", "0000-accepted.md"), "# molt receipt\nfine\n", "utf8");
+    mkdirSync(join(dir, ".maat", "receipts"), { recursive: true });
+    writeFileSync(join(dir, ".maat", "receipts", "0000-accepted.md"), "# molt receipt\nfine\n", "utf8");
     const i = new Integrity(dir);
     i.append({ kind: "session_start", session: "s1", journalRoot: "aa" });
     i.append({
@@ -197,8 +197,8 @@ describe("a chain that binds nothing says so", () => {
     const dir = ws();
     // Evidence from before the ledger existed: real receipts, bound by
     // nothing. Every project looked like this the day the ledger shipped.
-    mkdirSync(join(dir, ".molt", "receipts"), { recursive: true });
-    writeFileSync(join(dir, ".molt", "receipts", "0000-accepted.md"), "old\n", "utf8");
+    mkdirSync(join(dir, ".maat", "receipts"), { recursive: true });
+    writeFileSync(join(dir, ".maat", "receipts", "0000-accepted.md"), "old\n", "utf8");
 
     const v = Integrity.verify(dir);
     assert.equal(v.established, false, "an empty ledger must not read as an established chain");
@@ -215,18 +215,18 @@ describe("a chain that binds nothing says so", () => {
 
   it("names the evidence its records do not cover", () => {
     const dir = ws();
-    mkdirSync(join(dir, ".molt", "receipts"), { recursive: true });
-    mkdirSync(join(dir, ".molt", "exuviae"), { recursive: true });
-    writeFileSync(join(dir, ".molt", "receipts", "0000-accepted.md"), "before the ledger\n", "utf8");
-    writeFileSync(join(dir, ".molt", "receipts", "0001-accepted.md"), "bound\n", "utf8");
-    writeFileSync(join(dir, ".molt", "exuviae", "0000-shed.md"), "before the ledger\n", "utf8");
+    mkdirSync(join(dir, ".maat", "receipts"), { recursive: true });
+    mkdirSync(join(dir, ".maat", "exuviae"), { recursive: true });
+    writeFileSync(join(dir, ".maat", "receipts", "0000-accepted.md"), "before the ledger\n", "utf8");
+    writeFileSync(join(dir, ".maat", "receipts", "0001-accepted.md"), "bound\n", "utf8");
+    writeFileSync(join(dir, ".maat", "exuviae", "0000-shed.md"), "before the ledger\n", "utf8");
 
     const ledger = new Integrity(dir);
     ledger.append({
       kind: "receipt",
       session: "s1",
       receiptFile: "0001-accepted.md",
-      receiptSha: sha256FileSync(join(dir, ".molt", "receipts", "0001-accepted.md")),
+      receiptSha: sha256FileSync(join(dir, ".maat", "receipts", "0001-accepted.md")),
       journalRoot: INTEGRITY_GENESIS,
       verdict: "accepted",
     });
@@ -290,7 +290,7 @@ describe("what the ledger actually proves", () => {
 
     // Edit the evidence. Any edit will do — a verdict flipped, a failing
     // check deleted, a cost erased. The chain's job is to notice.
-    const file = join(dir, ".molt", "receipts", name);
+    const file = join(dir, ".maat", "receipts", name);
     writeFileSync(file, `${readFileSync(file, "utf8")}\nAnd nothing was checked.\n`, "utf8");
 
     const after = Integrity.verify(dir);
@@ -397,8 +397,8 @@ describe("what the ledger actually proves", () => {
 
   it("treats a record that names an artifact but carries no hash as drift", () => {
     const dir = ws();
-    mkdirSync(join(dir, ".molt", "receipts"), { recursive: true });
-    writeFileSync(join(dir, ".molt", "receipts", "0000-accepted.md"), "evidence\n", "utf8");
+    mkdirSync(join(dir, ".maat", "receipts"), { recursive: true });
+    writeFileSync(join(dir, ".maat", "receipts", "0000-accepted.md"), "evidence\n", "utf8");
     const ledger = new Integrity(dir);
     ledger.append({
       kind: "receipt",

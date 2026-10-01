@@ -202,7 +202,7 @@ export function judgePass(run: string, output: string, emptyAllowed = false): Pa
         (piped
           ? "The runner's exit status is lost in a pipe: the shell returns the LAST stage's " +
             "status. Add `set -o pipefail;` to the check, or drop the pipe."
-          : "Something between the runner and molt replaced its exit status.") +
+          : "Something between the runner and Maat replaced its exit status.") +
         " A red suite does not become green by exiting 0.",
       broken: piped,
     };
@@ -226,7 +226,7 @@ export function judgePass(run: string, output: string, emptyAllowed = false): Pa
       why:
         `\`${piped}\` feeds a pipe without pipefail, so this check exits with the LAST ` +
         "stage's status and the runner's verdict is lost. Add `set -o pipefail;` to the " +
-        "check in .molt/done.yml, or drop the pipe.",
+        "check in .maat/done.yml, or drop the pipe.",
     };
   }
   const swallowed = swallowsExit(run);
@@ -237,7 +237,7 @@ export function judgePass(run: string, output: string, emptyAllowed = false): Pa
       broken: true,
       why:
         `this check ends in \`${swallowed}\`, so it exits 0 whatever happened and its pass ` +
-        "establishes nothing. Remove it from the check in .molt/done.yml.",
+        "establishes nothing. Remove it from the check in .maat/done.yml.",
     };
   }
   return { ok: true, summary };

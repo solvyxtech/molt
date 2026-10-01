@@ -42,6 +42,7 @@ import {
   cmdAutoShed,
   cmdFor,
   cmdMap,
+  cmdMission,
   cmdRead,
   cmdRevert,
   cmdUndo,
@@ -148,7 +149,7 @@ type Job = {
  *
  * Generous, because this is what `v` reveals about what already happened, and
  * a transparency view whose memory is shorter than the session is a view that
- * hides the beginning of it. Still bounded: the durable copy is .molt/log.
+ * hides the beginning of it. Still bounded: the durable copy is .maat/log.
  */
 const FEED_MEMORY = 5_000;
 /** Feed lines on screen at once. The panel must never outgrow the viewport. */
@@ -166,11 +167,11 @@ const HELP = [
   "  start a line with ? to ask a question rather than request a change —",
   "  checks that require a file to change are not run for that turn.",
   "  arrows move · alt+arrows by word · ctrl+W/K/U cut · ctrl+A start · ctrl+E end",
-  "  you can keep typing while molt works — enter queues it for when the turn ends.",
+  "  you can keep typing while Maat works — enter queues it for when the turn ends.",
   "",
-  "  shift+V while molt is working (or ctrl+V any time) watches every call,",
+  "  shift+V while Maat is working (or ctrl+V any time) watches every call,",
   "  argument, and result — the same facts the session log records to disk.",
-  "  shift+A raises how much molt does without asking. ctrl+A at the prompt.",
+  "  shift+A raises how much Maat does without asking. ctrl+A at the prompt.",
 ].join("\n");
 
 /** Tokens, at a width that does not make the line jitter as it climbs. */
@@ -422,7 +423,7 @@ export function App({
    * of work a footer should never do.
    */
   const [hasKey, setHasKey] = useState(() => Object.keys(readAuth()).length > 0);
-  /** Compact bar strip: check names when .molt/done.yml exists. */
+  /** Compact bar strip: check names when .maat/done.yml exists. */
   const [spineNames, setSpineNames] = useState<string[]>([]);
   const [spineOn, setSpineOn] = useState(true);
   /** Last receipt verdict for the status "proof pressure" meter. */
@@ -631,7 +632,7 @@ export function App({
     if (!engine.hasBar) {
       add(
         "info",
-        "no .molt/done.yml in this project — completions will not be verified. /init to add one.",
+        "no .maat/done.yml in this project — completions will not be verified. /init to add one.",
       );
     }
     if (autoShed) add("info", `auto-shed above ${autoShed} tokens of history`);
@@ -821,7 +822,7 @@ export function App({
         add(
           "info",
           "everything else passed. work-landed requires this turn to have changed a file, so\n" +
-            "a question, a lookup, or an explanation can never satisfy it — and molt would\n" +
+            "a question, a lookup, or an explanation can never satisfy it — and Maat would\n" +
             "rather refuse an honest answer than accept an invented file edit.\n" +
             "ask questions with /ask <question> (or a leading ?): it runs the rest of the bar\n" +
             "and drops that one check for the turn.",
@@ -1056,7 +1057,7 @@ export function App({
           beginActivity("checking the bar");
           add(
             "info",
-            `checking ${ev.checks} condition(s) from .molt/done.yml: ${ev.names.join(", ")}`,
+            `checking ${ev.checks} condition(s) from .maat/done.yml: ${ev.names.join(", ")}`,
           );
           break;
         case "proof_result":
@@ -1251,7 +1252,7 @@ export function App({
       setTokens(0);
       setCost(undefined);
       setCostEstimated(false);
-      add("ok", `connected to ${h.detail} — molt runs it, your plan pays for it`);
+      add("ok", `connected to ${h.detail} — Maat runs it, your plan pays for it`);
       add("info", nextHint);
     },
     [add, engine],
@@ -1270,7 +1271,7 @@ export function App({
         return;
       }
       if (arg) add("info", `unknown provider '${arg}'`);
-      add("info", "choose a provider, or point molt at a server you run:");
+      add("info", "choose a provider, or point Maat at a server you run:");
       setMode({
         kind: "login-select",
         // The last row is not a provider and takes no key. It is here because
@@ -1369,7 +1370,7 @@ export function App({
       add("error", `${src.name}: unreachable (${(src.r as { error: string }).error})`);
     }
     if (!choices.length) {
-      add("error", "no models found — check the keys with molt doctor, or /login again");
+      add("error", "no models found — check the keys with Maat doctor, or /login again");
       return;
     }
     const rows = pickerRows(choices);
@@ -1429,7 +1430,7 @@ export function App({
             return;
           }
           if (url.protocol !== "http:" && url.protocol !== "https:") {
-            add("error", `${url.protocol} is not a scheme molt can call — use http or https`);
+            add("error", `${url.protocol} is not a scheme Maat can call — use http or https`);
             return;
           }
           // A key is not asked for: the case this exists to serve is a server
@@ -1783,7 +1784,7 @@ export function App({
             setSpineOn(true);
             refreshSpine();
             if (!spineNames.length && !hasBar(engine.cwd)) {
-              add("info", "no .molt/done.yml — /init to seal a bar, then the spine appears");
+              add("info", "no .maat/done.yml — /init to seal a bar, then the spine appears");
             } else {
               add("info", `spine on · ${spineNames.length || "?"} check(s) pinned above the prompt`);
             }
@@ -1862,7 +1863,7 @@ export function App({
         case "/bar": {
           try {
             const bar = loadBar(engine.cwd);
-            if (!bar) add("info", "no .molt/done.yml — /init to create one");
+            if (!bar) add("info", "no .maat/done.yml — /init to create one");
             else
               for (const c of bar.checks)
                 add("info", `  ${c.name}: ${c.kind === "command" ? c.run : `builtin ${c.builtin}`}`);
@@ -1885,6 +1886,11 @@ export function App({
         }
         case "/for": {
           const r = cmdFor(engine, arg);
+          add(r.kind, r.text);
+          return true;
+        }
+        case "/mission": {
+          const r = cmdMission(engine, arg);
           add(r.kind, r.text);
           return true;
         }
@@ -2148,7 +2154,7 @@ export function App({
         if (!r.ok) add("error", r.error);
         else {
           engine.setBar(r.bar);
-          add("ok", "wrote into .molt/done.yml — task criteria still need a Run to seal");
+          add("ok", "wrote into .maat/done.yml — task criteria still need a Run to seal");
         }
         return;
       }
@@ -2245,7 +2251,7 @@ export function App({
             command(text);
           } else {
             queued.current.push(text);
-            add("info", `queued — molt will start this when the current turn ends: ${text}`);
+            add("info", `queued — Maat will start this when the current turn ends: ${text}`);
           }
         }
         return;
@@ -2856,7 +2862,7 @@ export function App({
             </Box>
           ) : mode.kind === "autonomy-select" ? (
             <Box flexDirection="column">
-              <Text color={theme.dim}>  how much molt does without asking:</Text>
+              <Text color={theme.dim}>  how much Maat does without asking:</Text>
               {AUTONOMY_LEVELS.map((level, i) => {
                 const active = i === mode.index;
                 return (

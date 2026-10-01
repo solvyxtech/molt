@@ -30,7 +30,7 @@ export function ceilingAsk(spent: string, maxSteps: number): { name: string; det
     name: "keep going past the ceiling?",
     detail:
       `${spent}. Stopping keeps everything done so far and writes the receipt. ` +
-      `Continuing allows another ${maxSteps} steps before molt asks again.`,
+      `Continuing allows another ${maxSteps} steps before Maat asks again.`,
   };
 }
 

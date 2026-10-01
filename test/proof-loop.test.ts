@@ -280,7 +280,7 @@ describe("the proof loop", () => {
     const lastRequest = provider.requests().at(-1) as { messages: { content: string }[] };
     const injected = lastRequest.messages.map((m) => m.content ?? "").join("\n");
     assert.match(injected, /auth token refresh/, "real check output must reach the model");
-    assert.match(injected, /do not modify \.molt\/done\.yml/i, "and the anti-cheat instruction");
+    assert.match(injected, /do not modify \.maat\/done\.yml/i, "and the anti-cheat instruction");
   });
 
   it("passes straight through when every check is already satisfied", async () => {
@@ -359,12 +359,12 @@ describe("receipts", () => {
     assert.ok(receipts.some((f) => f.includes("refused")));
     assert.ok(receipts.some((f) => f.includes("accepted")));
 
-    const refused = readFileSync(join(dir, ".molt", "receipts", receipts[0]), "utf8");
+    const refused = readFileSync(join(dir, ".maat", "receipts", receipts[0]), "utf8");
     // The receipt answers "what did it do, and should I believe it finished?"
     // in that order, so the headings changed with it.
     assert.match(refused, /## What the model claimed/);
     assert.match(refused, /Done\./, "the claim itself is preserved verbatim");
-    assert.match(refused, /molt refused this claim/);
+    assert.match(refused, /Maat refused this claim/);
     assert.match(refused, /## What the model changed/, "a receipt has to say what happened");
     assert.match(refused, /## What was checked, and what it established/);
   });
@@ -383,7 +383,7 @@ describe("receipts", () => {
 
     await drain(engine.run("go", allowAll));
     const files = new Receipts(dir).list();
-    const body = readFileSync(join(dir, ".molt", "receipts", files[0]), "utf8");
+    const body = readFileSync(join(dir, ".maat", "receipts", files[0]), "utf8");
     assert.match(body, /specific failure detail 4711/);
   });
 });

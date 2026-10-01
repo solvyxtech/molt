@@ -192,14 +192,14 @@ export function proposeBar(cwd: string): { yaml: string; detected: Detected[] } 
   const head = [
     '# What "done" means in this project.',
     "#",
-    "# molt will not emit a final answer while any check below fails. Checks are",
+    "# Maat will not emit a final answer while any check below fails. Checks are",
     "# ordinary shell commands, so anything your CI can run, your agent must pass.",
     "#",
     detected.length
       ? "# The commands below were read out of this project — each says where from."
-      : "# molt found no build or test commands here, so this bar only proves that",
+      : "# Maat found no build or test commands here, so this bar only proves that",
     detected.length
-      ? "# Edit freely: it is your file, and molt only wrote a first draft."
+      ? "# Edit freely: it is your file, and Maat only wrote a first draft."
       : "# work landed. Add your own commands; that is where a bar gets its value.",
     "",
     "version: 1",
@@ -217,7 +217,7 @@ export function proposeBar(cwd: string): { yaml: string; detected: Detected[] } 
       body.push("    advisory: true");
     }
     if (c.watch?.length) {
-      body.push("    # What it reads. molt skips re-running a check when none of this moved.");
+      body.push("    # What it reads. Maat skips re-running a check when none of this moved.");
       body.push(`    watch: [${c.watch.map((w) => `"${w}"`).join(", ")}]`);
     }
     if (c.tags?.length) body.push(`    tags: [${c.tags.join(", ")}]`);
@@ -225,8 +225,8 @@ export function proposeBar(cwd: string): { yaml: string; detected: Detected[] } 
   }
 
   const tail = [
-    "  # molt runs these itself, against the session record. They are meaningful",
-    "  # after a turn; a `molt prove` with no turn behind it reports them as n/a.",
+    "  # Maat runs these itself, against the session record. They are meaningful",
+    "  # after a turn; a `maat prove` with no turn behind it reports them as n/a.",
     "  - name: work-landed",
     "    builtin: files-changed",
     "    tags: [session]",
@@ -254,7 +254,7 @@ export function proposeBar(cwd: string): { yaml: string; detected: Detected[] } 
     "  # Nothing committed may depend on a file that was not committed. A commit",
     "  # that stages a module's dependents but not the module builds perfectly on",
     "  # the machine that made it and nowhere else, and a suite that reads the",
-    "  # working tree cannot see it. No session needed: `molt prove` runs it too.",
+    "  # working tree cannot see it. No session needed: `maat prove` runs it too.",
     "  - name: work-complete",
     "    builtin: imports-tracked",
     "",

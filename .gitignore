@@ -33,3 +33,9 @@ finetune/repro-2026-09-02/index.jsonl.before-repair
 
 # staged CLI publish package
 out-cli/
+
+# background jobs started by the bash tool, and mission handoffs
+.molt/bg/
+.molt/mission/handoffs/
+*.tgz
+.molt/out/
