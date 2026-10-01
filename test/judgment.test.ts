@@ -8,6 +8,7 @@ import { describe, it } from "node:test";
 import { Engine } from "../src/engine.js";
 import { Receipts } from "../src/receipts.js";
 import { draftCriteria } from "../src/criteria.js";
+import { parseBar } from "../src/bar.js";
 import { cmdJudge, type JudgeIO } from "../src/judge-cli.js";
 import { Judgments, caseReason, sendBackPrompt, type OpenCase } from "../src/judgment.js";
 import type { Check } from "../src/types.js";
@@ -101,6 +102,19 @@ describe("which jobs open a case", () => {
     }
   });
 
+  it("a question asked without '?', refused only because nothing changed, opens no case", async () => {
+    const ws = workspace();
+    try {
+      const bar = parseBar("version: 1\nchecks:\n  - name: work-landed\n    builtin: files-changed\n");
+      const { end } = await jobEnd(engineIn(ws.dir, [{ text: "It reads the config and prints it." }], { bar }), "what does main.py do");
+      assert.equal(end.outcome, "not proven");
+      assert.equal(end.case, undefined);
+      assert.equal(new Judgments(ws.dir).all().length, 0);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
   it("work that nothing could check opens a case", async () => {
     const ws = workspace();
     try {
@@ -128,6 +142,9 @@ describe("which jobs open a case", () => {
     assert.equal(caseReason({ outcome: "verified", review: { confirmed: true }, wrote: true }), null);
     assert.equal(caseReason({ outcome: "unverified", wrote: true, allRetired: true }), "checks retired");
     for (const outcome of ["answered", "cancelled", "error", "stopped"] as const) assert.equal(caseReason({ outcome, wrote: true }), null, outcome);
+    // A question asked without the "?": refused only because nothing changed. No case.
+    assert.equal(caseReason({ outcome: "not proven", wrote: false, onlyNothingChanged: true }), null);
+    assert.equal(caseReason({ outcome: "not proven", wrote: true, onlyNothingChanged: true }), "not proven", "work that was written is still judged");
   });
 });
 

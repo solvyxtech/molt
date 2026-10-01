@@ -139,8 +139,14 @@ export function caseReason(ev: {
   review?: { confirmed: boolean };
   wrote: boolean;
   allRetired?: boolean;
+  /**
+   * Every failing check was the "did anything change?" builtin. With nothing
+   * written, that is a question asked without the leading `?`: there is no
+   * work on disk to judge.
+   */
+  onlyNothingChanged?: boolean;
 }): CaseReason | null {
-  if (ev.outcome === "not proven") return "not proven";
+  if (ev.outcome === "not proven") return !ev.wrote && ev.onlyNothingChanged ? null : "not proven";
   if (ev.outcome === "unverified") {
     if (ev.checksDisagree?.length) return "drafted checks disagree";
     if (!ev.wrote) return null;

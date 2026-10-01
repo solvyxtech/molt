@@ -3778,6 +3778,7 @@ export class Engine {
       review: review ?? undefined,
       wrote: this.turnWrites.length > 0,
       allRetired: this.turnAllRetired,
+      onlyNothingChanged: failing.length > 0 && failing.every((r) => r.kind === "builtin" && r.detail === "files-changed"),
     });
     let opened: number | undefined;
     if (reason && this.cfg.judgment !== false) {
