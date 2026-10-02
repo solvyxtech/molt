@@ -211,7 +211,7 @@ class Wc:
         p = d / "wc.py"
         if not p.exists():
             return False, "no wc.py"
-        extra = [x.name for x in d.iterdir() if x.name not in ("wc.py", ".molt", "__pycache__")]
+        extra = [x.name for x in d.iterdir() if x.name not in ("wc.py", ".molt", ".maat", "__pycache__")]
         if extra:
             return False, f"extra files left behind: {extra}"
         tmp = Path(os.environ.get("TMPDIR", "/tmp")) / "wc-grade"

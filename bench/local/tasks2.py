@@ -30,7 +30,7 @@ from decimal import Decimal
 from pathlib import Path
 
 # agent bookkeeping that may appear in the task folder and is never judged
-IGNORED = {".molt", ".factory", ".droid", "__pycache__", ".DS_Store"}
+IGNORED = {".molt", ".maat", ".factory", ".droid", "__pycache__", ".DS_Store"}
 
 
 def sh(cmd: str, cwd: Path) -> str:
