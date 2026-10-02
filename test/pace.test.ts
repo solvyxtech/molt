@@ -44,6 +44,33 @@ describe("pace", () => {
     }
   });
 
+  it("at halfway, asks for a working deliverable in place before more polish", async () => {
+    const ws = workspace();
+    try {
+      const { engine, provider } = engineFor(ws.dir, [{ calls: [{ name: "bash", args: { command: "sleep 1.2" } }] }, { text: "done" }], 2_000);
+      await drain(engine.run("wait", allowAll));
+      assert.match(provider.bodies[1]!, /Half the time is gone\. If the deliverable is not in its final place yet/);
+      assert.doesNotMatch(provider.bodies[1]!, /Less than a quarter/);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  // query-optimize re-ran a 130 s query four times and ran out a 705 s clock.
+  it("says so when one command used a fifth of the whole budget", async () => {
+    const ws = workspace();
+    try {
+      const { engine, provider } = engineFor(ws.dir, [{ calls: [{ name: "bash", args: { command: "sleep 1.2" } }] }, { text: "done" }], 5_000);
+      await drain(engine.run("wait", allowAll));
+      assert.match(provider.bodies[1]!, /that one command used 2\d% of this task's time/);
+      const quick = engineFor(ws.dir, [{ calls: [{ name: "bash", args: { command: "echo hi" } }] }, { text: "done" }], 60_000);
+      await drain(quick.engine.run("say hi", allowAll));
+      assert.doesNotMatch(quick.provider.bodies[1]!, /that one command used/);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
   it("caps a command's timeout at the time left", async () => {
     const ws = workspace();
     try {

@@ -939,6 +939,14 @@ export type RunOptions = {
    */
   pendingCriteria?: Promise<{ taskChecks: Check[]; taskNotes: string[] }>;
   /**
+   * What of `pendingCriteria` is ready now — the checks that passed review so
+   * far. With a time budget the wait for the full draft is bounded
+   * (criteriaWaitMs); when it runs out these are sealed instead.
+   */
+  criteriaSoFar?: () => Promise<{ taskChecks: Check[]; taskNotes: string[] }>;
+  /** Overrides criteriaWaitMs(budget). Tests only. */
+  criteriaWaitMs?: number;
+  /**
    * Criteria stated in words rather than as commands.
    *
    * Recorded on the receipt and shown to the model, never treated as passed.
@@ -1034,6 +1042,16 @@ export function changesSomething(name: string, rawArgs: string): boolean {
   if (a.background === true || a.stop_job !== undefined) return true;
   const cmds = typeof a.command === "string" ? [a.command] : Array.isArray(a.commands) ? a.commands.map(String) : [];
   return cmds.length === 0 || !cmds.every((c) => isReadOnlyCommand(c));
+}
+
+/**
+ * How long a turn with a time budget waits for its drafted checks before
+ * sealing what is ready: a tenth of the budget, between 45 s and 2 min. No
+ * budget, no bound — a person at the keyboard can wait.
+ */
+export function criteriaWaitMs(budgetMs: number): number | undefined {
+  if (!budgetMs) return undefined;
+  return Math.min(120_000, Math.max(45_000, Math.round(budgetMs / 10)));
 }
 
 export function withTaskChecks(bar: Bar | null | undefined, task: Check[]): Bar | null {
@@ -2260,7 +2278,15 @@ export class Engine {
       total < 120_000 ? `${Math.max(0, Math.round(ms / 1000))}s` : `${Math.max(0, Math.round(ms / 60_000))}m`;
     const used = total - left;
     const base = `[molt: ${min(used)} of ${min(total)} used]`;
-    if (left > total / 4) return base;
+    if (left > total / 2) return base;
+    if (left > total / 4) {
+      // Halfway: of 8 Terminal-Bench trials stopped by the budget, most had no
+      // deliverable in place when it ran out (compcert, caffe: no binary).
+      return (
+        `${base} Half the time is gone. If the deliverable is not in its final place yet, ` +
+        `get a working version there first and improve it after.`
+      );
+    }
     return (
       `${base} Less than a quarter of the time is left. Put the deliverable in its ` +
       `final place and form now, working or not, then finish it or say done; ` +
@@ -2905,7 +2931,15 @@ export class Engine {
             "so its later output is not shown. Start servers with background=true, or redirect them " +
             "(`cmd >/tmp/x.log 2>&1 &`).]"
           : "";
-        const ran = (took >= SLOW_COMMAND_MS ? `\n[molt: ran ${fmtSeconds(took)}]` : "") + held;
+        // One command that ate a fifth of the whole budget: query-optimize
+        // re-ran a 130 s query four times and ran out the clock.
+        const total = this.turnDeadlineMs;
+        const hog =
+          total && took >= total / 5
+            ? `\n[molt: that one command used ${Math.round((100 * took) / total)}% of this task's time. ` +
+              `Do not run it again unless that is the plan; test on something smaller first.]`
+            : "";
+        const ran = (took >= SLOW_COMMAND_MS ? `\n[molt: ran ${fmtSeconds(took)}]` : "") + held + hog;
         // One trailing newline is folded into the note so the result does not
         // end in a blank line; the model reads "slow\n[molt: ran 2.2s]".
         const body = (out: string) => (ran ? out.replace(/\n$/, "") : out);
@@ -4392,6 +4426,7 @@ export class Engine {
      * change, or its first claim, waits for them to be sealed.
      */
     let pendingCriteria = opts.pendingCriteria;
+    const criteriaSince = Date.now();
     /** Sealed mid-step: tell the model once this step's tool results are in. */
     let announceAfterTools = false;
     const self = this;
@@ -4568,7 +4603,29 @@ export class Engine {
       pendingCriteria = undefined;
       const ready = await Promise.race([p.then(() => true, () => true), new Promise<boolean>((r) => setTimeout(() => r(false), 50))]);
       if (!ready) yield { kind: "info", text: "waiting for this task's checks to be sealed before the first change" };
-      const got = await p.catch(() => ({ taskChecks: [] as Check[], taskNotes: [] as string[] }));
+      const none = { taskChecks: [] as Check[], taskNotes: [] as string[] };
+      // Bounded under a time budget: query-optimize spent 262 s of 705 here.
+      const cap = opts.criteriaWaitMs ?? criteriaWaitMs(self.turnDeadlineMs);
+      let got: { taskChecks: Check[]; taskNotes: string[] };
+      if (cap !== undefined && opts.criteriaSoFar) {
+        const left = Math.max(0, cap - (Date.now() - criteriaSince));
+        let timer: NodeJS.Timeout | undefined;
+        const out = await Promise.race([
+          p.catch(() => none),
+          new Promise<null>((r) => { timer = setTimeout(() => r(null), left); }),
+        ]);
+        clearTimeout(timer);
+        if (out) got = out;
+        else {
+          got = await opts.criteriaSoFar().catch(() => none);
+          yield {
+            kind: "info",
+            text: `checks were still being drafted after ${Math.round(cap / 1000)}s of the time budget; sealing the ${got.taskChecks.length} reviewed so far`,
+          };
+        }
+      } else {
+        got = await p.catch(() => none);
+      }
       yield* sealCriteria([...(opts.taskChecks ?? []), ...got.taskChecks], [...(opts.taskNotes ?? []), ...got.taskNotes]);
       // Mid-step, the announcement waits for this step's tool results: a
       // message between a tool call and its result is a malformed

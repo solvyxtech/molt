@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { changesSomething, Engine } from "../src/engine.js";
+import { changesSomething, criteriaWaitMs, Engine } from "../src/engine.js";
 import type { Check, EngineEvent } from "../src/types.js";
 import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
@@ -73,6 +73,37 @@ describe("criteria drafted while the model reads", () => {
     } finally {
       ws.cleanup();
     }
+  });
+
+  // Terminal-Bench query-optimize: 262 s of a 705 s budget waiting for a draft.
+  it("under a time budget, seals what was reviewed so far instead of waiting out the draft", async () => {
+    const ws = workspace();
+    try {
+      const provider = scriptedProvider([{ calls: [{ name: "write_file", args: { path: "out.txt", content: "y" } }] }, { text: "Done." }]);
+      const engine = new Engine({ baseUrl: "http://p.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high" });
+      engine.setTurnDeadline(600_000);
+      const started = Date.now();
+      const ev = await drain(
+        engine.run("make out.txt", allowAll, {
+          pendingCriteria: later({ taskChecks: [], taskNotes: [] }, 30_000),
+          criteriaSoFar: async () => ({ taskChecks: [check], taskNotes: [] }),
+          criteriaWaitMs: 200,
+        }),
+      );
+      assert.ok(Date.now() - started < 10_000, "waited out the whole draft");
+      assert.ok(ev.some((e) => e.kind === "info" && /sealing the 1 reviewed so far/.test(e.text)));
+      const end = ev.find((e) => e.kind === "job_end");
+      assert.ok(end && end.kind === "job_end" && end.outcome === "verified", "the check reviewed so far judged the claim");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("bounds the wait at a tenth of the budget, 45 s to 2 min, and not at all without one", () => {
+    assert.equal(criteriaWaitMs(0), undefined);
+    assert.equal(criteriaWaitMs(705_000), 70_500);
+    assert.equal(criteriaWaitMs(100_000), 45_000);
+    assert.equal(criteriaWaitMs(3_000_000), 120_000);
   });
 
   it("knows which calls change something", () => {

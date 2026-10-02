@@ -28,7 +28,7 @@ import { buildRepoMap, DEFAULT_MAP_TOKENS } from "./repomap.js";
 import { buildBrief, DEFAULT_BRIEF_TOKENS } from "./brief.js";
 import { draftMission, missionStatus, runMission, writePlan, type MissionSummary } from "./mission.js";
 import { parseDuration } from "./session-commands.js";
-import { commandsHere, draftCriteriaCritiqued, preflightCriteria, taskChecksFrom } from "./criteria.js";
+import { commandsHere, draftCriteriaCritiqued, preflightCriteria, taskChecksFrom, type Draft } from "./criteria.js";
 import { listProject, removeNew } from "./leftovers.js";
 import { projectScripts } from "./interview.js";
 import {
@@ -1059,7 +1059,11 @@ async function cmdMission(args: Args): Promise<number> {
  * work exists to be judged. A check that cannot run at all is dropped and
  * said, so a hallucinated command does not fail the turn for the wrong reason.
  */
-async function autoDraft(engine: Engine, args: Args): Promise<ReturnType<typeof taskChecksFrom>> {
+async function autoDraft(
+  engine: Engine,
+  args: Args,
+  soFar?: { draft?: Draft },
+): Promise<ReturnType<typeof taskChecksFrom>> {
   const none: ReturnType<typeof taskChecksFrom> = { taskChecks: [], taskNotes: [] };
   // Drafted, then read cold by a critic against the task text: a check that
   // invents or guesses is dropped (with a task quote), and a draft where
@@ -1075,15 +1079,24 @@ async function autoDraft(engine: Engine, args: Args): Promise<ReturnType<typeof 
     model: args.model,
     cwd: args.cwd,
     reasoningEffort: args.reasoningChecks ?? args.reasoning,
+    // What is ready when a time budget stops the wait (RunOptions.criteriaSoFar).
+    onProgress: (d) => {
+      if (soFar) soFar.draft = d;
+    },
   });
   if (!r.ok) {
     process.stderr.write(`maat: criteria not drafted — ${r.error}; running against the project bar only\n`);
     return none;
   }
   for (const line of r.critique) process.stderr.write(`maat: criteria review — ${line}\n`);
+  return sealDraft(r.draft, args);
+}
+
+/** A draft as sealed, hidden checks, with the ones that break before any work dropped. */
+async function sealDraft(draft: Draft, args: Args): Promise<ReturnType<typeof taskChecksFrom>> {
   // Hidden: the model wrote these, and a model shown its own exam makes the
   // work equal the check. It gets the names, and the output on failure.
-  const sealed = taskChecksFrom(r.draft, { hidden: true });
+  const sealed = taskChecksFrom(draft, { hidden: true });
   // Headless, the checks' own side effects are cleaned up (src/leftovers.ts).
   const beforeTry = listProject(args.cwd);
   const broken = await preflightCriteria(sealed.taskChecks, { cwd: args.cwd });
@@ -1283,11 +1296,15 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   const { taskChecks, taskNotes } = criteriaFromArgs(args);
   // Drafted while the model starts reading: the engine seals them before the
   // first change or claim, so they still predate the work (see RunOptions).
-  const pendingCriteria = args.autoCriteria && !ask ? autoDraft(engine, args) : undefined;
+  const soFar: { draft?: Draft } = {};
+  const pendingCriteria = args.autoCriteria && !ask ? autoDraft(engine, args, soFar) : undefined;
+  const criteriaSoFar = pendingCriteria
+    ? () => (soFar.draft ? sealDraft(soFar.draft, args) : Promise.resolve({ taskChecks: [], taskNotes: [] }))
+    : undefined;
   let undetermined = false;
   /** The turn's own verdict, from job_end. */
   let outcome: string | undefined;
-  for await (const ev of engine.run(args.task, confirm, { ask, taskChecks, taskNotes, pendingCriteria })) {
+  for await (const ev of engine.run(args.task, confirm, { ask, taskChecks, taskNotes, pendingCriteria, criteriaSoFar })) {
     emit(ev);
     if (ev.kind === "proof_exhausted" && ev.result.undetermined?.length) undetermined = true;
     // The sentence that explains an undetermined bar arrives as an error, so

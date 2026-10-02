@@ -496,8 +496,18 @@ export const CRITIC_SYSTEM = [
   '  "runs"     — it runs the deliverable on an input and checks what it produces.',
   "For invents and guesses, quote the task words the check gets wrong, verbatim.",
   "",
+  "Then list hard requirements no check would catch if the work got them wrong. A hard",
+  "requirement is a concrete fact a shell command could test on this machine, right now:",
+  "an exact output path that must exist, an exact name or signature, an exact number,",
+  "threshold or tolerance the result must meet on data present here, an exact output",
+  "format. NOT goals or effort (\"as many as possible\", \"figure out\"), NOT anything",
+  "measured on hidden or private data, NOT how the work is done. Quote only the few words",
+  "that state it, verbatim, at most two. Usually the list is empty: list one only when",
+  "you are sure a wrong result would pass every check.",
+  "",
   "Reply with JSON only:",
-  '{"checks":[{"name":"...","verdict":"invents|guesses|surface|runs","quote":"verbatim task words, or empty"}]}',
+  '{"checks":[{"name":"...","verdict":"invents|guesses|surface|runs","quote":"verbatim task words, or empty"}],',
+  ' "uncovered":["verbatim task words"]}',
 ].join("\n");
 
 export type Critique = {
@@ -505,6 +515,12 @@ export type Critique = {
   dropped: { name: string; verdict: "invents" | "guesses"; quote: string }[];
   /** No kept check runs the deliverable. */
   surfaceOnly: boolean;
+  /**
+   * Requirements the task states that no check would catch, quoted verbatim —
+   * string-matched against the task like a drop's quote, so the list cannot
+   * hold a requirement nobody stated.
+   */
+  uncovered: string[];
 };
 
 function norm(s: string): string {
@@ -542,8 +558,19 @@ export function applyCritique(draft: Draft, reply: string, task: string): Critiq
     kept.push(v?.verdict === "surface" ? { ...c, surface: true } : c);
     if (!v || v.verdict === "runs") runs += 1;
   }
-  return { kept, dropped, surfaceOnly: runs === 0 && kept.length > 0 };
+  const said = (raw as { uncovered?: unknown }).uncovered;
+  const uncovered = (Array.isArray(said) ? said : [])
+    .map((q) => String(q ?? "").trim())
+    .filter((q) => norm(q).length >= 8 && t.includes(norm(q)))
+    .slice(0, CRITIC_MAX_UNCOVERED);
+  return { kept, dropped, surfaceOnly: runs === 0 && kept.length > 0, uncovered };
 }
+
+/** How long the uncovered-requirement step may add to drafting. */
+export const COVER_MAX_MS = 30_000;
+
+/** How many uncovered requirements one critique may raise. */
+export const CRITIC_MAX_UNCOVERED = 3;
 
 /**
  * Draft, critique, and — when nothing runs the deliverable or checks were
@@ -551,7 +578,12 @@ export function applyCritique(draft: Draft, reply: string, task: string): Critiq
  * what the critic did, for the receipt.
  */
 export async function draftCriteriaCritiqued(
-  opts: Parameters<typeof draftCriteria>[0],
+  opts: Parameters<typeof draftCriteria>[0] & {
+    /** Called with the best draft so far — the reviewed checks once there are any. */
+    onProgress?: (d: Draft) => void;
+    /** Bound on the step that adds checks for uncovered requirements (COVER_MAX_MS). */
+    coverMaxMs?: number;
+  },
 ): Promise<{ ok: true; draft: Draft; critique: string[] } | { ok: false; error: string }> {
   const fix = (d: Draft): Draft =>
     opts.commands ? { ...d, checks: d.checks.map((c) => ({ ...c, run: fixInterpreters(c.run, opts.commands!) })) } : d;
@@ -577,11 +609,48 @@ export async function draftCriteriaCritiqued(
     return asked.ok ? applyCritique(d, asked.text, opts.task) : null;
   };
   const said: string[] = [];
+  opts.onProgress?.(first.draft);
   const c1 = await critic(first.draft);
   if (!c1) return { ...first, critique: ["the checks could not be reviewed; sealed as drafted"] };
+  if (c1.kept.length) opts.onProgress?.({ ...first.draft, checks: c1.kept });
   const runOf = (name: string) => first.draft.checks.find((c) => c.name === name)?.run ?? "";
   for (const d of c1.dropped) said.push(`dropped ${d.name} (${runOf(d.name)}): it ${d.verdict === "invents" ? "demands what the task does not state" : "guesses an answer the task does not give"} — "${d.quote}"`);
-  if (!c1.surfaceOnly && c1.kept.length) return { ok: true, draft: { ...first.draft, checks: c1.kept }, critique: said };
+  if (!c1.surfaceOnly && c1.kept.length) {
+    if (!c1.uncovered.length) return { ok: true, draft: { ...first.draft, checks: c1.kept }, critique: said };
+    // Sound checks, but a stated requirement nothing would catch. On
+    // Terminal-Bench the false "verified" claims were mostly that: primers'
+    // "at most 5" degrees apart, "equal to A1", "58 and 72" — stated in the
+    // task, untested, failed by the grader. Draft checks for those only and
+    // add the ones the critic keeps; the reviewed checks are never replaced.
+    // Bounded: it adds two requests to a draft the first change waits for.
+    const coverStep = async () => {
+      const cover = await draftCriteria({
+        ...opts,
+        task:
+          `${opts.task}\n\n(These checks are already sealed: ${c1.kept.map((c) => c.name).join(", ")}. ` +
+          `Nothing tests these stated requirements yet: ${c1.uncovered.map((q) => `"${q}"`).join("; ")}. ` +
+          `Draft checks for these requirements only.)`,
+      });
+      const extra = cover.ok ? fix(cover.draft).checks : [];
+      return extra.length ? await critic({ checks: extra, notes: [] }) : null;
+    };
+    let coverTimer: NodeJS.Timeout | undefined;
+    const c3 = await Promise.race([
+      coverStep().catch(() => null),
+      new Promise<null>((r) => {
+        coverTimer = setTimeout(() => r(null), opts.coverMaxMs ?? COVER_MAX_MS);
+      }),
+    ]);
+    clearTimeout(coverTimer);
+    const taken = new Set(c1.kept.map((c) => c.name));
+    const added = (c3 ? c3.kept : []).filter((c) => !taken.has(c.name)).slice(0, Math.max(0, CRITERIA_MAX_CHECKS - c1.kept.length));
+    said.push(
+      added.length
+        ? `added ${added.map((c) => c.name).join(", ")} for what no check tested: ${c1.uncovered.map((q) => `"${q}"`).join("; ")}`
+        : `no check could be added for ${c1.uncovered.map((q) => `"${q}"`).join("; ")}`,
+    );
+    return { ok: true, draft: { ...first.draft, checks: [...c1.kept, ...added] }, critique: said };
+  }
 
   // Once more, told what was wrong. Its result is critiqued the same way.
   const findings = [

@@ -15,13 +15,15 @@ import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
 const TASK = "Write out.txt containing a greeting. Valid for 365 days.";
 
-function replying(texts: string[]): { fetchFn: typeof fetch; calls: () => number } {
+function replying(texts: string[]): { fetchFn: typeof fetch; calls: () => number; bodies: string[] } {
   let i = 0;
-  const fetchFn = (async () => {
+  const bodies: string[] = [];
+  const fetchFn = (async (_url: unknown, init?: { body?: unknown }) => {
+    bodies.push(String(init?.body ?? ""));
     const content = texts[Math.min(i++, texts.length - 1)]!;
     return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content }, finish_reason: "stop" }] }), text: async () => "" } as unknown as Response;
   }) as unknown as typeof fetch;
-  return { fetchFn, calls: () => i };
+  return { fetchFn, calls: () => i, bodies };
 }
 
 describe("disputes", () => {
@@ -246,6 +248,30 @@ describe("the check critic", () => {
     assert.deepEqual(out.draft.checks.map((c) => c.name), ["greets"]);
     assert.ok(out.critique.some((l) => /a check now runs the deliverable/.test(l)));
     assert.equal(r.calls(), 4);
+  });
+
+  // Terminal-Bench dna-insert: "at most 5" degrees apart was stated, no check
+  // tested it, and the grader failed the verified work on exactly that.
+  it("adds a check for a stated requirement nothing tested, keeping the reviewed ones", async () => {
+    const d1 = JSON.stringify({ checks: [{ name: "greets", run: "grep -q hello out.txt" }], notes: [] });
+    const c1 = JSON.stringify({ checks: [{ name: "greets", verdict: "runs", quote: "" }], uncovered: ["Valid for 365 days", "never stated anywhere at all"] });
+    const d2 = JSON.stringify({ checks: [{ name: "valid-365", run: "grep -q 365 out.txt" }], notes: [] });
+    const c2 = reply([{ name: "valid-365", verdict: "runs", quote: "" }]);
+    const r = replying([d1, c1, d2, c2]);
+    const out = await draftCriteriaCritiqued({ task: TASK, scripts: [], barChecks: [], baseUrl: "http://p.test/v1", model: "m", fetchFn: r.fetchFn });
+    assert.ok(out.ok);
+    assert.deepEqual(out.draft.checks.map((c) => c.name), ["greets", "valid-365"]);
+    assert.ok(out.critique.some((l) => /added valid-365 for what no check tested: "Valid for 365 days"$/.test(l)), out.critique.join("\n"));
+    assert.ok(r.bodies.at(-2)?.includes("Nothing tests these stated requirements yet"));
+  });
+
+  it("an uncovered requirement the task never states asks for nothing", () => {
+    const c = applyCritique(
+      { checks: [{ name: "greets", run: "grep -q hello out.txt" }], notes: [] },
+      JSON.stringify({ checks: [{ name: "greets", verdict: "runs", quote: "" }], uncovered: ["must finish in 2 seconds"] }),
+      TASK,
+    )!;
+    assert.deepEqual(c.uncovered, []);
   });
 
   it("changes nothing when the critic cannot be read", async () => {
