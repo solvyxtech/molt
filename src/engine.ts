@@ -2900,7 +2900,12 @@ export class Engine {
         // took, once it took long enough to matter. A model that knows the
         // suite is forty seconds stops re-running it to "double check", and
         // sets timeout_s before the next slow thing rather than after.
-        const ran = took >= SLOW_COMMAND_MS ? `\n[molt: ran ${fmtSeconds(took)}]` : "";
+        const held = r.heldOpen && !r.timedOut
+          ? "\n[molt: the command finished, but something it started is still running and holding its output, " +
+            "so its later output is not shown. Start servers with background=true, or redirect them " +
+            "(`cmd >/tmp/x.log 2>&1 &`).]"
+          : "";
+        const ran = (took >= SLOW_COMMAND_MS ? `\n[molt: ran ${fmtSeconds(took)}]` : "") + held;
         // One trailing newline is folded into the note so the result does not
         // end in a blank line; the model reads "slow\n[molt: ran 2.2s]".
         const body = (out: string) => (ran ? out.replace(/\n$/, "") : out);

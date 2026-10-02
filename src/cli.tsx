@@ -346,6 +346,12 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    // `--` ends the options: everything after it is the command and the task,
+    // however it starts. A task is free text and may itself begin with "- ".
+    if (a === "--") {
+      positional.push(...argv.slice(i + 1));
+      break;
+    }
     /**
      * The value belonging to `a`, or an error naming what is missing.
      *
@@ -582,7 +588,9 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         out.json = true;
         break;
       default:
-        if (a.startsWith("-")) throw new Error(`unknown option: ${a}`);
+        // No option contains whitespace, so a word with a space in it is the
+        // task, even one that starts with a dash ("- You are given…").
+        if (a.startsWith("-") && !/\s/.test(a)) throw new Error(`unknown option: ${a}`);
         positional.push(a);
     }
   }
@@ -1786,6 +1794,11 @@ function driftLines(drift: { kind: string; file: string; bound: string }[]): str
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
+  // The task text is on our command line, so `pkill -f server.py` from a model
+  // restarting the task's server matched molt itself and killed the run
+  // (Terminal-Bench kv-store-grpc, rstan-to-pystan: exit 143, no verdict).
+  // A plain title keeps the task out of `ps`, `pgrep -f` and `pkill -f`.
+  if (argv.length > 1) process.title = "maat";
   let args: Args;
   try {
     args = parseArgs(argv, storedEndpoint());

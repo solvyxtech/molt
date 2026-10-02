@@ -22,7 +22,7 @@ What this does, and why each part is the way it is:
   (exit 1) may still have done the task. Only exit 2 — usage or configuration —
   is raised, because that is a broken harness, not a failed task.
 
-- **Moves `.molt/` out of the task directory before grading.** Receipts, the
+- **Moves `.maat/` (`.molt/` on older builds) out of the task directory before grading.** Receipts, the
   journal and the ledger are molt's record, not the task's output. They are
   kept under the agent's logs so a trial can be audited afterwards.
 
@@ -254,15 +254,16 @@ class Molt(BaseInstalledAgent):
 
         # The exit code is recorded and, except for a usage error, swallowed:
         # harbor grades the disk, and a refused claim can still be a done task.
-        # `.molt/` is moved out of the way before the verifier looks, and
+        # The state folder is moved out of the way before the verifier looks, and
         # kept, so the receipts can be read on the host afterwards.
         command = (
             f"mkdir -p {shlex.quote(logs)}/config; "
             f'printf "%s" "$MOLT_TASK" > {shlex.quote(logs)}/instruction.txt; '
-            f'molt run {" ".join(flags)} "$MOLT_TASK" 2>&1 | tee {shlex.quote(logs)}/molt.jsonl; '
+            f'molt run {" ".join(flags)} -- "$MOLT_TASK" 2>&1 | tee {shlex.quote(logs)}/molt.jsonl; '
             "rc=${PIPESTATUS[0]}; "
             f"echo $rc > {shlex.quote(logs)}/exit-code; "
-            f"if [ -d .molt ]; then rm -rf {shlex.quote(logs)}/record; mv .molt {shlex.quote(logs)}/record; fi; "
+            # `.maat/` since the rename; `.molt/` from older builds.
+            f"for s in .maat .molt; do if [ -d $s ]; then rm -rf {shlex.quote(logs)}/record; mv $s {shlex.quote(logs)}/record; fi; done; "
             "[ \"$rc\" -ne 2 ]"
         )
         await self.exec_as_agent(environment, command=f"bash -c {shlex.quote(command)}", env=env)

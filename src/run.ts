@@ -39,9 +39,21 @@ export type RunResult = {
   timedOut: boolean;
   /** True when output was cut at `maxBuffer`. */
   truncated: boolean;
+  /**
+   * The command ended, but something it started (a server, a daemon) still
+   * held its output open, so molt stopped reading rather than wait for it.
+   */
+  heldOpen?: boolean;
 };
 
 const KILL_GRACE_MS = 2_000;
+
+/**
+ * How long to keep reading after the shell itself has exited. Output still in
+ * the pipe arrives within milliseconds; anything later belongs to a process
+ * the command left running, which may never close it.
+ */
+export const DRAIN_GRACE_MS = 1_000;
 
 /**
  * Run a command through the shell and resolve with what it did.
@@ -59,6 +71,9 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
         shell: true,
         env: opts.env,
         stdio: ["ignore", "pipe", "pipe"],
+        // Its own process group, so a timeout can kill everything the command
+        // started and not just the shell (see `kill`).
+        detached: process.platform !== "win32",
       });
     } catch (e) {
       reject(e as Error);
@@ -78,9 +93,29 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
      * this module exists to remove, arriving by a different road.
      */
     let killTimer: NodeJS.Timeout | undefined;
+    let drainTimer: NodeJS.Timeout | undefined;
+    /**
+     * The whole group, not the shell. Killing only the shell left a server it
+     * had started holding the output pipe, and "close" never came: Terminal-
+     * Bench's mailman, reshard-c4-data and install-windows trials sat on one
+     * such call until the harness killed them, molt's own deadline included.
+     */
+    const signalAll = (sig: NodeJS.Signals) => {
+      try {
+        if (child.pid && process.platform !== "win32") process.kill(-child.pid, sig);
+        else child.kill(sig);
+      } catch {
+        child.kill(sig);
+      }
+    };
     const kill = () => {
-      child.kill("SIGTERM");
-      killTimer = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS);
+      signalAll("SIGTERM");
+      killTimer = setTimeout(() => {
+        signalAll("SIGKILL");
+        // Killed, and still something holds the pipe (a process that left
+        // the group): stop reading so the call returns at all.
+        drainTimer ??= setTimeout(() => finish(child.exitCode, child.signalCode, true), DRAIN_GRACE_MS);
+      }, KILL_GRACE_MS);
       killTimer.unref?.();
     };
 
@@ -114,24 +149,35 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
     const onAbort = () => kill();
     opts.signal?.addEventListener("abort", onAbort, { once: true });
 
-    const finish = (code: number | null, signal: NodeJS.Signals | null) => {
+    const finish = (code: number | null, signal: NodeJS.Signals | null, heldOpen = false) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
+      if (drainTimer) clearTimeout(drainTimer);
       opts.signal?.removeEventListener("abort", onAbort);
-      resolve({ stdout, stderr, code, signal, timedOut, truncated });
+      if (heldOpen) {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+      }
+      resolve({ stdout, stderr, code, signal, timedOut, truncated, ...(heldOpen ? { heldOpen } : {}) });
     };
 
     // "close" rather than "exit": exit fires when the process ends, which can
     // be before its pipes have drained, and reading a command's output only to
-    // lose the last of it is its own quiet lie.
-    child.on("close", finish);
+    // lose the last of it is its own quiet lie. But a process the command
+    // started can hold the pipes open forever, so after exit the wait for
+    // "close" is bounded.
+    child.on("close", (code, signal) => finish(code, signal));
+    child.on("exit", (code, signal) => {
+      drainTimer ??= setTimeout(() => finish(code, signal, true), DRAIN_GRACE_MS);
+    });
     child.on("error", (e) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
+      if (drainTimer) clearTimeout(drainTimer);
       opts.signal?.removeEventListener("abort", onAbort);
       reject(e);
     });

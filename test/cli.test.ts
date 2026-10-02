@@ -57,6 +57,22 @@ describe("parseArgs", () => {
     assert.throws(() => parseArgs(["--nope"]), /unknown option/);
   });
 
+  // Terminal-Bench's pytorch-model-recovery task begins "- You are given…";
+  // molt refused it as an option and the trial scored 0 without a single step.
+  it("takes a task that starts with a dash as the task", () => {
+    const a = parseArgs(["run", "--json", "- You are given a state dict"]);
+    assert.equal(a.cmd, "run");
+    assert.equal(a.task, "- You are given a state dict");
+    assert.ok(a.json);
+  });
+
+  it("treats everything after -- as the command and task", () => {
+    const a = parseArgs(["--json", "--", "run", "--yes"]);
+    assert.equal(a.cmd, "run");
+    assert.equal(a.task, "--yes");
+    assert.ok(!a.yes);
+  });
+
   it("treats -h and --help alike", () => {
     assert.ok(parseArgs(["-h"]).help);
     assert.ok(parseArgs(["--help"]).help);

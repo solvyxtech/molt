@@ -220,6 +220,36 @@ describe("runCommand", () => {
     const r = await runCommand("exit 1", { cwd: ws() });
     assert.equal(r.code, 1);
   });
+
+  // Terminal-Bench mailman / reshard-c4-data / install-windows: a server
+  // started with a bare `&` kept the output pipe open, "close" never came,
+  // and the trial hung until the harness killed it.
+  it("returns when the command exits even though a server it started holds the pipe", async () => {
+    const started = Date.now();
+    const r = await runCommand("sleep 30 & echo up", { cwd: ws(), timeoutMs: 20_000 });
+    assert.ok(Date.now() - started < 5_000, `waited ${Date.now() - started}ms on the server's pipe`);
+    assert.equal(r.code, 0);
+    assert.equal(r.stdout, "up\n");
+    assert.equal(r.heldOpen, true);
+    assert.equal(r.timedOut, false);
+  });
+
+  it("does not flag a command whose pipes closed normally", async () => {
+    const r = await runCommand("echo hi", { cwd: ws() });
+    assert.equal(r.heldOpen, undefined);
+  });
+
+  it("kills what a timed-out command started, not only the shell", async () => {
+    const dir = ws();
+    const started = Date.now();
+    const r = await runCommand("sh -c 'sleep 30; echo late > survived' & sleep 30", { cwd: dir, timeoutMs: 300 });
+    assert.ok(Date.now() - started < 6_000, `hung ${Date.now() - started}ms after the timeout`);
+    assert.equal(r.timedOut, true);
+    // The child got the group's signal: no grandchild is left sleeping.
+    const { execSync } = await import("node:child_process");
+    const left = execSync("pgrep -f 'echo late > survived' || true").toString().trim();
+    assert.equal(left, "", `the server outlived the timeout: pids ${left}`);
+  });
 });
 
 describe("molt while it works", () => {
