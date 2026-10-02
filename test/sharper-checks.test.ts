@@ -7,7 +7,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { formatBarFailure } from "../src/bar.js";
-import { applyCritique, draftCriteria, draftCriteriaCritiqued, repairEscapes } from "../src/criteria.js";
+import { applyCritique, draftCriteria, draftCriteriaCritiqued, repairEscapes, taskChecksFrom } from "../src/criteria.js";
 import { arbitrate, parseDisputes, quotedIn } from "../src/dispute.js";
 import { Engine } from "../src/engine.js";
 import type { BarResult, Check } from "../src/types.js";
@@ -91,6 +91,41 @@ describe("a disputed check, in a turn", () => {
     } finally {
       ws.cleanup();
     }
+  });
+
+  // Terminal-Bench pytorch-model-recovery: the one check that ran the model
+  // was retired, "it loads, the weights match" was left, and that carried a
+  // verified the grader failed on the first forward() call.
+  it("retiring the checks that ran the work leaves a claim unverified when what remains only looks", async () => {
+    const ws = workspace();
+    try {
+      const looks: Check[] = [{ ...checks[0]!, tags: ["task", "surface"] }, checks[1]!];
+      const yes = JSON.stringify({ contradicts: true, quote: "Valid for 365 days", reason: "the task says 365" });
+      const provider = scriptedProvider([
+        { calls: [{ name: "write_file", args: { path: "out.txt", content: "hello 365\n" } }] },
+        { text: "Done." },
+        { text: 'DISPUTE too-strict: "Valid for 365 days" — the check demands 366' },
+        { text: yes }, { text: yes }, { text: yes },
+      ]);
+      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high" });
+      const events = await drain(engine.run(TASK, allowAll, { taskChecks: looks }));
+      const end = events.find((e) => e.kind === "job_end");
+      assert.ok(end && end.kind === "job_end");
+      assert.equal(end.outcome, "unverified");
+      assert.ok(events.some((e) => e.kind === "info" && /what is left only looks at it/.test(e.text)));
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("the critic's surface reading reaches the sealed check as a tag", () => {
+    const c = applyCritique(
+      { checks: [{ name: "exists", run: "test -f out.txt" }, { name: "runs", run: "./tool in > out" }], notes: [] },
+      JSON.stringify({ checks: [{ name: "exists", verdict: "surface", quote: "" }, { name: "runs", verdict: "runs", quote: "" }] }),
+      TASK,
+    )!;
+    const sealed = taskChecksFrom({ checks: c.kept, notes: [] }, { hidden: true });
+    assert.deepEqual(sealed.taskChecks.map((t) => t.tags), [["task", "surface"], ["task"]]);
   });
 
   it("a rejected dispute leaves the check standing and tells the model so", async () => {
@@ -235,6 +270,24 @@ describe("a draft that does not parse", () => {
     const out = await draftCriteria({ task: TASK, scripts: [], barChecks: [], baseUrl: "http://p.test/v1", model: "m", fetchFn: r.fetchFn });
     assert.ok(out.ok);
     assert.deepEqual(out.draft.checks.map((c) => c.name), ["exists"]);
+    assert.equal(r.calls(), 2);
+  });
+
+  // Terminal-Bench db-wal-recovery / install-windows: two empty replies in a
+  // row and the task ran with no checks; the same prompt drafted fine later.
+  it("asks again after a pause when the replies came back empty", async () => {
+    const good = JSON.stringify({ checks: [{ name: "exists", run: "test -f out.txt" }], notes: [] });
+    const r = replying(["", "", "", good]);
+    const out = await draftCriteria({ task: TASK, scripts: [], barChecks: [], baseUrl: "http://p.test/v1", model: "m", fetchFn: r.fetchFn, emptyRetryDelayMs: 1 });
+    assert.ok(out.ok);
+    assert.deepEqual(out.draft.checks.map((c) => c.name), ["exists"]);
+    assert.equal(r.calls(), 4);
+  });
+
+  it("does not keep asking when the model answers with something that is not JSON", async () => {
+    const r = replying(["prose", "more prose", "never asked"]);
+    const out = await draftCriteria({ task: TASK, scripts: [], barChecks: [], baseUrl: "http://p.test/v1", model: "m", fetchFn: r.fetchFn, emptyRetryDelayMs: 1 });
+    assert.ok(!out.ok);
     assert.equal(r.calls(), 2);
   });
 });

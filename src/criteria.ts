@@ -27,7 +27,12 @@ import { askModel } from "./ask.js";
 import { runCommand } from "./run.js";
 import { diagnoseFailure } from "./bar.js";
 
-export type DraftedCheck = { name: string; run: string };
+/**
+ * `surface`: the critic read it as only looking (a file exists, a word
+ * appears, it compiles) rather than running the deliverable. Kept, but such a
+ * check alone cannot carry a "verified" once the ones that ran it are retired.
+ */
+export type DraftedCheck = { name: string; run: string; surface?: true };
 export type Draft = { checks: DraftedCheck[]; notes: string[] };
 
 /** Same bounds the drafter uses — applied again at `session:run`. */
@@ -73,6 +78,7 @@ export function sanitizeCriteria(raw: unknown): Draft {
         .map((c) => ({
           name: c.name.trim().slice(0, CRITERIA_MAX_NAME),
           run: c.run.trim(),
+          ...(c.surface === true ? { surface: true as const } : {}),
         }))
     : [];
   const notes: string[] = Array.isArray(o.notes)
@@ -111,7 +117,7 @@ export function taskChecksFrom(
       run: c.run,
       timeoutMs: 120_000,
       expectExit: 0,
-      tags: ["task"],
+      tags: c.surface ? ["task", "surface"] : ["task"],
       ...(opts.hidden ? { hidden: true } : {}),
     })),
     taskNotes: drafted.notes,
@@ -359,6 +365,8 @@ export async function draftCriteria(opts: {
   agyRun?: (cmd: string, args: string[], opts: object) => Promise<{ stdout: string }>;
   /** How long the HTTP question may wait for its answer; see askTimeoutMs. Tests only. */
   timeoutMs?: number;
+  /** Pause before re-asking after empty replies (EMPTY_DRAFT_DELAY_MS). Tests only. */
+  emptyRetryDelayMs?: number;
   reasoningEffort?: string;
   /** What is installed, so a check never calls a command that is not (see commandsHere). */
   commands?: { present: string[]; missing: string[] };
@@ -423,8 +431,39 @@ export async function draftCriteria(opts: {
   });
   if (!again.ok) return first;
   const second = drafted(again.text, again.cutOff);
-  return second.ok ? second : first;
+  if (second.ok) return second;
+  // Empty twice is the provider, not the prompt: on Terminal-Bench two trials
+  // of ten got two empty replies back to back and ran with no checks at all,
+  // while the same prompt drafted 4 of 4 a minute later. So an empty reply is
+  // asked again after a pause, up to EMPTY_DRAFT_RETRIES more times.
+  for (let i = 0; i < EMPTY_DRAFT_RETRIES && again.text.trim() === "" && first.ok === false; i++) {
+    await new Promise((r) => setTimeout(r, (opts.emptyRetryDelayMs ?? EMPTY_DRAFT_DELAY_MS) * (i + 1)));
+    const more = await askModel({
+      baseUrl: opts.baseUrl,
+      apiKey: opts.apiKey,
+      model: opts.model,
+      system: SYSTEM,
+      prompt: context,
+      cwd: opts.cwd,
+      what: "drafting criteria",
+      fetchFn: opts.fetchFn,
+      claudeCodeSdk: opts.claudeCodeSdk,
+      acpSpawn: opts.acpSpawn,
+      agyRun: opts.agyRun,
+      timeoutMs: opts.timeoutMs,
+      reasoningEffort: opts.reasoningEffort,
+    });
+    if (!more.ok) break;
+    const d = drafted(more.text, more.cutOff);
+    if (d.ok) return d;
+    if (more.text.trim() !== "") break;
+  }
+  return first;
 }
+
+/** Further asks after two empty draft replies, and the pause before the first. */
+export const EMPTY_DRAFT_RETRIES = 2;
+export const EMPTY_DRAFT_DELAY_MS = 4_000;
 
 /**
  * A second, fresh reading of a draft, before it is sealed.
@@ -500,7 +539,7 @@ export function applyCritique(draft: Draft, reply: string, task: string): Critiq
       dropped.push({ name: c.name, verdict: v.verdict, quote: v.quote });
       continue;
     }
-    kept.push(c);
+    kept.push(v?.verdict === "surface" ? { ...c, surface: true } : c);
     if (!v || v.verdict === "runs") runs += 1;
   }
   return { kept, dropped, surfaceOnly: runs === 0 && kept.length > 0 };

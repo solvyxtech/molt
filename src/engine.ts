@@ -5973,10 +5973,21 @@ export class Engine {
       }
 
       // Every check was retired: nothing is left to judge the claim, so it is
-      // reported the way an unchecked answer is — unverified.
-      if (retiredNow > 0 && (barNow()?.checks.length ?? 0) === 0) {
+      // reported the way an unchecked answer is — unverified. The same when
+      // what is left of the task's checks only looks: Terminal-Bench
+      // pytorch-model-recovery retired the one check that ran the model, and
+      // "the file loads, the weights match" carried a verified the grader
+      // failed on the first forward() call.
+      const liveTask = (barNow()?.checks ?? []).filter((c) => c.tags?.includes("task"));
+      const onlyLooks = liveTask.length > 0 && liveTask.every((c) => c.tags?.includes("surface"));
+      if (retiredNow > 0 && ((barNow()?.checks.length ?? 0) === 0 || onlyLooks)) {
         this.turnAllRetired = true;
-        yield { kind: "info", text: "every check was retired by dispute — this claim is unverified." };
+        yield {
+          kind: "info",
+          text: onlyLooks
+            ? "the checks that ran the work were retired by dispute; what is left only looks at it — this claim is unverified."
+            : "every check was retired by dispute — this claim is unverified.",
+        };
         log?.append("session_end", { reason: "unverified: every check retired" });
         if (claim) yield { kind: "assistant_text", text: redact(claim, this.secrets()), streamed: streamedContent };
         return;
