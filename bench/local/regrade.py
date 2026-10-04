@@ -21,8 +21,8 @@ for r in rows:
     if not d.is_dir():
         continue
     ok, why = by[r["task"]].grade(d)
-    if ok != r["passed"]:
-        changed += 1
+    if ok != r["passed"] or why != r["why"]:
+        changed += ok != r["passed"]
         print(f"{r['task']} {r['agent']} {r['rep']}: {r['passed']} -> {ok}  ({r['why'][:60]} -> {why[:60]})")
         r["passed"], r["why"] = ok, why
 print(f"{changed} changed of {len(rows)}")
