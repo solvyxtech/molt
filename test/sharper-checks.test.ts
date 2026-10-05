@@ -130,6 +130,47 @@ describe("a disputed check, in a turn", () => {
     assert.deepEqual(sealed.taskChecks.map((t) => t.tags), [["task", "surface"], ["task"]]);
   });
 
+  it("revealOnStuck: a hidden check failing the same way twice is shown once, and the turn goes on", async () => {
+    const ws = workspace();
+    try {
+      const provider = scriptedProvider([
+        { calls: [{ name: "write_file", args: { path: "out.txt", content: "hello\n" } }] },
+        { text: "Done." },
+        { calls: [{ name: "write_file", args: { path: "out.txt", content: "hello again\n" } }] },
+        { text: "Done again." },
+        { calls: [{ name: "write_file", args: { path: "out.txt", content: "hello 366\n" } }] },
+        { text: "Fixed." },
+      ]);
+      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high", revealOnStuck: true });
+      const events = await drain(engine.run(TASK, allowAll, { taskChecks: checks }));
+      assert.ok(events.some((e) => e.kind === "info" && /showing the model its command once/.test(e.text)));
+      assert.ok(provider.bodies.some((b) => b.includes("too-strict: `grep -q 366 out.txt`")), "the command was shown");
+      const end = events.find((e) => e.kind === "job_end");
+      assert.ok(end && end.kind === "job_end" && end.outcome === "verified");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("without revealOnStuck, the same repeat failure ends the turn", async () => {
+    const ws = workspace();
+    try {
+      const provider = scriptedProvider([
+        { calls: [{ name: "write_file", args: { path: "out.txt", content: "hello\n" } }] },
+        { text: "Done." },
+        { calls: [{ name: "write_file", args: { path: "out.txt", content: "hello again\n" } }] },
+        { text: "Done again." },
+        { text: "unreached" },
+      ]);
+      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high" });
+      const events = await drain(engine.run(TASK, allowAll, { taskChecks: checks }));
+      assert.ok(events.some((e) => e.kind === "info" && /failed in exactly the same way twice/.test(e.text)));
+      assert.ok(!provider.bodies.some((b) => b.includes("grep -q 366")), "a hidden command leaked");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
   it("a rejected dispute leaves the check standing and tells the model so", async () => {
     const ws = workspace();
     try {

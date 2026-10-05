@@ -1174,6 +1174,14 @@ export type EngineConfig = {
    */
   retryReasoningEffort?: string;
   /**
+   * When the turn's own drafted (hidden) checks fail the same way twice, show
+   * the model those checks' commands once and let it go on — fix the work or
+   * dispute the check — instead of stopping. On Terminal-Bench that stop came
+   * with right work 34 times and wrong work 33: a coin flip, a fifth of tasks.
+   * Off by default until measured.
+   */
+  revealOnStuck?: boolean;
+  /**
    * Review a verified claim independently and label it (src/review.ts):
    * `votes` reviews of the task text and the receipt; a majority-backed,
    * task-quoted violation makes the claim "passed its checks, unconfirmed".
@@ -4546,6 +4554,7 @@ export class Engine {
     let lastResult: BarResult | null = null;
     /** The previous attempt's failures, to notice a bar going nowhere. */
     let lastFailure = "";
+    let revealedThisTurn = false;
     let lastReceipt: string | undefined;
     let lastReceiptPath: string | undefined;
     /** The reviewers' findings have been put to the model once this turn. */
@@ -6138,7 +6147,20 @@ export class Engine {
         .filter((r) => !r.ok)
         .map((r) => `${r.name}:${r.output.trim()}`)
         .join("|");
-      const stuck = !result.ok && signature === lastFailure;
+      let stuck = !result.ok && signature === lastFailure;
+      // Experiment (revealOnStuck): once per turn, a repeat failure of hidden
+      // drafted checks only is answered by showing their commands, not a stop.
+      const stuckHidden = result.results.filter((r) => !r.ok && !r.advisory);
+      const revealNow =
+        stuck &&
+        this.cfg.revealOnStuck === true &&
+        !revealedThisTurn &&
+        stuckHidden.length > 0 &&
+        stuckHidden.every((r) => (barNow()?.checks ?? []).find((c) => c.name === r.name)?.hidden === true);
+      if (revealNow) {
+        revealedThisTurn = true;
+        stuck = false;
+      }
       const stuckChecks = stuck
         ? result.results.filter((r) => !r.ok).map((r) => r.name)
         : [];
@@ -6362,6 +6384,20 @@ export class Engine {
         result.results.filter((r) => !r.ok && !r.advisory).map((r) => r.name).join(", "),
       );
       this.transcript.pushBarFailure(formatBarFailure(result, proofAttempts, maxAttempts));
+      if (revealNow) {
+        const shown = stuckHidden.map((r) => {
+          const c = (barNow()?.checks ?? []).find((k) => k.name === r.name);
+          return `- ${r.name}: \`${c && "run" in c ? c.run : "?"}\``;
+        });
+        yield { kind: "info", text: `the same hidden check failed twice; showing the model ${stuckHidden.length === 1 ? "its command" : "their commands"} once` };
+        this.transcript.push({
+          role: "user",
+          content:
+            `[molt] The same check failed the same way twice. These are the commands that ran:\n${shown.join("\n")}\n` +
+            `Read the task again. If your work is wrong, fix it. If a check demands something the task ` +
+            `does not say, do not bend the work to it: reply DISPUTE <check name>: "<exact words from the task>".`,
+        });
+      }
     }
 
     yield {

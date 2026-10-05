@@ -74,6 +74,7 @@ class Molt(BaseInstalledAgent):
         reasoning: str | None = None,
         steps: int = 300,
         batch: bool | str = False,
+        reveal_stuck: bool | str = False,
         reasoning_checks: str | None = None,
         reasoning_retry: str | None = None,
         review: int | str | None = None,
@@ -102,6 +103,7 @@ class Molt(BaseInstalledAgent):
         self._steps = int(steps)
         # Batch mode: one act call per reply carrying a list of actions.
         self._batch = str(batch).lower() in ("1", "true", "yes", "on")
+        self._reveal_stuck = str(reveal_stuck).lower() in ("1", "true", "yes", "on")
         # Effort for drafting checks only, and for steps after a refusal.
         self._reasoning_checks = reasoning_checks
         self._reasoning_retry = reasoning_retry
@@ -245,6 +247,8 @@ class Molt(BaseInstalledAgent):
         flags.append(f"--steps {self._steps}")
         if self._batch:
             flags.append("--batch")
+        if self._reveal_stuck:
+            flags.append("--reveal-stuck")
         if self._reasoning_checks:
             flags.append(f"--reasoning-checks {shlex.quote(str(self._reasoning_checks))}")
         if self._review:

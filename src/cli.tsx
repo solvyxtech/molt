@@ -138,6 +138,9 @@ options
                      the task and the receipt; a majority-backed violation quoted
                      from the task labels the work "passed its checks,
                      unconfirmed". A label only: nothing is refused or redone.
+  --reveal-stuck     experimental: when its own hidden checks fail the same way
+                     twice, show the model their commands once instead of
+                     stopping
   --batch            batch mode: every reply is one act call carrying a plan and
                      a list of actions, for models that make one tool call per
                      reply. Each action is still approved, recorded and checked
@@ -232,6 +235,8 @@ type Args = {
   steps?: number;
   /** `--batch`: the model's only tool is act — a plan and a list of actions per reply. */
   batch?: boolean;
+  /** `--reveal-stuck`: see EngineConfig.revealOnStuck. Experimental. */
+  revealStuck?: boolean;
   /** `--review [n]`: independent review of a verified claim, n votes (default 3). A label, not a gate. */
   review?: number;
   attempts?: number;
@@ -438,6 +443,9 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         break;
       case "--batch":
         out.batch = true;
+        break;
+      case "--reveal-stuck":
+        out.revealStuck = true;
         break;
       case "--review": {
         // Optional count: `--review` alone is three votes.
@@ -683,6 +691,7 @@ function buildEngine(args: Args, session = false): Engine {
     retryReasoningEffort: args.reasoningRetry,
     maxSteps: args.steps,
     batch: args.batch === true,
+    ...(args.revealStuck ? { revealOnStuck: true } : {}),
     ...(args.review ? { review: { votes: args.review, reasoningEffort: args.reasoningChecks ?? args.reasoning } } : {}),
     // MAAT_JUDGMENT=0: no judgment cases (benchmarks, where no person will ever rule).
     ...(env("JUDGMENT") === "0" ? { judgment: false } : {}),
