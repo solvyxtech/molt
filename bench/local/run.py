@@ -19,7 +19,9 @@ from pathlib import Path
 from tasks import TASKS
 
 HERE = Path(__file__).resolve().parent
-WORK = HERE / "work"
+# Outside every git repository: a task folder inside this one let agents'
+# `git commit` walk up and commit task files into molt-desktop's main.
+WORK = Path(os.environ.get("BENCH_WORK", Path.home() / ".cache/maat-bench/work"))
 MOLT = Path.home() / os.environ.get("MOLT_DIST", "Documents/molt-desktop/dist-compare") / "cli.js"
 DROID = Path.home() / ".local/bin/droid"
 LIMIT = 600  # seconds per task

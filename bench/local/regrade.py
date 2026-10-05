@@ -13,11 +13,12 @@ from tasks2 import TASKS2
 
 HERE = Path(__file__).resolve().parent
 out = HERE / os.environ.get("RESULTS", "results-v4.jsonl")
+WORK = Path(os.environ.get("BENCH_WORK", Path.home() / ".cache/maat-bench/work"))
 by = {T.name: T for T in TASKS + TASKS2}
 rows = [json.loads(l) for l in out.read_text().splitlines()]
 changed = 0
 for r in rows:
-    d = HERE / "work" / f"{r['task']}-{r['agent']}-{r['rep']}"
+    d = WORK / f"{r['task']}-{r['agent']}-{r['rep']}"
     if not d.is_dir():
         continue
     ok, why = by[r["task"]].grade(d)

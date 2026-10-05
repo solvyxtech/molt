@@ -39,3 +39,4 @@ out-cli/
 .molt/mission/handoffs/
 *.tgz
 .molt/out/
+bench/local/work/
