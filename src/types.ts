@@ -447,6 +447,14 @@ export type EngineEvent =
   /** A fragment as it arrives. Render incrementally; do not accumulate twice. */
   | { kind: "delta"; text: string }
   /**
+   * A fragment of the model's reasoning, where the provider streams it apart
+   * from the answer (`reasoning_content` / `reasoning` on the OpenAI shape).
+   *
+   * Never part of the answer, never on the transcript, never a claim. A
+   * surface may show it or drop it; nothing molt judges reads it.
+   */
+  | { kind: "thought"; text: string }
+  /**
    * The assistant's message for this step is complete.
    *
    * Streamed prose does not end in a newline, so without an explicit end a
@@ -499,11 +507,32 @@ export type EngineEvent =
   | { kind: "stream_reset"; why: string }
   // Emitted before the tool runs, so a UI can say what is happening while it
   // happens. `tool` still follows on completion and carries the outcome.
-  | { kind: "tool_start"; name: string; detail: string }
+  | {
+      kind: "tool_start";
+      name: string;
+      detail: string;
+      /**
+       * The model's id for this call, and its arguments as JSON (redacted).
+       *
+       * A surface that renders one row per call — an editor's agent panel
+       * over ACP — has to tie the start, the permission prompt and the result
+       * to the same row, and the name alone does not: two reads in one step
+       * share it.
+       */
+      id?: string;
+      args?: string;
+    }
   | {
       kind: "tool";
       name: string;
       detail: string;
+      /** Same id as the `tool_start` (and the permission prompt) for this call. */
+      id?: string;
+      /**
+       * What a write did to the file, when it wrote one: the text before and
+       * after, as molt read and wrote them. Absent for a refused write.
+       */
+      diff?: FileDiff;
       note?: string;
       durationMs?: number;
       /** Exact arguments the model sent, as JSON. Capped, never reworded. */
@@ -610,7 +639,21 @@ export type EngineEvent =
   | { kind: "receipt"; path: string }
   | { kind: "shed"; before: number; after: number; dropped: number; path: string }
   | { kind: "info"; text: string }
-  | { kind: "error"; text: string };
+  | {
+      kind: "error";
+      text: string;
+      /**
+       * Which ceiling stopped the turn, when one did.
+       *
+       * The sentence is for a person; this is for a protocol that has to say
+       * why a turn ended in its own terms — ACP distinguishes running out of
+       * requests from running out of tokens — without parsing the sentence.
+       */
+      ceiling?: "steps" | "budget" | "turn";
+    };
+
+/** One file write, as the text before and after it. `oldText` null means the file was new. */
+export type FileDiff = { path: string; oldText: string | null; newText: string };
 
 /**
  * How a job ended, in molt's own terms.
@@ -634,7 +677,21 @@ export type JobOutcome =
   | "error"
   | "stopped";
 
-export type Confirm = (name: string, detail: string) => Promise<boolean>;
+/**
+ * Ask whether a gated tool call may run.
+ *
+ * `call` identifies the exact call being asked about, for a surface that
+ * shows the request against the call's own row. Optional, so every existing
+ * confirm that reads only the name and the detail is still one.
+ */
+export type Confirm = (name: string, detail: string, call?: ConfirmCall) => Promise<boolean>;
+
+export type ConfirmCall = {
+  id: string;
+  args: Record<string, unknown>;
+  /** The autonomy rule that made this a question, when it gave one. */
+  why?: string;
+};
 
 /** Honest estimate (≈ chars/4). Real usage comes from the API response. */
 export const estTokens = (s: string): number => Math.ceil(s.length / 4);

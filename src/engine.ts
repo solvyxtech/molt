@@ -123,6 +123,7 @@ import {
   type Bom,
   type Confirm,
   type EngineEvent,
+  type FileDiff,
   type LedgerEntry,
   type JobOutcome,
   type Msg,
@@ -1327,6 +1328,26 @@ export type EngineConfig = {
    * exactly the file that quietly accumulates credentials.
    */
   captureDir?: string;
+  /**
+   * Where file reads and writes go, when not straight to disk.
+   *
+   * An editor driving molt over ACP holds the files the person is looking at
+   * in buffers, some with changes not yet saved. Writing past it to disk
+   * clobbers those changes or leaves the buffer stale; reading past it gives
+   * the model a file the person is no longer looking at. So a surface that has
+   * the editor's buffers supplies these, and molt goes through them.
+   *
+   * The ledger still records what is on DISK afterwards, because that is what
+   * the bar reads: an editor that reformats on save changes the file molt
+   * wrote, and a hash of the text molt sent would then disagree with the tree.
+   * Either function may throw; molt then does the operation on disk itself.
+   */
+  files?: FileAccess;
+};
+
+export type FileAccess = {
+  read?: (absPath: string) => Promise<string>;
+  write?: (absPath: string, content: string) => Promise<void>;
 };
 
 /**
@@ -1502,13 +1523,13 @@ function num(v: unknown, fallback: number): number {
  * lines are left and the offset that continues it.
  */
 function readPart(
-  abs: string,
+  text: string,
   shown: string,
   offset: number,
   limit: number,
   cap = READ_MAX_BYTES,
 ): string {
-  const raw = readFileSync(abs, "utf8").split("\n");
+  const raw = text.split("\n");
   // A trailing newline is a terminator, not an empty last line. Counting it
   // reports 401 lines for a 400-line file, and every offset the model is told
   // to use is then one past what it means.
@@ -1566,6 +1587,18 @@ function readPart(
       ? `\n[molt: ${lines.length - i} more line(s). Continue with read_file offset=${i}.]`
       : "";
   return `${head}\n${out.join("\n")}${cappedNotice}${tail}`;
+}
+
+/**
+ * What a write result says when the file on disk is not the text the model
+ * sent — an editor formatted it on save. The model's next edit has to match
+ * what is there, so it is told rather than left to find out by a failed edit.
+ */
+function reshaped(sent: string, landed: string): string {
+  return sent === landed
+    ? ""
+    : ` [the editor reformatted it on save: the file now holds ${Buffer.byteLength(landed, "utf8")} ` +
+        `bytes, not the ${Buffer.byteLength(sent, "utf8")} sent — read it before editing it again]`;
 }
 
 /** Cut a string to at most `maxBytes` of UTF-8, without splitting a character. */
@@ -1822,6 +1855,12 @@ export class Engine {
    */
   private readPaths = new Set<string>();
   /**
+   * What each write did, by call id, until its `tool` event carries it out.
+   * A surface that shows edits as diffs needs the before and after text, and
+   * only runTool ever holds both.
+   */
+  private writeDiffs = new Map<string, FileDiff>();
+  /**
    * What the model did this turn, one line each, in order.
    *
    * The receipt is read by someone asking "what did it do, and should I
@@ -1878,6 +1917,20 @@ export class Engine {
   private standalone = false;
   private barHash: string | null;
   private inFlight?: AbortController;
+  /**
+   * A cancel that arrived while nothing was in flight.
+   *
+   * `cancel()` aborts the request or the command that is running, and until
+   * this existed that was all it did: a cancel that landed while molt was
+   * waiting on a permission answer, or between a tool and the next request,
+   * aborted nothing, and the turn carried on as if it had never been asked to
+   * stop. A surface that cancels whenever the person says so — an editor over
+   * ACP sends session/cancel at any moment — needs the turn to end at the next
+   * thing it would have started. Only set while a turn runs, so a cancel at
+   * an idle prompt cannot cancel the next turn before it begins.
+   */
+  private cancelRequested = false;
+  private turnActive = false;
   /** ctrl+C dropped the subscription session mid-step; the step reports a cancel, not a fault. */
   private ccCancelled = false;
   /** Aborts the command or bar check currently executing, if any. */
@@ -2084,6 +2137,7 @@ export class Engine {
    * that only cancelled the network would look like it had done nothing.
    */
   cancel(): void {
+    if (this.turnActive) this.cancelRequested = true;
     this.inFlight?.abort();
     this.running?.abort();
     /**
@@ -2717,6 +2771,56 @@ export class Engine {
     };
   }
 
+  /**
+   * A file's text, through the editor when there is one.
+   *
+   * A read the editor cannot serve — a path outside its project, a file it
+   * cannot open — falls back to disk rather than failing the call: the
+   * editor is where the freshest copy lives, not the only copy there is.
+   */
+  private async readText(abs: string): Promise<string> {
+    const read = this.cfg.files?.read;
+    if (read) {
+      try {
+        return await read(abs);
+      } catch {
+        /* the editor could not serve it; disk can */
+      }
+    }
+    return readFileSync(abs, "utf8");
+  }
+
+  /**
+   * Write a file, through the editor when there is one, and return what is
+   * on disk afterwards.
+   *
+   * The editor writes into its buffer and saves, and may format on the way.
+   * What it saved is what the bar will read, so that is what is returned and
+   * ledgered — not the text molt sent. An editor that took the write but did
+   * not save it leaves disk behind the buffer; molt then writes disk itself,
+   * so the two agree and the ledger names a file that exists.
+   */
+  private async writeText(abs: string, content: string): Promise<string> {
+    mkdirSync(dirname(abs), { recursive: true });
+    const write = this.cfg.files?.write;
+    if (write) {
+      const pre = sha256Of(abs);
+      try {
+        await write(abs, content);
+        if (existsSync(abs)) {
+          const landed = readFileSync(abs, "utf8");
+          // A buffer the editor accepted but never saved still holds the old
+          // text on disk. Only a changed file is evidence the save happened.
+          if (landed === content || sha256Of(abs) !== pre) return landed;
+        }
+      } catch {
+        /* the editor refused the write; disk will not */
+      }
+    }
+    writeFileSync(abs, content, "utf8");
+    return content;
+  }
+
   private overBudget(): boolean {
     return this.budgetTokens !== undefined && this.sessionTokens >= this.budgetTokens;
   }
@@ -2749,7 +2853,7 @@ export class Engine {
       case "read_file":
         this.readPaths.add(String(args.path ?? ""));
         return readPart(
-          resolve(this.cwd, String(args.path ?? "")),
+          await this.readText(resolve(this.cwd, String(args.path ?? ""))),
           String(args.path ?? ""),
           num(args.offset, 0),
           num(args.limit, Number.MAX_SAFE_INTEGER),
@@ -2767,22 +2871,25 @@ export class Engine {
         // The text as well as the hash: a hash proves the file changed, and
         // only the text can say whether the change was a comment.
         let priorText = "";
-        if (existsSync(abs)) {
+        const existed = existsSync(abs);
+        if (existed) {
           try {
-            priorText = readFileSync(abs, "utf8");
+            priorText = await this.readText(abs);
           } catch {
             /* unreadable: the change scores as substantive, which never blocks work */
           }
         }
-        const content = String(args.content ?? "");
+        const sent = String(args.content ?? "");
         // A whole file that is really a diff of one. Same failure as the
         // edit_file guard below, and the same one-step refusal.
         if (!isPatchPath(rel)) {
-          const why = diffSyntaxIn(content);
+          const why = diffSyntaxIn(sent);
           if (why) return `write refused: ${diffSyntaxRefusal("content", why)}`;
         }
-        mkdirSync(dirname(abs), { recursive: true });
-        writeFileSync(abs, content, "utf8");
+        // What landed, which is what the sent text became if an editor
+        // reformatted it on save. Everything below is measured on that.
+        const content = await this.writeText(abs, sent);
+        this.writeDiffs.set(callId, { path: abs, oldText: existed ? priorText : null, newText: content });
         const after = createHash("sha256").update(content, "utf8").digest("hex");
         const at = isAbsolute(rel) ? relative(this.cwd, abs) : rel;
         if (!isGenerated(at)) {
@@ -2800,6 +2907,7 @@ export class Engine {
         }
         return (
           `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${rel}` +
+          reshaped(sent, content) +
           (isGenerated(at)
             ? " [build output — written, but not counted as work: the next build overwrites it]"
             : "")
@@ -2843,7 +2951,7 @@ export class Engine {
         if (this.isReadOnly(rel, abs)) return readOnlyRefusal(rel);
         if (!existsSync(abs)) return `no such file: ${rel} — write_file creates a new one`;
         const before = sha256Of(abs);
-        const current = readFileSync(abs, "utf8");
+        const current = await this.readText(abs);
         const edit = applyEdit(
           current,
           String(args.old_text ?? ""),
@@ -2852,27 +2960,29 @@ export class Engine {
           { allowDiffText: isPatchPath(rel) },
         );
         if (!edit.ok) return `edit refused: ${edit.why}`;
-        writeFileSync(abs, edit.text, "utf8");
+        const landed = await this.writeText(abs, edit.text);
+        this.writeDiffs.set(callId, { path: abs, oldText: current, newText: landed });
         // Ledgered exactly like a write, so files-changed and record-intact
         // prove a surgical edit the same way they prove a whole-file rewrite.
         const editedAt = isAbsolute(rel) ? relative(this.cwd, abs) : rel;
         if (!isGenerated(editedAt)) {
-          const specGone = isTestPath(editedAt) ? removedAssertions(current, edit.text) : [];
+          const specGone = isTestPath(editedAt) ? removedAssertions(current, landed) : [];
           this.ledger.push({
             path: editedAt,
             before,
-            after: createHash("sha256").update(edit.text, "utf8").digest("hex"),
+            after: createHash("sha256").update(landed, "utf8").digest("hex"),
             callId,
-            substance: substanceOf(current, edit.text),
-            changedLines: changedLinesOf(current, edit.text),
+            substance: substanceOf(current, landed),
+            changedLines: changedLinesOf(current, landed),
             ...(specGone.length ? { specRemoved: specGone } : {}),
           });
           this.turnWrites.push({ path: editedAt, before });
         }
-        const delta = Buffer.byteLength(edit.text, "utf8") - Buffer.byteLength(current, "utf8");
+        const delta = Buffer.byteLength(landed, "utf8") - Buffer.byteLength(current, "utf8");
         return (
           `replaced ${edit.replacements} occurrence(s) in ${rel} · ` +
-          `${delta >= 0 ? "+" : ""}${delta} bytes`
+          `${delta >= 0 ? "+" : ""}${delta} bytes` +
+          reshaped(edit.text, landed)
         );
       }
 
@@ -3043,6 +3153,7 @@ export class Engine {
     // The bar is the longest-running thing molt does. It gets the same
     // cancellation handle a tool call gets, for the same reason.
     this.running = new AbortController();
+    if (this.cancelRequested) this.running.abort();
     try {
       return await this.runBarInner(bar, claim, t0);
     } finally {
@@ -3676,6 +3787,23 @@ export class Engine {
   ): AsyncGenerator<EngineEvent> {
     const job = ++this.jobCount;
     const startedAt = Date.now();
+    this.cancelRequested = false;
+    this.turnActive = true;
+    try {
+      yield* this.runSealedTurn(userText, confirm, opts, job, startedAt);
+    } finally {
+      this.turnActive = false;
+      this.cancelRequested = false;
+    }
+  }
+
+  private async *runSealedTurn(
+    userText: string,
+    confirm: Confirm,
+    opts: RunOptions,
+    job: number,
+    startedAt: number,
+  ): AsyncGenerator<EngineEvent> {
     const before = this.meter();
     this.turnStartedAt = startedAt;
     this.turnWrites = [];
@@ -4213,11 +4341,19 @@ export class Engine {
     // where the clock is honoured; the model is told, and the step loop
     // closes the turn the way any deadline closes one.
     const outOfTime = this.pastDeadline();
-    const allowed = outOfTime
+    // A turn being cancelled runs nothing more, asked or not — including a
+    // call whose permission question the cancel arrived during.
+    const asked = outOfTime || this.cancelRequested
       ? false
       : decision.ask
-        ? await ctx.confirm(name, `${detail}${decision.why ? ` — ${decision.why}` : ""}`)
+        ? await ctx.confirm(name, `${detail}${decision.why ? ` — ${decision.why}` : ""}`, {
+            id: callId,
+            args,
+            ...(decision.why ? { why: decision.why } : {}),
+          })
         : true;
+    const stopping = this.cancelRequested;
+    const allowed = asked && !stopping;
 
     let result: string;
     let note: string | undefined;
@@ -4226,6 +4362,7 @@ export class Engine {
       yield {
         kind: "tool",
         name,
+        id: callId,
         detail: "malformed arguments",
         note: "malformed",
         args: raw,
@@ -4260,10 +4397,18 @@ export class Engine {
         ? `[molt: the time budget for this turn is up — ${name} was not run, and no further ` +
           `call will be. Stop calling tools and answer now with what you have already found, ` +
           `saying plainly what is unfinished.]`
-        : "User denied this action.";
-      note = outOfTime ? "out of time" : "denied";
+        : stopping
+          ? "[molt: the turn was cancelled before this ran.]"
+          : "User denied this action.";
+      note = outOfTime ? "out of time" : stopping ? "cancelled" : "denied";
     } else {
-      yield { kind: "tool_start", name, detail };
+      yield {
+        kind: "tool_start",
+        name,
+        detail,
+        id: callId,
+        args: redact(capture(call.rawArgs), this.secrets()),
+      };
       const toolStartedAt = Date.now();
       // Scoped to this one call, so ctrl+C reaches the command that is
       // actually running and nothing that ran before it.
@@ -4390,9 +4535,21 @@ export class Engine {
     // screen a distribution channel like any other — and unlike the
     // prompt above, nobody is judging a command from the scrollback.
     const hide = (t: string) => redact(t, this.secrets());
+    const diff = this.writeDiffs.get(callId);
+    this.writeDiffs.delete(callId);
     yield {
       kind: "tool",
       name,
+      id: callId,
+      ...(diff
+        ? {
+            diff: {
+              path: diff.path,
+              oldText: diff.oldText === null ? null : hide(diff.oldText),
+              newText: hide(diff.newText),
+            },
+          }
+        : {}),
       detail: hide(detail),
       note,
       durationMs,
@@ -4684,6 +4841,17 @@ export class Engine {
      */
     let deadlineInterrupted = false;
     for (let step = 0; ; step++) {
+      // Cancelled while nothing was in flight — during a permission question,
+      // or between a tool and the next request. The next step is the next
+      // thing the turn would have started, so it is where the turn ends, with
+      // the same rollback and the same record as any other cancel.
+      if (this.cancelRequested) {
+        this.transcript.rollbackTo(turnStart);
+        const wrote = [...new Set(this.ledger.map((e) => e.path))];
+        log?.append("cancelled", { step, rolledBack: true, filesWritten: wrote });
+        yield { kind: "cancelled", filesWritten: wrote };
+        return;
+      }
       if (step >= stepCap) {
         if (!opts.onCeiling) break;
         const spent =
@@ -4723,6 +4891,7 @@ export class Engine {
         yield {
           kind: "error",
           text: `budget hit (${this.budgetTokens} tokens) — loop stopped. /budget to raise.`,
+          ceiling: "budget",
         };
         yield* this.salvage(`You have reached the token budget for this session.`, fetchFn, log);
         return;
@@ -4831,6 +5000,7 @@ export class Engine {
         });
         yield {
           kind: "error",
+          ceiling: "turn",
           text:
             `stopped: this turn has spent ${ceilingLine}, its ceiling for a single turn. Nothing ` +
             `was verified. Narrow the request, raise it with /budget, or remove it with ` +
@@ -5284,15 +5454,19 @@ export class Engine {
                 // endpoint a step is tens of seconds, and buffering meant the
                 // window showed nothing at all for the whole of it. Three runs in
                 // one session were cancelled during that silence.
-                const frag = new Fragments();
+                // Answer text and reasoning share one queue, tagged, so the
+                // loop below wakes for either and keeps their order.
+                const frag = new Fragments<{ text: string; thought?: true }>();
                 const safe = new SafeStream((t: string) => redact(t, this.secrets()));
+                const safeThought = new SafeStream((t: string) => redact(t, this.secrets()));
                 let streamAcc: StreamAccumulator | undefined;
                 let live = "";
                 shownThisAttempt = false;
                 const reading = readStream(
                   res.body!,
-                  (fragment) => frag.push(fragment),
+                  (fragment) => frag.push({ text: fragment }),
                   (a) => (streamAcc = a),
+                  (thought) => frag.push({ text: thought, thought: true }),
                 )
                   .then((r) => {
                     frag.finish();
@@ -5302,7 +5476,14 @@ export class Engine {
                     frag.finish();
                     throw e;
                   });
-                for await (const fragment of frag.drain()) {
+                for await (const piece of frag.drain()) {
+                  if (piece.thought) {
+                    // Redacted like the answer: reasoning quotes files too.
+                    const shown = safeThought.take(piece.text);
+                    if (shown) yield { kind: "thought", text: shown };
+                    continue;
+                  }
+                  const fragment = piece.text;
                   live += fragment;
                   const showable = safe.take(fragment);
                   if (showable) {
@@ -5318,6 +5499,8 @@ export class Engine {
                     yield { kind: "tool_pending", name };
                   }
                 }
+                const thoughtTail = safeThought.flush();
+                if (thoughtTail) yield { kind: "thought", text: thoughtTail };
                 const tail = safe.flush();
                 if (tail) {
                   streamedContent = true;
@@ -6402,6 +6585,7 @@ export class Engine {
 
     yield {
       kind: "error",
+      ceiling: "steps",
       text:
         `stopped after ${stepCap} steps (loop guard) · ${this.sessionTokens} tokens` +
         (this.costUsd() === undefined ? "" : ` · ${fmtUsd(this.costUsd() ?? 0)}`) +

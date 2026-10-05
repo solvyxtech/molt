@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 — molt in the editor
 
 ### Changed
 
@@ -73,6 +73,15 @@
   call limit is not a finished claim; the window honours `MOLT_CAPTURE_DIR`.
 
 ### Added
+
+- **`molt acp`: molt as an editor's agent.** Serves the Agent Client
+  Protocol (v1, as Zed builds it) on stdio. The editor sees streamed text and
+  reasoning, one row per tool call with a diff for every write, molt's own
+  permission questions, the bar as the plan, cost after every step — and the
+  bar's verdict as the last line of every turn. Edits go through the
+  editor's buffers when it offers them. See [docs/acp-server.md](docs/acp-server.md).
+  The editor's own pickers choose molt's model (grouped as subscriptions, API
+  keys and local), autonomy and reasoning effort.
 
 - **`tests-real` builtin (opt-in)**: refuses a test this turn added that
   cannot fail — a value compared with itself, no assertion, or a new test file

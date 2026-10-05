@@ -7,18 +7,19 @@
  * bar is not met, so molt can sit in CI, in a script, or in a benchmark
  * harness without a human watching.
  */
-import { acpAgentFor } from "./acp.js";
-import { isAgy } from "./agy.js";
-import { isClaudeCode } from "./claude-code.js";
+import { acpAgentFor, acpHealth } from "./acp.js";
+import { agyHealth, isAgy } from "./agy.js";
+import { claudeCodeHealth, isClaudeCode } from "./claude-code.js";
 import { expandEndpointShorthand } from "./endpoint.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
+import { formatWithOptions } from "node:util";
 import { resolve } from "node:path";
 import { Archive } from "./archive.js";
 import { isAutonomy, type Autonomy } from "./autonomy.js";
 import { fmtCost, fmtDuration } from "./banner.js";
 import { stepDid } from "./format.js";
 import { BarError, hasBar, loadBar, selectChecks, writeDefaultBar } from "./bar.js";
-import { Engine } from "./engine.js";
+import { Engine, type FileAccess } from "./engine.js";
 import { describeDrift, driftSince } from "./git.js";
 import { Journal } from "./journal.js";
 import { Judgments } from "./judgment.js";
@@ -36,8 +37,13 @@ import {
   fetchPricing,
   isSelfHosted,
   keyForUrl,
+  defaultConfigDir,
   needsPriceLookup,
+  planFor,
+  PROVIDERS,
   providerName,
+  readAuth,
+  saveEndpoint,
   savePricing,
   storedEndpoint,
   type StoredEndpoint,
@@ -96,6 +102,9 @@ usage
   maat prove                run .maat/done.yml now and exit
   maat init                 write a starter .maat/done.yml
   maat doctor               check the endpoint and model
+  maat acp                  run as an Agent Client Protocol agent on stdio, for an
+                            editor's agent panel (Zed). --acp works too. Endpoint,
+                            model, key and --autonomy come from the usual flags.
 
   maat receipts             list completion attempts (--grep, --show <file>, --repair)
   maat archive              list shed batches (--grep, --show <n>, --explain)
@@ -287,6 +296,8 @@ type Args = {
   json: boolean;
   help: boolean;
   version: boolean;
+  /** Serve ACP on stdio. `molt acp`, or `--acp` for launchers that want a flag. */
+  acp: boolean;
 };
 
 /** Parse a price, rejecting junk rather than letting NaN reach the meter. */
@@ -346,6 +357,7 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
     json: false,
     help: false,
     version: false,
+    acp: false,
   };
   const positional: string[] = [];
 
@@ -595,6 +607,9 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
       case "--json":
         out.json = true;
         break;
+      case "--acp":
+        out.acp = true;
+        break;
       default:
         // No option contains whitespace, so a word with a space in it is the
         // task, even one that starts with a dash ("- You are given…").
@@ -631,22 +646,36 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
  * thing do?", and a doctor invocation did not do a session.
  */
 function buildEngine(args: Args, session = false): Engine {
-  let bar = null;
   try {
-    bar = loadBar(args.cwd);
+    return engineFor(args, session);
   } catch (e) {
-    if (e instanceof BarError) {
+    if (e instanceof BarError || e instanceof EmptySelection) {
       process.stderr.write(`maat: ${e.message}\n`);
       process.exit(2);
     }
     throw e;
   }
+}
+
+class EmptySelection extends Error {
+  constructor() {
+    super("tag selection left no checks — refusing to run an empty bar");
+  }
+}
+
+/**
+ * The engine for `args`, throwing where buildEngine exits.
+ *
+ * An ACP session is built long after the process started, on a request from
+ * the editor, and a broken done.yml there is an answer to that request — the
+ * editor shows it — not a reason to kill the server every other session runs
+ * on.
+ */
+function engineFor(args: Args, session = false, extra: { files?: FileAccess } = {}): Engine {
+  let bar = loadBar(args.cwd);
   if (bar && (args.only?.length || args.skip?.length)) {
     bar = selectChecks(bar, { only: args.only, skip: args.skip });
-    if (bar.checks.length === 0) {
-      process.stderr.write("maat: tag selection left no checks — refusing to run an empty bar\n");
-      process.exit(2);
-    }
+    if (bar.checks.length === 0) throw new EmptySelection();
   }
   const journal = session ? new Journal(args.cwd) : undefined;
   journal?.append("session_start", {
@@ -701,6 +730,7 @@ function buildEngine(args: Args, session = false): Engine {
     autonomy: args.yes ? "high" : args.autonomy,
     unattended: session,
     sandbox: args.sandbox === true,
+    files: extra.files,
   });
 }
 
@@ -1377,6 +1407,122 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   return 0;
 }
 
+/**
+ * `molt acp` — serve the Agent Client Protocol on stdio until the editor
+ * closes it.
+ *
+ * Stdout carries protocol frames and nothing else. One stray line — a
+ * library's console.log, a warning printed the ordinary way — and the editor
+ * reads garbage where it expected JSON-RPC. So the real writer is taken once,
+ * here, and handed to the server; every other write to stdout for the life of
+ * the process is sent to stderr instead, where an editor keeps its agent log.
+ */
+async function cmdAcp(args: Args): Promise<number> {
+  const frame = process.stdout.write.bind(process.stdout);
+  const toStderr = process.stderr.write.bind(process.stderr) as (s: string) => boolean;
+  process.stdout.write = ((chunk: string | Uint8Array, ...rest: unknown[]) =>
+    (process.stderr.write as (c: string | Uint8Array, ...r: unknown[]) => boolean)(chunk, ...rest)) as typeof process.stdout.write;
+  const toLog = (...a: unknown[]) => void toStderr(`${formatWithOptions({ colors: false }, ...a)}\n`);
+  console.log = toLog;
+  console.info = toLog;
+  console.debug = toLog;
+
+  const { AcpServer } = await import("./acp-server.js");
+  const { discoverModels, readRememberedEndpoints } = await import(
+    "./acp-catalog.js"
+  );
+  const norm = (u: string) => u.trim().replace(/\/+$/, "");
+  /**
+   * `MOLT_ACP_SUBSCRIPTIONS=claude-code,grok-build` lists exactly those
+   * subscription backends without probing them. The probes spawn each CLI
+   * and open a session with it; this skips that, for a machine where the
+   * answer is known — and for tests, which must not depend on whose laptop
+   * has which CLI signed in.
+   */
+  const declared = process.env.MOLT_ACP_SUBSCRIPTIONS;
+  const subscriptionUsable = async (url: string): Promise<boolean> => {
+    if (declared !== undefined) {
+      const names = declared.split(",").map((n) => n.trim()).filter(Boolean);
+      return names.some((n) => PROVIDERS[n]?.url === url);
+    }
+    if (isClaudeCode(url)) return (await claudeCodeHealth()).ok;
+    if (isAgy(url)) return (await agyHealth()).ok;
+    const spec = acpAgentFor(url);
+    return spec ? (await acpHealth(spec)).ok : false;
+  };
+  const waitRaw = Number(process.env.MOLT_ACP_DISCOVERY_WAIT_MS);
+  const server = new AcpServer({
+    models: {
+      discover: () =>
+        discoverModels({
+          auth: readAuth(),
+          stored: storedEndpoint(),
+          remembered: readRememberedEndpoints(defaultConfigDir()),
+          current: { url: args.url, key: args.key, model: args.model || undefined },
+          listModels: (url, key) => new Engine({ baseUrl: url, apiKey: key, model: "probe", bar: null }).listModels(url, key),
+          subscriptionUsable,
+          log: (line) => void toStderr(`molt acp: ${line}\n`),
+        }),
+      ...(Number.isFinite(waitRaw) && waitRaw >= 0 ? { waitMs: waitRaw } : {}),
+      // What /model does in the terminal: point the engine, remember the
+      // choice in config.json, and re-price for the model now running.
+      apply: async (engine, url, model) => {
+        const flagged = norm(url) === norm(args.url);
+        const key = keyForUrl(url, flagged ? args.key : undefined);
+        if (norm(engine.baseUrl) !== norm(url)) engine.setBaseUrl(url, key, providerName(url));
+        engine.setModel(model);
+        saveEndpoint(url, model);
+        if (flagged && model === args.model && args.priceSource === "set by hand") {
+          engine.setPricing({ in: args.priceIn, out: args.priceOut, source: "set by hand" });
+          return;
+        }
+        // A price belongs to a model, and a plan is not a price.
+        engine.setPricing({});
+        if (planFor(url)) return;
+        await priceEngine(engine, { ...args, url, model, key, priceIn: undefined, priceOut: undefined });
+      },
+    },
+    write: (line) => void frame(line),
+    version: VERSION,
+    log: (line) => void toStderr(`${line}\n`),
+    // No model is not a reason to refuse the session any more: the editor's
+    // model picker can choose one, and a prompt without one is refused with
+    // a sentence saying so.
+    newEngine: async ({ cwd, files }) => {
+      const a: Args = { ...args, cwd };
+      const engine = engineFor(a, true, { files });
+      if (a.budget) engine.setBudget(a.budget);
+      await primeRepoMap(engine, a);
+      await priceEngine(engine, a);
+      return engine;
+    },
+  });
+
+  return new Promise<number>((done) => {
+    let ended = false;
+    const end = () => {
+      if (ended) return;
+      ended = true;
+      server.close();
+      // Frames already written may still be queued on a pipe; exiting before
+      // they drain would drop the last answers the editor is waiting for.
+      // Bounded, because a pipe that broke will never drain.
+      const late = setTimeout(() => done(0), 1000);
+      frame("", () => {
+        clearTimeout(late);
+        done(0);
+      });
+    };
+    // The editor closing the pipe is the end of the session, and so is a
+    // write to a pipe nobody reads any more.
+    process.stdout.on("error", end);
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (d: string) => server.feed(d));
+    process.stdin.on("end", end);
+    process.stdin.on("error", end);
+  });
+}
+
 async function cmdProve(args: Args): Promise<number> {
   if (!hasBar(args.cwd)) {
     process.stderr.write("maat: no .maat/done.yml here. run `maat init` first.\n");
@@ -1845,6 +1991,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     process.stderr.write(`maat: no such directory: ${args.cwd}\n`);
     return 2;
   }
+
+  // Before anything else can print: from here on stdout is the protocol.
+  if (args.acp || args.cmd === "acp") return cmdAcp(args);
 
   switch (args.cmd) {
     case "run":

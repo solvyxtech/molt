@@ -9,6 +9,8 @@
 > still `@solvyx/molt` and both the `maat` and `molt` commands work.
 
 [![check](https://github.com/solvyxtech/molt/actions/workflows/check.yml/badge.svg)](https://github.com/solvyxtech/molt/actions/workflows/check.yml)
+[![npm](https://img.shields.io/npm/v/@solvyx/molt.svg)](https://www.npmjs.com/package/@solvyx/molt)
+[![npm downloads](https://img.shields.io/npm/dm/@solvyx/molt.svg)](https://www.npmjs.com/package/@solvyx/molt)
 [![licence: Apache 2.0](https://img.shields.io/badge/licence-Apache%202.0-blue.svg)](LICENSE)
 
 Maat Agent is an open source coding agent for developers. Terminal CLI and Electron desktop. Written in TypeScript. It runs any OpenAI compatible model and Anthropic’s native API. Then it refuses to accept done until every check in your project’s `.maat/done.yml` passes (projects that already have `.molt/` keep using it) against the real state on disk. A completion is a claim. Maat checks the claim and writes a receipt either way.
@@ -16,6 +18,8 @@ Maat Agent is an open source coding agent for developers. Terminal CLI and Elect
 False done does not count. Acceptance lives outside the model. Every write gets before and after hashes. One receipt per attempt including refusals. A hash chained journal you can recompute with `maat verify`.
 
 Studio page: [solvyx.xyz/work/molt](https://solvyx.xyz/work/molt).
+
+How this differs from Stop hooks, Aider, Cursor, and CI alone: [COMPARISONS.md](COMPARISONS.md).
 
 Support ongoing maintenance via [GitHub Sponsors](https://github.com/sponsors/solvyxtech) or [Polar](https://polar.sh/solvyx).
 
@@ -183,6 +187,7 @@ molt run "fix the failing test" --criterion "gate=npm test -- fmtDuration"
 molt ask "what does the bar check?"         # a question: write checks are not applied
 molt prove                                  # run the bar now, no model
 molt verify                                 # recompute every hash chain
+molt acp                                    # serve ACP on stdio, for an editor's agent panel
 ```
 
 Exit codes: `0` the bar was met · `1` it was not · `2` usage · `3` finished
@@ -400,6 +405,7 @@ held to them.
 - [transparency.md](docs/transparency.md) — the journal, receipts, cost accounting, the integrity chain
 - [shed.md](docs/shed.md) — mechanical context compaction and the archive
 - [autonomy.md](docs/autonomy.md) — what runs without asking, and what never does
+- [acp-server.md](docs/acp-server.md) — `molt acp`: running molt as an editor's agent (Zed) over the Agent Client Protocol
 - [testing-charter.md](docs/testing-charter.md) — how to find bugs in molt
 - [audit-2026-09-02.md](docs/audit-2026-09-02.md) — the latest audit, live-model evidence, open decisions
 - [prior-art.md](docs/prior-art.md), [receipts.md](docs/receipts.md), [metrics.md](docs/metrics.md)
@@ -415,3 +421,7 @@ explicit about the list.
 ## Status
 
 Early and moving. The macOS build is unsigned. Apache 2.0 licence.
+
+## Star
+
+If molt caught a false done for you, starring the repo helps other builders find it.
