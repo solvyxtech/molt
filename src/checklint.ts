@@ -27,7 +27,9 @@
  *   L11 absolute path outside the project (strayPath)                  7
  *   L12 call to a function the project defines, wrong argument count  14
  *   L13 string literal passed to a project function, from nowhere      5
- *   L15 the check itself runs git checkout/merge/commit/…              .
+ *   L15 the check changes the work: git checkout/merge/commit/…, rm,
+ *       mv, sed -i, tee or a redirect into the project, a package
+ *       install (src/checkwrites.ts). Always on, MAAT_CHECK_LINT or not.
  * Left out as noisy in the replay: hand-computed numbers (L14) and paths not
  * in the tree (L10) — each fired as often on good checks as on bad ones.
  */
@@ -36,6 +38,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { swallowsExit, runnerPipedAway } from "./evidence.js";
 import { strayPath } from "./criteria.js";
+import { checkMutates } from "./checkwrites.js";
 
 export type LintHit = { rule: string; why: string };
 
@@ -352,10 +355,11 @@ export function lintAll(run: string, ctx: LintCtx): LintHit[] {
       }
     }
   }
-  // L15 the check performs the task
-  if (/\bgit\s+(checkout|merge|revert|reset|commit|add)\b/.test(cmd) && !low.includes("revert") && !low.includes("merge")) {
-    add("L15-mutates", "it changes the repository itself (checkout/merge/revert/reset/commit/add); a check only reads");
-  }
+  // L15 the check changes the work it judges (src/checkwrites.ts). No task
+  // wording excuses it: "merge them into master" is what the WORK must do, and
+  // a check that does the merge passes on its own effort.
+  const writes = checkMutates(cmd);
+  if (writes) add("L15-mutates", writes);
   return hits;
 }
 

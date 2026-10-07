@@ -282,8 +282,12 @@ describe("a hidden criterion", () => {
       assert.doesNotMatch(everything, /the-secret-command/, "the model never sees the command");
       const receipt = events.find((e) => e.kind === "receipt");
       assert.ok(receipt && "path" in receipt);
-      const text = readFileSync(receipt.path, "utf8");
-      assert.match(text, /the-secret-command/, "a person reading the receipt does");
+      // Not while the job runs (the worker can read the receipts folder); in the
+      // full twin written when it ends (src/withhold.ts).
+      assert.doesNotMatch(readFileSync(receipt.path, "utf8"), /the-secret-command/, "the receipt on disk during the job does not");
+      const full = engine.receipts!.fullPath(receipt.path);
+      assert.notEqual(full, receipt.path, "a full twin was written at job end");
+      assert.match(readFileSync(full, "utf8"), /the-secret-command/, "a person reading the full receipt does");
     } finally {
       ws.cleanup();
     }

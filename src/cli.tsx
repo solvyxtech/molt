@@ -1342,7 +1342,8 @@ async function sealDraft(draft: Draft, args: Args, late = false): Promise<Return
   }
   const taskChecks = sealed.taskChecks.filter((c) => !drop.has(c.name));
   if (!args.json) {
-    for (const c of taskChecks) process.stdout.write(`· criterion ${c.name}: ${c.run}\n`);
+    // Names only: the commands are printed when the job releases them (checks_released).
+    for (const c of taskChecks) process.stdout.write(`· criterion ${c.name} (command withheld until the job ends)\n`);
     for (const n of sealed.taskNotes) process.stdout.write(`· note ${n}\n`);
   }
   return { taskChecks, taskNotes: sealed.taskNotes, ...(sealed.requirements ? { requirements: sealed.requirements } : {}) };
@@ -1378,7 +1379,11 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   // break the line before saying anything of molt's own.
   let midLine = false;
 
-  const emit = (ev: EngineEvent) => {
+  const emit = (raw: EngineEvent) => {
+    // Hidden check commands stay out of the stream until the job releases
+    // them: a harness that tees this into a file the worker can read
+    // (bench/harbor) would otherwise hand them over (src/withhold.ts).
+    const ev = engine.maskEvent(raw);
     if (args.json) {
       process.stdout.write(JSON.stringify(ev) + "\n");
       return;
@@ -1511,6 +1516,10 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         break;
       case "info":
         process.stdout.write(`· ${ev.text}\n`);
+        break;
+      case "checks_released":
+        for (const c of ev.checks) process.stdout.write(`· criterion ${c.name}: ${c.run}\n`);
+        for (const r of ev.receipts) process.stdout.write(`· full receipt ${r}\n`);
         break;
       case "error":
         process.stderr.write(`maat: ${ev.text}\n`);

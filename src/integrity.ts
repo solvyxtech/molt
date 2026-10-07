@@ -49,6 +49,19 @@ export type IntegrityEvent =
   | { kind: "session_start"; session: string; journalRoot: string }
   /** Context was shed to the archive. Binds the exuvia and journal root. */
   | { kind: "shed"; session: string; exuvia: string; exuviaSha: string; journalRoot: string }
+  /**
+   * A receipt's full twin was written when the job ended (src/withhold.ts):
+   * the receipt itself carried hidden check commands masked. Bound like a
+   * receipt; `receiptFile` is relative to the receipts folder (`full/…`).
+   */
+  | {
+      kind: "release";
+      session: string;
+      receiptFile: string;
+      receiptSha: string;
+      of: string;
+      journalRoot: string;
+    }
   /** A receipt was written. Binds the receipt file and journal root. */
   | {
       kind: "receipt";
@@ -246,7 +259,7 @@ export class Integrity {
     // what the ledger said it was at the moment of binding.
     for (const r of records) {
       const d = r.data;
-      if (r.kind === "receipt") {
+      if (r.kind === "receipt" || r.kind === "release") {
         const file = String(d.receiptFile ?? "");
         const bound = String(d.receiptSha ?? "");
         if (!file) continue;

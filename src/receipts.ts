@@ -13,6 +13,10 @@ import { join } from "node:path";
 import { MIN_SECRET_CHARS, redact } from "./redact.js";
 import type { BarResult } from "./types.js";
 import { stateDir } from "./statedir.js";
+import { WITHHELD, maskDeep, maskText } from "./withhold.js";
+
+/** Where a receipt's full text goes when hidden commands were masked in it (src/withhold.ts). */
+export const FULL_DIR = "full";
 
 export type Receipt = {
   path: string;
@@ -284,6 +288,62 @@ export class Receipts {
     this.dir = stateDir(root, "receipts");
     mkdirSync(this.dir, { recursive: true });
     this.indexPath = join(this.dir, "index.jsonl");
+  }
+
+  /**
+   * Hidden check commands, masked in every receipt written until `release`
+   * (src/withhold.ts). The full text of each receipt written meanwhile is
+   * held here, in memory, and written to `full/` when the job ends: the
+   * worker can read this folder while it works.
+   */
+  private withheld: string[] = [];
+  private pending: { file: string; full: string }[] = [];
+
+  /** Mask these commands in every receipt from here until `release()`. */
+  withhold(commands: readonly string[]): void {
+    for (const c of commands) if (c && !this.withheld.includes(c)) this.withheld.push(c);
+  }
+
+  /**
+   * Stop masking, and write the full text of every receipt that was masked to
+   * `full/<file>`. Each receipt on disk stays byte for byte as written (it is
+   * hash-bound in the integrity ledger); the full twin is a new file. Returns
+   * what was written, relative to the receipts folder.
+   */
+  release(): { file: string; of: string; path: string }[] {
+    const out: { file: string; of: string; path: string }[] = [];
+    if (this.pending.length) {
+      const dir = join(this.dir, FULL_DIR);
+      mkdirSync(dir, { recursive: true });
+      for (const p of this.pending) {
+        const path = join(dir, p.file);
+        const [title, ...rest] = p.full.split("\n");
+        const text = [
+          title,
+          "",
+          `> The full text of \`${p.file}\`, written when the job ended. While the job ran, that file`,
+          `> carried each hidden check's command as \`${WITHHELD}\`; nothing else differs.`,
+          ...rest,
+        ].join("\n");
+        try {
+          writeFileSync(path, text, "utf8");
+          out.push({ file: `${FULL_DIR}/${p.file}`, of: p.file, path });
+        } catch {
+          // A full twin that could not be written leaves the masked receipt and
+          // the journal's released commands; the record is thinner, not wrong.
+        }
+      }
+    }
+    this.pending = [];
+    this.withheld = [];
+    return out;
+  }
+
+  /** The full twin of a receipt, once released; otherwise the receipt itself. */
+  fullPath(receiptPath: string): string {
+    const name = receiptPath.replace(/^.*[\\/]/, "");
+    const twin = join(this.dir, FULL_DIR, name);
+    return existsSync(twin) ? twin : receiptPath;
   }
 
   /** Register a value to mask in every receipt from here on. */
@@ -598,7 +658,20 @@ export class Receipts {
     // claim, a command, and a check's stdout are three different ways for the
     // same key to arrive, and a filter with three entry points has three
     // chances to miss one.
-    writeFileSync(p, redact([...head, ...rows, ...detail, ...foot].join("\n"), this.secrets), "utf8");
+    const full = redact([...head, ...rows, ...detail, ...foot].join("\n"), this.secrets);
+    const shown = maskText(full, this.withheld);
+    if (shown !== full) {
+      this.pending.push({ file, full });
+      writeFileSync(
+        p,
+        shown +
+          `\nHidden check commands are withheld from this file while the job runs; the seal above is a\n` +
+          `hash over them. The full receipt is written to \`${FULL_DIR}/${file}\` when the job ends.\n`,
+        "utf8",
+      );
+    } else {
+      writeFileSync(p, full, "utf8");
+    }
 
     const record: ReceiptRecord = {
       seq,
@@ -628,7 +701,7 @@ export class Receipts {
       ...(args.head ? { head: args.head.sha, ...(args.head.dirty ? { dirty: true } : {}) } : {}),
       file,
     };
-    appendFileSync(this.indexPath, redact(JSON.stringify(record), this.secrets) + "\n", "utf8");
+    appendFileSync(this.indexPath, redact(JSON.stringify(maskDeep(record, this.withheld)), this.secrets) + "\n", "utf8");
 
     return { path: p, attempt: args.attempt, verdict: args.verdict };
   }

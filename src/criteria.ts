@@ -31,6 +31,8 @@ import { namedInputs, profileLine } from "./inspect.js";
 import { askModel, type AskOptions } from "./ask.js";
 import { runCommand, draftedShell, bashPath } from "./run.js";
 import { lintAll, readTree, type LintCtx, type Tree } from "./checklint.js";
+import { checkMutates } from "./checkwrites.js";
+import { copyTree } from "./scratch.js";
 import { diagnoseFailure } from "./bar.js";
 import { normalizeRequirements } from "./signout.js";
 import { evidenceTags } from "./tiers.js";
@@ -307,9 +309,13 @@ export async function preflightCriteria(
       broken.push({ name: c.name, run: c.run, why: `it uses ${stray}, an absolute path outside the project (paths must be relative to the working directory)` });
       continue;
     }
+    // In a copy, like the bar (src/scratch.ts): tried before the work, a check
+    // that checks out a branch or deletes a file would change the folder the
+    // work starts from.
+    const copy = process.env.MAAT_CHECK_COPY === "0" ? null : copyTree(opts.cwd);
     try {
       const r = await runCommand(c.run, {
-        cwd: opts.cwd,
+        cwd: copy?.dir ?? opts.cwd,
         // Drafted checks (stray set) run under the shell the bar will use.
         shell: draftedShell({ hidden: !!opts.stray, tags: ["task"] }),
         timeoutMs: opts.timeoutMs ?? 5_000,
@@ -328,11 +334,13 @@ export async function preflightCriteria(
       const selfError = r.code !== (c.expectExit ?? 0) ? checkSelfError(`${r.stdout}\n${r.stderr}`) : null;
       if (d.didNotRun) broken.push({ name: c.name, run: c.run, why: d.hint ?? "did not run" });
       else if (unparsed) {
-        broken.push({ name: c.name, run: c.run, why: `the shell could not parse it: ${firstLine(r.stderr)}` });
+        broken.push({ name: c.name, run: c.run, why: `the shell could not parse it: ${firstLine(copy ? copy.unmap(r.stderr) : r.stderr)}` });
       } else if (selfError) broken.push({ name: c.name, run: c.run, why: selfError }); else if (!r.timedOut && r.code === (c.expectExit ?? 0)) opts.passed?.push(c.name);
     } catch {
       // Failing to spawn it here is molt's problem, not the criterion's.
       // Reporting it as broken would block work for the wrong reason.
+    } finally {
+      copy?.cleanup();
     }
   }
   return broken;
@@ -954,7 +962,9 @@ async function critiqued(
     for (const c of checks) {
       // Off unless MAAT_CHECK_LINT=1: in the v13 paired run the lint left fewer, shallower
       // checks sealed (the redraft lands after the seal), which cost passes and let wrong work through.
-      const hit = process.env.MAAT_CHECK_LINT === "1" ? lintAll(c.run, lintCtx)[0] : undefined;
+      // Except L15: a check that changes the work it judges is never sealed (checkwrites.ts).
+      const writes = checkMutates(c.run);
+      const hit = process.env.MAAT_CHECK_LINT === "1" ? lintAll(c.run, lintCtx)[0] : writes ? { rule: "L15-mutates", why: writes } : undefined;
       if (!hit) ok.push(c);
       else bad.push({ name: c.name, run: c.run, rule: hit.rule, why: hit.why, redraft });
     }

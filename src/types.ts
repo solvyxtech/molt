@@ -688,6 +688,11 @@ export type EngineEvent =
   | { kind: "receipt"; path: string }
   | { kind: "shed"; before: number; after: number; dropped: number; path: string }
   | { kind: "info"; text: string }
+  /**
+   * The hidden checks' commands, released once the work is over (src/withhold.ts).
+   * Until this event nothing Maat writes or prints quotes them.
+   */
+  | { kind: "checks_released"; seal: string; checks: { name: string; run: string }[]; receipts: string[] }
   | {
       kind: "error";
       text: string;

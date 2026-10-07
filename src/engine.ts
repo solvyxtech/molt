@@ -53,6 +53,7 @@ import {
 import { errorText } from "./format.js";
 import { MOLT_TOOL_NAMES, narratedCallIn, narratedCallNudge } from "./narrated.js";
 import { redact } from "./redact.js";
+import { WITHHELD_MIN_CHARS, commandSha, hiddenCommands, maskDeep, maskText } from "./withhold.js";
 import { Watchdog, envFirstByteMs, firstByteMs, probeError, probeSignal, requestIdleMs, waited, localSpeed, LatencyLearner } from "./watchdog.js";
 import {
   SKIP_DIRS,
@@ -2452,6 +2453,15 @@ export class Engine {
   private turnReview: Review | null | undefined = undefined;
   /** The task checks this turn sealed (set when they are sealed, which may be after the first reads). */
   private sealedChecks: readonly Check[] = [];
+  /** The notes sealed with them, for recomputing the seal when the commands are released. */
+  private sealedNotes: readonly string[] = [];
+  /**
+   * Text withheld from every record while this job runs: the commands of its
+   * hidden checks, and the reference check's source (src/withhold.ts). Held in
+   * memory only, and released — journalled in full, receipts' full twins
+   * written — when the job's work is over.
+   */
+  private withheld: { name: string; text: string }[] = [];
 
   /** The effort the next request carries. */
   private get effortNow(): string | undefined {
@@ -2632,6 +2642,72 @@ export class Engine {
     return ms > 0 && this.turnStartedAt > 0 && Date.now() - this.turnStartedAt >= ms;
   }
 
+  /** Withhold these checks' commands (the hidden ones) from every record until the job ends. */
+  private withholdChecks(checks: readonly Check[]): void {
+    for (const c of checks) {
+      if (c.kind !== "command" || hiddenCommands([c]).length === 0) continue;
+      this.withholdText(c.name, c.run);
+    }
+  }
+
+  /** Withhold one string (a command, a reference program) until the job ends. */
+  private withholdText(name: string, text: string): void {
+    if (!text || text.length < WITHHELD_MIN_CHARS || this.withheld.some((w) => w.text === text)) return;
+    this.withheld.push({ name, text });
+    this.cfg.journal?.withhold([text]);
+    this.cfg.receipts?.withhold([text]);
+  }
+
+  /** Text with every withheld string masked. Identity once the job's commands are released. */
+  maskWithheld(text: string): string {
+    return maskText(text, this.withheld.map((w) => w.text));
+  }
+
+  /** An event as it may be printed while the job runs: withheld strings masked. */
+  maskEvent<T>(ev: T): T {
+    return this.withheld.length ? maskDeep(ev, this.withheld.map((w) => w.text)) : ev;
+  }
+
+  /**
+   * The work is over: write what was withheld. The journal records each
+   * hidden command in full (the seal journalled before the work is a hash over
+   * them, so the two can be compared), each masked receipt gets its full twin
+   * under receipts/full/, bound into the integrity chain. Null when nothing
+   * was withheld. Idempotent.
+   */
+  private releaseWithheld(): Extract<EngineEvent, { kind: "checks_released" }> | null {
+    if (!this.withheld.length) return null;
+    const items = this.withheld;
+    this.withheld = [];
+    this.cfg.journal?.release();
+    const twins = this.cfg.receipts?.release() ?? [];
+    const checks = this.sealedChecks
+      .filter((c): c is Extract<Check, { kind: "command" }> => c.kind === "command" && items.some((w) => w.text === c.run))
+      .map((c) => ({ name: c.name, run: c.run }));
+    const other = items.filter((w) => !checks.some((c) => c.run === w.text));
+    const seal = this.sealedChecks.length || this.sealedNotes.length ? sealOf([...this.sealedChecks], [...this.sealedNotes]) : "";
+    this.cfg.journal?.append("note", {
+      kind: "checks-released",
+      text: `the work is over: ${checks.length} hidden check command(s) released`,
+      seal,
+      checks: checks.map((c) => ({ ...c, sha256: commandSha(c.run) })),
+      ...(other.length ? { withheld: other.map((w) => ({ name: w.name, text: w.text })) } : {}),
+      receipts: twins.map((t) => t.file),
+    });
+    for (const t of twins) {
+      if (!this.cfg.integrity || !this.cfg.journal) break;
+      this.cfg.integrity.append({
+        kind: "release",
+        session: this.cfg.journal.sessionId,
+        receiptFile: t.file,
+        receiptSha: sha256Of(t.path) ?? "",
+        of: t.of,
+        journalRoot: this.cfg.journal.chainRoot(),
+      });
+    }
+    return { kind: "checks_released", seal, checks, receipts: twins.map((t) => t.path) };
+  }
+
   /** Values that must not appear on screen or in a file molt writes. */
   private secrets(): (string | undefined)[] {
     return [this.cfg.apiKey, env("API_KEY"), process.env.OPENAI_API_KEY];
@@ -2768,7 +2844,7 @@ export class Engine {
     try {
       const rel = `${stateDirName(this.cwd)}/out/${callId.replace(/[^\w-]/g, "_")}.txt`;
       mkdirSync(stateDir(this.cwd, "out"), { recursive: true });
-      writeFileSync(join(this.cwd, rel), redact(text, this.secrets()), "utf8");
+      writeFileSync(join(this.cwd, rel), this.maskWithheld(redact(text, this.secrets())), "utf8");
       return rel;
     } catch {
       return null;
@@ -4007,7 +4083,7 @@ export class Engine {
         costUsd: this.costUsd() ?? null,
         costEstimated: this.costEstimated,
       };
-      writeFileSync(join(dir, name), redact(JSON.stringify(body, null, 1), this.secrets()), "utf8");
+      writeFileSync(join(dir, name), redact(JSON.stringify(this.maskEvent(body), null, 1), this.secrets()), "utf8");
     } catch {
       // A capture that could not be written is a training example lost, not a
       // turn broken. The receipt and the journal still hold the verdict.
@@ -4099,6 +4175,8 @@ export class Engine {
     try {
       yield* this.runSealedTurn(userText, confirm, opts, job, startedAt);
     } finally {
+      // A turn that threw or was abandoned still releases what it withheld.
+      this.releaseWithheld();
       this.turnActive = false;
       this.cancelRequested = false;
     }
@@ -4123,6 +4201,7 @@ export class Engine {
     this.turnReview = undefined;
     this.reviewSkipped = undefined;
     this.sealedChecks = [];
+    this.sealedNotes = [];
     this.turnCalls = new Set();
     // molt's records stay out of the project's `git status` (leftovers.ts).
     excludeMoltFromGit(this.cwd);
@@ -4173,6 +4252,11 @@ export class Engine {
       }
       yield ev;
     }
+
+    // The work is over; nothing the worker does from here can change the
+    // verdict, so the hidden commands may now be written (src/withhold.ts).
+    const released = this.releaseWithheld();
+    if (released) yield released;
 
     // Order matters: a bar that was never met is "not proven" even though an
     // error event follows it, and an answer nothing checked is never
@@ -4255,7 +4339,7 @@ export class Engine {
       yield { kind: "info", text: "reviewing the claim independently against the task text" };
       review = await reviewClaim({
         task: userText,
-        receipt: readFileSync(receiptPath, "utf8"),
+        receipt: readFileSync(this.cfg.receipts?.fullPath(receiptPath) ?? receiptPath, "utf8"),
         votes: this.cfg.review.votes,
         ask: {
           ...judgeTarget({ baseUrl: this.cfg.baseUrl, apiKey: this.cfg.apiKey, model: this.cfg.model }),
@@ -5116,6 +5200,8 @@ export class Engine {
     Object.freeze(taskNotes);
     taskSeal = taskChecks.length || taskNotes.length ? sealOf(taskChecks, taskNotes) : "";
     self.sealedChecks = taskChecks;
+    self.sealedNotes = taskNotes;
+    self.withholdChecks(taskChecks);
     if (taskSeal) {
       // Journalled before the first request, so the record shows the criteria
       // predating the work rather than merely claiming to.
@@ -5373,6 +5459,9 @@ export class Engine {
       if (taskChecks.some((c) => c.name === check.name)) return;
       taskChecks = Object.freeze([...taskChecks, check]) as Check[];
       self.sealedChecks = taskChecks;
+      self.withholdChecks([check]);
+      // The reference program is the check's expected values: withheld like a command.
+      if (typeof got.note.source === "string") self.withholdText(`${check.name} (reference source)`, got.note.source);
       bar = withTaskChecks(self.cfg.bar, taskChecks);
       log?.append("note", { text: "reference check joined the sealed checks", ...got.note });
       yield {
@@ -5452,6 +5541,8 @@ export class Engine {
       taskSeal = sealOf(taskChecks, taskNotes);
       requirements = normalizeRequirements([...requirements, ...(got?.requirements ?? [])]);
       self.sealedChecks = taskChecks;
+      self.sealedNotes = taskNotes;
+      self.withholdChecks(added);
       bar = withTaskChecks(self.cfg.bar, taskChecks);
       log?.append("note", {
         kind: "late-checks",
