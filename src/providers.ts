@@ -30,13 +30,21 @@ export type Provider = {
 
 export const PROVIDERS: Record<string, Provider> = {
   ollama: { url: "http://localhost:11434/v1", needsKey: false },
-  openrouter: { url: "https://openrouter.ai/api/v1", needsKey: true },
+  openrouter: {
+    url: "https://openrouter.ai/api/v1",
+    needsKey: true,
+    hint: "Your own OpenRouter API key (BYOK) — Maat does not pool or resell keys",
+  },
   anthropic: {
     url: "https://api.anthropic.com/v1",
     needsKey: true,
     hint: "Console API key (metered) — subscription logins are not permitted in third-party tools",
   },
-  openai: { url: "https://api.openai.com/v1", needsKey: true },
+  openai: {
+    url: "https://api.openai.com/v1",
+    needsKey: true,
+    hint: "Your own OpenAI API key (BYOK) — Maat does not pool or resell keys",
+  },
   xai: { url: "https://api.x.ai/v1", needsKey: true },
   groq: { url: "https://api.groq.com/openai/v1", needsKey: true },
   /**

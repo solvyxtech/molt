@@ -1,7 +1,7 @@
 {
   "name": "molt-desktop",
   "version": "0.2.1",
-  "description": "molt, with a window. A coding agent that can't say \"done\" without proving it.",
+  "description": "Maat Agent desktop \u2014 a coding agent that can't say done without proving it. Built on the molt engine. OpenAI-compatible and Anthropic APIs; Grok Build via ACP.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -12,11 +12,13 @@
     "url": "https://github.com/solvyxtech/molt/issues"
   },
   "keywords": [
+    "maat",
+    "maat-agent",
     "coding-agent",
     "verification",
     "electron",
     "openai-compatible",
-    "anthropic",
+    "byok",
     "receipts"
   ],
   "author": "Tyler Skelton",
