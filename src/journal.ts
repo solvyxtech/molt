@@ -58,6 +58,17 @@ export type JournalKind =
    * unfinished, and a reader must be able to tell those apart later.
    */
   | "deadline"
+  /**
+   * Unattended, hidden checks: a file tool refused a path outside the task
+   * (outside the project, or Maat's own `.maat/`), or a bash command named
+   * one. Bash is not blocked; it is recorded (src/scope.ts).
+   */
+  | "outside_task"
+  /**
+   * Unattended: tool calls that changed no file in the project. The first
+   * entry is the nudge, the second the stop (`action`).
+   */
+  | "no_progress"
   /** A verified change was committed. Carries the sha and the receipt. */
   | "git_commit"
   /** An unverified change was put back. Carries what was restored, removed, kept. */
@@ -414,6 +425,16 @@ export class Journal {
           break;
         case "deadline":
           out.push(`${t}  deadline · ${Math.round(Number(d.spentMs ?? 0) / 1000)}s of ${Math.round(Number(d.limitMs ?? 0) / 1000)}s — stopped on the clock, not on a failure`);
+          break;
+        case "outside_task":
+          out.push(
+            d.refused
+              ? `${t}  outside the task · ${d.tool} refused ${d.path} (${d.reach})`
+              : `${t}  outside the task · bash named ${[...(d.stateDir ? [".maat/"] : []), ...((d.outside as unknown as string[] | undefined) ?? [])].join(", ")}`,
+          );
+          break;
+        case "no_progress":
+          out.push(`${t}  no progress · ${d.calls} tool call(s) changed no file · ${d.action}`);
           break;
         case "git_commit":
           out.push(`${t}  commit ${String(d.sha ?? "").slice(0, 8)} · ${d.files} file(s) · receipt ${d.receipt || "(none)"}`);

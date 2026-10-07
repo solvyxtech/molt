@@ -659,7 +659,7 @@ export type EngineEvent =
        * happened. The outcome is what the sealed bar said of the tree as it
        * stood, never a default.
        */
-      endedBy?: "deadline" | "provider";
+      endedBy?: "deadline" | "provider" | "no-progress";
       /** The turn's wall-clock budget ended it (endedBy "deadline"). */
       deadline?: boolean;
       /**

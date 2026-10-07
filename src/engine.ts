@@ -133,6 +133,7 @@ import {
   type Spend,
 } from "./types.js";
 import { stateDir, stateDirName } from "./statedir.js";
+import { bashReach, noProgressCallsFromEnv, outsideTask, taskPathsIn, treeStamp } from "./scope.js";
 import { env } from "./env.js";
 import { Judgments, caseReason, reasonText } from "./judgment.js";
 
@@ -1569,6 +1570,13 @@ export type EngineConfig = {
    */
   sandbox?: boolean;
   /**
+   * Unattended: tool calls in a row that change no file in the project before
+   * the model is told to finish or stop; as many again and the turn ends,
+   * judged on disk ("no-progress"). 0 turns the guard off. Default:
+   * MAAT_NO_PROGRESS_CALLS, else 30 (src/scope.ts).
+   */
+  noProgressCalls?: number;
+  /**
    * Where to write one JSON file per completion attempt holding the whole
    * turn: the wire transcript, the ledger, the bar's result, the receipt name.
    *
@@ -2272,7 +2280,7 @@ export class Engine {
    * all because the clock or a failed request stopped the turn before any check
    * ran; two of them had passing work on disk.
    */
-  private turnEndedBy: "deadline" | "provider" | undefined;
+  private turnEndedBy: "deadline" | "provider" | "no-progress" | undefined;
   /** A subprocess backend went silent past the stall allowance this turn (a provider issue). */
   private turnProviderStall = false;
   /** `--revert` put this turn's work back, so a person cannot accept it as it stands. */
@@ -2542,6 +2550,43 @@ export class Engine {
    * written — when the job's work is over.
    */
   private withheld: { name: string; text: string }[] = [];
+  /** Absolute paths this turn's task names: part of the task, though outside the project (src/scope.ts). */
+  private turnTaskPaths: string[] = [];
+  /** This turn's checks are hidden, or are being drafted to be (src/scope.ts). */
+  private turnHidesChecks = false;
+
+  /**
+   * Whether the file tools are held to the task: an unattended job with
+   * hidden checks, while it runs. A person at the keyboard can read what they
+   * like; a worker alone with checks it cannot see spent whole budgets
+   * reading Maat's records and other tasks' logs instead (src/scope.ts).
+   */
+  private scoped(): boolean {
+    return this.cfg.unattended === true && this.turnActive && (this.turnHidesChecks || this.withheld.length > 0);
+  }
+
+  /** The refusal for a file tool's path outside the task, journalled; null when the path is in scope. */
+  private refuseOutsideTask(tool: string, path: string): string | null {
+    if (!this.scoped()) return null;
+    const v = outsideTask(this.cwd, path, { tool, taskPaths: this.turnTaskPaths });
+    if (!v) return null;
+    this.cfg.journal?.append("outside_task", { tool, path: path || ".", reach: v.kind, refused: true });
+    return v.message;
+  }
+
+  /** A bash command that names `.maat/` or a path outside the project: not blocked, journalled. */
+  private noteBashReach(command: string): void {
+    if (!this.scoped()) return;
+    const r = bashReach(this.cwd, command, this.turnTaskPaths);
+    if (!r.stateDir && r.outside.length === 0) return;
+    this.cfg.journal?.append("outside_task", {
+      tool: "bash",
+      refused: false,
+      stateDir: r.stateDir,
+      outside: r.outside,
+      command: command.slice(0, 500),
+    });
+  }
 
   /** The effort the next request carries. */
   private get effortNow(): string | undefined {
@@ -3266,6 +3311,8 @@ export class Engine {
       case "inspect": {
         const rel = String(args.path ?? ".");
         const abs = resolve(this.cwd, rel);
+        const off = this.refuseOutsideTask("inspect", rel);
+        if (off) return off;
         if (!existsSync(abs)) return `${rel} does not exist`;
         try {
           return statSync(abs).isDirectory()
@@ -3276,7 +3323,9 @@ export class Engine {
         }
       }
 
-      case "read_file":
+      case "read_file": {
+        const off = this.refuseOutsideTask("read_file", String(args.path ?? ""));
+        if (off) return off;
         this.readPaths.add(String(args.path ?? ""));
         return readPart(
           await this.readText(resolve(this.cwd, String(args.path ?? ""))),
@@ -3285,6 +3334,7 @@ export class Engine {
           num(args.limit, Number.MAX_SAFE_INTEGER),
           this.resultBudget(),
         );
+      }
 
       case "write_file": {
         const rel = String(args.path ?? "");
@@ -3343,6 +3393,8 @@ export class Engine {
       case "list_dir": {
         const rel = String(args.path ?? ".");
         const abs = resolve(this.cwd, rel);
+        const off = this.refuseOutsideTask("list_dir", rel);
+        if (off) return off;
         this.mustBeInside(abs, rel);
         // Bounded and off the main thread: a listing the model asks for can be
         // pointed at anything, including a home directory.
@@ -3359,6 +3411,8 @@ export class Engine {
       case "grep": {
         const rel = String(args.path ?? ".");
         const abs = resolve(this.cwd, rel);
+        const off = this.refuseOutsideTask("grep", rel);
+        if (off) return off;
         this.mustBeInside(abs, rel);
         const pattern = String(args.pattern ?? "");
         return formatMatches(
@@ -3417,6 +3471,7 @@ export class Engine {
         // a caller that reaches runTool directly (a subscription backend).
         foldCommands(args, this.cwd);
         const command = String(args.command ?? "");
+        this.noteBashReach(command);
         if (!command.trim() && args.stop_job === undefined) {
           return "bash needs a command, or commands: a list to run in order";
         }
@@ -4008,7 +4063,7 @@ export class Engine {
     result: BarResult,
     attempts: number,
     log?: Journal,
-    endedBy?: "deadline" | "provider",
+    endedBy?: "deadline" | "provider" | "no-progress",
   ): AsyncGenerator<EngineEvent> {
     const onlyWrites = failedOnlyWriteChecks(result);
     if (this.cfg.receipts) {
@@ -4312,6 +4367,8 @@ export class Engine {
     this.sealedChecks = [];
     this.sealedNotes = [];
     this.turnCalls = new Set();
+    this.turnTaskPaths = taskPathsIn(userText);
+    this.turnHidesChecks = false;
     // molt's records stay out of the project's `git status` (leftovers.ts).
     excludeMoltFromGit(this.cwd);
     // Per turn, or receipt five lists what turn one ran. It did: receipts
@@ -4380,7 +4437,7 @@ export class Engine {
             ? opts.ask && this.turnWrites.length === 0
               ? "answered"
               : "verified"
-            : answered || this.turnEndedBy === "deadline"
+            : answered || this.turnEndedBy === "deadline" || this.turnEndedBy === "no-progress"
               ? "unverified"
               : "stopped";
 
@@ -4396,7 +4453,7 @@ export class Engine {
       outcome = "unverified";
       yield {
         kind: "info",
-        text: `the checks passed on the work as it stood when the ${this.turnEndedBy === "deadline" ? "clock" : "provider"} stopped the model, but it never said it was done — unverified.`,
+        text: `the checks passed on the work as it stood when the ${this.turnEndedBy === "deadline" ? "clock" : this.turnEndedBy === "no-progress" ? "no-progress guard" : "provider"} stopped the model, but it never said it was done — unverified.`,
       };
     }
 
@@ -5309,6 +5366,8 @@ export class Engine {
      */
     let pendingCriteria = opts.pendingCriteria;
     const criteriaSince = Date.now();
+    // Drafted checks are hidden; given ones may be. Either way the file tools are held to the task.
+    this.turnHidesChecks = Boolean(pendingCriteria) || (opts.taskChecks ?? []).some((c) => c.hidden === true);
     /**
      * The draft, when the time budget's cut found it with no checks: kept alive
      * to join at the first claim instead of sealing nothing (joinLateCriteria).
@@ -5757,7 +5816,7 @@ export class Engine {
      * is what it says: verified only if it passed, not proven if it did not,
      * unverified when nothing was sealed. Returns whether a bar ran.
      */
-    async function* judgeOnDisk(why: "deadline" | "provider", claim: string): AsyncGenerator<EngineEvent, boolean> {
+    async function* judgeOnDisk(why: "deadline" | "provider" | "no-progress", claim: string): AsyncGenerator<EngineEvent, boolean> {
       self.turnEndedBy = why;
       if (opts.ask) return false;
       let barThis = barNow();
@@ -5873,6 +5932,19 @@ export class Engine {
      * rather than left to re-measure and perhaps disagree.
      */
     let deadlineInterrupted = false;
+    /**
+     * The no-progress guard, unattended only (src/scope.ts). Tool calls since
+     * a file in the project last changed; at `idleLimit` the model is told
+     * once to finish or stop, at twice that the turn ends and the work on
+     * disk is judged the way the deadline judges it. 2026-10-07: a worker
+     * made 90-125 calls a task reading other tasks' logs and Maat's records,
+     * changing nothing, until the clock ran out.
+     */
+    const idleLimit = this.cfg.unattended ? (this.cfg.noProgressCalls ?? noProgressCallsFromEnv()) : 0;
+    let idleStamp = idleLimit > 0 ? treeStamp(this.cwd) : null;
+    let idleCalls = 0;
+    let idleNudged = false;
+    let idleStop = false;
     for (let step = 0; ; step++) {
       // Cancelled while nothing was in flight — during a permission question,
       // or between a tool and the next request. The next step is the next
@@ -5903,6 +5975,17 @@ export class Engine {
       // whatever state the work is in when they are up is the state the judge
       // sees. Unlike a token ceiling it is not a proxy for anything — it is
       // the thing the person waiting actually spends.
+      if (idleStop) {
+        yield {
+          kind: "info",
+          text:
+            `no progress: ${idleCalls} tool calls in a row changed no file in the project, after ` +
+            `being told to finish or stop — no more tool calls. The sealed checks judge the work as it stands.`,
+        };
+        const judged = yield* judgeOnDisk("no-progress", "");
+        if (!judged) yield* this.salvage("No file in the project has changed for a long time; the turn is over.", fetchFn, log);
+        return;
+      }
       if (deadlineInterrupted || this.pastDeadline()) {
         const spentMs = Date.now() - this.turnStartedAt;
         log?.append("deadline", { limitMs: this.turnDeadlineMs, spentMs });
@@ -7102,6 +7185,37 @@ export class Engine {
           announceCriteria();
         }
         yield summary(called, "tools");
+
+        if (idleLimit > 0) {
+          const stamp = treeStamp(this.cwd);
+          if (stamp === null || idleStamp === null) {
+            // Not measurable (the walk was cut short): never counted as idle.
+            idleStamp = stamp;
+          } else if (stamp !== idleStamp) {
+            idleStamp = stamp;
+            idleCalls = 0;
+            idleNudged = false;
+          } else {
+            idleCalls += called.length;
+            if (!idleNudged && idleCalls >= idleLimit) {
+              idleNudged = true;
+              log?.append("no_progress", { step, calls: idleCalls, limit: idleLimit, action: "nudged" });
+              yield { kind: "info", text: `no progress: ${idleCalls} tool calls in a row changed no file in the project — told the model to finish or stop` };
+              this.transcript.push({
+                role: "user",
+                content:
+                  `[molt: your last ${idleCalls} tool calls changed no file in the project. Reading ` +
+                  `more will not finish the task. If you know what to change, change it now and ` +
+                  `say done. If you cannot finish, say plainly what is blocking you and stop. If ` +
+                  `${idleLimit} more calls change nothing, the turn ends and the work is judged as it stands.]`,
+                molt: { nudge: true },
+              });
+            } else if (idleNudged && idleCalls >= 2 * idleLimit) {
+              log?.append("no_progress", { step, calls: idleCalls, limit: idleLimit, action: "stopped" });
+              idleStop = true;
+            }
+          }
+        }
 
         // A step that mostly repeated itself learned little. Worth saying —
         // and nothing more than that.
