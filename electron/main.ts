@@ -1542,7 +1542,7 @@ ipcMain.handle(
       baseUrl: session.baseUrl,
       apiKey: session.engine.apiKey,
       model: session.model,
-      // The workspace, not the app's own directory: on the Claude Code
+      // The workspace, not the app's own directory: on the ACP
       // backend this is where the CLI that answers is run.
       cwd: session.cwd,
     });
