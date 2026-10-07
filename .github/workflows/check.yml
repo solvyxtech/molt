@@ -32,14 +32,23 @@ jobs:
           # doctor may exit >1 when default localhost endpoint is down (no Ollama in CI)
           node dist/cli.js doctor || true
 
-  # Privilege separation (--worker-user) is Linux-first and needs root to
-  # switch users: its tests skip on macOS and run here, in a root container.
-  # The test creates its own worker user.
+  # Privilege separation (--worker-user, --check-user, --worker-strict) is
+  # Linux-first and needs root to switch users: its tests skip on macOS and
+  # run here, in a root container. The test creates its own worker and check
+  # users. The container gets CAP_SYS_ADMIN, so the worker's PID namespace and
+  # each check run's PID namespace and private /tmp can be made, and
+  # MAAT_TEST_REQUIRE_PIDNS=1 makes the namespace tests fail here rather than
+  # skip when they are not. Docker's default AppArmor profile on Ubuntu hosts
+  # denies mount(2) (needed for the namespace's own /proc and the check's
+  # tmpfs /tmp) even with the capability, so it is lifted for this container.
   privsep-linux:
     runs-on: ubuntu-latest
-    container: node:22-bookworm
+    container:
+      image: node:22-bookworm
+      options: --cap-add=SYS_ADMIN --security-opt apparmor=unconfined
     env:
       ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      MAAT_TEST_REQUIRE_PIDNS: "1"
     steps:
       - uses: actions/checkout@v4
       - run: npm ci
