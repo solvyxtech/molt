@@ -12,8 +12,8 @@
  * The checks file is looked up across both, because a person's
  * `.molt/done.yml` must never be ignored because a `.maat/` appeared later.
  */
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
 
 export const STATE_DIR = ".maat";
 export const LEGACY_STATE_DIR = ".molt";
@@ -27,13 +27,56 @@ export function stateDirName(root: string): string {
   return STATE_DIR;
 }
 
+/**
+ * Privilege separation (src/privsep.ts) moves Maat's records out of the
+ * project, into a folder only Maat's user can read, for as long as a job
+ * runs. What stays in the project is what belongs to it: the checks file a
+ * person wrote, and the worker's own background-job logs.
+ */
+const KEPT_IN_PROJECT = new Set(["done.yml", "bg"]);
+let redirect: { roots: Set<string>; to: string } | undefined;
+
+/** Send this project's records to `to` (null: back to the project). */
+export function redirectState(project: string | null, to?: string): void {
+  if (project === null || !to) {
+    redirect = undefined;
+    return;
+  }
+  const roots = new Set([resolve(project)]);
+  try {
+    roots.add(realpathSync(project));
+  } catch {
+    /* compare as given */
+  }
+  redirect = { roots, to };
+}
+
+/** Where this project's records live while redirected, or undefined. */
+export function stateRedirect(root: string): string | undefined {
+  return redirect && redirect.roots.has(resolve(root)) ? redirect.to : undefined;
+}
+
+function redirected(root: string, first: string | undefined): string | undefined {
+  if (first === undefined || KEPT_IN_PROJECT.has(first)) return undefined;
+  return stateRedirect(root);
+}
+
 /** The absolute folder, optionally with a path inside it. */
 export function stateDir(root: string, ...parts: string[]): string {
+  const to = redirected(root, parts[0]);
+  if (to) return join(to, ...parts);
+  return join(root, stateDirName(root), ...parts);
+}
+
+/** The folder inside the project itself, whatever privilege separation does. */
+export function projectStateDir(root: string, ...parts: string[]): string {
   return join(root, stateDirName(root), ...parts);
 }
 
 /** `.maat/<file>` if it exists, else `.molt/<file>` if that does, else where a new one goes. */
 export function stateFile(root: string, file: string): string {
+  const to = redirected(root, file);
+  if (to) return join(to, file);
   for (const d of STATE_DIRS) {
     const p = join(root, d, file);
     if (existsSync(p)) return p;

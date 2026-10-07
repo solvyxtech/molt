@@ -54,13 +54,21 @@ def openrouter_key() -> str:
 # denied calls per 60 runs: writing the deliverable through a heredoc, removing
 # the model's own scratch files. BENCH_GATE=yes reproduces the old runs.
 AGENT_USER = os.environ.get("BENCH_AGENT_USER")  # set in the containers: the agent runs unprivileged
+# Privilege separation (default in the containers): Maat runs as root and only the worker's
+# tools run as BENCH_AGENT_USER (--worker-user), so the worker cannot read Maat's state dir,
+# the reference program, the judge's HOME or its process list either. BENCH_PRIVSEP=0 runs the
+# whole of Maat as the agent user, as before 2026-10-07.
+PRIVSEP = bool(AGENT_USER) and os.environ.get("BENCH_PRIVSEP", "1") != "0" and os.geteuid() == 0
 
 
 def as_agent(cmd: list, env: dict | None = None) -> tuple[list, dict | None]:
     """With BENCH_AGENT_USER set, run the agent as that user: it cannot read the graders
-    or the reference solutions, which stay root-only. Unset (Mac host lanes): unchanged."""
+    or the reference solutions, which stay root-only. Unset (Mac host lanes): unchanged.
+    With privilege separation Maat stays root and is told which user the worker is."""
     if not AGENT_USER:
         return cmd, env
+    if PRIVSEP:
+        return [*cmd[:3], "--worker-user", AGENT_USER, *cmd[3:]], env
     import pwd
     home = pwd.getpwnam(AGENT_USER).pw_dir
     return ["runuser", "-u", AGENT_USER, "--", "env", f"HOME={home}", *cmd], env
@@ -81,6 +89,26 @@ def kill_tree(proc: subprocess.Popen) -> None:
 def hand_over(d: Path) -> None:
     if AGENT_USER:
         subprocess.run(["chown", "-R", AGENT_USER, str(d)], check=True)
+
+
+def lock(p: Path) -> None:
+    """A finished task's folder and logs: root-only, so a later task's worker cannot read an
+    earlier run's released checks, receipts or Maat's log (/work is shared by every task)."""
+    if not AGENT_USER or not p.exists():
+        return
+    try:
+        os.chown(p, 0, 0, follow_symlinks=False)
+        os.chmod(p, 0o700 if p.is_dir() else 0o600)
+    except (PermissionError, FileNotFoundError):
+        pass
+
+
+def write_private(p: Path, text: str) -> None:
+    """Written mode 600 from the start: the logs carry every hidden check once a job ends."""
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    lock(p)
 
 
 def provider_capped(out: str, steps: int) -> bool:
@@ -121,9 +149,9 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
             out, err = "", ""
         timed_out = True
     secs = time.time() - t0
-    log.write_text(out)
+    write_private(log, out)
     # Maat's own notices (criteria not drafted, dropped checks, refusals) go to stderr.
-    log.with_suffix(".err").write_text(err or "")
+    write_private(log.with_suffix(".err"), err or "")
     steps = 0; per = []; outcome = None; spend = {}; review = None; disagree = []; extra = {}
     for line in out.splitlines():
         if not line.startswith("{"):
@@ -210,6 +238,10 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
         tasks = [T for T in tasks if T.name in want]
     arms = parse_arms(os.environ.get("ARMS"))
     out = Path(os.environ.get("RESULTS_DIR", HERE)) / os.environ.get("RESULTS", f"results-{which}-x{repeats}.jsonl")
+    # Earlier runs' folders and logs (a resumed run, an earlier lane): out of the worker's reach.
+    if AGENT_USER and WORK.exists():
+        for p in WORK.iterdir():
+            lock(p)
     done = set()
     if out.exists():  # resume: skip runs already recorded
         for line in out.read_text().splitlines():
@@ -242,6 +274,7 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
                         print(f"STOPPED: the provider's daily limit / quota is reached ({tag} not recorded)", flush=True)
                         return
                     ok, why = T.grade(d)
+                    lock(d)
                     final = ""
                     r.update(task=T.name, agent=a, rep=rep, passed=ok, why=why, final=final[:300])
                     if arm:

@@ -53,6 +53,8 @@ import type { BarResult, Check, EngineEvent } from "./types.js";
 import { stateDir } from "./statedir.js";
 import { draftReference, snapshotProject } from "./reference.js";
 import { env } from "./env.js";
+import { fileURLToPath } from "node:url";
+import { disablePrivSep, enablePrivSep, workerUserFrom, type PrivSep } from "./privsep.js";
 
 /**
  * The version, from the manifest that npm actually publishes.
@@ -232,6 +234,11 @@ options
                      what high autonomy would still ask about runs (rm, sudo,
                      python -c, a write outside the directory). For a container
                      or a throwaway VM, never for a machine you keep.
+  --worker-user <u>  run the worker's tools as user <u> (Linux; Maat runs as
+                     root or with passwordless sudo to <u>). Maat's records go
+                     to a private state dir (MAAT_STATE_DIR) and are copied
+                     into .maat/ when the job ends. For containers and
+                     unattended runs. (MAAT_WORKER_USER)
   --json             machine-readable output (run/prove/stats/receipts)
   --version          print the version and exit
   --no-stream        disable token streaming (default: streaming on)
@@ -306,6 +313,8 @@ type Args = {
    * boundary, and approves every gated call instead of refusing it.
    */
   sandbox?: boolean;
+  /** `--worker-user <name>`: the worker's tools run as that user (src/privsep.ts). */
+  workerUser?: string;
   /** `molt mission run --features n`: stop after n worker runs. */
   features?: number;
   /** Files the model may read and never write. `--read`, repeatable. */
@@ -685,6 +694,9 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
       case "--sandbox":
         out.sandbox = true;
         out.yes = true;
+        break;
+      case "--worker-user":
+        out.workerUser = next();
         break;
       case "--json":
         out.json = true;
@@ -2223,6 +2235,39 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   // Before anything else can print: from here on stdout is the protocol.
   if (args.acp || args.cmd === "acp") return cmdAcp(args);
 
+  // Privilege separation, when asked for: before any record is opened, so
+  // every one of them is made in the private state dir (src/privsep.ts).
+  const worker = workerUserFrom(args.workerUser);
+  const separates = args.cmd === "run" || args.cmd === "ask" || (args.cmd === "mission" && (args.task ?? "").split(" ")[0] === "run");
+  if (worker && separates) {
+    let ps: PrivSep;
+    try {
+      ps = enablePrivSep({
+        user: worker,
+        project: args.cwd,
+        helper: fileURLToPath(new URL("./fs-helper.js", import.meta.url)),
+        notice: (t) => process.stderr.write(`maat: ${t}\n`),
+      });
+    } catch (e) {
+      process.stderr.write(`maat: ${(e as Error).message}\n`);
+      return 2;
+    }
+    process.stderr.write(
+      `maat: worker tools run as ${ps.worker.name} (uid ${ps.worker.uid})` +
+        `${ps.pidns ? " in their own PID namespace" : ""}; Maat's records are in ${ps.stateRoot} until the job ends\n`,
+    );
+    try {
+      return args.cmd === "mission" ? await cmdMission(args) : await cmdRun(args, args.cmd === "ask");
+    } finally {
+      try {
+        const dest = ps.publish();
+        process.stderr.write(`maat: records copied to ${dest}\n`);
+      } catch (e) {
+        process.stderr.write(`maat: could not copy the records from ${ps.stateRoot} into the project: ${(e as Error).message}\n`);
+      }
+      disablePrivSep();
+    }
+  }
   switch (args.cmd) {
     case "run":
       return cmdRun(args);

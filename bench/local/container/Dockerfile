@@ -7,8 +7,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && git config --system user.name "bench" && git config --system user.email "bench@localhost" \
     && git config --system init.defaultBranch master
-# The agent under test runs as this user; run-in-container.sh keeps the graders and the
-# reference solutions in root-only places it cannot read.
+# The worker's tools run as this user: Maat runs as root with --worker-user agent (privilege
+# separation, src/privsep.ts), or wholly as this user with BENCH_PRIVSEP=0. run-in-container.sh
+# keeps the graders and the reference solutions in root-only places it cannot read; /root (the
+# judge's HOME) is 700.
 RUN useradd -m -u 1001 -s /bin/bash agent && chmod 700 /root
 ENV BENCH_AGENT_USER=agent
 WORKDIR /opt

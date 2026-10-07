@@ -31,7 +31,7 @@ import { runCommand } from "./run.js";
 import { diagnoseFailure } from "./bar.js";
 import type { Check, Confirm, EngineEvent, JobOutcome, Spend } from "./types.js";
 import { estTokens } from "./types.js";
-import { stateDir, stateDirName } from "./statedir.js";
+import { projectStateDir, stateDir, stateDirName } from "./statedir.js";
 
 /** How the folder is named in messages; the real one is `missionRel(cwd)`. */
 export const MISSION_DIR = ".maat/mission";
@@ -363,7 +363,8 @@ export function assertionNotes(contract: Contract, ids: readonly string[]): stri
 
 /** Every `.md` under the library, as the worker is shown it, within a budget. */
 export function readLibrary(cwd: string, budgetTokens = LIBRARY_TOKENS): string {
-  const dir = join(missionDir(cwd), LIBRARY_DIR);
+  // In the project even under privilege separation: the worker writes it.
+  const dir = projectStateDir(cwd, "mission", LIBRARY_DIR);
   if (!existsSync(dir)) return "";
   const files = readdirSync(dir).filter((f) => f.endsWith(".md")).sort();
   const parts: string[] = [];
@@ -874,7 +875,7 @@ export function writePlan(cwd: string, plan: MissionPlan, opts: { force?: boolea
   if (hasMission(cwd) && !opts.force) {
     throw new MissionError(`a mission already exists in ${MISSION_DIR}; pass --force to replace it`);
   }
-  mkdirSync(join(dir, LIBRARY_DIR), { recursive: true });
+  mkdirSync(projectStateDir(cwd, "mission", LIBRARY_DIR), { recursive: true });
   const written: string[] = [];
   const put = (name: string, text: string) => {
     writeFileSync(join(dir, name), text);

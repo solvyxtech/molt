@@ -18,6 +18,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
+import { privSep } from "./privsep.js";
 
 export type RunOptions = {
   cwd: string;
@@ -30,6 +31,11 @@ export type RunOptions = {
   shell?: string | true;
   /** Kills the command when it aborts, so a turn can be cancelled mid-command. */
   signal?: AbortSignal;
+  /**
+   * The worker asked for it: under privilege separation (src/privsep.ts) it
+   * runs as the worker user. Without privilege separation this changes nothing.
+   */
+  asWorker?: boolean;
 };
 
 export type RunResult = {
@@ -91,15 +97,27 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
   return new Promise<RunResult>((resolve, reject) => {
     let child: ChildProcess;
     try {
-      child = spawn(command, {
-        cwd: opts.cwd,
-        shell: opts.shell ?? true,
-        env: opts.env,
-        stdio: ["ignore", "pipe", "pipe"],
-        // Its own process group, so a timeout can kill everything the command
-        // started and not just the shell (see `kill`).
-        detached: process.platform !== "win32",
-      });
+      const ps = opts.asWorker ? privSep() : undefined;
+      if (ps) {
+        const spec = ps.commandSpec(command, opts.shell ?? true, opts.cwd, opts.env);
+        child = spawn(spec.file, spec.args, {
+          cwd: opts.cwd,
+          env: spec.env,
+          stdio: ["ignore", "pipe", "pipe"],
+          detached: true,
+          ...(spec.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
+        });
+      } else {
+        child = spawn(command, {
+          cwd: opts.cwd,
+          shell: opts.shell ?? true,
+          env: opts.env,
+          stdio: ["ignore", "pipe", "pipe"],
+          // Its own process group, so a timeout can kill everything the command
+          // started and not just the shell (see `kill`).
+          detached: process.platform !== "win32",
+        });
+      }
     } catch (e) {
       reject(e as Error);
       return;

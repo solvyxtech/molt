@@ -21,6 +21,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { copyTreeOrWhy, runsInCopy } from "./scratch.js";
 import { maskText } from "./withhold.js";
+import { privSep } from "./privsep.js";
 import { dirname, join, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { ArchiveLike } from "./archive.js";
@@ -2308,6 +2309,17 @@ export class CheckCache {
 }
 
 export async function runBar(bar: Bar, ctx: BarContext): Promise<BarResult> {
+  try {
+    return await runBarAs(bar, ctx);
+  } finally {
+    // Checks run as Maat. Under privilege separation, whatever one left in the
+    // project (a build in place, a cache) goes back to the worker, so the
+    // worker can still edit its own tree (src/privsep.ts).
+    privSep()?.handBack(ctx.cwd);
+  }
+}
+
+async function runBarAs(bar: Bar, ctx: BarContext): Promise<BarResult> {
   const t0 = Date.now();
   // In order, one at a time. Checks share a working directory and routinely
   // build into it; running them concurrently would have them tripping over

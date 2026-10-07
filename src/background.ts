@@ -26,6 +26,7 @@ import { spawn } from "node:child_process";
 import { closeSync, mkdirSync, openSync } from "node:fs";
 import { join } from "node:path";
 import { stateDirName } from "./statedir.js";
+import { privSep } from "./privsep.js";
 
 export type BackgroundProcess = {
   id: number;
@@ -91,7 +92,7 @@ function killGroup(pid: number, signal: NodeJS.Signals): boolean {
  */
 export function startBackground(
   command: string,
-  opts: { cwd: string; env?: NodeJS.ProcessEnv },
+  opts: { cwd: string; env?: NodeJS.ProcessEnv; asWorker?: boolean },
 ): BackgroundProcess {
   hookExit();
   const id = nextId++;
@@ -100,13 +101,29 @@ export function startBackground(
   mkdirSync(dir, { recursive: true });
   const log = `${bgRel}/${id}.log`;
   const fd = openSync(join(opts.cwd, log), "w");
-  const child = spawn(command, {
-    cwd: opts.cwd,
-    shell: true,
-    env: opts.env,
-    detached: true,
-    stdio: ["ignore", fd, fd],
-  });
+  // Under privilege separation the job, and its log, are the worker's.
+  const ps = opts.asWorker ? privSep() : undefined;
+  if (ps) {
+    ps.giveToWorker(join(opts.cwd, stateDirName(opts.cwd)));
+    ps.giveToWorker(dir);
+    ps.giveToWorker(join(opts.cwd, log));
+  }
+  const spec = ps?.commandSpec(command, true, opts.cwd, opts.env);
+  const child = spec
+    ? spawn(spec.file, spec.args, {
+        cwd: opts.cwd,
+        env: spec.env,
+        detached: true,
+        stdio: ["ignore", fd, fd],
+        ...(spec.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
+      })
+    : spawn(command, {
+        cwd: opts.cwd,
+        shell: true,
+        env: opts.env,
+        detached: true,
+        stdio: ["ignore", fd, fd],
+      });
   closeSync(fd);
   const entry: BackgroundProcess = {
     id,

@@ -30,3 +30,17 @@ jobs:
           node dist/cli.js --version
           # doctor may exit >1 when default localhost endpoint is down (no Ollama in CI)
           node dist/cli.js doctor || true
+
+  # Privilege separation (--worker-user) is Linux-first and needs root to
+  # switch users: its tests skip on macOS and run here, in a root container.
+  # The test creates its own worker user.
+  privsep-linux:
+    runs-on: ubuntu-latest
+    container: node:22-bookworm
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm ci
+      - run: npm run test:build && npm run build
+      - run: node --test --test-reporter=spec dist-test/test/privsep.test.js
