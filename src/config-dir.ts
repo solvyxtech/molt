@@ -1,13 +1,11 @@
 /**
  * Where molt keeps its own configuration.
  *
- * Its own module because both `providers.ts` and `agy.ts` need it, and having
- * `agy.ts` reach into `providers.ts` for it made a cycle: providers imports
- * the Antigravity URL to list it as a preset, agy imported providers for this
- * one function, and the pair deadlocked at load with "Cannot access 'AGY_URL'
- * before initialization" — a failure that reads as a bug in the backend and is
- * really one in the import graph. `providers.ts` re-exports it, so every
- * existing caller is unchanged.
+ * Its own module so `providers.ts` can re-export `defaultConfigDir` without
+ * other modules reaching into providers just for the path. That used to matter
+ * when a second backend also needed the directory and importing providers for
+ * it created a load-time cycle; keeping the path here avoids that class of
+ * deadlock even after those backends are gone.
  */
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";

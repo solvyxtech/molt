@@ -7,7 +7,7 @@
  * picker, because it moves your session to another provider without saying
  * so — and bills a different account for the next turn.
  *
- * Keys live in ~/.config/molt/auth.json at 0600 — outside the repo, so a
+ * Keys live in ~/.config/maat/auth.json at 0600 — outside the repo, so a
  * tool whose whole pitch is an auditable record never writes a credential
  * into one.
  */

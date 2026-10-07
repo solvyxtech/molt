@@ -5,7 +5,7 @@
  * resolution rules, and the mode that hides a pasted key, are pinned here.
  */
 import assert from "node:assert/strict";
-import { statSync, writeFileSync } from "node:fs";
+import { mkdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { fmtDuration, statusSegments } from "../src/banner.js";
@@ -766,12 +766,16 @@ describe("naming an endpoint you can point at", () => {
 /**
  * Where molt keeps its config, and why that has to be movable.
  *
- * `npm test` used to rewrite the developer's real ~/.config/molt on every run.
+ * `npm test` used to rewrite the developer's real config dir on every run.
  * A TUI test mounts the app, the app refreshes pricing for whatever model the
  * fixture used, and `savePricing` had nowhere to go but the real file — so it
  * replaced the stored endpoint and left `priceModel: "test-model"` behind. It
  * had been doing that since before the desktop existed, quietly, and it means
  * every run before this one started from whatever the previous run left.
+ *
+ * Default is ~/.config/maat (Maat Agent). An existing ~/.config/molt is kept
+ * when maat is absent, so keys and prices are not moved under someone who set
+ * molt up before the rename.
  */
 describe("the config directory is movable", () => {
   it("honours MOLT_CONFIG_DIR", () => {
@@ -787,16 +791,51 @@ describe("the config directory is movable", () => {
 
   it("falls back to the home directory when it is unset or blank", () => {
     const was = process.env.MOLT_CONFIG_DIR;
+    const wasMaat = process.env.MAAT_CONFIG_DIR;
+    const wasHome = process.env.HOME;
+    const ws = workspace();
     try {
       delete process.env.MOLT_CONFIG_DIR;
-      assert.match(defaultConfigDir(), /\.config[/\\]molt$/);
+      delete process.env.MAAT_CONFIG_DIR;
+      // Neither maat nor molt under this home → prefer maat.
+      process.env.HOME = ws.dir;
+      assert.match(defaultConfigDir(), /\.config[/\\]maat$/);
       // Blank is not a directory. Treating "" as an override would send every
       // read and write to the process's working directory.
       process.env.MOLT_CONFIG_DIR = "   ";
-      assert.match(defaultConfigDir(), /\.config[/\\]molt$/);
+      assert.match(defaultConfigDir(), /\.config[/\\]maat$/);
     } finally {
       if (was === undefined) delete process.env.MOLT_CONFIG_DIR;
       else process.env.MOLT_CONFIG_DIR = was;
+      if (wasMaat === undefined) delete process.env.MAAT_CONFIG_DIR;
+      else process.env.MAAT_CONFIG_DIR = wasMaat;
+      if (wasHome === undefined) delete process.env.HOME;
+      else process.env.HOME = wasHome;
+      ws.cleanup();
+    }
+  });
+
+  it("keeps a pre-rename ~/.config/molt when maat is absent", () => {
+    const was = process.env.MOLT_CONFIG_DIR;
+    const wasMaat = process.env.MAAT_CONFIG_DIR;
+    const wasHome = process.env.HOME;
+    const ws = workspace();
+    try {
+      delete process.env.MOLT_CONFIG_DIR;
+      delete process.env.MAAT_CONFIG_DIR;
+      process.env.HOME = ws.dir;
+      mkdirSync(join(ws.dir, ".config", "molt"), { recursive: true });
+      assert.match(defaultConfigDir(), /\.config[/\\]molt$/);
+      mkdirSync(join(ws.dir, ".config", "maat"), { recursive: true });
+      assert.match(defaultConfigDir(), /\.config[/\\]maat$/);
+    } finally {
+      if (was === undefined) delete process.env.MOLT_CONFIG_DIR;
+      else process.env.MOLT_CONFIG_DIR = was;
+      if (wasMaat === undefined) delete process.env.MAAT_CONFIG_DIR;
+      else process.env.MAAT_CONFIG_DIR = wasMaat;
+      if (wasHome === undefined) delete process.env.HOME;
+      else process.env.HOME = wasHome;
+      ws.cleanup();
     }
   });
 
