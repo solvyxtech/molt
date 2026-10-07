@@ -25,7 +25,7 @@ import {
   historyBudget,
   keepForRound,
   keepRecentForRound,
-  NETWORK_RETRIES,
+  NETWORK_RETRIES, OVERLOAD_RETRIES,
   SYSTEM_PROMPT,
 } from "../src/engine.js";
 import { Transcript } from "../src/transcript.js";
@@ -91,7 +91,7 @@ describe("a turn that ends badly still says what it found", () => {
       const p = refusingProvider(
         429,
         "I read three files and found one bug; I did not verify it.",
-        NETWORK_RETRIES + 1,
+        OVERLOAD_RETRIES + 1,
       );
       const engine = engineWith(ws.dir, { fetchFn: p.fetchFn, stream: false });
       const events = await drain(engine.run("look for bugs", allowAll));
@@ -104,7 +104,7 @@ describe("a turn that ends badly still says what it found", () => {
       // And the turn closes with what it had rather than with nothing.
       assert.equal(
         p.bodies.length,
-        NETWORK_RETRIES + 2,
+        OVERLOAD_RETRIES + 2,
         "every attempt, and then exactly one salvage request",
       );
       assert.equal(p.bodies.at(-1)!.tool_choice, "none", "the salvage may not call more tools");
@@ -222,7 +222,7 @@ describe("a turn that ends badly still says what it found", () => {
 
       assert.equal(
         calls,
-        NETWORK_RETRIES + 2,
+        OVERLOAD_RETRIES + 2,
         "every attempt, one failed salvage, and then it stops",
       );
       const told = events.some((e) => e.kind === "info" && /could not write a closing summary/.test(e.text));
@@ -438,7 +438,7 @@ describe("the ceiling asks before it gives up", () => {
   
     /**
      * `/budget $5` was the advice whatever the unit. Where no price is known —
-     * every Claude Code turn, since a subscription run has no dollar figure —
+     * every subscription (ACP) turn, since a subscription run has no dollar figure —
      * the money ceiling is not what stopped anything, so that command changes a
      * number nothing reads and the turn hits the same wall.
      */

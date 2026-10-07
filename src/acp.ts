@@ -14,7 +14,7 @@
  * and that process authenticates itself. molt is the client on the other end
  * of a documented protocol the vendor shipped for exactly this.
  *
- * Grok Build is the only CLI driven this way. The Claude Code, Antigravity
+ * Grok Build and OpenCode are the CLIs driven this way. The Claude Code, Antigravity
  * and Gemini CLI backends were removed over those vendors' terms on running
  * a third-party harness on a plan; see `docs/provider-terms.md`.
  *
@@ -83,7 +83,8 @@ import { promisify } from "node:util";
 import { errorText } from "./format.js";
 import { RpcPeer, type RpcMessage } from "./jsonrpc.js";
 import type { BackendEvent, MoltTool, ToolRunner } from "./backend.js";
-import { GROK_BUILD_URL } from "./endpoint.js";
+import { GROK_BUILD_URL, OPENCODE_URL } from "./endpoint.js";
+import { OPENCODE_CONFIG } from "./opencode.js";
 import { estTokens } from "./types.js";
 
 const exec = promisify(execFile);
@@ -103,6 +104,8 @@ export type AcpAgentSpec = {
   readonly url: string;
   readonly bin: string;
   readonly args: readonly string[];
+  /** Extra environment for the child, on top of the process's own. */
+  readonly env?: Readonly<Record<string, string>>;
   /** Aliases the CLI resolves itself against whatever the account can reach. */
   readonly models: readonly string[];
   readonly installHint: string;
@@ -122,6 +125,13 @@ export type AcpAgentSpec = {
    * rather than being optional, so the call site has no branch.
    */
   readonly sessionMeta: (o: { systemPrompt: string }) => Record<string, unknown>;
+  /**
+   * The session meta for a pre-turn question (acpAsk), where no MCP server is
+   * offered. Defaults to `sessionMeta`; Grok needs its own, because its
+   * session meta tells it every tool lives on an MCP server `molt` that a
+   * question never has, and the model went looking for it instead of answering.
+   */
+  readonly askMeta?: (o: { systemPrompt: string }) => Record<string, unknown>;
 };
 
 /**
@@ -129,6 +139,55 @@ export type AcpAgentSpec = {
  * the documented way to say "these builtins and no others". Empty means none:
  * everything the model can do arrives over molt's MCP server.
  */
+/**
+ * Grok 1.0.46 does not list MCP tools to the model at all. Every MCP tool is
+ * reached through two of its own meta-tools: `search_tool` (discovery, never
+ * asks permission) and `use_tool` with `{tool_name: "molt__grep", tool_input}`.
+ * Measured against the real CLI over ACP: the `tool_call` announcement is
+ * titled `use_tool`, and the permission request carries
+ * `rawInput: {variant: "UseTool", tool_name: "molt__grep", ...}` with
+ * `_meta["x.ai/tool"].name === "use_tool"` and no `toolName`. Judging by the
+ * title therefore saw "use_tool" for every Maat call and refused all of them,
+ * so the model never got a single tool and the turn ended with nothing done.
+ *
+ * The real identity of such a call is the tool it targets. A `use_tool` whose
+ * target is not a fully-qualified Maat tool (another MCP server, a target
+ * hidden in an arguments file, a bare name that could belong to anyone) keeps
+ * the name `use_tool` and is refused like any other builtin.
+ */
+export function useToolTarget(raw: unknown, title?: string, metaName?: string): string | undefined {
+  const o = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const wrapped = title === "use_tool" || metaName === "use_tool" || o.variant === "UseTool";
+  if (!wrapped) return undefined;
+  const target = o.tool_name;
+  return typeof target === "string" && target ? target : "use_tool";
+}
+
+/** Grok's discovery meta-tool: lists tool names and schemas, changes nothing. */
+const GROK_DISCOVERY_TOOL = "search_tool";
+
+/**
+ * Said to Grok because it cannot be inferred from its tool list: that list has
+ * no Maat tools in it (see `useToolTarget`), so a model told only "use your
+ * tools" reaches for `run_terminal_command`, is refused, and stops.
+ */
+export const GROK_TOOL_ROUTE = [
+  "TOOL ROUTING (mandatory). Every tool you may use is served by the MCP server `molt`.",
+  "They are not in your direct tool list. Call `search_tool` with query `molt` to list them with their schemas,",
+  "then call each one through `use_tool` with `tool_name` set to the fully-qualified name `molt__<tool>`",
+  "(for example `molt__grep`) and `tool_input` set to its arguments.",
+  "Never call run_terminal_command, read_file, search_replace, write, list_dir, grep or any other built-in tool directly: they are refused.",
+].join(" ");
+
+/**
+ * A pre-turn question has no tools at all. Without this Grok, still believing
+ * the routing text above, spent 65 s "looking through the project" and answered
+ * in prose, so the drafted checks never arrived (bench grok1, 29 of 29 runs).
+ */
+export const GROK_ASK_NO_TOOLS =
+  "You have NO tools in this conversation: do not search for tools, do not read files, do not run anything. " +
+  "Everything you need is in the message. Answer immediately, in text, in exactly the format the message asks for.";
+
 const GROK_MOLT_PROFILE = { name: "molt", description: "Maat drives every tool", tools: "" };
 
 export const ACP_AGENTS: readonly AcpAgentSpec[] = [
@@ -149,9 +208,29 @@ export const ACP_AGENTS: readonly AcpAgentSpec[] = [
     credentialPath: ".grok/auth.json",
     mcpTransport: "http",
     sessionMeta: ({ systemPrompt }) => ({
-      systemPromptOverride: systemPrompt,
+      systemPromptOverride: `${systemPrompt}\n\n${GROK_TOOL_ROUTE}`,
       agentProfile: GROK_MOLT_PROFILE,
     }),
+    askMeta: ({ systemPrompt }) => ({
+      systemPromptOverride: `${systemPrompt}\n\n${GROK_ASK_NO_TOOLS}`,
+      agentProfile: GROK_MOLT_PROFILE,
+    }),
+  },
+  {
+    name: "opencode",
+    label: "OpenCode",
+    url: OPENCODE_URL,
+    bin: "opencode",
+    args: ["acp"],
+    // Every permission is "ask": a deny breaks the free tier (see opencode.ts), and an ask
+    // reaches `session/request_permission`, where Maat refuses all but its own tools.
+    env: { OPENCODE_CONFIG_CONTENT: OPENCODE_CONFIG },
+    models: ["opencode/big-pickle"],
+    installHint: "npm install -g opencode-ai",
+    loginHint: "opencode auth login",
+    credentialPath: ".local/share/opencode/auth.json",
+    mcpTransport: "http",
+    sessionMeta: () => ({}),
   },
 ];
 
@@ -381,7 +460,7 @@ export class AcpConnection {
       // empty PATH and it cannot find its own helpers.
       // `electron/login-path.ts` has already repaired process.env.PATH by the
       // time anything gets here.
-      env: { ...process.env },
+      env: { ...process.env, ...this.spec.env, ...(this.spec.env ? { PWD: this.opts.cwd ?? process.cwd() } : {}) },
     });
     this.child = child;
     // A write to a child that has died raises EPIPE as an 'error' event on its
@@ -863,6 +942,15 @@ export class AcpSession<H> {
     }
   }
 
+  /**
+   * OpenCode names an MCP tool `<server>_<tool>` (`molt_write_file`) where the others say
+   * `molt__write_file`. Its own builtins have no `molt_` prefix, so the rewrite cannot
+   * promote one of them into a Maat tool.
+   */
+  private canon(name: string): string {
+    return this.opts.spec.name === "opencode" ? name.replace(/^molt_(?=[a-z])/u, "molt__") : name;
+  }
+
   /** Notifications: the streamed reply, thoughts, tool calls, plans. */
   private onNotify(method: string, params: unknown): void {
     if (method !== "session/update" && method !== "x.ai/session/update") return;
@@ -881,7 +969,7 @@ export class AcpSession<H> {
       const name = String(u.title ?? (u as { toolCallId?: string }).toolCallId ?? "");
       const raw = (u.rawInput ?? {}) as Record<string, unknown>;
       const id = String((u as { toolCallId?: string }).toolCallId ?? `acp_${Date.now().toString(36)}`);
-      const called = String((u as { toolName?: string }).toolName ?? name);
+      const called = this.canon(useToolTarget(raw, name) ?? String((u as { toolName?: string }).toolName ?? name));
       this.toolCallNames.set(id, called);
       if (McpToolServer.isMoltTool(called)) {
         // The transcript records the call Maat is about to run — the handler
@@ -892,6 +980,9 @@ export class AcpSession<H> {
           text: "",
           toolCalls: [{ id, name: McpToolServer.bareName(called), args: raw }],
         });
+      } else if (called === GROK_DISCOVERY_TOOL) {
+        // Discovery of Maat's own catalogue: nothing to account for.
+        return;
       } else {
         /**
          * A builtin, announced. Nothing is concluded yet.
@@ -941,24 +1032,33 @@ export class AcpSession<H> {
       throw new Error(`maat does not implement ${method}`);
     }
     const p = (params ?? {}) as {
-      toolCall?: { toolCallId?: string; title?: string; toolName?: string };
+      toolCall?: {
+        toolCallId?: string;
+        title?: string;
+        toolName?: string;
+        rawInput?: unknown;
+        _meta?: Record<string, { name?: string } | undefined>;
+      };
       options?: { optionId?: string; kind?: string }[];
     };
-    const called = String(
-      p.toolCall?.toolName ??
-        this.toolCallNames.get(String(p.toolCall?.toolCallId ?? "")) ??
-        p.toolCall?.title ??
-        "",
+    const called = this.canon(
+      String(
+        useToolTarget(p.toolCall?.rawInput, p.toolCall?.title, p.toolCall?._meta?.["x.ai/tool"]?.name) ??
+          p.toolCall?.toolName ??
+          this.toolCallNames.get(String(p.toolCall?.toolCallId ?? "")) ??
+          p.toolCall?.title ??
+          "",
+      ),
     );
     const options = p.options ?? [];
-    if (McpToolServer.isMoltTool(called)) {
+    if (McpToolServer.isMoltTool(called) || called === GROK_DISCOVERY_TOOL) {
       const allow =
         options.find((o) => o.kind === "allow_always") ?? options.find((o) => o.kind === "allow_once");
       if (allow?.optionId) return { outcome: { outcome: "selected", optionId: allow.optionId } };
     }
     const reject =
       options.find((o) => o.kind === "reject_always") ?? options.find((o) => o.kind === "reject_once");
-    if (!McpToolServer.isMoltTool(called)) {
+    if (!McpToolServer.isMoltTool(called) && called !== GROK_DISCOVERY_TOOL) {
       for (const [id, name] of this.inFlight) if (name === called) this.inFlight.delete(id);
       if (!this.refused.has(called)) {
         this.refused.add(called);
@@ -1126,6 +1226,7 @@ export async function acpAsk(
     onRequest: async () => ({ outcome: { outcome: "cancelled" } }),
   });
   let answer = "";
+  const askMeta = opts.spec.askMeta ?? opts.spec.sessionMeta;
   const limit = opts.timeoutMs ?? 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const expired =
@@ -1148,7 +1249,7 @@ export async function acpAsk(
     const res = (await conn.request("session/new", {
       cwd: opts.cwd ?? process.cwd(),
       mcpServers: [],
-      _meta: opts.spec.sessionMeta({ systemPrompt: opts.systemPrompt }),
+      _meta: askMeta({ systemPrompt: opts.systemPrompt }),
     })) as { sessionId?: string; models?: AcpModelState };
     if (!res?.sessionId) return { ok: false, error: `${opts.spec.bin} opened no session` };
     // The same choice the session makes, for the same reason: a draft written
@@ -1165,7 +1266,7 @@ export async function acpAsk(
         if (offered.length) throw e;
       });
     }
-    const prompt = ("systemPromptOverride" in opts.spec.sessionMeta({ systemPrompt: opts.systemPrompt })
+    const prompt = ("systemPromptOverride" in askMeta({ systemPrompt: opts.systemPrompt })
       ? opts.prompt
       : `${opts.systemPrompt}\n\n${opts.prompt}`);
     await conn.request("session/prompt", {

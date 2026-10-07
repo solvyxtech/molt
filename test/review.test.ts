@@ -73,7 +73,10 @@ describe("the review in a turn", () => {
       const events = await drain(engine.run(TASK, allowAll, { taskChecks: [check] }));
       const end = events.find((e) => e.kind === "job_end");
       assert.ok(end && end.kind === "job_end");
-      assert.equal(end.outcome, "verified", "a nudge never turns a pass into a refusal");
+      // A nudge never turns a pass into a refusal; but 3/3 reviewers contradicting
+      // the task is not the word "verified" either (src/tiers.ts).
+      assert.deepEqual([end.outcome, end.tier], ["unverified", "passed-checks"]);
+      assert.match(end.tierReason!, /independent review found 3\/3/);
       assert.deepEqual([end.review?.confirmed, end.review?.votes], [false, "3/3"], "the final state is still labelled");
       assert.ok(provider.bodies[5]!.includes("independent reviewers who read only the task and your receipt found"));
       assert.ok(provider.bodies[5]!.includes('the task says \\"exactly 365 lines\\"'));

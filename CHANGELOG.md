@@ -9,7 +9,7 @@
   written. Stale `claude-code://`, `antigravity://`, `agy://`, and
   `gemini-cli://` configs now fail with a clear removal message. Grok Build
   (ACP) and the metered xAI API provider remain.
-- **Droid benchmarking** from the harbor/local bench path, and **xAI rows**
+- **Competitor benchmarking** from the harbor/local bench path, and **xAI rows**
   from the committed fine-tune dataset (provider-terms alignment). See
   `docs/provider-terms.md`.
 

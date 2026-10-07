@@ -130,7 +130,7 @@ it requires owning both compaction and verification in one harness.
 
 ## Long-horizon work
 
-**Factory Missions** (Factory AI, 2026). A frontier-model orchestrator
+**A competitor's missions** (2026). A frontier-model orchestrator
 interviews the user, writes a validation contract of prose assertions with
 stable ids, decomposes the goal into `features.json`, designs worker skills,
 then runs a worker session per feature and injects model "validators" at each
@@ -145,14 +145,14 @@ the work looks done. Their CTO's own account of what a model does when it
 cannot run something — "it will validate this by just looking at it, and it
 will fundamentally make a mistake" — is the argument for all three.
 
-**Ralph loops.** The pattern Factory credits as prior: run an agent in a
+**Ralph loops.** The pattern a competitor credits as prior: run an agent in a
 `while true` against a fixed prompt until a condition holds. molt's proof
 loop is the same idea with the condition made mechanical and the claim
 refused rather than the loop merely continued.
 
 ## Terminal-Bench harness engineering
 
-**Factory's Terminal-Bench write-up** lists what moved their score with the
+**A competitor's Terminal-Bench write-up** lists what moved their score with the
 same model: a small tool repertoire, bootstrapping each session with system
 information, short default timeouts the agent may raise, a planning tool that
 leans on recency bias, a controlled background-execution primitive, and

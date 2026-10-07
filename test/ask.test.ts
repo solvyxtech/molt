@@ -68,10 +68,13 @@ describe("askModel", () => {
     assert.equal(p.ceilings.length, 1);
   });
 
-  it("reports an HTTP failure with what was being asked", async () => {
+  it("reports an HTTP failure with what was being asked, and marks a rate limit worth asking again", async () => {
     const p = replying([{ content: null, status: 429 }]);
-    const r = await ask(p.fetchFn);
-    assert.deepEqual(r, { ok: false, error: "HTTP 429 drafting" });
+    const r = await ask(p.fetchFn, { overloadBackoffMs: [] });
+    assert.deepEqual(r, { ok: false, error: "HTTP 429 drafting", transient: true });
+    const q = replying([{ content: null, status: 400 }]);
+    assert.deepEqual(await ask(q.fetchFn, { overloadBackoffMs: [0] }), { ok: false, error: "HTTP 400 drafting" });
+    assert.equal(q.ceilings.length, 1, "a request the provider called wrong is not asked again");
   });
 });
 

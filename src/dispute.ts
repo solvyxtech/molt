@@ -74,7 +74,7 @@ export const ARBITER_SYSTEM = [
 ].join("\n");
 
 /**
- * Rule on one dispute with `votes` independent asks. Upheld only when more
+ * Rule on one dispute with `votes` independent asks (one by default). Upheld only when more
  * than half say the check contradicts the task with a quote that really is in
  * the task text. Null when no ask could be made at all.
  */
@@ -86,7 +86,7 @@ export async function arbitrate(opts: {
   votes?: number;
   ask: Omit<AskOptions, "system" | "prompt" | "maxTokens" | "what">;
 }): Promise<Ruling | null> {
-  const votes = Math.max(1, opts.votes ?? 3);
+  const votes = Math.max(1, opts.votes ?? 1);
   const prompt =
     `TASK TEXT:\n${opts.task}\n\nCHECK "${opts.check.name}":\n${opts.check.run}\n\n` +
     `CHECK OUTPUT (it failed):\n${opts.output.slice(0, 4000)}\n\n` +

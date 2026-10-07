@@ -319,6 +319,14 @@ export type CheckResult = {
    */
   didNotRun?: boolean;
   /**
+   * True when the command was killed at its own time limit.
+   *
+   * A drafted check that hangs says nothing about the work, and a bar that
+   * waits on it is how a run reached the runner's kill with no verdict at all.
+   * The engine retires such a check for the run, like one that errs in its own code.
+   */
+  timedOut?: boolean;
+  /**
    * False when the check passed without establishing anything.
    *
    * A builtin can pass for two very different reasons: it looked and found
@@ -598,10 +606,22 @@ export type EngineEvent =
        */
       selfChecked?: boolean;
       /**
+       * The claim passed its checks but the independent review was not run:
+       * the turn's clock had too little left for it. Said as "passed its
+       * checks, unreviewed", never as reviewed.
+       */
+      unreviewed?: boolean;
+      /**
        * The turn was refused only by checks the model drafted itself, and is
        * reported unverified rather than "not proven": names of those checks.
        */
       checksDisagree?: string[];
+      /**
+       * Hidden checks whose commands were shown to the model after they failed
+       * the same way twice. A claim verified after that stays verified, said
+       * as what it is: the model had read the check it then met.
+       */
+      revealed?: string[];
       /**
        * The independent review of a verified claim, when one ran. Not
        * confirmed means "passed its checks, unconfirmed": a majority of
@@ -610,6 +630,29 @@ export type EngineEvent =
       review?: { confirmed: boolean; votes: string; violations: { quote: string; evidence: string }[] };
       /** The judgment case this job opened: the scale did not settle it, a person will (judgment.ts). */
       case?: number;
+      /**
+       * Why the model stopped before it said done, when the turn was judged
+       * anyway: the clock ran out, or the provider gave up after work had
+       * happened. The outcome is what the sealed bar said of the tree as it
+       * stood, never a default.
+       */
+      endedBy?: "deadline" | "provider";
+      /** The turn's wall-clock budget ended it (endedBy "deadline"). */
+      deadline?: boolean;
+      /**
+       * The sealed checks passed on the tree as it stood when the model was
+       * stopped. Recorded, but the outcome is unverified: the model never
+       * said the work was done.
+       */
+      passedAtEnd?: boolean;
+      /**
+       * What a passing turn earned (src/tiers.ts): "verified" only when a
+       * check ran the deliverable and asserted a value (or a person wrote the
+       * check) and no reviewer contradicted it. "passed-checks" is the outcome
+       * "unverified" with `tierReason` saying why the word was not earned.
+       */
+      tier?: "verified" | "passed-checks";
+      tierReason?: string;
     }
   | {
       kind: "step_summary";

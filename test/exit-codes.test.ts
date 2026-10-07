@@ -67,7 +67,7 @@ async function draftingProvider(): Promise<string> {
         res.end(JSON.stringify({ choices: [{ message: content, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 5 } }));
       };
       if (body.includes("You draft acceptance criteria")) {
-        return reply({ role: "assistant", content: JSON.stringify({ checks: [{ name: "made", run: "test -f a.txt" }], notes: [] }) });
+        return reply({ role: "assistant", content: JSON.stringify({ checks: [{ name: "made", run: "[ \"$(cat a.txt)\" = \"a\" ]" }], notes: [] }) });
       }
       if (body.includes("You review acceptance checks")) {
         return reply({ role: "assistant", content: JSON.stringify({ checks: [{ name: "made", verdict: "runs", quote: "" }] }) });

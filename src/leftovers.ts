@@ -84,3 +84,24 @@ export function excludeMoltFromGit(cwd: string): boolean {
     return false;
   }
 }
+
+/**
+ * Files that appeared since `before` which the task text never names — by
+ * path, by file name, or by a folder they sit in ("sorted/" covers
+ * sorted/a/b.txt). The likely leftovers: a helper script, a copy, a test
+ * file the worker made for itself. On local redact-secrets the work was right
+ * and failed only on the redact.py left beside it, against "create no other
+ * files"; organize-files the same with organize.py.
+ */
+export function unnamedNewFiles(before: ProjectListing | null, after: ProjectListing | null, task: string): string[] {
+  if (!before || !after) return [];
+  const out: string[] = [];
+  for (const f of after.files) {
+    if (before.files.has(f)) continue;
+    const parts = f.split("/");
+    const names = [f, parts.at(-1)!, ...parts.slice(0, -1).map((_, i) => parts.slice(0, i + 1).join("/"))];
+    if (names.some((n) => n && task.includes(n))) continue;
+    out.push(f);
+  }
+  return out.sort();
+}

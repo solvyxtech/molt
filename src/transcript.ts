@@ -146,7 +146,20 @@ export class Transcript {
    * providers reject unknown fields with varying degrees of politeness.
    */
   wire(): Omit<Msg, "molt">[] {
-    return this.all().map(({ molt: _molt, ...rest }) => rest);
+    // One system message, and it comes first. The pinned task and a shed's
+    // digest were system messages of their own, which OpenAI-style APIs take
+    // and strict chat templates refuse: Qwen's raises "System message must be
+    // at the beginning" on the second one, so every request to a local
+    // llama.cpp Qwen failed with a 500. Leading system messages are joined
+    // in order; a system message anywhere later goes as a user message.
+    const out: Omit<Msg, "molt">[] = [];
+    for (const { molt: _molt, ...m } of this.all()) {
+      if (m.role !== "system") out.push(m);
+      else if (out.length === 0) out.push({ ...m });
+      else if (out.length === 1 && out[0]!.role === "system") out[0] = { ...out[0]!, content: `${out[0]!.content ?? ""}\n\n${m.content ?? ""}` };
+      else out.push({ role: "user", content: m.content ?? "" });
+    }
+    return out;
   }
 
   /**

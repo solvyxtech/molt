@@ -7,7 +7,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { formatBarFailure } from "../src/bar.js";
-import { applyCritique, draftCriteria, draftCriteriaCritiqued, repairEscapes, taskChecksFrom } from "../src/criteria.js";
+import { applyCritique, checkSelfError, draftCriteria, draftCriteriaCritiqued, repairEscapes, taskChecksFrom } from "../src/criteria.js";
 import { arbitrate, parseDisputes, quotedIn } from "../src/dispute.js";
 import { Engine } from "../src/engine.js";
 import type { BarResult, Check } from "../src/types.js";
@@ -43,9 +43,9 @@ describe("disputes", () => {
     const invented = JSON.stringify({ contradicts: true, quote: "valid for at least a year", reason: "x" });
     const no = JSON.stringify({ contradicts: false, quote: "", reason: "fair reading" });
     const base = { task: TASK, check: { name: "c", run: "openssl x509 -checkend 31536000" }, output: "Certificate will expire", dispute: { name: "c", quote: "Valid for 365 days", why: "" } };
-    const up = await arbitrate({ ...base, ask: { baseUrl: "http://p.test/v1", model: "m", fetchFn: replying([yes, yes, no]).fetchFn } });
+    const up = await arbitrate({ ...base, votes: 3, ask: { baseUrl: "http://p.test/v1", model: "m", fetchFn: replying([yes, yes, no]).fetchFn } });
     assert.deepEqual([up!.upheld, up!.votes, up!.quote], [true, "2/3", "Valid for 365 days"]);
-    const down = await arbitrate({ ...base, ask: { baseUrl: "http://p.test/v1", model: "m", fetchFn: replying([yes, no, no]).fetchFn } });
+    const down = await arbitrate({ ...base, votes: 3, ask: { baseUrl: "http://p.test/v1", model: "m", fetchFn: replying([yes, no, no]).fetchFn } });
     assert.equal(down!.upheld, false);
     const ungrounded = await arbitrate({ ...base, ask: { baseUrl: "http://p.test/v1", model: "m", fetchFn: replying([invented]).fetchFn } });
     assert.equal(ungrounded!.upheld, false, "a quote that is not in the task cannot retire a check");
@@ -64,8 +64,10 @@ describe("disputes", () => {
 });
 
 describe("a disputed check, in a turn", () => {
+  // An arbiter other than the worker: a same-model arbiter is skipped.
+  const ARBITER = { model: "arbiter" };
   const checks: Check[] = [
-    { name: "made", kind: "command", run: "test -f out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true },
+    { name: "made", kind: "command", run: "head -c 5 out.txt | grep -qx hello", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true },
     { name: "too-strict", kind: "command", run: "grep -q 366 out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true },
   ];
 
@@ -78,15 +80,13 @@ describe("a disputed check, in a turn", () => {
         { text: "Done." },
         { text: 'DISPUTE too-strict: "Valid for 365 days" — the check demands 366' },
         { text: yes },
-        { text: yes },
-        { text: yes },
       ]);
-      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high" });
+      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high", dispute: ARBITER });
       const events = await drain(engine.run(TASK, allowAll, { taskChecks: checks }));
       const end = events.find((e) => e.kind === "job_end");
       assert.ok(end && end.kind === "job_end");
       assert.equal(end.outcome, "verified");
-      assert.ok(events.some((e) => e.kind === "info" && /check too-strict retired \(3\/3 reviews\)/.test(e.text)));
+      assert.ok(events.some((e) => e.kind === "info" && /check too-strict retired \(1\/1 reviews\)/.test(e.text)));
       const starts = events.filter((e) => e.kind === "proof_start");
       assert.deepEqual(starts.at(-1)!.kind === "proof_start" && starts.at(-1)!.names, ["task:made"]);
       assert.equal(readFile(join(ws.dir, "out.txt")), "hello 365\n", "the work was not bent to the check");
@@ -107,9 +107,9 @@ describe("a disputed check, in a turn", () => {
         { calls: [{ name: "write_file", args: { path: "out.txt", content: "hello 365\n" } }] },
         { text: "Done." },
         { text: 'DISPUTE too-strict: "Valid for 365 days" — the check demands 366' },
-        { text: yes }, { text: yes }, { text: yes },
+        { text: yes },
       ]);
-      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high" });
+      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high", dispute: ARBITER });
       const events = await drain(engine.run(TASK, allowAll, { taskChecks: looks }));
       const end = events.find((e) => e.kind === "job_end");
       assert.ok(end && end.kind === "job_end");
@@ -152,7 +152,7 @@ describe("a disputed check, in a turn", () => {
     }
   });
 
-  it("without revealOnStuck, the same repeat failure ends the turn", async () => {
+  it("with revealOnStuck: false (--no-reveal), the same repeat failure ends the turn", async () => {
     const ws = workspace();
     try {
       const provider = scriptedProvider([
@@ -162,10 +162,61 @@ describe("a disputed check, in a turn", () => {
         { text: "Done again." },
         { text: "unreached" },
       ]);
-      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high" });
+      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high", revealOnStuck: false });
       const events = await drain(engine.run(TASK, allowAll, { taskChecks: checks }));
       assert.ok(events.some((e) => e.kind === "info" && /failed in exactly the same way twice/.test(e.text)));
       assert.ok(!provider.bodies.some((b) => b.includes("grep -q 366")), "a hidden command leaked");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("one arbiter ask per dispute by default, and --dispute-votes raises it", async () => {
+    const ws = workspace();
+    try {
+      const no = JSON.stringify({ contradicts: false, quote: "", reason: "fair" });
+      const run = async (dispute: { model: string; votes?: number }) => {
+        const asks = Array.from({ length: dispute.votes ?? 1 }, () => ({ text: no }));
+        const provider = scriptedProvider([
+          { calls: [{ name: "write_file", args: { path: "out.txt", content: "hello\n" } }] },
+          { text: "Done." },
+          { text: 'DISPUTE too-strict: "Valid for 365 days" — wrong' },
+          ...asks,
+          { calls: [{ name: "write_file", args: { path: "out.txt", content: "hello 366\n" } }] },
+          { text: "Done now." },
+        ]);
+        const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high", dispute });
+        const events = await drain(engine.run(TASK, allowAll, { taskChecks: checks }));
+        return events.find((e) => e.kind === "info" && /dispute of too-strict was rejected/.test(e.text));
+      };
+      const one = await run({ model: "arbiter" });
+      assert.ok(one && one.kind === "info" && /\(0\/1 reviews/.test(one.text), "one ask");
+      const three = await run({ model: "arbiter", votes: 3 });
+      assert.ok(three && three.kind === "info" && /\(0\/3 reviews/.test(three.text), "configurable");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("a same-model arbiter is skipped: the dispute is rejected with the reason and no ask is made", async () => {
+    const ws = workspace();
+    try {
+      const provider = scriptedProvider([
+        { calls: [{ name: "write_file", args: { path: "out.txt", content: "hello\n" } }] },
+        { text: "Done." },
+        { text: 'DISPUTE too-strict: "Valid for 365 days" — the check demands 366' },
+        { calls: [{ name: "write_file", args: { path: "out.txt", content: "hello 366\n" } }] },
+        { text: "Done now." },
+      ]);
+      // No dispute config: the arbiter would be the worker (same baseUrl and model).
+      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high" });
+      const events = await drain(engine.run(TASK, allowAll, { taskChecks: checks }));
+      assert.ok(events.some((e) => e.kind === "info" && /dispute of too-strict was rejected: no independent arbiter/.test(e.text)));
+      assert.ok(provider.bodies.some((b) => b.includes("no independent arbiter")), "the model is told why");
+      assert.ok(!provider.bodies.some((b) => b.includes("You settle a disagreement")), "no arbiter ask went out");
+      assert.ok(!events.some((e) => e.kind === "info" && /retired/.test(e.text)));
+      const end = events.find((e) => e.kind === "job_end");
+      assert.ok(end && end.kind === "job_end" && end.outcome === "verified");
     } finally {
       ws.cleanup();
     }
@@ -180,14 +231,12 @@ describe("a disputed check, in a turn", () => {
         { text: "Done." },
         { text: 'DISPUTE too-strict: "Valid for 365 days" — wrong' },
         { text: no },
-        { text: no },
-        { text: no },
         { calls: [{ name: "write_file", args: { path: "out.txt", content: "hello 366\n" } }] },
         { text: "Done now." },
       ]);
-      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high" });
+      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high", dispute: ARBITER });
       const events = await drain(engine.run(TASK, allowAll, { taskChecks: checks }));
-      assert.ok(events.some((e) => e.kind === "info" && /dispute of too-strict was rejected \(0\/3/.test(e.text)));
+      assert.ok(events.some((e) => e.kind === "info" && /dispute of too-strict was rejected \(0\/1/.test(e.text)));
       assert.ok(provider.bodies.some((b) => b.includes("Your dispute of too-strict was rejected")));
       const end = events.find((e) => e.kind === "job_end");
       assert.ok(end && end.kind === "job_end" && end.outcome === "verified");
@@ -204,9 +253,9 @@ describe("a disputed check, in a turn", () => {
         { calls: [{ name: "write_file", args: { path: "out.txt", content: "hello\n" } }] },
         { text: "Done." },
         { text: 'DISPUTE too-strict: "Valid for 365 days" — wrong' },
-        { text: yes }, { text: yes }, { text: yes },
+        { text: yes },
       ]);
-      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high" });
+      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high", dispute: ARBITER });
       const events = await drain(engine.run(TASK, allowAll, { taskChecks: [checks[1]!] }));
       const end = events.find((e) => e.kind === "job_end");
       assert.ok(end && end.kind === "job_end");
@@ -504,5 +553,55 @@ describe("what a refusal is called", () => {
     } finally {
       ws.cleanup();
     }
+  });
+});
+
+describe("a drafted check that fails in its own code", () => {
+  it("is recognised by its compile error, whichever tool wrote it", () => {
+    assert.ok(checkSelfError(`  File "<string>", line 10\n    print(f'Line {i}: missing :\n          ^\nSyntaxError: unterminated f-string literal (detected at line 10)`));
+    assert.ok(checkSelfError("jq: error: syntax error, unexpected INVALID_CHARACTER (Unix shell quoting issues?) at <top-level>, line 1:\njq: 1 compile error"));
+    assert.ok(checkSelfError('Parse error: near "SELEC": syntax error\n  SELEC name FROM t'));
+  });
+
+  it("is not blamed for the deliverable's own syntax error, or for the work's missing column", () => {
+    const deliverable = `Traceback (most recent call last):\n  File "<string>", line 1, in <module>\n  File "/w/tool.py", line 3\n    def f(:\n          ^\nSyntaxError: invalid syntax`;
+    assert.equal(checkSelfError(deliverable), null);
+    assert.equal(checkSelfError("Parse error: no such column: total"), null);
+  });
+
+  it("is retired at the claim and the claim judged by the checks that remain", async () => {
+    const ws = workspace();
+    try {
+      const checks: Check[] = [
+        { name: "made", kind: "command", run: "head -c 5 out.txt | grep -qx hello", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true },
+        // Fails on the missing file before the work, so preflight keeps it; its own bug shows only after.
+        { name: "broken-after", kind: "command", run: "test -f out.txt && python3 -c \"print(f'x {1')\"", timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true },
+      ];
+      const provider = scriptedProvider([
+        { calls: [{ name: "write_file", args: { path: "out.txt", content: "hello\n" } }] },
+        { text: "Done." },
+      ]);
+      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high" });
+      const events = await drain(engine.run(TASK, allowAll, { taskChecks: checks }));
+      assert.ok(events.some((e) => e.kind === "info" && /check broken-after failed in its own code, not on the work/.test(e.text)));
+      const end = events.find((e) => e.kind === "job_end");
+      assert.ok(end && end.kind === "job_end");
+      assert.equal(end.outcome, "verified");
+    } finally {
+      ws.cleanup();
+    }
+  });
+});
+
+describe("more ways a drafted check fails on its own", () => {
+  it("reads a file from a HEAD that does not hold it, or names a revision that does not exist", () => {
+    assert.ok(checkSelfError("fatal: path 'pricing.py' does not exist in 'HEAD'"));
+    assert.ok(checkSelfError("fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree."));
+  });
+  it("misuses the syntax tree", () => {
+    assert.ok(checkSelfError("Traceback (most recent call last):\n  File \"<string>\", line 3, in <module>\nAttributeError: 'FunctionDef' object has no attribute 'docstring'"));
+  });
+  it("but a branch the work was meant to create and did not is the work's failure", () => {
+    assert.equal(checkSelfError("fatal: ambiguous argument 'feature-x': unknown revision or path not in the working tree."), null);
   });
 });

@@ -27,7 +27,9 @@ import { buildRepoMap, DEFAULT_MAP_TOKENS } from "./repomap.js";
 import { buildBrief, DEFAULT_BRIEF_TOKENS } from "./brief.js";
 import { draftMission, missionStatus, runMission, writePlan, type MissionSummary } from "./mission.js";
 import { parseDuration } from "./session-commands.js";
-import { commandsHere, draftCriteriaCritiqued, preflightCriteria, taskChecksFrom, type Draft } from "./criteria.js";
+import { passedChecksWords } from "./tiers.js";
+import { judgeEffort, judgeTarget } from "./judge.js";
+import { commandsHere,draftCriteriaCritiqued, preflightCriteria, taskChecksFrom, type Draft } from "./criteria.js";
 import { listProject, removeNew } from "./leftovers.js";
 import { projectScripts } from "./interview.js";
 import {
@@ -47,8 +49,9 @@ import {
   type StoredEndpoint,
 } from "./providers.js";
 import { Receipts } from "./receipts.js";
-import type { BarResult, EngineEvent } from "./types.js";
+import type { BarResult, Check, EngineEvent } from "./types.js";
 import { stateDir } from "./statedir.js";
+import { draftReference, snapshotProject } from "./reference.js";
 import { env } from "./env.js";
 
 /**
@@ -146,13 +149,37 @@ options
                      the task and the receipt; a majority-backed violation quoted
                      from the task labels the work "passed its checks,
                      unconfirmed". A label only: nothing is refused or redone.
+  --reference        a second model writes an independent reference from the task
+                     text and the project as it was before the work, and a hidden
+                     check compares the deliverable with it on the task's
+                     examples, edge cases and random inputs (needs python3)
   --reveal-stuck     experimental: when its own hidden checks fail the same way
                      twice, show the model their commands once instead of
-                     stopping
+                     stopping (off by default: it let the model bend correct
+                     work to wrong checks, 37/60 vs 44/60)
+  --no-reveal        stop at the repeat failure (the default)
+  --review-advisory  experimental: the --review verdict is recorded but does not
+                     gate; "verified" then needs a drafted check that asserts a
+                     value, ran the work, and failed before the work began
+                     (also MAAT_REVIEW_ADVISORY=1)
+  --signout          before an unattended claim is judged, put each stated
+                     requirement to the model once beside the commands it ran
+                     (off by default: 60 rounds rescued no task)
+  --arbiter-model M  a different model rules on DISPUTE lines (same endpoint).
+                     Without one, a dispute is rejected: the worker model as
+                     its own arbiter shares the misreading
+  --dispute-votes N  arbiter asks per dispute (default 1)
   --batch            batch mode: every reply is one act call carrying a plan and
                      a list of actions, for models that make one tool call per
                      reply. Each action is still approved, recorded and checked
                      as its own call. HTTP endpoints only.
+  --judge <model>    draft the hidden checks and review the claim on a different
+                     model than the worker (same endpoint unless --judge-url).
+                     A separate judge does not share the worker's misreadings;
+                     it raised verified-on-correct-work on every worker tested
+                     with no wrong verifieds. Same as MAAT_JUDGE_MODEL.
+  --judge-url <url>  where the judge runs, e.g. grok-build://subscription,
+                     opencode://subscription, or an OpenAI-style URL.
   --reasoning-checks <e>  effort for drafting checks and planning a mission only
                      (single calls outside the work loop). Defaults to --reasoning.
   --reasoning-retry <e>   effort for every step after the checks refuse a claim.
@@ -235,6 +262,10 @@ type Args = {
   maxTokens?: number;
   /** `--reasoning low`: a reasoning model's effort, sent only when set. */
   reasoning?: string;
+  /** `--judge <model>`: the model that drafts checks and reviews (MAAT_JUDGE_MODEL). */
+  judge?: string;
+  /** `--judge-url <url>`: where the judge runs (MAAT_JUDGE_URL). */
+  judgeUrl?: string;
   /** `--reasoning-checks high`: effort for drafting checks and planning only. */
   reasoningChecks?: string;
   /** `--reasoning-retry high`: effort after the checks refuse a claim. */
@@ -243,8 +274,17 @@ type Args = {
   steps?: number;
   /** `--batch`: the model's only tool is act — a plan and a list of actions per reply. */
   batch?: boolean;
-  /** `--reveal-stuck`: see EngineConfig.revealOnStuck. Experimental. */
+  /** `--reveal-stuck` (opt-in) / `--no-reveal`: see EngineConfig.revealOnStuck. */
   revealStuck?: boolean;
+  /** `--review-advisory`: see EngineConfig.reviewAdvisory. */
+  reviewAdvisory?: boolean;
+  /** `--signout`: see EngineConfig.signOut. */
+  signout?: boolean;
+  /** `--arbiter-model` / `--dispute-votes`: see EngineConfig.dispute. */
+  arbiterModel?: string;
+  disputeVotes?: number;
+  /** `--reference`: an independent reference check (src/reference.ts). */
+  reference?: boolean;
   /** `--review [n]`: independent review of a verified claim, n votes (default 3). A label, not a gate. */
   review?: number;
   attempts?: number;
@@ -458,6 +498,24 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
       case "--reveal-stuck":
         out.revealStuck = true;
         break;
+      case "--no-reveal":
+        out.revealStuck = false;
+        break;
+      case "--review-advisory":
+        out.reviewAdvisory = true;
+        break;
+      case "--signout":
+        out.signout = true;
+        break;
+      case "--arbiter-model":
+        out.arbiterModel = next();
+        break;
+      case "--dispute-votes":
+        out.disputeVotes = positiveInt("--dispute-votes", next());
+        break;
+      case "--reference":
+        out.reference = true;
+        break;
       case "--review": {
         // Optional count: `--review` alone is three votes.
         const peek = argv[i + 1];
@@ -474,6 +532,18 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         const n = Number(raw);
         if (!Number.isInteger(n) || n < 0) throw new Error(`--steps takes a whole number (0 for none); got ${raw}`);
         out.steps = n;
+        break;
+      }
+      case "--judge":
+        out.judge = next();
+        break;
+      case "--judge-url": {
+        // Same words as --url (`grok`, `opencode`), and refused here rather
+        // than when the first check is drafted.
+        const judgeUrl = expandEndpointShorthand(next());
+        const wrong = endpointProblem(judgeUrl);
+        if (wrong) throw new Error(`--judge-url: ${wrong}`);
+        out.judgeUrl = judgeUrl;
         break;
       }
       case "--reasoning-checks":
@@ -719,7 +789,10 @@ function engineFor(args: Args, session = false, extra: { files?: FileAccess } = 
     retryReasoningEffort: args.reasoningRetry,
     maxSteps: args.steps,
     batch: args.batch === true,
-    ...(args.revealStuck ? { revealOnStuck: true } : {}),
+    ...(args.revealStuck === true ? { revealOnStuck: true } : args.revealStuck === false ? { revealOnStuck: false } : {}),
+    ...(args.reviewAdvisory || env("REVIEW_ADVISORY") === "1" ? { reviewAdvisory: true } : {}),
+    ...(args.signout ? { signOut: true } : {}),
+    ...(args.arbiterModel || args.disputeVotes ? { dispute: { model: args.arbiterModel, votes: args.disputeVotes } } : {}),
     ...(args.review ? { review: { votes: args.review, reasoningEffort: args.reasoningChecks ?? args.reasoning } } : {}),
     // MAAT_JUDGMENT=0: no judgment cases (benchmarks, where no person will ever rule).
     ...(env("JUDGMENT") === "0" ? { judgment: false } : {}),
@@ -1100,45 +1173,118 @@ async function cmdMission(args: Args): Promise<number> {
 async function autoDraft(
   engine: Engine,
   args: Args,
-  soFar?: { draft?: Draft },
+  soFar?: { draft?: Draft; sealed?: boolean; late?: boolean },
 ): Promise<ReturnType<typeof taskChecksFrom>> {
   const none: ReturnType<typeof taskChecksFrom> = { taskChecks: [], taskNotes: [] };
   // Drafted, then read cold by a critic against the task text: a check that
   // invents or guesses is dropped (with a task quote), and a draft where
   // nothing runs the deliverable is asked for once more. See criteria.ts.
-  const r = await draftCriteriaCritiqued({
-    commands: commandsHere(args.cwd),
-    lessons: new Judgments(args.cwd).lessons(),
+  const draftOnce = () =>
+    draftCriteriaCritiqued({
+      commands: commandsHere(args.cwd),
+      lessons: new Judgments(args.cwd).lessons(),
+      task: args.task ?? "",
+      scripts: projectScripts(args.cwd),
+      barChecks: (engine.cfg.bar?.checks ?? []).map((c) => c.name),
+      ...judgeTarget({ baseUrl: args.url, apiKey: args.key, model: args.model }),
+      cwd: args.cwd,
+      reasoningEffort: judgeEffort(args.reasoningChecks ?? args.reasoning),
+      latency: engine.askLatency,
+      // What is ready when a time budget stops the wait (RunOptions.criteriaSoFar).
+      onProgress: (d) => {
+        if (soFar) soFar.draft = d;
+      },
+    });
+  let r = await draftOnce();
+  // One unlucky reply (an overloaded provider, JSON that does not parse) leaves
+  // a run with no checks, and so no verdict worth the name. Asked
+  // once more; a second failure is journalled as `no-checks`, not left silent.
+  if (!r.ok && !soFar?.sealed) {
+    process.stderr.write(`maat: criteria not drafted — ${r.error}; asking once more\n`);
+    engine.cfg.journal?.append("note", { kind: "draft-failed", text: `criteria draft failed once: ${r.error}` });
+    r = await draftOnce();
+  }
+  if (!r.ok) {
+    process.stderr.write(`maat: criteria not drafted — ${r.error}; running against the project bar only\n`);
+    engine.cfg.journal?.append("note", { kind: "no-checks", text: `no-checks: criteria could not be drafted after two tries — ${r.error}` });
+    return none;
+  }
+  for (const line of r.critique) process.stderr.write(`maat: criteria review — ${line}\n`);
+  // A check the seal-time lint retired is never sealed; the record says which and why.
+  for (const d of r.lint ?? []) {
+    engine.cfg.journal?.append("note", {
+      kind: "check-lint-dropped",
+      text: `drafted check ${d.name} dropped by lint ${d.rule}: ${d.why}`,
+      name: d.name,
+      run: d.run,
+      rule: d.rule,
+      redraft: d.redraft,
+    });
+  }
+  // A time budget already sealed what was ready (criteriaSoFar), and the work
+  // has begun in this folder. Sealing again would run the preflight a second
+  // time — and its cleanup removes every file that appeared while it ran,
+  // which by now includes the model's.
+  if (soFar?.sealed) return none;
+  return sealDraft(r.draft, args, soFar?.late);
+}
+
+/**
+ * Snapshot the project now, before the first step, and write a reference
+ * check from it in the background (src/reference.ts). Null — said once — when
+ * there is no python3, the project is too large to copy, or no reference
+ * applies.
+ */
+function startReference(args: Args): Promise<{ check: Check; note: Record<string, unknown> } | null> | undefined {
+  const here = commandsHere(args.cwd);
+  if (!here.present.includes("python3")) {
+    process.stderr.write("maat: no reference check — python3 is not installed here\n");
+    return undefined;
+  }
+  const snapshot = snapshotProject(args.cwd);
+  if (!snapshot) {
+    process.stderr.write("maat: no reference check — the project is too large to snapshot\n");
+    return undefined;
+  }
+  return draftReference({
     task: args.task ?? "",
-    scripts: projectScripts(args.cwd),
-    barChecks: (engine.cfg.bar?.checks ?? []).map((c) => c.name),
+    snapshot,
     baseUrl: args.url,
     apiKey: args.key,
     model: args.model,
     cwd: args.cwd,
     reasoningEffort: args.reasoningChecks ?? args.reasoning,
-    // What is ready when a time budget stops the wait (RunOptions.criteriaSoFar).
-    onProgress: (d) => {
-      if (soFar) soFar.draft = d;
-    },
+  }).then((r) => {
+    if (!r.ok) {
+      process.stderr.write(`maat: no reference check — ${r.why}\n`);
+      return null;
+    }
+    process.stderr.write(`maat: reference check ready — ${r.reason}\n`);
+    return {
+      check: r.check,
+      note: { snapshot: r.snapshot.hash, files: r.snapshot.files, reason: r.reason, source: r.source },
+    };
+  }).catch((e: unknown) => {
+    // A throw here (a file gone mid-copy) was an unhandled rejection whenever
+    // no claim was waiting on the reference — enough to end the process.
+    process.stderr.write(`maat: no reference check — ${e instanceof Error ? e.message : String(e)}\n`);
+    return null;
   });
-  if (!r.ok) {
-    process.stderr.write(`maat: criteria not drafted — ${r.error}; running against the project bar only\n`);
-    return none;
-  }
-  for (const line of r.critique) process.stderr.write(`maat: criteria review — ${line}\n`);
-  return sealDraft(r.draft, args);
 }
 
 /** A draft as sealed, hidden checks, with the ones that break before any work dropped. */
-async function sealDraft(draft: Draft, args: Args): Promise<ReturnType<typeof taskChecksFrom>> {
+async function sealDraft(draft: Draft, args: Args, late = false): Promise<ReturnType<typeof taskChecksFrom>> {
   // Hidden: the model wrote these, and a model shown its own exam makes the
   // work equal the check. It gets the names, and the output on failure.
   const sealed = taskChecksFrom(draft, { hidden: true });
   // Headless, the checks' own side effects are cleaned up (src/leftovers.ts).
-  const beforeTry = listProject(args.cwd);
-  const broken = await preflightCriteria(sealed.taskChecks, { cwd: args.cwd });
-  removeNew(args.cwd, beforeTry);
+  // A draft that joins at a claim (RunOptions.pendingCriteria, cut with no
+  // checks ready) lands after the work began: trying it in the live folder
+  // would be meaningless, and the cleanup after the try removes every file
+  // that appeared meanwhile, the model's included. It joins untried.
+  const beforeTry = late ? null : listProject(args.cwd);
+  const broken = late ? [] : await preflightCriteria(sealed.taskChecks, { cwd: args.cwd, stray: { task: args.task ?? "" } });
+  if (!late) removeNew(args.cwd, beforeTry);
   const drop = new Set(broken.map((b) => b.name));
   for (const b of broken) {
     process.stderr.write(`maat: dropped drafted criterion ${b.name} (${b.run}) — ${b.why}\n`);
@@ -1148,7 +1294,7 @@ async function sealDraft(draft: Draft, args: Args): Promise<ReturnType<typeof ta
     for (const c of taskChecks) process.stdout.write(`· criterion ${c.name}: ${c.run}\n`);
     for (const n of sealed.taskNotes) process.stdout.write(`· note ${n}\n`);
   }
-  return { taskChecks, taskNotes: sealed.taskNotes };
+  return { taskChecks, taskNotes: sealed.taskNotes, ...(sealed.requirements ? { requirements: sealed.requirements } : {}) };
 }
 
 async function cmdRun(args: Args, ask = false): Promise<number> {
@@ -1240,10 +1386,16 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         const sp = ev.spend;
         const cached = sp.cachedTokens > 0 ? ` (${sp.cachedTokens} cached)` : "";
         const said =
-          ev.outcome === "verified" && ev.review && !ev.review.confirmed
+          ev.tier === "passed-checks"
+            ? passedChecksWords(ev.tierReason)
+            : ev.outcome === "verified" && ev.revealed?.length
+            ? "verified (checks shown after a repeat failure)"
+            : ev.outcome === "verified" && ev.review && !ev.review.confirmed
             ? "passed its checks, unconfirmed"
             : ev.outcome === "verified" && ev.review?.confirmed
               ? "verified, independently reviewed"
+              : ev.outcome === "verified" && ev.unreviewed
+                ? "passed its checks, unreviewed"
               : ev.outcome === "verified" && ev.selfChecked
                 ? "passed its own checks"
                 : ev.outcome === "unverified" && ev.checksDisagree?.length
@@ -1334,15 +1486,25 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   const { taskChecks, taskNotes } = criteriaFromArgs(args);
   // Drafted while the model starts reading: the engine seals them before the
   // first change or claim, so they still predate the work (see RunOptions).
-  const soFar: { draft?: Draft } = {};
+  const soFar: { draft?: Draft; sealed?: boolean; late?: boolean } = {};
   const pendingCriteria = args.autoCriteria && !ask ? autoDraft(engine, args, soFar) : undefined;
   const criteriaSoFar = pendingCriteria
-    ? () => (soFar.draft ? sealDraft(soFar.draft, args) : Promise.resolve({ taskChecks: [], taskNotes: [] }))
+    ? () => {
+        // Nothing reviewed yet: leave the draft running to join at the claim
+        // (it is then sealed without the preflight, see sealDraft).
+        if (soFar.draft?.checks.length) soFar.sealed = true;
+        else soFar.late = true;
+        return soFar.draft?.checks.length ? sealDraft(soFar.draft, args) : Promise.resolve({ taskChecks: [], taskNotes: [] });
+      }
     : undefined;
+  const referenceCheck = args.reference && !ask ? startReference(args) : undefined;
   let undetermined = false;
   /** The turn's own verdict, from job_end. */
   let outcome: string | undefined;
-  for await (const ev of engine.run(args.task, confirm, { ask, taskChecks, taskNotes, pendingCriteria, criteriaSoFar })) {
+  // How long a timed turn waits for its drafted checks; for tests and debugging.
+  const waitEnv = Number(env("CRITERIA_WAIT_MS"));
+  const criteriaWait = Number.isFinite(waitEnv) && waitEnv > 0 ? { criteriaWaitMs: waitEnv } : {};
+  for await (const ev of engine.run(args.task, confirm, { ask, taskChecks, taskNotes, pendingCriteria, criteriaSoFar, referenceCheck, ...criteriaWait })) {
     emit(ev);
     if (ev.kind === "proof_exhausted" && ev.result.undetermined?.length) undetermined = true;
     // The sentence that explains an undetermined bar arrives as an error, so
@@ -1976,6 +2138,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     process.stdout.write(USAGE + "\n");
     return 0;
   }
+  // The judge is read where checks are drafted and claims reviewed (judge.ts).
+  if (args.judge) process.env.MAAT_JUDGE_MODEL = args.judge;
+  if (args.judgeUrl) process.env.MAAT_JUDGE_URL = args.judgeUrl;
   if (args.version) {
     process.stdout.write(VERSION + "\n");
     return 0;

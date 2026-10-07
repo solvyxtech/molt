@@ -9,7 +9,7 @@
  * feature in a milestone is done, every assertion in that milestone is run
  * again, together, and the milestone seals only if all of them still pass.
  *
- * What is deliberately NOT here: an orchestrator model. Factory's missions
+ * What is deliberately NOT here: an orchestrator model. A competitor's missions
  * put a frontier model in a loop with seventeen tools to decide what runs
  * next and whether a worker's handoff was good; it is the most expensive
  * process in the system and it is doing a job a loop can do. Here the

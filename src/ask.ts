@@ -13,10 +13,21 @@
  * person or a gate will read, never work.
  */
 import { acpAgentFor, acpAsk } from "./acp.js";
+import { isOpencode, opencodeAsk } from "./opencode.js";
 import { removedSubscriptionProblem } from "./endpoint.js";
 import { errorText } from "./format.js";
-import { authHeaders } from "./providers.js";
-import { askError, askTimeoutMs, probeSignal } from "./watchdog.js";
+import { authHeaders, isSelfHosted, selfHostedThinking, openRouterProvider } from "./providers.js";
+import { LONG_RATE_LIMIT_MS, longQuotaText, providerErrorText, rateLimitResetAt, readStream, transientProviderError, untilText, type ProviderError } from "./stream.js";
+import { askError, askTimeoutMs, localSpeed, probeSignal } from "./watchdog.js";
+import { takeTurn } from "./localgate.js";
+
+/**
+ * Pauses before asking again when the provider said it is overloaded or
+ * rate-limited — inside a 200 (`{"error":{"code":503,...}}`) or as a 429/503.
+ * Read as a reply, that error was an empty answer: on a free model the critic
+ * "could not review" two drafts in five and the reviewer abstained.
+ */
+export const ASK_OVERLOAD_BACKOFF_MS = [2_000, 5_000, 10_000, 20_000, 30_000];
 
 export type AskOptions = {
   baseUrl: string;
@@ -34,10 +45,23 @@ export type AskOptions = {
   what?: string;
   fetchFn?: typeof fetch;
   acpSpawn?: typeof import("node:child_process").spawn;
+  /** The CLI runner for the opencode ask path. Tests only. */
+  cliRun?: (cmd: string, args: string[], opts: object) => Promise<{ stdout: string }>;
   timeoutMs?: number;
+  /** Pauses between asks after an overloaded provider (ASK_OVERLOAD_BACKOFF_MS). Tests only. */
+  overloadBackoffMs?: number[];
+  /**
+   * The session's latency learner (Engine.askLatency). A completed ask to a
+   * cloud endpoint records how long it took, so the first stall of the engine's
+   * own requests is judged against what this provider has shown the drafter
+   * and the critic, not the full fixed allowance: three samples are needed
+   * before the learner tightens anything, and the drafter supplies two or
+   * three before the first step. Never recorded for a self-hosted server.
+   */
+  latency?: { record(w: { firstProgressMs: number | undefined; maxGapMs: number }): void };
 };
 
-export type Asked = { ok: true; text: string; cutOff: boolean } | { ok: false; error: string };
+export type Asked = { ok: true; text: string; cutOff: boolean } | { ok: false; error: string; transient?: true };
 
 /**
  * The output ceiling for one ask, unless the caller says otherwise.
@@ -54,6 +78,16 @@ export const ASK_MAX_TOKENS = 2_000;
 export const ASK_RETRY_FACTOR = 4;
 
 export async function askModel(opts: AskOptions): Promise<Asked> {
+  const pauses = opts.overloadBackoffMs ?? ASK_OVERLOAD_BACKOFF_MS;
+  let asked = await askSized(opts);
+  for (let i = 0; i < pauses.length && !asked.ok && asked.transient; i++) {
+    await new Promise((r) => setTimeout(r, pauses[i]));
+    asked = await askSized(opts);
+  }
+  return asked;
+}
+
+async function askSized(opts: AskOptions): Promise<Asked> {
   const first = await askOnce(opts, opts.maxTokens ?? ASK_MAX_TOKENS);
   // Empty AND cut off means the model spent the whole ceiling reasoning and
   // never started the answer. Once, with room: a model that empties a four
@@ -77,10 +111,28 @@ export async function askModel(opts: AskOptions): Promise<Asked> {
 }
 
 async function askOnce(opts: AskOptions, maxTokens: number): Promise<Asked> {
-  const limitMs = askTimeoutMs(maxTokens, opts.timeoutMs);
+  // Sized from this question's own prompt, and at local-hardware rates for a
+  // self-hosted server (watchdog.ts localSpeed): the NUC's drafter timed out
+  // on a fixed 2,000-token guess and a laptop's rates, and sealed nothing.
+  const limitMs = askTimeoutMs(maxTokens, opts.timeoutMs, {
+    promptTokens: Math.ceil((opts.system.length + opts.prompt.length) / 4),
+    ...(isSelfHosted(opts.baseUrl) ? { speed: localSpeed() } : {}),
+  });
 
   const removed = removedSubscriptionProblem(opts.baseUrl);
   if (removed) return { ok: false, error: removed };
+
+  if (isOpencode(opts.baseUrl)) {
+    const asked = await opencodeAsk({
+      timeoutMs: limitMs,
+      model: opts.model,
+      systemPrompt: opts.system,
+      prompt: opts.prompt,
+      ...(opts.cliRun ? { run: opts.cliRun } : {}),
+    });
+    if (asked.ok) return { ok: true, text: asked.text, cutOff: false };
+    return { ok: false, error: longQuotaText(asked.error) ?? asked.error, ...(asked.transient ? { transient: true as const } : {}) };
+  }
 
   const acp = acpAgentFor(opts.baseUrl);
   if (acp) {
@@ -93,11 +145,24 @@ async function askOnce(opts: AskOptions, maxTokens: number): Promise<Asked> {
       cwd: opts.cwd,
       ...(opts.acpSpawn ? { spawnFn: opts.acpSpawn } : {}),
     });
-    return asked.ok ? { ok: true, text: asked.text, cutOff: false } : asked;
+    if (asked.ok) return { ok: true, text: asked.text, cutOff: false };
+    return { ok: false, error: longQuotaText(asked.error) ?? asked.error };
   }
 
   const f = opts.fetchFn ?? fetch;
   const base = opts.baseUrl.replace(/\/$/, "");
+  // One request at a time to a self-hosted server, and the timeout below
+  // starts only once this one has its turn (src/localgate.ts).
+  const release = await takeTurn(base);
+  // A self-hosted server is asked with a streamed request. llama.cpp keeps
+  // generating a non-streamed request after the client has gone: on the NUC
+  // every ask Maat timed out or cancelled went on holding the only slot for
+  // minutes, with nobody to read the answer. It stops a streamed request when
+  // the connection closes. The reply is the same text either way; reasoning
+  // deltas are read and dropped. The timeout is unchanged: still one bound on
+  // the whole answer.
+  const stream = isSelfHosted(base);
+  const sentAt = Date.now();
   try {
     const res = await f(`${base}/chat/completions`, {
       method: "POST",
@@ -112,19 +177,58 @@ async function askOnce(opts: AskOptions, maxTokens: number): Promise<Asked> {
         max_tokens: maxTokens,
         temperature: 0,
         ...(opts.reasoningEffort ? { reasoning: { effort: opts.reasoningEffort } } : {}),
+        ...selfHostedThinking(base, opts.reasoningEffort),
+        ...openRouterProvider(base, opts.model),
+        ...(stream ? { stream: true } : {}),
       }),
     });
-    if (!res.ok) return { ok: false, error: `HTTP ${res.status}${opts.what ? ` ${opts.what}` : ""}` };
-    const json = (await res.json()) as {
+    if (!res.ok) {
+      const body = res.status === 429 ? await res.text().catch(() => "") : "";
+      const resetAt = rateLimitResetAt(body);
+      if (resetAt !== undefined && resetAt - Date.now() > LONG_RATE_LIMIT_MS) {
+        return { ok: false, error: `the provider's rate limit is reached ${untilText(resetAt)}${opts.what ? ` (${opts.what})` : ""}` };
+      }
+      return { ok: false, error: `HTTP ${res.status}${opts.what ? ` ${opts.what}` : ""}`, ...(res.status === 429 || res.status === 503 ? { transient: true } : {}) };
+    }
+    type Reply = {
       choices?: { message?: { content?: string | null }; finish_reason?: string | null }[];
+      error?: ProviderError;
     };
-    return {
-      ok: true,
-      text: json.choices?.[0]?.message?.content ?? "",
-      cutOff: json.choices?.[0]?.finish_reason === "length",
-    };
+    let content: string;
+    let finish: string | null | undefined;
+    let error: ProviderError | undefined;
+    // A server that was sent `stream: true` and answers with plain JSON (a
+    // proxy that buffers, or an error body) is read as JSON, as it always was.
+    if (stream && res.body && /text\/event-stream/i.test(res.headers.get("content-type") ?? "")) {
+      const done = await readStream(res.body, () => {});
+      content = done.message.content ?? "";
+      finish = done.finishReason;
+      error = done.error;
+    } else {
+      const json = (await res.json()) as Reply;
+      content = json.choices?.[0]?.message?.content ?? "";
+      finish = json.choices?.[0]?.finish_reason;
+      error = json.error && typeof json.error === "object" ? json.error : undefined;
+    }
+    if (error) {
+      const resetAt = rateLimitResetAt({ error });
+      if (resetAt !== undefined && resetAt - Date.now() > LONG_RATE_LIMIT_MS) {
+        return { ok: false, error: `the provider's rate limit is reached ${untilText(resetAt)}${opts.what ? ` (${opts.what})` : ""}` };
+      }
+      return { ok: false, error: `${providerErrorText(error)}${opts.what ? ` (${opts.what})` : ""}`, ...(transientProviderError(error) ? { transient: true } : {}) };
+    }
+    // The answer is small and read whole, so the time it took is both the wait
+    // for the first byte and the longest silence: the slow end of what this
+    // provider does, which is what the learner wants to know.
+    if (!stream && opts.latency) {
+      const took = Date.now() - sentAt;
+      opts.latency.record({ firstProgressMs: took, maxGapMs: took });
+    }
+    return { ok: true, text: content, cutOff: finish === "length" };
   } catch (e) {
     return { ok: false, error: askError(e, limitMs, errorText) };
+  } finally {
+    release();
   }
 }
 

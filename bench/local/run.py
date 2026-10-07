@@ -1,12 +1,15 @@
 """
-Run molt on the local tasks and record how it behaves. Graders are hidden in
-tasks.py.
+Run molt on the local tasks and grade the result. Graders are hidden in tasks.py.
 
-    python3 run.py [molt]
+    python3 run.py molt [repeats] [task,task]
+
+Paired arms: ARMS="base:REFERENCE=0;ref:REFERENCE=1" (or JSON) runs, per task,
+arm A then arm B before the next task; rows carry "arm"; resume is by
+(task, agent, rep, arm). BENCH_TASKS=a,b restricts the task set.
 
 Only molt is run here. Other vendors' agents are not benchmarked from this
 repository: their terms commonly forbid benchmarking and publishing
-performance data, and the results files hold molt rows only.
+performance data.
 """
 
 from __future__ import annotations
@@ -25,33 +28,84 @@ HERE = Path(__file__).resolve().parent
 # Outside every git repository: a task folder inside this one let agents'
 # `git commit` walk up and commit task files into molt-desktop's main.
 WORK = Path(os.environ.get("BENCH_WORK", Path.home() / ".cache/maat-bench/work"))
-MOLT = Path.home() / os.environ.get("MOLT_DIST", "Documents/molt-desktop/dist-compare") / "cli.js"
-LIMIT = 600  # seconds per task
+# MOLT_DIST_ABS: an absolute path to the built Maat (the container mounts it at /maat).
+MOLT = (Path(os.environ["MOLT_DIST_ABS"]) if os.environ.get("MOLT_DIST_ABS") else Path.home() / os.environ.get("MOLT_DIST", "Documents/molt-desktop/dist-compare")) / "cli.js"
+LIMIT = int(os.environ.get("BENCH_LIMIT", "600"))  # seconds per task
+# Space Bunny Alpha was withdrawn from OpenRouter on 2026-10-05; the owner chose Nemotron 3 Ultra.
+MODEL = os.environ.get("BENCH_MODEL") or "nvidia/nemotron-3-ultra-550b-a55b:free"
+# BENCH_URL points the run at another endpoint (e.g. the NUC's llama.cpp over the tunnel); the
+# OpenRouter key is then not sent anywhere.
+URL = os.environ.get("BENCH_URL") or "https://openrouter.ai/api/v1"
 
 
 def openrouter_key() -> str:
+    if os.environ.get("OPENROUTER_API_KEY"):  # the container is given the key, not the Mac's auth file
+        return os.environ["OPENROUTER_API_KEY"]
     return subprocess.run(
         ["node", "-e", "import('%s').then(m=>process.stdout.write(m.readAuth().openrouter||''))" % (Path.home() / "Documents/molt-desktop/dist/providers.js")],
         capture_output=True, text=True,
     ).stdout
 
 
+# --sandbox, as the Terminal-Bench adapter has always passed: the task folder
+# is throwaway (and, in a container, so is the machine). With --yes the
+# project boundary still asked, headless asking is "User denied", and every
+# local number from the first run to 2026-10-06 was measured with 118-168
+# denied calls per 60 runs: writing the deliverable through a heredoc, removing
+# the model's own scratch files. BENCH_GATE=yes reproduces the old runs.
+AGENT_USER = os.environ.get("BENCH_AGENT_USER")  # set in the containers: the agent runs unprivileged
+
+
+def as_agent(cmd: list, env: dict | None = None) -> tuple[list, dict | None]:
+    """With BENCH_AGENT_USER set, run the agent as that user: it cannot read the graders
+    or the reference solutions, which stay root-only. Unset (Mac host lanes): unchanged."""
+    if not AGENT_USER:
+        return cmd, env
+    import pwd
+    home = pwd.getpwnam(AGENT_USER).pw_dir
+    return ["runuser", "-u", AGENT_USER, "--", "env", f"HOME={home}", *cmd], env
+
+
+def hand_over(d: Path) -> None:
+    if AGENT_USER:
+        subprocess.run(["chown", "-R", AGENT_USER, str(d)], check=True)
+
+
+def provider_capped(out: str, steps: int) -> bool:
+    """The provider's cap (OpenRouter daily limit, OpenCode free-usage limit), not the work."""
+    return (
+        "rate limit is reached until" in out
+        or ("free-models-per-day" in out and steps == 0)
+        or ("OpenCode rate limit" in out and steps == 0)
+    )
+
+
 def run_molt(d: Path, prompt: str, log: Path) -> dict:
-    env = os.environ | {"MOLT_API_KEY": openrouter_key(), "MOLT_JUDGMENT": "0"}  # nobody rules on a benchmark run
+    key = openrouter_key() if "openrouter.ai" in URL else "local"
+    env = os.environ | {"MOLT_API_KEY": key, "MOLT_JUDGMENT": "0"}  # nobody rules on a benchmark run
     cmd = [
-        "node", str(MOLT), "run", "--url", "https://openrouter.ai/api/v1", "--model", "stealth/space-bunny-alpha",
-        "--reasoning", "low", "--yes", "--json", "--criteria", "auto", "--batch", "--review", "3", "--steps", "200", "--cwd", str(d), prompt,
+        "node", str(MOLT), "run", "--url", URL, "--model", os.environ.get("BENCH_MODEL") or MODEL,
+        "--reasoning", os.environ.get("BENCH_REASONING") or "low", *(["--yes"] if os.environ.get("BENCH_GATE") == "yes" else ["--sandbox"]), "--json", "--criteria", "auto", "--batch", "--review", "3", "--steps", "200",
+        # Maat stops itself a minute before the kill and judges what is on disk;
+        # the subprocess timeout below is only the backstop.
+        "--for", f"{max(60, LIMIT - 60)}s",
+        *(["--reference"] if os.environ.get("REFERENCE") == "1" else []), "--cwd", str(d), prompt,
     ]
     t0 = time.time()
+    cmd, env = as_agent(cmd, env)
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=LIMIT, env=env).stdout
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=LIMIT, env=env)
+        out, err = proc.stdout, proc.stderr
         timed_out = False
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        err = (e.stderr or b"").decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
         timed_out = True
     secs = time.time() - t0
     log.write_text(out)
-    steps = 0; per = []; outcome = None; spend = {}; review = None; disagree = []
+    # Maat's own notices (criteria not drafted, dropped checks, refusals) go to stderr.
+    log.with_suffix(".err").write_text(err or "")
+    steps = 0; per = []; outcome = None; spend = {}; review = None; disagree = []; extra = {}
     for line in out.splitlines():
         if not line.startswith("{"):
             continue
@@ -67,7 +121,13 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
             spend = ev.get("spend") or {}
             review = ev.get("review")
             disagree = ev.get("checksDisagree") or []
+            # Only what job_end carried; absent keys stay absent (older builds).
+            extra = {k: ev[k] for k in ("revealed", "deadline", "endedBy", "retired", "build", "tier", "tierReason") if k in ev}
+    # The provider's daily cap, not the work: every later task would fail the
+    # same way (2026-10-05: eleven tasks per arm "failed" in 140 s, 0 turns).
+    capped = provider_capped(out, steps)
     return {
+        "provider_capped": capped,
         "secs": round(secs), "turns": steps, "calls": sum(per), "multi": sum(1 for x in per if x > 1),
         "tokens_in": spend.get("promptTokens"), "claim": outcome, "timed_out": timed_out,
         "said_done": (outcome or "").startswith("verified"),
@@ -76,6 +136,7 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
         # Refused only by molt's own drafted checks (reported unverified).
         "checks_disagree": disagree,
         "said_done_reviewed": (outcome or "").startswith("verified") and not (review and not review.get("confirmed")),
+        **extra,
     }
 
 
@@ -93,34 +154,85 @@ def claims_done(text: str) -> bool:
                                 "passes", "passing", "finished", "works", "added", "updated", "written"))
 
 
+def parse_arms(spec: str | None) -> list[tuple[str | None, dict]]:
+    """
+    ARMS defines the arms of a paired run. Either "base:REFERENCE=0;ref:REFERENCE=1"
+    (arms split on ";", variables on ","), or JSON: {"base": {"REFERENCE": "0"}, ...}
+    or a path to such a file. No ARMS: one unnamed arm, the legacy behaviour.
+    """
+    if not spec:
+        return [(None, {})]
+    spec = spec.strip()
+    if spec.startswith("{") or (os.path.isfile(spec) and spec.endswith(".json")):
+        data = json.loads(spec if spec.startswith("{") else Path(spec).read_text())
+        return [(k, {a: str(b) for a, b in (v or {}).items()}) for k, v in data.items()]
+    arms = []
+    for part in filter(None, (x.strip() for x in spec.split(";"))):
+        name, _, vs = part.partition(":")
+        env = {}
+        for kv in filter(None, (x.strip() for x in vs.split(","))):
+            k, _, v = kv.partition("=")
+            env[k.strip()] = v
+        arms.append((name.strip(), env))
+    return arms
+
+
 def main(which: str, repeats: int, task_filter: str | None) -> None:
     from tasks2 import TASKS2  # noqa: PLC0415
+    from tasks3 import TASKS3  # noqa: PLC0415
     agents = {"molt": run_molt}
     if which not in agents:
         sys.exit(f"unknown agent {which!r}: this runner only runs molt")
     chosen = [which]
-    tasks = [T for T in TASKS + TASKS2 if not task_filter or T.name in task_filter.split(",")]
-    out = HERE / os.environ.get("RESULTS", f"results-{which}-x{repeats}.jsonl")
+    tasks = [T for T in TASKS + TASKS2 + TASKS3 if not task_filter or T.name in task_filter.split(",")]
+    # BENCH_TASKS restricts to a subset (e.g. the discordant tasks of an earlier pair).
+    if os.environ.get("BENCH_TASKS"):
+        want = {x.strip() for x in os.environ["BENCH_TASKS"].split(",") if x.strip()}
+        tasks = [T for T in tasks if T.name in want]
+    arms = parse_arms(os.environ.get("ARMS"))
+    out = Path(os.environ.get("RESULTS_DIR", HERE)) / os.environ.get("RESULTS", f"results-{which}-x{repeats}.jsonl")
     done = set()
     if out.exists():  # resume: skip runs already recorded
         for line in out.read_text().splitlines():
             r = json.loads(line)
-            done.add((r["task"], r["agent"], r["rep"]))
+            done.add((r["task"], r["agent"], r["rep"], r.get("arm")))
     for rep in range(repeats):
         for T in tasks:
-            for a in chosen:
-                if (T.name, a, rep) in done:
-                    continue
-                d = WORK / f"{T.name}-{a}-{rep}"
-                shutil.rmtree(d, ignore_errors=True)
-                d.mkdir(parents=True)
-                T.setup(d)
-                r = agents[a](d, T.PROMPT, WORK / f"{T.name}-{a}-{rep}.log")
-                ok, why = T.grade(d)
-                r.update(task=T.name, agent=a, rep=rep, passed=ok, why=why, final="")
-                with out.open("a") as f:
-                    f.write(json.dumps(r) + "\n")
-                print(json.dumps({k: r[k] for k in ("task", "agent", "rep", "passed", "said_done", "turns", "secs")}), flush=True)
+            for arm, arm_env in arms:  # paired: arm A then arm B on this task before the next task
+                for a in chosen:
+                    if (T.name, a, rep, arm) in done:
+                        continue
+                    tag = f"{T.name}-{a}-{rep}" + (f"-{arm}" if arm else "")
+                    d = WORK / tag
+                    shutil.rmtree(d, ignore_errors=True)
+                    d.mkdir(parents=True)
+                    T.setup(d)
+                    hand_over(d)
+                    saved = {k: os.environ.get(k) for k in arm_env}
+                    os.environ.update(arm_env)
+                    try:
+                        r = agents[a](d, T.PROMPT, WORK / f"{tag}.log")
+                    finally:
+                        for k, v in saved.items():
+                            if v is None:
+                                os.environ.pop(k, None)
+                            else:
+                                os.environ[k] = v
+                    if r.get("provider_capped"):
+                        # Not recorded, so a resume runs this task again.
+                        print(f"STOPPED: the provider's daily limit / quota is reached ({tag} not recorded)", flush=True)
+                        return
+                    ok, why = T.grade(d)
+                    final = ""
+                    r.update(task=T.name, agent=a, rep=rep, passed=ok, why=why, final=final[:300])
+                    if arm:
+                        r["arm"] = arm
+                    if os.environ.get("MAAT_BUILD"):
+                        r["build"] = os.environ["MAAT_BUILD"]  # sha8 of the packed Maat the container ran
+                    with out.open("a") as f:
+                        f.write(json.dumps(r) + "\n")
+                    print(json.dumps({k: r[k] for k in ("task", "agent", "arm", "rep", "passed", "said_done", "turns", "secs") if k in r}), flush=True)
+
 
 
 if __name__ == "__main__":

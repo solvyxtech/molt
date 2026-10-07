@@ -11,7 +11,7 @@
 import { DISPUTE_HINT } from "./dispute.js";
 import { judgePass } from "./evidence.js";
 import { testsRealFor } from "./tests-real.js";
-import { runCommand } from "./run.js";
+import { runCommand, draftedShell } from "./run.js";
 import { parseLcov, coverageFor, coverageCouldSpeak, unprovenIn, type Unproven } from "./coverage.js";
 import { planMutations, applyMutation, negateComparison, type Mutation } from "./mutate.js";
 import { proposeBar, type Detected } from "./detect.js";
@@ -2176,12 +2176,14 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
   let exitCode = 0;
   let output = "";
   let diagnosis: CommandDiagnosis = { didNotRun: false };
+  let timedOut = false;
   try {
     // Not execSync: a bar check is the longest thing molt runs (`npm test`,
     // two minutes by default) and running it synchronously froze the terminal
     // for its whole duration — including the ctrl+C that would have stopped it.
     const r = await runCommand(check.run, {
       cwd: ctx.cwd,
+      shell: draftedShell(check),
       timeoutMs: check.timeoutMs,
       maxBuffer: 8 * 1024 * 1024,
       signal: ctx.signal,
@@ -2189,6 +2191,7 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
     output = `${r.stdout}${r.stderr}`;
     exitCode = r.code ?? 1;
     if (r.timedOut) {
+      timedOut = true;
       output = `timed out after ${check.timeoutMs}ms\n` + output;
       exitCode = 124;
     } else if (exitCode !== check.expectExit) {
@@ -2219,6 +2222,7 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
     ...(check.advisory ? { advisory: true } : {}),
     ...(check.hidden ? { hidden: true } : {}),
     ...(diagnosis.didNotRun ? { didNotRun: true } : {}),
+    ...(timedOut ? { timedOut: true } : {}),
     tags: check.tags,
     kind: "command",
     detail: check.run,

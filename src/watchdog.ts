@@ -49,14 +49,38 @@ export const REQUEST_IDLE_MS = 5 * 60_000;
 export const PREFILL_MS_PER_TOKEN = 20;
 export const GENERATE_MS_PER_TOKEN = 100;
 
+/** Assumed rates for a request's first-byte allowance, in ms per token. */
+export type Speed = { prefillMsPerToken: number; generateMsPerToken: number };
+
+/**
+ * The rates for a self-hosted server: `MAAT_LOCAL_PREFILL_TPS` (default 10)
+ * and `MAAT_LOCAL_GENERATE_TPS` (default 5), in tokens per second.
+ *
+ * The defaults above are a laptop's. The NUC's integrated GPU reads a prompt
+ * at about 39 tokens/s; Maat's first request of a task (system prompt, tools,
+ * brief) is long enough that the first byte came after more than five
+ * minutes, the request was called hung and sent again three times, and the
+ * criteria draft timed out the same way, so a correct fix-git ended with no
+ * checks at all. A server that is slow is not one that is hung: once bytes
+ * flow, the idle allowance still catches a real stall.
+ */
+export function localSpeed(env: (name: string) => string | undefined = readEnv): Speed {
+  const tps = (name: string, fallback: number) => {
+    const n = Number(env(name));
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  };
+  return { prefillMsPerToken: 1000 / tps("LOCAL_PREFILL_TPS", 10), generateMsPerToken: 1000 / tps("LOCAL_GENERATE_TPS", 5) };
+}
+
 /** How long to wait for the first byte of a request. */
 export function firstByteMs(
   idleMs: number,
   req: { promptTokens: number; maxTokens: number; stream: boolean },
+  speed: Speed = { prefillMsPerToken: PREFILL_MS_PER_TOKEN, generateMsPerToken: GENERATE_MS_PER_TOKEN },
 ): number {
   if (!(idleMs > 0)) return 0;
-  const prefill = Math.max(0, req.promptTokens) * PREFILL_MS_PER_TOKEN;
-  const whole = req.stream ? 0 : Math.max(0, req.maxTokens) * GENERATE_MS_PER_TOKEN;
+  const prefill = Math.max(0, req.promptTokens) * speed.prefillMsPerToken;
+  const whole = req.stream ? 0 : Math.max(0, req.maxTokens) * speed.generateMsPerToken;
   return Math.max(idleMs, prefill + whole);
 }
 
@@ -87,6 +111,62 @@ export function requestIdleMs(configured?: number, env = readEnv("REQUEST_IDLE_M
   return REQUEST_IDLE_MS;
 }
 
+/** Whether a body chunk holds only SSE comment lines and blank lines. */
+export function keepAliveOnly(chunk: Uint8Array): boolean {
+  const text = new TextDecoder().decode(chunk);
+  return text.split(/\r?\n/).every((line) => line.trim() === "" || line.startsWith(":"));
+}
+
+/**
+ * How long this session's provider normally takes, learned from requests that
+ * completed: time to first progress and the longest silence inside an answer.
+ *
+ * The fixed allowances are sized for slow local hardware — five minutes of
+ * silence before a request counts as hung. Mercury 2.5 answers a step in about
+ * a second, yet on the local suite it stalled now and then, OpenRouter gave up
+ * after 120 s with "504 Upstream idle timeout", and one task spent 370 of its
+ * 540 s inside three such stalls. With three or more completed requests seen,
+ * the allowance becomes eight times the slow end (90th percentile) of what
+ * this provider has done, never under 45 s, never over the fixed allowance.
+ */
+export class LatencyLearner {
+  static readonly MIN_SAMPLES = 3;
+  static readonly FACTOR = 8;
+  static readonly FLOOR_MS = 45_000;
+  private first: number[] = [];
+  private gaps: number[] = [];
+
+  record(w: { firstProgressMs: number | undefined; maxGapMs: number }): void {
+    if (w.firstProgressMs === undefined) return;
+    this.first = [...this.first, w.firstProgressMs].slice(-20);
+    this.gaps = [...this.gaps, w.maxGapMs].slice(-20);
+  }
+
+  /** The first-byte allowance, tightened to what this provider has shown. */
+  firstByte(fixed: number): number {
+    return this.tighten(fixed, this.first);
+  }
+
+  /** The first-byte allowance this provider has earned, or undefined before enough requests completed. */
+  learnedFirstByte(): number | undefined {
+    const fixed = Number.POSITIVE_INFINITY;
+    const n = this.tighten(fixed, this.first);
+    return n === fixed ? undefined : n;
+  }
+
+  /** The silence allowance once bytes flow, tightened the same way. */
+  idle(fixed: number): number {
+    return this.tighten(fixed, this.gaps);
+  }
+
+  private tighten(fixed: number, xs: number[]): number {
+    if (!(fixed > 0) || xs.length < LatencyLearner.MIN_SAMPLES) return fixed;
+    const sorted = [...xs].sort((a, b) => a - b);
+    const p90 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.9))]!;
+    return Math.min(fixed, Math.max(LatencyLearner.FLOOR_MS, p90 * LatencyLearner.FACTOR));
+  }
+}
+
 export class Watchdog {
   private readonly own = new AbortController();
   /** Aborts on the parent (a cancel), on silence, or at the deadline. */
@@ -97,13 +177,20 @@ export class Watchdog {
   waitedMs = 0;
   private timer: ReturnType<typeof setTimeout> | undefined;
   private deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly startedAt = Date.now();
+  private lastProgress: number | undefined;
+  /** Time to the first real progress, and the longest silence between progress since. */
+  firstProgressMs: number | undefined;
+  maxGapMs = 0;
 
   constructor(
     parent: AbortSignal,
     private readonly opts: { firstByteMs: number; idleMs: number; deadlineAt?: number },
+    learned?: LatencyLearner,
   ) {
+    if (learned) this.opts = { ...opts, firstByteMs: learned.firstByte(opts.firstByteMs), idleMs: learned.idle(opts.idleMs) };
     this.signal = AbortSignal.any([parent, this.own.signal]);
-    this.arm(opts.firstByteMs);
+    this.arm(this.opts.firstByteMs);
     if (opts.deadlineAt !== undefined && opts.deadlineAt > 0) {
       const left = opts.deadlineAt - Date.now();
       if (left <= 0) this.fire("deadline", 0);
@@ -116,7 +203,12 @@ export class Watchdog {
 
   /** Something arrived. Silence is measured from here. */
   touch(): void {
-    if (!this.reason) this.arm(this.opts.idleMs);
+    if (this.reason) return;
+    const now = Date.now();
+    if (this.lastProgress === undefined) this.firstProgressMs = now - this.startedAt;
+    else this.maxGapMs = Math.max(this.maxGapMs, now - this.lastProgress);
+    this.lastProgress = now;
+    this.arm(this.opts.idleMs);
   }
 
   /** Wrap a response body so every chunk that arrives counts as progress. */
@@ -126,7 +218,10 @@ export class Watchdog {
     const body = res.body.pipeThrough(
       new TransformStream<Uint8Array, Uint8Array>({
         transform: (chunk, out) => {
-          this.touch();
+          // A chunk of SSE comments and blank lines only (OpenRouter's
+          // ": OPENROUTER PROCESSING") keeps the connection open; it says
+          // nothing about the answer, and a stalled upstream sends it too.
+          if (!keepAliveOnly(chunk)) this.touch();
           out.enqueue(chunk);
         },
       }),
@@ -212,9 +307,9 @@ export function probeError(e: unknown, url: string, ms = PROBE_TIMEOUT_MS): stri
  * answered left the window's checks panel reading "asking the model…" for
  * ever.
  */
-export function askTimeoutMs(maxTokens: number, override?: number): number {
+export function askTimeoutMs(maxTokens: number, override?: number, opts: { promptTokens?: number; speed?: Speed } = {}): number {
   if (override !== undefined) return Math.max(0, override);
-  return firstByteMs(requestIdleMs(), { promptTokens: 2_000, maxTokens, stream: false });
+  return firstByteMs(requestIdleMs(), { promptTokens: opts.promptTokens ?? 2_000, maxTokens, stream: false }, opts.speed);
 }
 
 /** A failed one-shot question, with its own timeout named as such. */

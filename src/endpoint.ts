@@ -31,10 +31,13 @@ const REMOVED_SHORTHANDS = [
   "gemini-cli",
 ] as const;
 
-/** The one subscription CLI molt still spawns: Grok Build over ACP. */
+/** A subscription CLI molt still spawns: Grok Build over ACP. */
 const GROK_BUILD_SCHEME = "grok-build://";
+/** OpenCode's own subscription (ACP), the other subscription CLI molt spawns. */
+const OPENCODE_SCHEME = "opencode://";
 
 export const GROK_BUILD_URL = `${GROK_BUILD_SCHEME}subscription`;
+export const OPENCODE_URL = `${OPENCODE_SCHEME}subscription`;
 
 /**
  * What someone types, and the sentinel it stands for.
@@ -46,6 +49,7 @@ export const GROK_BUILD_URL = `${GROK_BUILD_SCHEME}subscription`;
 const SHORTHAND: Readonly<Record<string, string>> = {
   "grok-build": GROK_BUILD_URL,
   grok: GROK_BUILD_URL,
+  opencode: OPENCODE_URL,
 };
 
 /** Why a removed subscription backend cannot be used. */
@@ -107,7 +111,7 @@ export function endpointProblem(baseUrl: string): string | null {
       `/login, or 'grok-build' to run your own logged-in Grok Build CLI.`
     );
   }
-  const allowed = ["http:", "https:", GROK_BUILD_SCHEME.replace(/\/\/$/u, "")];
+  const allowed = ["http:", "https:", ...[GROK_BUILD_SCHEME, OPENCODE_SCHEME].map((s) => s.replace(/\/\/$/u, ""))];
   if (!allowed.includes(parsed.protocol)) {
     return (
       `'${url}' uses the scheme '${parsed.protocol.replace(":", "")}', which Maat cannot ` +

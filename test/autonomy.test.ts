@@ -166,7 +166,7 @@ describe("things that cannot be undone", () => {
       "find . -name '*.ts' -exec rm {} \\;",
       "find . -delete",
       "truncate -s 0 notes.md",
-      "tee notes.md",
+      "tee ../notes.md", // outside the project; `tee new.md` inside it runs at high
       "git checkout HEAD~1 -- .",
       "git restore src/",
       "git rebase -i main",

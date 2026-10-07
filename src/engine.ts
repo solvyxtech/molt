@@ -21,10 +21,13 @@
 import { runCommand } from "./run.js";
 import { describeStart, listBackground, startBackground, stopBackground } from "./background.js";
 import { reviewClaim, type Review } from "./review.js";
+import { judgeEffort, judgeTarget } from "./judge.js";
+import { tierOf } from "./tiers.js";
 import { arbitrate, parseDisputes, type Ruling } from "./dispute.js";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
-import { excludeMoltFromGit, listProject, removeNew, type ProjectListing } from "./leftovers.js";
+import { excludeMoltFromGit, listProject, removeNew, unnamedNewFiles, type ProjectListing } from "./leftovers.js";
 import { inspectDir, inspectFile, namedInputs, profileLine } from "./inspect.js";
 import { basename, dirname, resolve, relative, isAbsolute, join } from "node:path";
 import type { ArchiveLike } from "./archive.js";
@@ -38,7 +41,7 @@ import {
   type BarContext,
   barPath,
 } from "./bar.js";
-import { preflightCriteria } from "./criteria.js";
+import { checkSelfError, preflightCriteria } from "./criteria.js";
 import {
   AUTONOMY_SUMMARY,
   DEFAULT_AUTONOMY,
@@ -48,9 +51,9 @@ import {
   isReadOnlyCommand,
 } from "./autonomy.js";
 import { errorText } from "./format.js";
-import { narratedCallIn, narratedCallNudge } from "./narrated.js";
+import { MOLT_TOOL_NAMES, narratedCallIn, narratedCallNudge } from "./narrated.js";
 import { redact } from "./redact.js";
-import { Watchdog, envFirstByteMs, firstByteMs, probeError, probeSignal, requestIdleMs, waited } from "./watchdog.js";
+import { Watchdog, envFirstByteMs, firstByteMs, probeError, probeSignal, requestIdleMs, waited, localSpeed, LatencyLearner } from "./watchdog.js";
 import {
   SKIP_DIRS,
   WALK_DEADLINE_MS,
@@ -97,9 +100,16 @@ import { Integrity } from "./integrity.js";
 import {
   authHeaders,
   isSelfHosted,
+  selfHostedThinking, openRouterProvider,
 } from "./providers.js";
 import { Receipts } from "./receipts.js";
-import { readStream, type StreamAccumulator, type Usage } from "./stream.js";
+import { normalizeRequirements, signOut, signOutMessage, type SignOut } from "./signout.js";
+import { gitPathsStaged, touches } from "./gitbend.js";
+import { REFERENCE_CHECK_NAME, REFERENCE_SELF_ERROR } from "./reference.js";
+import { argumentProblems } from "./toolargs.js";
+import { takeTurn } from "./localgate.js";
+import { parseLenient } from "./lenient-json.js";
+import { LONG_RATE_LIMIT_MS, longQuotaText, rateLimitResetAt, untilText, providerErrorText, normalizeMessage, readStream, transientProviderError, type ProviderError, type StreamAccumulator, type Usage } from "./stream.js";
 import { Fragments, SafeStream } from "./live.js";
 import { Transcript, toolDetail } from "./transcript.js";
 import { acpAgentFor, acpHealth, acpModels, AcpSession, isAcp } from "./acp.js";
@@ -478,6 +488,12 @@ export function resultBudgetBytes(window: number, scale: number, cap = READ_MAX_
 export const MAX_STEPS = 32;
 export const MAX_PROOF_ATTEMPTS = 4;
 /**
+ * The longest one sealed check may run once the turn's clock has run out. The
+ * runner kills the process a minute after `--for`, and the bar is what the
+ * verdict is made of: a check that needs more is retired as timed out.
+ */
+export const DEADLINE_CHECK_CAP_MS = 40_000;
+/**
  * How many empty assistant turns to ask through before treating one as a
  * claim of completion.
  *
@@ -558,6 +574,19 @@ export const NETWORK_RETRIES = 3;
 export const NETWORK_BACKOFF_MS = [500, 2_000, 5_000];
 
 /**
+ * Retries for a provider that said it is overloaded or rate-limited.
+ *
+ * A separate, longer budget, because the network policy above is sized for a
+ * blip and an overload is not a blip: on a free OpenRouter model half of all
+ * requests came back "Upstream error: Service temporarily overloaded", in
+ * runs that last seconds to a minute. Four tries inside eight seconds lose a
+ * thirty-step task to the provider about half the time; this waits it out
+ * for a little over two minutes before giving up.
+ */
+export const OVERLOAD_RETRIES = 8;
+export const OVERLOAD_BACKOFF_MS = [2_000, 4_000, 8_000, 15_000, 20_000, 30_000, 30_000, 30_000];
+
+/**
  * How long a provider asked us to wait, from `Retry-After`.
  *
  * Sent as either a number of seconds or an HTTP date. Believed over the fixed
@@ -572,6 +601,29 @@ function retryAfterMs(res: Response): number | undefined {
   const ms = Number.isFinite(secs) ? secs * 1000 : Date.parse(raw) - Date.now();
   if (!Number.isFinite(ms) || ms <= 0) return undefined;
   return Math.min(ms, 30_000);
+}
+
+/**
+ * A provider error that arrived inside a 200 response (see StreamChunk.error),
+ * as the request failure it is. Whatever partial message came with it is
+ * dropped by the caller: the retry replays the request from the start.
+ */
+function providerFailure(e: ProviderError): { text: string; why: string; retryable: boolean; overload?: boolean } {
+  const resetAt = rateLimitResetAt({ error: e });
+  if (resetAt !== undefined && resetAt - Date.now() > LONG_RATE_LIMIT_MS) {
+    return {
+      text: `the provider's rate limit is reached ${untilText(resetAt)} — ${providerErrorText(e)}`,
+      why: "The provider will not take requests again until its limit resets; waiting inside a turn cannot get past it.",
+      retryable: false,
+    };
+  }
+  const transient = transientProviderError(e);
+  return {
+    text: providerErrorText(e),
+    why: "The provider reported an error instead of an answer.",
+    retryable: transient,
+    ...(transient ? { overload: true } : {}),
+  };
 }
 
 /** Wait, unless the turn is cancelled first — then return immediately. */
@@ -763,7 +815,7 @@ export const MAX_BASH_TIMEOUT_MS = 30 * 60_000;
  * A plan, as the model reads it back.
  *
  * Done steps are crossed off, the current one is marked, the rest are
- * pending. The marking exploits the same recency bias Factory's write-up
+ * pending. The marking exploits the same recency bias a competitor's write-up
  * describes: the last thing in the result is the next thing to do.
  */
 export function renderPlan(steps: string[], current: number): string {
@@ -851,31 +903,66 @@ type ActSub = { id: string; name: string; rawArgs: string; label: string };
  * one (a malformed act falls through and is reported as malformed).
  */
 export function expandAct(call: { id: string; function?: { name?: string; arguments?: string } }):
-  | { analysis: string; subs: ActSub[] }
+  | { analysis: string; subs: ActSub[]; unusable: number }
   | null {
   if (call.function?.name !== "act") return null;
   let a: { analysis?: unknown; plan?: unknown; actions?: unknown };
   try {
-    a = JSON.parse(call.function.arguments || "{}");
+    a = parseLenient(call.function.arguments || "{}") as typeof a;
   } catch {
     return null;
   }
+  if (!a || typeof a !== "object") return null;
   const analysis = [a.analysis, a.plan].filter((x) => typeof x === "string" && x.trim()).join("\n\n");
-  const list = Array.isArray(a.actions) ? a.actions : [];
+  // Models drift from the schema in a few common, unambiguous ways, and on a
+  // long write the drift cost the write itself: Nemotron sent an act whose
+  // actions were not the {tool, args} array, nothing in it was read as an
+  // action, and an act with no actions is the "finished" signal — so a reply
+  // writing clean.csv became a claim with nothing on disk. Read the shapes
+  // whose meaning is not in doubt: actions as a JSON string, one action
+  // object instead of a list, name/function/tool_name for tool, and
+  // arguments/input/parameters (object or JSON string) for args.
+  let raw: unknown = a.actions;
+  if (typeof raw === "string") {
+    try {
+      raw = parseLenient(raw);
+    } catch {
+      /* left as is: counted as unusable below */
+    }
+  }
+  const list = Array.isArray(raw) ? raw : raw && typeof raw === "object" ? [raw] : [];
   const subs: ActSub[] = [];
+  let unusable = typeof raw === "string" && raw.trim() !== "" && raw.trim() !== "[]" ? 1 : 0;
   list.forEach((x, k) => {
-    if (!x || typeof x !== "object") return;
-    const o = x as { tool?: unknown; args?: unknown };
-    if (typeof o.tool !== "string") return;
-    const args = o.args && typeof o.args === "object" ? (o.args as Record<string, unknown>) : {};
+    if (!x || typeof x !== "object") {
+      unusable += 1;
+      return;
+    }
+    const o = x as Record<string, unknown>;
+    const fn = o.function && typeof o.function === "object" ? (o.function as Record<string, unknown>) : undefined;
+    const tool = [o.tool, o.name, o.tool_name, fn?.name, typeof o.function === "string" ? o.function : undefined].find((t) => typeof t === "string" && t.trim()) as string | undefined;
+    if (!tool) {
+      unusable += 1;
+      return;
+    }
+    let given: unknown = [o.args, o.arguments, o.input, o.parameters, fn?.arguments].find((v) => v !== undefined);
+    if (typeof given === "string") {
+      try {
+        given = parseLenient(given);
+      } catch {
+        unusable += 1;
+        return;
+      }
+    }
+    const args = given && typeof given === "object" && !Array.isArray(given) ? (given as Record<string, unknown>) : {};
     subs.push({
       id: `${call.id}~${k}`,
-      name: o.tool,
+      name: tool,
       rawArgs: JSON.stringify(args),
-      label: `${o.tool} ${toolDetail(o.tool, args)}`.slice(0, 160),
+      label: `${tool} ${toolDetail(tool, args)}`.slice(0, 160),
     });
   });
-  return { analysis, subs };
+  return { analysis, subs, unusable };
 }
 
 const SECRET_ENV = [
@@ -929,15 +1016,26 @@ export type RunOptions = {
    * drafter sees only the task text, never the transcript. Drafting took a
    * median 17 s of every local task, all of it before the first step.
    */
-  pendingCriteria?: Promise<{ taskChecks: Check[]; taskNotes: string[] }>;
+  pendingCriteria?: Promise<{ taskChecks: Check[]; taskNotes: string[]; requirements?: string[] }>;
   /**
    * What of `pendingCriteria` is ready now — the checks that passed review so
    * far. With a time budget the wait for the full draft is bounded
    * (criteriaWaitMs); when it runs out these are sealed instead.
    */
-  criteriaSoFar?: () => Promise<{ taskChecks: Check[]; taskNotes: string[] }>;
+  criteriaSoFar?: () => Promise<{ taskChecks: Check[]; taskNotes: string[]; requirements?: string[] }>;
   /** Overrides criteriaWaitMs(budget). Tests only. */
   criteriaWaitMs?: number;
+  /**
+   * An independent reference check, still being written (src/reference.ts).
+   * Built from the task text and a snapshot of the project taken before the
+   * first step, so it may join the sealed checks at a claim without the work
+   * having had any say in it. Null when none applies.
+   */
+  referenceCheck?: Promise<{ check: Check; note: Record<string, unknown> } | null>;
+  /** Overrides referenceWaitMs. Tests only. */
+  referenceWaitMs?: number;
+  /** Overrides how long a claim waits for checks still drafting after the time budget's cut. Tests only. */
+  lateCriteriaWaitMs?: number;
   /**
    * Criteria stated in words rather than as commands.
    *
@@ -948,6 +1046,13 @@ export type RunOptions = {
    * cannot make a turn succeed or fail.
    */
   taskNotes?: string[];
+  /**
+   * The task's stated requirements, verbatim (src/signout.ts), kept with the
+   * sealed criteria. Unattended, the first claim is held once while each is
+   * paired with the commands the model ran for it. Empty or absent: nothing
+   * happens.
+   */
+  requirements?: string[];
 };
 
 /**
@@ -1044,6 +1149,42 @@ export function changesSomething(name: string, rawArgs: string): boolean {
 export function criteriaWaitMs(budgetMs: number): number | undefined {
   if (!budgetMs) return undefined;
   return Math.min(120_000, Math.max(45_000, Math.round(budgetMs / 10)));
+}
+
+/**
+ * How long a claim waits for a reference check still being written: up to five
+ * minutes with no time budget, else a quarter of what is left, at most three.
+ * Not ready by then, the claim is judged without it, and the next claim looks
+ * again.
+ */
+export function referenceWaitMs(timeLeftMs: number | undefined): number {
+  if (timeLeftMs === undefined) return 300_000;
+  return Math.max(0, Math.min(180_000, Math.round(timeLeftMs / 4)));
+}
+
+/**
+ * How long a claim waits for drafted checks that were cut with none ready:
+ * they are the only thing that can make the claim verifiable, so they get most
+ * of what is left (60%, leaving the rest for running the bar), at most two
+ * minutes; with no time budget, two minutes.
+ */
+export function lateCriteriaWaitMs(timeLeftMs: number | undefined): number {
+  if (timeLeftMs === undefined) return 120_000;
+  return Math.max(0, Math.min(120_000, Math.round(timeLeftMs * 0.6)));
+}
+
+/**
+ * A hash of everything the drafter reads: the task text and the project's file
+ * listing before the first step. Journalled at turn start and again when late
+ * checks join, so "written without sight of the work" is two equal lines in
+ * the record rather than a promise.
+ */
+export function draftInputsHash(task: string, listing: ProjectListing | null): string {
+  const h = createHash("sha256");
+  h.update(task, "utf8");
+  h.update("\0files\0" + [...(listing?.files ?? [])].sort().join("\n"));
+  h.update("\0dirs\0" + [...(listing?.dirs ?? [])].sort().join("\n"));
+  return h.digest("hex").slice(0, 16);
 }
 
 export function withTaskChecks(bar: Bar | null | undefined, task: Check[]): Bar | null {
@@ -1153,10 +1294,38 @@ export type EngineConfig = {
    * When the turn's own drafted (hidden) checks fail the same way twice, show
    * the model those checks' commands once and let it go on — fix the work or
    * dispute the check — instead of stopping. On Terminal-Bench that stop came
-   * with right work 34 times and wrong work 33: a coin flip, a fifth of tasks.
-   * Off by default until measured.
+   * with right work 34 times and wrong work 33: a coin flip, a fifth of tasks,
+   * and locally it ended runs whose check was right and whose work the model
+   * could still have fixed. OFF unless `true` (`--reveal-stuck`): as the default
+   * it cost 7 tasks of 60 on Mercury by letting the model bend correct work to
+   * wrong checks (see the proof loop). A claim that
+   * then passes carries `revealed`, and a later write to a path the task names
+   * as an input, or to one DISPUTE_HINT forbids, refuses it (bentAfterReveal).
    */
   revealOnStuck?: boolean;
+  /**
+   * Experimental (`--review-advisory`, MAAT_REVIEW_ADVISORY=1): the independent
+   * review is recorded and shown but gates nothing — no nudge, no demotion —
+   * and "verified" instead needs a passing drafted runs+value check that
+   * failed before the work (tiers.ts `reviewAdvisory`). Off by default.
+   */
+  reviewAdvisory?: boolean;
+  /**
+   * Requirement sign-out (src/signout.ts): one round per unattended turn that
+   * lists each stated requirement beside the commands run for it. Off unless
+   * `true` (`--signout`): it fired 60 times in one measured set of runs and
+   * rescued no task, while doubling steps and pushing input tokens to 97-116k.
+   */
+  signOut?: boolean;
+  /**
+   * Who rules on a DISPUTE line (src/dispute.ts), and how many asks. One ask
+   * unless `votes` says more (`--dispute-votes`). `model` / `baseUrl` name an
+   * arbiter other than the worker (`--arbiter-model`). With none, or the same
+   * baseUrl and model as the worker, the dispute is rejected without asking:
+   * 0 of 20 were upheld, ten of those trees passed the grader, and a model
+   * ruling on its own misreading repeats it.
+   */
+  dispute?: { votes?: number; model?: string; baseUrl?: string; apiKey?: string };
   /**
    * Review a verified claim independently and label it (src/review.ts):
    * `votes` reviews of the task text and the receipt; a majority-backed,
@@ -1698,6 +1867,13 @@ export class Engine {
   /** The turn's tool context, read by the MCP handlers as each call arrives. */
   private ccCtx?: ToolContext;
   /**
+   * The seal gate for a subprocess backend. The agent there makes its own tool
+   * calls inside one step, so the check the native loop does between planning
+   * and running (seal the drafted checks before the first change) has to run
+   * here, per call, before the tool does. Set by `run()` for the turn.
+   */
+  private ccGate?: (name: string, args: Record<string, unknown>) => AsyncGenerator<EngineEvent>;
+  /**
    * Tools are shut for the rest of this turn.
    *
    * The HTTP salvage says `tool_choice: "none"` in a request body. There is
@@ -1842,6 +2018,8 @@ export class Engine {
    * nowhere in the document.
    */
   private did: string[] = [];
+  /** This turn's requirement sign-out, for the receipt (src/signout.ts). */
+  private turnSignOut: SignOut | undefined;
   /**
    * Tool calls made this turn, by id. The session ledger is keyed by call id,
    * so this is what tells a write this turn made from one an earlier turn did
@@ -1932,13 +2110,47 @@ export class Engine {
   private createdThisSession(): ReadonlySet<string> {
     const out = new Set<string>();
     for (const e of this.sessionLedger()) if (e.before === null) out.add(e.path);
+    for (const f of this.bashCreated) out.add(f);
     return out;
   }
+
+  /**
+   * Project-relative files that first appeared while a bash call ran.
+   *
+   * The ledger only sees file-tool writes, so `echo x > t1.txt; ...; rm t1.txt`
+   * was a delete of a file molt "did not create": refused headless, left
+   * behind, and the grader failed the task for the leftover. A file absent
+   * before a call and present after it is molt's own doing exactly as a
+   * write_file of a new path is. Files only: a folder created by bash may
+   * later hold things that were moved into it.
+   */
+  private bashCreated = new Set<string>();
 
   /** Files this TURN wrote, with what was there before — what a revert acts on. */
   private turnWrites: LedgerLike[] = [];
   /** Every check was retired by an upheld dispute this turn (judgment.ts). */
   private turnAllRetired = false;
+  /** This session's provider latency, learned from completed requests (watchdog.ts). */
+  private readonly latency = new LatencyLearner();
+  /**
+   * The learner for the drafter's and critic's asks (AskOptions.latency):
+   * what they take teaches the engine's own requests what normal is. Not
+   * offered for a self-hosted server, whose allowances come from its hardware.
+   */
+  get askLatency(): LatencyLearner | undefined {
+    return isSelfHosted(this.cfg.baseUrl) ? undefined : this.latency;
+  }
+  /** Why the independent review was skipped this turn (see reviewSkipReason), if it was. */
+  private reviewSkipped: string | undefined;
+  /** Hidden checks whose commands were shown to the model this turn. */
+  private turnRevealed: string[] = [];
+  /**
+   * Set when the model was stopped (clock, provider) and the sealed bar was run
+   * on the tree as it stood. Six of twenty local runs ended with no verdict at
+   * all because the clock or a failed request stopped the turn before any check
+   * ran; two of them had passing work on disk.
+   */
+  private turnEndedBy: "deadline" | "provider" | undefined;
   /** `--revert` put this turn's work back, so a person cannot accept it as it stands. */
   private turnRestored = false;
   /** The pre-turn working tree, as a commit object nothing else can see. */
@@ -2290,6 +2502,27 @@ export class Engine {
   private deadlineAt(): number | undefined {
     const ms = this.turnDeadlineMs;
     return ms > 0 && this.turnStartedAt > 0 ? this.turnStartedAt + ms : undefined;
+  }
+
+  /**
+   * Whether the independent review would outlast the turn, and so is not run.
+   * Six of eight no-verdict runs on Mercury 2.5 passed their bar and then died
+   * inside the review's three asks, past the runner's grace; one stalled ask is
+   * 123 s. With under three first-byte allowances left (a fixed 60 s until the
+   * provider has shown what its normal is) the claim ends as it stands, said
+   * to be unreviewed.
+   */
+  private reviewSkipReason(): string | undefined {
+    const left = this.timeLeftMs();
+    if (left === undefined) return undefined;
+    // The review runs on the judge. A separate judge model is timed at the default, not
+    // at the worker's learned latency (a slow worker made a fast judge's review look like 9 min).
+    const judged = judgeTarget({ baseUrl: this.cfg.baseUrl, model: this.cfg.model }).model !== this.cfg.model;
+    const need = 3 * ((judged ? undefined : this.latency.learnedFirstByte()) ?? 20_000);
+    if (left > need) return undefined;
+    return left <= 0
+      ? "the time budget had run out"
+      : `${Math.round(left / 1000)}s of the time budget were left, under the ${Math.round(need / 1000)}s a review can take`;
   }
 
   /** Milliseconds left before this turn's deadline, or undefined for none. */
@@ -3002,6 +3235,9 @@ export class Engine {
         const left = this.timeLeftMs();
         const timeoutMs = left !== undefined ? Math.max(5_000, Math.min(wanted, left - 10_000)) : wanted;
         const t0 = Date.now();
+        // Only a command that could write needs the before/after listing; a
+        // listing that was cut short (null) records nothing rather than guess.
+        const listed = isReadOnlyCommand(command) ? null : listProject(this.cwd);
         const r = await runCommand(command, {
           cwd: this.cwd,
           timeoutMs,
@@ -3013,6 +3249,10 @@ export class Engine {
           signal: this.running?.signal,
         });
         const took = Date.now() - t0;
+        if (listed) {
+          const now = listProject(this.cwd);
+          if (now) for (const f of now.files) if (!listed.files.has(f)) this.bashCreated.add(f);
+        }
         // Same shape execSync produced: bare stdout when it worked, and a
         // tagged dump of both streams when it did not — plus how long it
         // took, once it took long enough to matter. A model that knows the
@@ -3054,6 +3294,18 @@ export class Engine {
         if (!steps.length) return "a plan needs at least one step";
         return renderPlan(steps, Number(args.current ?? 0));
       }
+
+      case "act":
+        // Reached only when an act's actions could not be read (expandAct):
+        // a readable one never arrives here as itself.
+        return (
+          "act: nothing ran, because at least one of its actions could not be read. The actions go in order, " +
+          "so the readable ones were not run without it either. This is not a refusal — nothing was " +
+          "denied; the action list itself could not be parsed. `actions` must be a JSON array (not a " +
+          "string holding one) of " +
+          '{"tool": "<tool name>", "args": {...}} objects, e.g. ' +
+          '[{"tool": "write_file", "args": {"path": "out.txt", "content": "..."}}]. Send them again.'
+        );
 
       default:
         return `unknown tool: ${name}`;
@@ -3195,6 +3447,11 @@ export class Engine {
     return this.markGuards(await runBar(bar, this.barContext(claim)));
   }
 
+  /** tierOf's advisory-review arguments: empty unless `reviewAdvisory`. */
+  private advisoryTier(): { reviewAdvisory?: true; guards?: ReadonlySet<string> } {
+    return this.cfg.reviewAdvisory === true ? { reviewAdvisory: true, guards: this.passedBeforeWork } : {};
+  }
+
   /** See `passedBeforeWork`. Only a passing command criterion is relabelled. */
   private markGuards(result: BarResult): BarResult {
     if (this.passedBeforeWork.size === 0) return result;
@@ -3278,7 +3535,7 @@ export class Engine {
           promptTokens: Math.round(this.bom().requestTotalEst * this.tokenScale),
           maxTokens: this.maxTokensFor(),
           stream: false,
-        }),
+        }, isSelfHosted(this.cfg.baseUrl) ? localSpeed() : undefined),
       idleMs: idle,
     });
     try {
@@ -3495,6 +3752,7 @@ export class Engine {
     result: BarResult,
     attempts: number,
     log?: Journal,
+    endedBy?: "deadline" | "provider",
   ): AsyncGenerator<EngineEvent> {
     const onlyWrites = failedOnlyWriteChecks(result);
     if (this.cfg.receipts) {
@@ -3507,6 +3765,7 @@ export class Engine {
         provider: this.provider,
         sessionTokens: this.sessionTokens,
         shedBatches: this.transcript.shedCount,
+        ...(endedBy ? { endedBy } : {}),
       });
       log?.append("receipt", { verdict: "exhausted", file: receipt.path, attempt: attempts });
       this.bindReceipt(receipt.path, "exhausted");
@@ -3782,9 +4041,12 @@ export class Engine {
     this.turnStartedAt = startedAt;
     this.turnWrites = [];
     this.turnAllRetired = false;
+    this.turnRevealed = [];
+    this.turnEndedBy = undefined;
     this.turnRestored = false;
     this.refusedThisTurn = false;
     this.turnReview = undefined;
+    this.reviewSkipped = undefined;
     this.sealedChecks = [];
     this.turnCalls = new Set();
     // molt's records stay out of the project's `git status` (leftovers.ts).
@@ -3792,6 +4054,7 @@ export class Engine {
     // Per turn, or receipt five lists what turn one ran. It did: receipts
     // 0043–0047 of this project each open with the same three reads.
     this.did = [];
+    this.turnSignOut = undefined;
     await this.captureTree();
     this.turnTree = snapshotTree(this.cwd);
     let steps = 0;
@@ -3806,6 +4069,7 @@ export class Engine {
 
     let receiptPath: string | undefined;
     let exhaustedResult: BarResult | undefined;
+    let lastProof: BarResult | undefined;
     for await (const ev of this.runTurn(userText, confirm, job, opts)) {
       switch (ev.kind) {
         case "receipt":
@@ -3826,6 +4090,7 @@ export class Engine {
           break;
         case "proof_result":
           proven = true;
+          lastProof = ev.result;
           break;
         case "assistant_text":
           answered = true;
@@ -3841,15 +4106,31 @@ export class Engine {
       ? "cancelled"
       : exhausted
         ? "not proven"
-        : errored
+        : errored && !(this.turnEndedBy && proven)
           ? "error"
           : proven
             ? opts.ask && this.turnWrites.length === 0
               ? "answered"
               : "verified"
-            : answered
+            : answered || this.turnEndedBy === "deadline"
               ? "unverified"
               : "stopped";
+
+    // Checks that passed on a tree the model was STOPPED on — by the clock or
+    // a failed provider — never make "verified": the model never said the work
+    // was done. On Mercury 2.5 that is exactly where the false verifieds came
+    // from: log-summary, sql-top-customers and cron-next each ran out the
+    // clock half-finished, the drafted checks passed on what was there, and
+    // the grader failed all three. The pass is kept on the record
+    // (passedAtEnd) — it is information — but the outcome is unverified.
+    const passedAtEnd = outcome === "verified" && this.turnEndedBy !== undefined;
+    if (passedAtEnd) {
+      outcome = "unverified";
+      yield {
+        kind: "info",
+        text: `the checks passed on the work as it stood when the ${this.turnEndedBy === "deadline" ? "clock" : "provider"} stopped the model, but it never said it was done — unverified.`,
+      };
+    }
 
     // Refused only by checks the model drafted for itself. On the local suite
     // such a refusal was right about one time in five: 19 of 23 "not proven"
@@ -3891,20 +4172,24 @@ export class Engine {
       if (review && !review.confirmed) {
         yield { kind: "info", text: `passed its checks, unconfirmed: the reviewer (${review.votes}) found ` + review.violations.map((v) => `"${v.quote}" — ${v.evidence}`).join("; ") };
       }
-    } else if (outcome === "verified" && this.cfg.review && receiptPath && existsSync(receiptPath)) {
+    } else if (outcome === "verified" && this.cfg.review && !this.turnEndedBy && this.reviewSkipReason()) {
+      this.reviewSkipped = this.reviewSkipReason();
+      this.cfg.journal?.append("review", { ran: false, skipped: this.reviewSkipped });
+      yield { kind: "info", text: `skipping the independent review: ${this.reviewSkipped}. The claim stands as checked, unreviewed.` };
+    } else if (outcome === "verified" && this.cfg.review && !this.turnEndedBy && receiptPath && existsSync(receiptPath)) {
       yield { kind: "info", text: "reviewing the claim independently against the task text" };
       review = await reviewClaim({
         task: userText,
         receipt: readFileSync(receiptPath, "utf8"),
         votes: this.cfg.review.votes,
         ask: {
-          baseUrl: this.cfg.baseUrl,
-          apiKey: this.cfg.apiKey,
-          model: this.cfg.model,
+          ...judgeTarget({ baseUrl: this.cfg.baseUrl, apiKey: this.cfg.apiKey, model: this.cfg.model }),
           cwd: this.cwd,
-          reasoningEffort: this.cfg.review.reasoningEffort ?? this.cfg.reasoningEffort,
+          reasoningEffort: judgeEffort(this.cfg.review.reasoningEffort ?? this.cfg.reasoningEffort),
           fetchFn: this.cfg.fetchFn,
           acpSpawn: this.cfg.acpSpawn,
+          // Never longer than the turn has left: a review that outlives the clock ends it without a verdict.
+          ...(this.timeLeftMs() !== undefined ? { timeoutMs: Math.max(1_000, this.timeLeftMs()!) } : {}),
         },
       }).catch(() => null);
       this.cfg.journal?.append("review", review ? { confirmed: review.confirmed, votes: review.votes, violations: review.violations.length } : { ran: false });
@@ -3951,6 +4236,29 @@ export class Engine {
         // The record of a case is never worth failing the turn over.
       }
     }
+    // The word "verified" is earned by evidence, the same on every model: a
+    // passing check that ran the deliverable and asserted a value (or one a
+    // person wrote), and no reviewer contradiction. Measured, that class was
+    // right 7/7 where everything else carrying the word was right 28/50. What
+    // passed without earning it is reported as what it is. After the judgment
+    // case above, which is opened on what the reviewers said.
+    let tier: "verified" | "passed-checks" | undefined;
+    let tierReason: string | undefined;
+    if (outcome === "verified" && lastProof) {
+      // Review was asked for and did not run (skipped near the deadline, or a
+      // nudge cleared it and no re-review followed): no "verified". On v11, 6
+      // of the 7 "verified" claims were unreviewed this way and 4 were wrong.
+      const unreviewed = this.cfg.review !== undefined && !review;
+      const t = tierOf({ results: lastProof.results, review, unreviewed, ...this.advisoryTier() });
+      tier = t.tier;
+      if (t.tier === "passed-checks") {
+        outcome = "unverified";
+        tierReason = t.reason;
+        yield { kind: "info", text: `passed its checks (not verified: ${t.reason}).` };
+      }
+      if (receiptPath) this.cfg.receipts?.amendTier(basename(receiptPath), t);
+      this.cfg.journal?.append("note", { text: `tier: ${t.tier}`, evidence: t.evidence, ...(t.reason ? { reason: t.reason } : {}), ...(t.reviewNote ? { review: t.reviewNote } : {}) });
+    }
     yield {
       kind: "job_end",
       job,
@@ -3958,15 +4266,111 @@ export class Engine {
       spend: this.spendSince(before),
       durationMs: Date.now() - startedAt,
       outcome,
+      ...(tier ? { tier, ...(tierReason ? { tierReason } : {}) } : {}),
       ...(selfChecked ? { selfChecked: true } : {}),
+      ...(this.reviewSkipped ? { unreviewed: true } : {}),
+      ...(this.turnEndedBy ? { endedBy: this.turnEndedBy, ...(this.turnEndedBy === "deadline" ? { deadline: true } : {}) } : {}),
+      ...(passedAtEnd ? { passedAtEnd: true } : {}),
       ...(checksDisagree ? { checksDisagree: failing.map((r) => r.name) } : {}),
+      ...(outcome === "verified" && this.turnRevealed.length ? { revealed: [...this.turnRevealed] } : {}),
       ...(review ? { review: { confirmed: review.confirmed, votes: review.votes, violations: review.violations } } : {}),
       ...(opened !== undefined ? { case: opened } : {}),
     };
   }
 
   /**
-   * The live ACP (Grok Build) session, started when it is first needed.
+   * The git-tracked project files the revealed checks' commands name: fixtures
+   * the check reads, which the model did not create. Committing one after the
+   * reveal is bentAfterReveal's git case. Untracked names are the model's own
+   * output and stay free.
+   */
+  private revealedTargets(commands: string[]): string[] {
+    let tracked: Set<string>;
+    try {
+      tracked = new Set(
+        execFileSync("git", ["ls-files"], { cwd: this.cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+          .split("\n")
+          .filter(Boolean),
+      );
+    } catch {
+      return [];
+    }
+    const out = new Set<string>();
+    for (const cmd of commands) {
+      for (const w of cmd.match(/[\w./-]+/g) ?? []) {
+        const rel = relative(this.cwd, resolve(this.cwd, w));
+        if (tracked.has(rel)) out.add(rel);
+      }
+    }
+    return [...out];
+  }
+
+  /**
+   * Why a claim that passed after a reveal is refused, or undefined.
+   *
+   * Once the model has read a hidden check's command, the cheap way to meet it
+   * is to change what the check reads: the task's input data, the shell, an
+   * installed package, the check's own files. 10 of the 29 right-looking
+   * Terminal-Bench passes after such a reveal were bent that way. Only writes
+   * made after the reveal count, and only to a file that existed (an input the
+   * model created is an output). Inputs are the paths the task text names
+   * itself, not namedInputs' guess at the project's data files.
+   */
+  private bentAfterReveal(
+    seen: Set<string>,
+    task: string,
+    revealed?: { didAt: number; targets: string[] },
+  ): { reason: string; hard: boolean } | undefined {
+    const later = this.turnLedger().filter((e) => !seen.has(e.callId));
+    const inputs = new Set(
+      namedInputs(task, this.cwd)
+        .filter((p) => task.includes(relative(this.cwd, p)) || task.includes(basename(p)))
+        .map((p) => resolve(p)),
+    );
+    // A `git add` / `git commit` through bash after the reveal makes a change
+    // to the check's target durable without the ledger seeing a write. Same
+    // split as the writes below: environment or a test file the task does not
+    // ask for is hard; a named input, or a tracked file the revealed check
+    // reads, ends the claim unverified.
+    if (revealed) {
+      // What the model created this turn is an output, however the task names it.
+      const made = new Set(this.turnLedger().filter((e) => e.before === null).map((e) => resolve(this.cwd, e.path)));
+      for (const rel of gitPathsStaged(this.did.slice(revealed.didAt), this.cwd)) {
+        const abs = resolve(this.cwd, rel);
+        if (/^\/(usr\/)?(local\/)?s?bin\//.test(abs) || /\/(site|dist)-packages\//.test(abs) || /\/\.maat\//.test(abs)) {
+          return { reason: `after the check was shown, the model committed ${rel} with git, part of the environment, not the work`, hard: true };
+        }
+        if (isTestPath(rel) && !task.includes(basename(rel))) {
+          return { reason: `after the check was shown, the model committed ${rel} with git, a test or check file the task does not ask for`, hard: true };
+        }
+        if (made.has(abs)) continue;
+        if ([...inputs].some((i) => touches(rel, relative(this.cwd, i))) || revealed.targets.some((t) => touches(rel, t))) {
+          return { reason: `after the check was shown, the model committed ${rel} with git, a file the check reads or the task names as an input`, hard: false };
+        }
+      }
+    }
+    if (later.length === 0) return undefined;
+    for (const e of later) {
+      const abs = resolve(this.cwd, e.path);
+      if (/^\/(usr\/)?(local\/)?s?bin\//.test(abs) || /\/(site|dist)-packages\//.test(abs) || /\/\.maat\//.test(abs)) {
+        return { reason: `after the check was shown, the model wrote ${e.path}, part of the environment, not the work`, hard: true };
+      }
+      if (e.before !== null && inputs.has(abs)) {
+        // Not a refusal: in a task that transforms its inputs in place
+        // (config-migrate, redact-secrets) the named file IS the deliverable,
+        // and refusing would fail correct work. It cannot earn "verified"
+        // after the check was shown, so the claim ends unverified, said why.
+        return { reason: `after the check was shown, the model changed ${e.path}, an input the task names`, hard: false };
+      }
+      if (isTestPath(e.path) && !task.includes(basename(e.path))) {
+        return { reason: `after the check was shown, the model changed ${e.path}, a test or check file the task does not ask for`, hard: true };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * The live ACP session (Grok Build, OpenCode), started when it is first needed.
    *
    * Rebuilt whenever molt's system prompt changes — `/map`, `/read` and a
    * repo-map refresh all rewrite it — because a session carrying the old one
@@ -3994,6 +4398,14 @@ export class Engine {
         if (!ctx) return "[molt: no turn is running]";
         if (this.ccNoTools) {
           return "[molt: the turn is over. No more tools — answer with what you already have.]";
+        }
+        if (this.ccGate) {
+          const gate = this.ccGate(name, args);
+          for (;;) {
+            const g = await gate.next();
+            if (g.done) break;
+            emit(g.value);
+          }
         }
         const calls = this.invokeTool({ id: callId, name, rawArgs: JSON.stringify(args) }, ctx);
         for (;;) {
@@ -4165,7 +4577,15 @@ export class Engine {
       return null;
     }
     if (done.error) {
-      ctx.log?.append("error", { text: done.error });
+      const wall = longQuotaText(done.error);
+      ctx.log?.append("error", { text: wall ?? done.error, ...(wall ? { providerCapped: true } : {}) });
+      if (wall) {
+        // A quota that lifts hours from now is not this task's failure, and
+        // nothing inside a turn gets past it. Fail fast, say when it lifts.
+        yield { kind: "error", text: `${wall}. Nothing was verified; the work above still happened.` };
+        await this.dropAcpSession();
+        return null;
+      }
       yield {
         kind: "error",
         text:
@@ -4257,9 +4677,14 @@ export class Engine {
     const { id: callId, name } = call;
     let args: Record<string, unknown> = {};
     let malformed = false;
+    /** What the arguments get wrong against the tool's schema (src/toolargs.ts). */
+    let violations: string[] = [];
     try {
-      args = JSON.parse(call.rawArgs || "{}") as Record<string, unknown>;
+      args = parseLenient(call.rawArgs || "{}") as Record<string, unknown>;
+      if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("not an object");
       if (name === "bash") foldCommands(args, this.cwd);
+      violations = argumentProblems(TOOLS.find((t) => t.function.name === name)?.function.parameters as never, args);
+      if (violations.length) malformed = true;
     } catch {
       // Running with empty arguments produced a misleading error — a
       // malformed read_file became "EISDIR: illegal operation on a
@@ -4316,7 +4741,7 @@ export class Engine {
         kind: "tool",
         name,
         id: callId,
-        detail: "malformed arguments",
+        detail: violations.length ? "arguments do not fit the schema" : "malformed arguments",
         note: "malformed",
         args: raw,
         bytes: 0,
@@ -4336,8 +4761,11 @@ export class Engine {
           `off part-way through the arguments for ${name}, so nothing ran. Sending the same call ` +
           `again will be cut off in the same place. Write less in one go — a smaller file, or one ` +
           `part of it at a time — or ask for the ceiling to be raised with --max-tokens.]`
-        : `[molt: the arguments for ${name} were not valid JSON, so nothing ran. ` +
-          `Send them again as a JSON object. What arrived was: ${raw}]`;
+        : violations.length
+          ? `[molt: the arguments for ${name} do not fit its schema, so nothing ran: ` +
+            `${violations.join("; ")}. Send the call again with them fixed.]`
+          : `[molt: the arguments for ${name} were not valid JSON, so nothing ran. ` +
+            `Send them again as a JSON object. What arrived was: ${raw}]`;
       this.transcript.push({ role: "tool", tool_call_id: callId, content: complaint });
       return { name, result: complaint, auto: true, repeated: false };
     }
@@ -4523,6 +4951,16 @@ export class Engine {
   ): AsyncGenerator<EngineEvent> {
     // Remember where this turn began so a cancellation can leave no trace.
     const turnStart = this.transcript.length;
+    /**
+     * The project as the turn found it, headless only: at the first claim,
+     * files that appeared since and that the task never names are put to the
+     * model once — the helper script or copy it left beside the deliverable.
+     */
+    const turnListing = this.cfg.unattended ? listProject(this.cwd) : null;
+    let leftoversAsked = false;
+    /** Requirement sign-out: the stated requirements, and whether they were put once (src/signout.ts). */
+    let requirements = normalizeRequirements(opts.requirements);
+    let signedOut = false;
     this.passedBeforeWork = new Set();
     const log = this.cfg.journal;
     /**
@@ -4545,6 +4983,16 @@ export class Engine {
      */
     let pendingCriteria = opts.pendingCriteria;
     const criteriaSince = Date.now();
+    /**
+     * The draft, when the time budget's cut found it with no checks: kept alive
+     * to join at the first claim instead of sealing nothing (joinLateCriteria).
+     */
+    let lateCriteria: typeof pendingCriteria;
+    let draftInputs = "";
+    if (pendingCriteria && !opts.ask) {
+      draftInputs = draftInputsHash(userText, listProject(this.cwd));
+      log?.append("note", { kind: "draft-inputs", text: "drafter inputs fixed at turn start", inputsSha: draftInputs });
+    }
     /** Sealed mid-step: tell the model once this step's tool results are in. */
     let announceAfterTools = false;
     const self = this;
@@ -4665,6 +5113,11 @@ export class Engine {
     /** The previous attempt's failures, to notice a bar going nowhere. */
     let lastFailure = "";
     let revealedThisTurn = false;
+    let revealMark: { didAt: number; targets: string[] } | undefined;
+    /** Calls already ledgered when the reveal happened: what is new came after the model read the check. */
+    let revealSeen = new Set<string>();
+    /** Set when a write after the reveal bent the work to the check; ends the turn refused. */
+    let bentReason: string | undefined;
     let lastReceipt: string | undefined;
     let lastReceiptPath: string | undefined;
     /** The reviewers' findings have been put to the model once this turn. */
@@ -4722,10 +5175,10 @@ export class Engine {
       pendingCriteria = undefined;
       const ready = await Promise.race([p.then(() => true, () => true), new Promise<boolean>((r) => setTimeout(() => r(false), 50))]);
       if (!ready) yield { kind: "info", text: "waiting for this task's checks to be sealed before the first change" };
-      const none = { taskChecks: [] as Check[], taskNotes: [] as string[] };
+      const none: { taskChecks: Check[]; taskNotes: string[]; requirements?: string[] } = { taskChecks: [], taskNotes: [] };
       // Bounded under a time budget: query-optimize spent 262 s of 705 here.
       const cap = opts.criteriaWaitMs ?? criteriaWaitMs(self.turnDeadlineMs);
-      let got: { taskChecks: Check[]; taskNotes: string[] };
+      let got: { taskChecks: Check[]; taskNotes: string[]; requirements?: string[] };
       if (cap !== undefined && opts.criteriaSoFar) {
         const left = Math.max(0, cap - (Date.now() - criteriaSince));
         let timer: NodeJS.Timeout | undefined;
@@ -4737,14 +5190,28 @@ export class Engine {
         if (out) got = out;
         else {
           got = await opts.criteriaSoFar().catch(() => none);
-          yield {
-            kind: "info",
-            text: `checks were still being drafted after ${Math.round(cap / 1000)}s of the time budget; sealing the ${got.taskChecks.length} reviewed so far`,
-          };
+          if (got.taskChecks.length === 0 && !opts.ask) {
+            // Sealing nothing would leave every correct result unverifiable
+            // (14 of 60 runs on Mercury 2.5, when the drafter's request
+            // stalled). The draft keeps going and joins at the first claim.
+            lateCriteria = p;
+            yield {
+              kind: "info",
+              text:
+                `checks were still being drafted after ${Math.round(cap / 1000)}s of the time budget and none was ready; ` +
+                `not sealing an empty set — the first claim waits up to ${Math.round((opts.lateCriteriaWaitMs ?? lateCriteriaWaitMs(self.timeLeftMs())) / 1000)}s for them and judges with them if they arrive`,
+            };
+          } else {
+            yield {
+              kind: "info",
+              text: `checks were still being drafted after ${Math.round(cap / 1000)}s of the time budget; sealing the ${got.taskChecks.length} reviewed so far`,
+            };
+          }
         }
       } else {
         got = await p.catch(() => none);
       }
+      requirements = normalizeRequirements([...requirements, ...(got.requirements ?? [])]);
       yield* sealCriteria([...(opts.taskChecks ?? []), ...got.taskChecks], [...(opts.taskNotes ?? []), ...got.taskNotes]);
       // Mid-step, the announcement waits for this step's tool results: a
       // message between a tool call and its result is a malformed
@@ -4754,6 +5221,107 @@ export class Engine {
       bar = opts.ask
         ? withoutWriteChecks(withTaskChecks(self.cfg.bar, taskChecks))
         : withTaskChecks(self.cfg.bar, taskChecks);
+    }
+    // The same gate for a backend that runs its own tool calls (ACP, Claude
+    // Code): sealed before the first call that changes anything.
+    this.ccGate = async function* (name, args) {
+      if (pendingCriteria && changesSomething(name, JSON.stringify(args))) yield* settleCriteria(false);
+    };
+    /** The reference check, until it joins or proves not to apply. */
+    let referencePending = opts.ask ? undefined : opts.referenceCheck;
+    async function* joinReference(): AsyncGenerator<EngineEvent> {
+      const p = referencePending;
+      if (!p) return;
+      const wait = opts.referenceWaitMs ?? referenceWaitMs(self.timeLeftMs());
+      let timer: NodeJS.Timeout | undefined;
+      const late = Symbol("late");
+      const got = await Promise.race([
+        p.catch(() => null),
+        new Promise<typeof late>((r) => { timer = setTimeout(() => r(late), wait); }),
+      ]);
+      clearTimeout(timer);
+      if (got === late) {
+        yield { kind: "info", text: "the reference check is still being written; judging this claim without it" };
+        return;
+      }
+      referencePending = undefined;
+      if (!got) return;
+      const check = Object.freeze({ ...got.check, name: got.check.name.startsWith("task:") ? got.check.name : `task:${got.check.name}` });
+      if (taskChecks.some((c) => c.name === check.name)) return;
+      taskChecks = Object.freeze([...taskChecks, check]) as Check[];
+      self.sealedChecks = taskChecks;
+      bar = withTaskChecks(self.cfg.bar, taskChecks);
+      log?.append("note", { text: "reference check joined the sealed checks", ...got.note });
+      yield {
+        kind: "info",
+        text: "an independent reference check joined this turn's checks — written from the task text and the project as it was before the work",
+      };
+      self.transcript.push({
+        role: "user",
+        content:
+          "An independent reference check has joined the acceptance criteria. It was written from the task text " +
+          "and the project as it was before you began, by a reviewer who never saw your work: it compares your " +
+          "deliverable with a reference on the task's examples, the edge cases its words imply, and random inputs. " +
+          "The command is withheld; on a failure you will see the input, the expected and the actual result.",
+      });
+    }
+    /**
+     * Checks that were still drafting when the time budget's cut found none
+     * ready. Like the reference check they were written from the task text and
+     * the project before the first step, so they may join at a claim; the
+     * inputs' hash journalled at turn start is journalled again here. Not
+     * ready by the claim, it is judged without them and the next claim looks
+     * again.
+     */
+    async function* joinLateCriteria(): AsyncGenerator<EngineEvent> {
+      const p = lateCriteria;
+      if (!p) return;
+      const wait = opts.lateCriteriaWaitMs ?? lateCriteriaWaitMs(self.timeLeftMs());
+      let timer: NodeJS.Timeout | undefined;
+      const late = Symbol("late");
+      const got = await Promise.race([
+        p.catch(() => null),
+        new Promise<typeof late>((r) => { timer = setTimeout(() => r(late), wait); }),
+      ]);
+      clearTimeout(timer);
+      if (got === late) {
+        yield { kind: "info", text: `the drafted checks did not arrive within ${Math.round(wait / 1000)}s; this claim is judged without them, so it cannot be verified by task checks` };
+        return;
+      }
+      lateCriteria = undefined;
+      const have = new Set(taskChecks.map((c) => c.name));
+      const added = (got?.taskChecks ?? [])
+        .map((c) => Object.freeze({ ...c, name: c.name.startsWith("task:") ? c.name : `task:${c.name}` }))
+        .filter((c) => !have.has(c.name));
+      if (!added.length) {
+        log?.append("note", { kind: "late-checks", text: "the drafter finished with no checks to join", inputsSha: draftInputs });
+        return;
+      }
+      taskChecks = Object.freeze([...taskChecks, ...added]) as Check[];
+      taskNotes = Object.freeze([...taskNotes, ...(got?.taskNotes ?? [])]) as string[];
+      taskSeal = sealOf(taskChecks, taskNotes);
+      requirements = normalizeRequirements([...requirements, ...(got?.requirements ?? [])]);
+      self.sealedChecks = taskChecks;
+      bar = withTaskChecks(self.cfg.bar, taskChecks);
+      log?.append("note", {
+        kind: "late-checks",
+        text: `late drafted checks joined the sealed checks: ${added.length} check(s)`,
+        inputsSha: draftInputs,
+        seal: taskSeal,
+        checks: added.map((c) => c.name),
+      });
+      yield {
+        kind: "info",
+        text: `${added.length} drafted check(s) joined this turn's checks — written from the task text and the project as it was before the work`,
+      };
+      self.transcript.push({
+        role: "user",
+        content:
+          "Drafted acceptance criteria have joined this turn's checks. They were written from the task text and " +
+          "the project as it was before you began, by a drafter that never saw your work: " +
+          added.map((c) => c.name).join(", ") +
+          ". The commands are withheld; on a failure you will see the output.",
+      });
     }
     // Drafted checks retired by an upheld dispute this turn (src/dispute.ts),
     // and every check already disputed once, by bare name.
@@ -4765,6 +5333,136 @@ export class Engine {
       opts.ask
         ? asQuestion(withTaskChecks(this.cfg.bar, liveTaskChecks()), this.turnLedger().length === 0)
         : withTaskChecks(this.cfg.bar, liveTaskChecks());
+    /**
+     * Sealed checks that failed in their own code or ran out their own time.
+     *
+     * A drafted check that errs says nothing about the work. One that hangs
+     * says nothing either, and a bar that waits on it ends the run at the
+     * runner's kill with no verdict: a check that never finished is retired
+     * for this run, and the others judge.
+     */
+    const brokenOwn = (res: BarResult): CheckResult[] =>
+      res.cancelled
+        ? []
+        : res.results.filter((r) => {
+            if (r.ok || r.advisory || retired.has(bare(r.name))) return false;
+            if (bare(r.name) === REFERENCE_CHECK_NAME) return r.exitCode === REFERENCE_SELF_ERROR || r.timedOut === true;
+            const sealed = taskChecks.some((c) => bare(c.name) === bare(r.name));
+            return sealed && (r.timedOut === true || (r.hidden === true && checkSelfError(r.output) !== null));
+          });
+    async function* retireBroken(list: CheckResult[]): AsyncGenerator<EngineEvent> {
+      for (const r of list) {
+        const timeout = r.timedOut === true;
+        const why = timeout
+          ? "timeout"
+          : bare(r.name) === REFERENCE_CHECK_NAME
+            ? "the reference check failed in its own code"
+            : (checkSelfError(r.output) ?? "");
+        retired.set(bare(r.name), { name: bare(r.name), upheld: true, votes: timeout ? "timeout" : "own error", reason: why });
+        log?.append("note", { text: `check ${bare(r.name)} retired: ${why}`, output: r.output.slice(-500) });
+        yield {
+          kind: "info",
+          text: timeout
+            ? `check ${bare(r.name)} timed out, which says nothing about the work; retired, and the claim judged without it`
+            : `check ${bare(r.name)} failed in its own code, not on the work (${why}); retired, and the claim judged without it`,
+        };
+      }
+    }
+    /**
+     * The model is stopped; the work on disk is not left unjudged.
+     *
+     * The clock and a failed provider both used to end a turn with no check
+     * run: 6 of 20 local runs had no verdict, two with passing work in place.
+     * The sealed bar runs once on the tree as it stands, and the turn's outcome
+     * is what it says: verified only if it passed, not proven if it did not,
+     * unverified when nothing was sealed. Returns whether a bar ran.
+     */
+    async function* judgeOnDisk(why: "deadline" | "provider", claim: string): AsyncGenerator<EngineEvent, boolean> {
+      self.turnEndedBy = why;
+      if (opts.ask) return false;
+      let barThis = barNow();
+      if (!barThis || barThis.checks.length === 0) return false;
+      // Whatever the runner allows after the deadline is short: a check may
+      // not take the rest of it. Past the cap it is retired as timed out.
+      const capMs = why === "deadline" ? DEADLINE_CHECK_CAP_MS : undefined;
+      const capped = (b: Bar): Bar =>
+        capMs === undefined
+          ? b
+          : { ...b, checks: b.checks.map((c) => (c.kind === "command" ? { ...c, timeoutMs: Math.min(c.timeoutMs, capMs) } : c)) };
+      proofAttempts += 1;
+      yield { kind: "proof_start", checks: barThis.checks.length, names: barThis.checks.map((c) => c.name) };
+      let result = await self.runBarGuarded(claim, capped(barThis));
+      const broken = brokenOwn(result);
+      if (broken.length) {
+        yield* retireBroken(broken);
+        barThis = barNow();
+        if (!barThis || barThis.checks.length === 0) {
+          self.turnAllRetired = true;
+          yield { kind: "info", text: "no other check is left to judge the work — this claim is unverified." };
+          log?.append("session_end", { reason: `unverified: every check retired (${why})` });
+          return true;
+        }
+        result = await self.runBarGuarded(claim, capped(barThis));
+      }
+      if (result.cancelled) return true;
+      lastResult = result;
+      self.actsSinceBar = 0;
+      log?.append("bar_run", {
+        attempt: proofAttempts,
+        ok: result.ok,
+        total: result.results.length,
+        passed: result.results.filter((r) => r.ok).length,
+        failed: result.results.filter((r) => !r.ok).map((r) => r.name).join(", "),
+        ms: result.durationMs,
+        endedBy: why,
+        checks: result.results.map((r) => ({
+          name: r.name, kind: r.kind, detail: r.detail, ok: r.ok, exitCode: r.exitCode ?? null, ms: r.durationMs, cached: r.cached === true,
+        })),
+      });
+      const undetermined =
+        !result.ok && (result.undetermined?.length ?? 0) > 0 && result.results.every((r) => r.ok || r.advisory || r.skipped);
+      if (result.ok || undetermined) {
+        const verdict = result.ok ? "accepted" : "undetermined";
+        if (self.cfg.receipts) {
+          const head = await treeState(self.cwd).catch(() => null);
+          const receipt = self.cfg.receipts.write({
+            claim, result, attempt: proofAttempts, verdict, head,
+            model: self.modelOfRecord(), provider: self.provider, sessionTokens: self.sessionTokens,
+            session: self.cfg.journal?.sessionId, costUsd: self.costUsd(), costEstimated: self.costEstimated,
+            shedBatches: self.transcript.shedCount, endedBy: why,
+            changed: self.turnLedger().map((e) => ({
+              path: e.path, before: e.before, after: e.after,
+              ...(e.changedLines?.length ? { lines: e.changedLines } : {}),
+            })),
+            cwd: self.cwd, did: [...self.did],
+            task: taskSeal
+              ? {
+                  seal: sealOf(taskChecks, taskNotes),
+                  checks: taskChecks.map((c) => (c.kind === "command" ? `${c.name}: ${c.run}` : `${c.name}: builtin ${c.builtin}`)),
+                  notes: [...taskNotes],
+                }
+              : undefined,
+          ...(verdict === "accepted" ? { tier: tierOf({ results: result.results, ...self.advisoryTier() }) } : {}),
+          });
+          log?.append("receipt", { verdict, file: receipt.path, attempt: proofAttempts, endedBy: why });
+          self.bindReceipt(receipt.path, verdict);
+          self.capture(receipt.path, verdict, userText, result, claim);
+          lastReceipt = basename(receipt.path);
+          lastReceiptPath = receipt.path;
+          yield { kind: "receipt", path: receipt.path };
+        }
+        if (result.ok) {
+          log?.append("session_end", { reason: "bar met", attempts: proofAttempts, endedBy: why });
+          yield { kind: "proof_result", result, attempt: proofAttempts };
+          yield* self.settlePassed(userText, proofAttempts, result.results.map((r) => r.name), lastReceipt, log);
+        } else {
+          log?.append("session_end", { reason: "undetermined", attempts: proofAttempts, endedBy: why });
+        }
+        return true;
+      }
+      yield* self.finishUnproven(claim, result, proofAttempts, log, why);
+      return true;
+    }
     if (opts.ask) {
       const dropped = (this.cfg.bar?.checks.length ?? 0) - (bar?.checks.length ?? 0);
       log?.append("note", { text: `ask turn — ${dropped} write-dependent check(s) not run` });
@@ -4834,7 +5532,10 @@ export class Engine {
             `tool calls. The bar still decides what the work was worth: nothing is committed ` +
             `that it did not pass.`,
         };
-        yield* this.salvage("Your time budget for this turn is up.", fetchFn, log);
+        // The work on disk is judged before anything else is asked of the
+        // provider: a closing summary can take the minutes the verdict needs.
+        const judged = yield* judgeOnDisk("deadline", "");
+        if (!judged) yield* this.salvage("Your time budget for this turn is up.", fetchFn, log);
         return;
       }
 
@@ -5107,6 +5808,10 @@ export class Engine {
                 tools: this.offeredTools,
                 tool_choice: "auto",
                 ...(this.effortNow ? { reasoning: { effort: this.effortNow } } : {}),
+                // Thinking off on a self-hosted server, where `reasoning` is
+                // ignored (see selfHostedThinking). Nothing on a cloud endpoint.
+                ...selfHostedThinking(this.cfg.baseUrl, this.effortNow),
+                ...openRouterProvider(this.cfg.baseUrl, this.cfg.model),
                 ...(stream ? { stream: true } : {}),
                 ...(withUsage ? { stream_options: { include_usage: true } } : {}),
               };
@@ -5140,7 +5845,7 @@ export class Engine {
         // the credentials being wrong does not improve by asking again, and a
         // second identical refusal is exactly the spending this avoids.
         let failure:
-          | { text: string; why: string; retryable: boolean; retryAfterMs?: number }
+          | { text: string; why: string; retryable: boolean; retryAfterMs?: number; overload?: boolean }
           | undefined;
         /**
          * Shed-and-retry rounds used on this step.
@@ -5164,10 +5869,21 @@ export class Engine {
         /** The deadline ended this step's request; the step loop closes the turn. */
         let deadlineHit = false;
 
+        /** This request's turn at a self-hosted endpoint (src/localgate.ts); a no-op otherwise. */
+        let releaseTurn: () => void = () => {};
         for (let attempt = 0; ; attempt++) {
           failure = undefined;
           msg = undefined;
           watch?.dispose();
+          // An attempt that left through a `continue` or a `break` inside the
+          // try (a shed-and-retry, a refusal that stops the retries) never
+          // reached the release below; its turn is given back here and after
+          // the loop, or the next request to a one-slot server waits for it
+          // for ever. Safe to call twice.
+          releaseTurn();
+          // Taken before the watchdog starts: waiting behind Maat's own other
+          // requests to a one-slot local server is not the server being hung.
+          releaseTurn = await takeTurn(this.cfg.baseUrl, controller.signal).catch(() => () => {});
           watch = new Watchdog(controller.signal, {
             firstByteMs:
               this.cfg.requestFirstByteMs ??
@@ -5176,10 +5892,10 @@ export class Engine {
                 promptTokens: Math.round(requestEst * this.tokenScale),
                 maxTokens: this.maxTokensFor(),
                 stream,
-              }),
+              }, isSelfHosted(this.cfg.baseUrl) ? localSpeed() : undefined),
             idleMs: idle,
             deadlineAt: this.deadlineAt(),
-          });
+          }, isSelfHosted(this.cfg.baseUrl) ? undefined : this.latency);
           let res: Response | undefined;
           try {
             res = await send(askForUsage);
@@ -5370,10 +6086,20 @@ export class Engine {
                 break;
               }
               const transient = res.status === 408 || res.status === 429 || res.status >= 500;
+              const resetAt = res.status === 429 ? rateLimitResetAt(body) : undefined;
+              if (resetAt !== undefined && resetAt - Date.now() > LONG_RATE_LIMIT_MS) {
+                failure = {
+                  text: `the provider's rate limit is reached ${untilText(resetAt)} — ${body.slice(0, 200)}`,
+                  why: "The provider will not take requests again until its limit resets; waiting inside a turn cannot get past it.",
+                  retryable: false,
+                };
+                break;
+              }
               failure = {
                 text: `HTTP ${res.status}: ${body.slice(0, 300)}`,
                 why: `The provider refused the request with HTTP ${res.status}.`,
                 retryable: transient,
+                ...(res.status === 429 || res.status === 503 || res.status === 529 ? { overload: true } : {}),
               };
               // A rate limit usually says when to come back. Believe it over a
               // fixed backoff — guessing shorter earns a second refusal, and
@@ -5461,6 +6187,7 @@ export class Engine {
                   yield { kind: "delta", text: tail };
                 }
                 const result = await reading;
+                if (result.error) failure = providerFailure(result.error);
                 msg = result.message;
                 finishReason = result.finishReason;
                 usage = {
@@ -5478,6 +6205,7 @@ export class Engine {
                 type Payload = {
                   choices?: { message?: Msg; finish_reason?: string | null }[];
                   usage?: Usage;
+                  error?: ProviderError;
                 };
                 let json: Payload | undefined;
                 try {
@@ -5502,6 +6230,7 @@ export class Engine {
                   finishReason = finishReasonFor(native.stop_reason);
                   usage = usageFor(native.usage);
                 } else if (json) {
+                  if (json.error && typeof json.error === "object") failure = providerFailure(json.error);
                   msg = json.choices?.[0]?.message;
                   finishReason = json.choices?.[0]?.finish_reason ?? undefined;
                   usage = json.usage;
@@ -5517,9 +6246,11 @@ export class Engine {
                   retryable: true,
                 };
               }
+              if (msg) msg = normalizeMessage(msg);
             }
           } catch (e) {
             if (controller.signal.aborted) {
+              releaseTurn();
               watch.dispose();
               this.inFlight = undefined;
               this.transcript.rollbackTo(turnStart);
@@ -5551,6 +6282,7 @@ export class Engine {
                   retryable: true,
                 };
           }
+          releaseTurn();
           // The watchdog, whichever layer noticed it. A body read cut off by
           // it can surface as "not JSON" or as a network error, and neither is
           // what happened.
@@ -5571,8 +6303,14 @@ export class Engine {
             };
           }
 
+          if (failure) msg = undefined;
+          // A request that completed teaches the session what this provider's
+          // normal looks like (watchdog.ts LatencyLearner). Local servers keep
+          // their hardware-based allowances.
+          if (!failure && msg && !isSelfHosted(this.cfg.baseUrl)) this.latency.record(watch);
           if (!failure) break;
-          if (!failure.retryable || attempt >= NETWORK_RETRIES) break;
+          const retries = failure.overload ? OVERLOAD_RETRIES : NETWORK_RETRIES;
+          if (!failure.retryable || attempt >= retries) break;
           // About to replay this message from the beginning. Anything already on
           // screen belongs to an attempt that is being abandoned, and leaving it
           // there would show the reader the same sentence twice with no way to
@@ -5581,14 +6319,14 @@ export class Engine {
             shownThisAttempt = false;
             yield { kind: "stream_reset", why: failure.text };
           }
-          const backoff = this.cfg.retryBackoffMs ?? NETWORK_BACKOFF_MS;
+          const backoff = this.cfg.retryBackoffMs ?? (failure.overload ? OVERLOAD_BACKOFF_MS : NETWORK_BACKOFF_MS);
           const wait = failure.retryAfterMs ?? backoff[attempt] ?? backoff.at(-1) ?? 4_000;
           log?.append("note", { text: `${failure.text} — retrying in ${wait}ms` });
           yield {
             kind: "info",
             text:
               `${failure.text} — retrying in ${Math.round(wait / 100) / 10}s, ` +
-              `attempt ${attempt + 2} of ${NETWORK_RETRIES + 1}`,
+              `attempt ${attempt + 2} of ${retries + 1}`,
           };
           await sleepUnlessAborted(wait, controller.signal);
           if (controller.signal.aborted) {
@@ -5602,6 +6340,7 @@ export class Engine {
         }
 
         watch?.dispose();
+        releaseTurn();
         this.inFlight = undefined;
 
         if (deadlineHit) {
@@ -5628,7 +6367,9 @@ export class Engine {
           // is the conversation, the model id, or the credentials being wrong,
           // and a salvage would be refused in exactly the same way — paying
           // twice to be told the same thing is the spending this avoids.
-          if (failure?.retryable !== false) {
+          // Work that happened is judged, whatever the provider did after it.
+          const judged = this.turnWrites.length > 0 ? yield* judgeOnDisk("provider", "") : false;
+          if (!judged && failure?.retryable !== false) {
             yield* this.salvage(failure?.why ?? "The provider returned nothing usable.", fetchFn, log);
           }
           return;
@@ -5810,7 +6551,10 @@ export class Engine {
       // with text and no tool call — so the claim path is the ordinary one.
       if (this.cfg.batch && msg.tool_calls?.length) {
         const acts = msg.tool_calls.map((c) => expandAct(c));
-        if (acts.every((a) => a !== null && a.subs.length === 0)) {
+        // Finished only when every act really is empty. One that carried
+        // actions Maat could not read is not "done": it goes to the tool path
+        // below, which answers it with an error naming the expected shape.
+        if (acts.every((a) => a !== null && a.subs.length === 0 && a.unusable === 0)) {
           const said = acts.map((a) => a!.analysis).filter(Boolean).join("\n\n");
           msg = { ...msg, content: [msg.content, said].filter((x) => x && x.trim()).join("\n\n") };
           delete (msg as { tool_calls?: unknown }).tool_calls;
@@ -5883,7 +6627,15 @@ export class Engine {
         for (const [i, call] of msg.tool_calls.entries()) {
           const last = finishReason === "length" && i === msg.tool_calls.length - 1;
           const act = this.cfg.batch ? expandAct(call) : null;
-          if (act && act.subs.length) {
+          if (act && act.unusable > 0) {
+            log?.append("note", { text: `act with ${act.unusable} unreadable action(s)`, args: (call.function?.arguments ?? "").slice(0, 20_000) });
+          }
+          // An act with any action Maat could not read runs none of them: the
+          // others may depend on the one that was dropped (a write, then the
+          // command that reads it), and the model, shown results for fewer
+          // actions than it sent, would not know which one vanished. It goes
+          // the unreadable way below and is answered with the expected shape.
+          if (act && act.subs.length && act.unusable === 0) {
             act.subs.forEach((sub, k) =>
               planned.push({ id: sub.id, name: sub.name, rawArgs: sub.rawArgs, truncated: last && k === act.subs.length - 1 }),
             );
@@ -6006,7 +6758,7 @@ export class Engine {
       // step that did call something is left alone: its text is a report.
       const narrated =
         msg.content && !(this.subprocess && this.turnCalls.size > callsBeforeStep)
-          ? narratedCallIn(msg.content)
+          ? narratedCallIn(msg.content, this.cfg.batch ? [...MOLT_TOOL_NAMES, "act"] : undefined)
           : null;
       if (narrated) {
         narratedTurns += 1;
@@ -6085,6 +6837,52 @@ export class Engine {
       // ---- The model believes it is finished. That is a claim. ----
       const claim = msg.content ?? "";
       if (pendingCriteria) yield* settleCriteria();
+      if (referencePending) yield* joinReference();
+      if (lateCriteria) yield* joinLateCriteria();
+
+      // Once per turn, unattended, before anything is judged: each stated
+      // requirement beside the commands the model ran for it. The checks are
+      // hidden, so nothing else sends the model back down the task's list.
+      // Exactly one round; the hidden checks never appear in it.
+      if (this.cfg.unattended && this.cfg.signOut === true && !signedOut && !opts.ask && requirements.length) {
+        signedOut = true;
+        const so = signOut(requirements, this.did);
+        this.turnSignOut = so;
+        log?.append("note", {
+          text: "requirements put to the model for sign-out before judging",
+          signout: so,
+        });
+        yield {
+          kind: "info",
+          text:
+            `before checking: signing out ${requirements.length} stated requirement(s) — ` +
+            `${so.unexercised.length} not yet run`,
+        };
+        this.transcript.push({ role: "user", content: signOutMessage(so), molt: { nudge: true } });
+        continue;
+      }
+
+      // Once per turn, before anything is judged: what the work left behind
+      // that the task did not ask for. A nudge, never a deletion — the model
+      // knows which of them the task needs, and says so or removes the rest.
+      if (turnListing && !leftoversAsked && !opts.ask) {
+        leftoversAsked = true;
+        const extra = unnamedNewFiles(turnListing, listProject(this.cwd), userText);
+        if (extra.length) {
+          const shown = extra.slice(0, 12).join(", ") + (extra.length > 12 ? `, and ${extra.length - 12} more` : "");
+          log?.append("note", { text: "files the task does not name, put to the model before judging", files: extra.slice(0, 50) });
+          yield { kind: "info", text: `before checking: asking about files the task does not name — ${shown}` };
+          this.transcript.push({
+            role: "user",
+            content:
+              `[Maat: before this is checked — you created files the task does not name: ${shown}. ` +
+              "If any is a helper script, a copy, a test or scratch file you made for yourself, delete it now: " +
+              "the task's directory should hold only what the task asks for. If the task needs one, say which in a " +
+              "line. Then give your final answer again.]",
+          });
+          continue;
+        }
+      }
 
       if (!bar || bar.checks.length === 0) {
         yield {
@@ -6129,17 +6927,31 @@ export class Engine {
             continue;
           }
           disputed.add(d.name);
+          const arb = this.cfg.dispute;
+          const arbModel = arb?.model || this.cfg.model;
+          const arbUrl = arb?.baseUrl || this.cfg.baseUrl;
+          if (arbModel === this.cfg.model && arbUrl === this.cfg.baseUrl) {
+            rejectedNow += 1;
+            const why = "rejected: no independent arbiter (the worker model would rule on its own misreading; set --arbiter-model)";
+            log?.append("dispute", { check: d.name, quote: d.quote, why: d.why, ran: false, skipped: "same model" });
+            yield { kind: "info", text: `the dispute of ${d.name} was ${why}; the check stands` };
+            this.transcript.push({
+              role: "user",
+              content: `[molt] Your dispute of ${d.name} was ${why}. The check stands. Change the work so it passes.`,
+            });
+            continue;
+          }
           yield { kind: "info", text: `reviewing the dispute of ${d.name} against the task text` };
           const ruling = await arbitrate({
             task: userText,
             check: { name: d.name, run: check.run },
             output: failed.output,
             dispute: d,
-            votes: 3,
+            votes: arb?.votes ?? 1,
             ask: {
-              baseUrl: this.cfg.baseUrl,
-              apiKey: this.cfg.apiKey,
-              model: this.cfg.model,
+              baseUrl: arbUrl,
+              apiKey: arb?.apiKey ?? this.cfg.apiKey,
+              model: arbModel,
               cwd: this.cwd,
               reasoningEffort: this.cfg.review?.reasoningEffort ?? this.cfg.reasoningEffort,
               fetchFn: this.cfg.fetchFn,
@@ -6236,7 +7048,30 @@ export class Engine {
         checks: barThis.checks.length,
         names: barThis.checks.map((c) => c.name),
       };
-      const result = await this.runBarGuarded(claim, barThis);
+      let result = await this.runBarGuarded(claim, barThis);
+      // A check that failed in its own code is no verdict on the work. The
+      // reference check says so with exit 3 (src/reference.ts); a drafted
+      // check says so in its output — a compile error in its own program, a
+      // tool rejecting its options (criteria.ts checkSelfError). Preflight
+      // catches these before the work only when the check gets that far: a
+      // node-summarize check piped `node summarize.js` into a jq program that
+      // was wrong, failed first on the missing script, and then refused six
+      // correct solutions. Retired, and the claim judged by what remains.
+      const selfBroken = brokenOwn(result);
+      if (selfBroken.length) {
+        yield* retireBroken(selfBroken);
+        const rest = barNow();
+        if (!rest || rest.checks.length === 0) {
+          // Nothing else judges the claim: unverified, as when every check is
+          // retired by dispute — never a pass on an empty bar.
+          this.turnAllRetired = true;
+          yield { kind: "info", text: "no other check is left to judge the claim — this claim is unverified." };
+          log?.append("session_end", { reason: "unverified: every check retired" });
+          if (claim) yield { kind: "assistant_text", text: redact(claim, this.secrets()), streamed: streamedContent };
+          return;
+        }
+        result = await this.runBarGuarded(claim, rest);
+      }
       if (this.checkLeftovers.length) {
         log?.append("note", { text: `removed what the checks created: ${this.checkLeftovers.join(", ")}` });
         yield { kind: "info", text: `removed what the checks created in the project: ${this.checkLeftovers.join(", ")}` };
@@ -6283,18 +7118,62 @@ export class Engine {
         .map((r) => `${r.name}:${r.output.trim()}`)
         .join("|");
       let stuck = !result.ok && signature === lastFailure;
-      // Experiment (revealOnStuck): once per turn, a repeat failure of hidden
-      // drafted checks only is answered by showing their commands, not a stop.
+      // A repeat failure of hidden drafted checks only is not a verdict: the
+      // work was right 34 times and wrong 33 at this stop, so it decided the
+      // outcome on a coin flip. The model is shown the commands once and the
+      // turn goes on, bounded by the attempt limit; the DISPUTE route stays
+      // open. A check a person wrote still ends the turn here.
       const stuckHidden = result.results.filter((r) => !r.ok && !r.advisory);
-      const revealNow =
-        stuck &&
-        this.cfg.revealOnStuck === true &&
-        !revealedThisTurn &&
+      const hiddenOnly =
         stuckHidden.length > 0 &&
         stuckHidden.every((r) => (barNow()?.checks ?? []).find((c) => c.name === r.name)?.hidden === true);
+      // Opt-in again (`--reveal-stuck`). As the default it was measured on
+      // Mercury 2.5 against the build that stops here: 37/60 vs 44/60. Shown
+      // a wrong drafted check, the model bent correct work to fit it — six
+      // runs passed their checks on a second try and failed the grader
+      // (0 in the stopping build): a report cut to the check's 6 lines, a
+      // folder deleted to make "exactly 5 files", git reset --hard. One rescue
+      // in 120 runs, at three times the tokens. Stopping leaves the work on
+      // disk, reported unverified, and that work passed 24 of 25 times.
+      const revealNow = stuck && this.cfg.revealOnStuck === true && !revealedThisTurn && hiddenOnly;
+      if (stuck && this.cfg.revealOnStuck === true && hiddenOnly) stuck = false;
       if (revealNow) {
         revealedThisTurn = true;
-        stuck = false;
+        revealSeen = new Set(this.turnLedger().map((e) => e.callId));
+        this.turnRevealed = stuckHidden.map((r) => bare(r.name));
+        revealMark = {
+          didAt: this.did.length,
+          targets: this.revealedTargets(
+            stuckHidden.flatMap((r) => {
+              const c = (barNow()?.checks ?? []).find((k) => k.name === r.name);
+              return c && c.kind === "command" ? [c.run] : [];
+            }),
+          ),
+        };
+      }
+      // The model has read the check; work that then edits the task's input or
+      // the environment to satisfy it is the check's answer, not the task's.
+      if (result.ok && revealedThisTurn) {
+        const bent = this.bentAfterReveal(revealSeen, userText, revealMark);
+        if (bent && !bent.hard) {
+          log?.append("note", { text: `unverified after a reveal: ${bent.reason}` });
+          yield { kind: "info", text: `${bent.reason} — this claim is unverified.` };
+          log?.append("session_end", { reason: "unverified: input changed after a reveal" });
+          if (claim) yield { kind: "assistant_text", text: redact(claim, this.secrets()), streamed: streamedContent };
+          return;
+        }
+        bentReason = bent?.reason;
+        if (bentReason) {
+          result = {
+            ...result,
+            ok: false,
+            results: [
+              ...result.results,
+              { name: "bent-work", kind: "builtin", detail: "bent-work", ok: false, output: bentReason, durationMs: 0 },
+            ],
+          };
+          log?.append("note", { text: `claim refused after a reveal: ${bentReason}` });
+        }
       }
       const stuckChecks = stuck
         ? result.results.filter((r) => !r.ok).map((r) => r.name)
@@ -6312,7 +7191,7 @@ export class Engine {
         !result.ok && !result.cancelled && (result.undetermined?.length ?? 0) > 0 &&
         result.results.every((r) => r.ok || r.advisory || r.skipped);
       const exhausted =
-        !result.ok && (undetermined || stuck || allBroken || proofAttempts >= maxAttempts);
+        !result.ok && (undetermined || stuck || allBroken || bentReason !== undefined || proofAttempts >= maxAttempts);
       const verdict = result.ok
         ? "accepted"
         : undetermined
@@ -6359,6 +7238,7 @@ export class Engine {
           })),
           cwd: this.cwd,
           did: [...this.did],
+          signout: this.turnSignOut,
           task: taskSeal
             ? {
                 // Recomputed from the frozen arrays, not carried along, so a
@@ -6371,6 +7251,8 @@ export class Engine {
                 notes: [...taskNotes],
               }
             : undefined,
+          ...(this.turnRevealed.length ? { revealed: [...this.turnRevealed] } : {}),
+          ...(verdict === "accepted" ? { tier: tierOf({ results: result.results, ...this.advisoryTier() }) } : {}),
         });
         log?.append("receipt", { verdict, file: receipt.path, attempt: proofAttempts });
         this.bindReceipt(receipt.path, verdict);
@@ -6387,23 +7269,28 @@ export class Engine {
       // wrong. Afterwards it was only a label: on the local comparison the
       // reviewers named the missing user and the uppercase email, and both
       // tasks were still lost because the turn had already ended.
-      if (result.ok && this.cfg.review && !reviewNudged && !opts.ask && lastReceiptPath && existsSync(lastReceiptPath)) {
+      const skipReview = result.ok && this.cfg.review && !reviewNudged && !opts.ask ? this.reviewSkipReason() : undefined;
+      if (skipReview) {
+        this.reviewSkipped = skipReview;
+        this.turnReview = null;
+        log?.append("review", { ran: false, skipped: skipReview });
+        yield { kind: "info", text: `skipping the independent review: ${skipReview}. The claim stands as checked, unreviewed.` };
+      } else if (result.ok && this.cfg.review && !reviewNudged && !opts.ask && lastReceiptPath && existsSync(lastReceiptPath)) {
         yield { kind: "info", text: "reviewing the claim independently against the task text" };
         const review = await reviewClaim({
           task: userText,
           receipt: readFileSync(lastReceiptPath, "utf8"),
           votes: this.cfg.review.votes,
           ask: {
-            baseUrl: this.cfg.baseUrl,
-            apiKey: this.cfg.apiKey,
-            model: this.cfg.model,
+            ...judgeTarget({ baseUrl: this.cfg.baseUrl, apiKey: this.cfg.apiKey, model: this.cfg.model }),
             cwd: this.cwd,
-            reasoningEffort: this.cfg.review.reasoningEffort ?? this.cfg.reasoningEffort,
+            reasoningEffort: judgeEffort(this.cfg.review.reasoningEffort ?? this.cfg.reasoningEffort),
             fetchFn: this.cfg.fetchFn,
-              acpSpawn: this.cfg.acpSpawn,
+            acpSpawn: this.cfg.acpSpawn,
+            ...(this.timeLeftMs() !== undefined ? { timeoutMs: Math.max(1_000, this.timeLeftMs()!) } : {}),
           },
         }).catch(() => null);
-        if (review && !review.confirmed && review.violations.length) {
+        if (review && !review.confirmed && review.violations.length && this.cfg.reviewAdvisory !== true) {
           reviewNudged = true;
           this.turnReview = undefined;
           log?.append("review", { confirmed: false, votes: review.votes, violations: review.violations.length, nudged: true });
@@ -6480,6 +7367,17 @@ export class Engine {
               `The command was not found or could not be executed, so no verdict was ` +
               `reached either way, and no change to the work could produce one. ` +
               `Repair the check in .maat/done.yml — Maat will not spend more attempts on it.`,
+          };
+          yield* this.settleFailed(log);
+          return;
+        }
+        if (bentReason) {
+          yield {
+            kind: "error",
+            text:
+              `claim refused: ${bentReason}. The checks passed only after the model read a hidden ` +
+              `check's command, and the work that met it changed what the task or the environment ` +
+              `supplies. Maat will not call that verified. Undo that change and meet the task as written.`,
           };
           yield* this.settleFailed(log);
           return;

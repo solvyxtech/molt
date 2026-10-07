@@ -55,6 +55,8 @@ export type ReceiptRecord = {
    * questions before this field existed.
    */
   ask?: boolean;
+  /** Set when the model was stopped and the tree judged as it stood. */
+  endedBy?: "deadline" | "provider";
   /** True when the cost rests on molt's own token estimate anywhere in the session. */
   costEstimated?: boolean;
   /**
@@ -70,6 +72,19 @@ export type ReceiptRecord = {
   /** The commit the judged tree sat on; `dirty` when it differed from it. */
   head?: string;
   dirty?: boolean;
+  /** Hidden checks whose commands were shown to the model after a repeat failure. */
+  revealed?: string[];
+  /**
+   * What the passing checks earned (src/tiers.ts): "verified", or
+   * "passed-checks" with `tierReason` saying why not. Set on accepted claims;
+   * the independent review can lower it after the receipt is written
+   * (`amendTier`), so the index row is the last word and the receipt file,
+   * hash-bound when it was written, is never rewritten.
+   */
+  tier?: "verified" | "passed-checks";
+  tierReason?: string;
+  /** The strongest evidence class among the passing checks. */
+  evidence?: string;
 };
 
 /** What `repair()` changed, and what it left alone. */
@@ -293,8 +308,12 @@ export class Receipts {
     costUsd?: number;
     /** True when that figure rests on molt's own token estimate. */
     costEstimated?: boolean;
+    /** The tier the passing checks earned, before any independent review (src/tiers.ts). */
+    tier?: { tier: "verified" | "passed-checks"; reason?: string; evidence: string };
     /** True for a question: the bar ran advisory and could not refuse. */
     ask?: boolean;
+    /** The model was stopped (clock, provider) and the tree was judged as it stood. */
+    endedBy?: "deadline" | "provider";
     /**
      * Every file the turn changed, with the hashes that prove it — and which
      * lines it wrote, so the receipt can show the work rather than describe it.
@@ -312,8 +331,16 @@ export class Receipts {
      * work out which is which.
      */
     task?: { seal: string; checks: string[]; notes: string[] };
+    /**
+     * Hidden checks whose commands were shown to the model after they failed
+     * the same way twice. A pass after that is a pass against a check the
+     * model had read, and the receipt says so.
+     */
+    revealed?: string[];
     /** What the model ran and read, in order, as one line each. */
     did?: string[];
+    /** The requirement sign-out put to the model before this claim (src/signout.ts). */
+    signout?: { requirements: string[]; matched: { requirement: string; calls: string[] }[]; unexercised: string[] };
     /**
      * The commit the tree sat on when the bar ran, and whether the tree
      * differed from it.
@@ -335,7 +362,7 @@ export class Receipts {
     // believe it finished?" — so it answers in that order. It used to open
     // with a provider name and a token count, which answer neither question,
     // and put the work itself nowhere at all.
-    const verdictLine =
+    let verdictLine =
       args.verdict === "accepted" && args.ask
         ? "Maat recorded this answer. A question runs the bar advisory — a turn that wrote " +
           "nothing cannot have broken anything — so no check could refuse it, and nothing " +
@@ -348,6 +375,15 @@ export class Receipts {
             ? "Maat did not accept this claim: every check that ran passed, but checks " +
               "done.yml requires were not run. Nothing failed, and nothing established the rest."
             : "Maat reported failure: the attempt limit was reached with checks still failing.";
+
+    if (args.verdict === "accepted" && !args.ask && args.tier) {
+      verdictLine += args.tier.tier === "verified"
+        ? `\n\nEvidence: ${args.tier.evidence}. A passing check of this class earns the word "verified".`
+        : `\n\nPassed its checks, not verified: ${args.tier.reason}. The strongest passing check is ${args.tier.evidence}.`;
+    }
+    if (args.revealed?.length) {
+      verdictLine += `\n\nThe command of ${args.revealed.map((n) => `\`${n}\``).join(", ")} was shown to the model after it failed the same way twice; the work was judged against a check the model had read.`;
+    }
 
     const changed = args.changed ?? [];
     // The task's own criteria go above what changed, because they are what the
@@ -399,6 +435,21 @@ export class Receipts {
       work.push(...wroteSection(args.cwd ?? process.cwd(), changed));
     }
 
+    const so = args.signout;
+    if (so && so.requirements.length) {
+      work.push("## Requirement sign-out", "");
+      work.push(
+        "Before this claim was judged, each stated requirement was put to the model beside the",
+        "commands it ran that touch it. Matching is by keyword and path, not proof.",
+        "",
+      );
+      for (const r of so.requirements) {
+        const calls = so.matched.find((m) => m.requirement === r)?.calls;
+        work.push(calls ? `- "${r}" — ran: ${calls.slice(-3).map((c) => `\`${c.slice(0, 110)}\``).join("; ")}` : `- "${r}" — not run before the sign-out`);
+      }
+      work.push("");
+    }
+
     const did = args.did ?? [];
     if (did.length > 0) {
       work.push("## What the model ran", "");
@@ -412,6 +463,14 @@ export class Receipts {
       "",
       verdictLine,
       "",
+      ...(args.endedBy
+        ? [
+            args.endedBy === "deadline"
+              ? "The turn's time budget ran out before the model said it was done; the sealed checks ran on the tree as it stood."
+              : "The provider failed after work had been done; the sealed checks ran on the tree as it stood.",
+            "",
+          ]
+        : []),
       "## What the model claimed",
       "",
       "> " + (args.claim.trim() || "(no final message)").split("\n").join("\n> "),
@@ -516,6 +575,8 @@ export class Receipts {
       `- attempt: ${args.attempt}`,
       `- provider: ${args.provider}`,
       `- model: ${args.model}`,
+      // Who wrote and reviewed the checks, when that is not the worker (judge.ts).
+      ...(process.env.MAAT_JUDGE_MODEL?.trim() ? [`- judge: ${process.env.MAAT_JUDGE_MODEL.trim()}${process.env.MAAT_JUDGE_URL?.trim() ? ` at ${process.env.MAAT_JUDGE_URL.trim()}` : ""}`] : []),
       `- session tokens: ${args.sessionTokens}`,
       ...(args.costUsd === undefined
         ? []
@@ -551,6 +612,11 @@ export class Receipts {
       ...(args.costUsd === undefined ? {} : { costUsd: args.costUsd }),
       ...(args.costEstimated ? { costEstimated: true } : {}),
       ...(args.ask ? { ask: true } : {}),
+      ...(args.revealed?.length ? { revealed: [...args.revealed] } : {}),
+      ...(args.endedBy ? { endedBy: args.endedBy } : {}),
+      ...(args.verdict === "accepted" && !args.ask && args.tier
+        ? { tier: args.tier.tier, evidence: args.tier.evidence, ...(args.tier.reason ? { tierReason: args.tier.reason } : {}) }
+        : {}),
       // Only when the caller said what changed. A row with no count is
       // unknown, and unknown is not zero — it is counted as a change, which is
       // what every row written before this field existed already was.
@@ -565,6 +631,40 @@ export class Receipts {
     appendFileSync(this.indexPath, redact(JSON.stringify(record), this.secrets) + "\n", "utf8");
 
     return { path: p, attempt: args.attempt, verdict: args.verdict };
+  }
+
+  /**
+   * Lower a receipt's recorded tier once the whole turn has been judged.
+   *
+   * The independent review reads the receipt, so it cannot be in it: a claim
+   * that passed on strong checks and was then contradicted would otherwise sit
+   * in the index as "verified". Only the index row changes; the receipt file
+   * is hash-bound and stays byte for byte as written. A row that is not
+   * there, or an index that cannot be read, is left alone.
+   */
+  amendTier(file: string, tier: { tier: "verified" | "passed-checks"; reason?: string }): boolean {
+    try {
+      if (!existsSync(this.indexPath)) return false;
+      let hit = false;
+      const out = readFileSync(this.indexPath, "utf8")
+        .split("\n")
+        .map((l) => {
+          if (!l.trim()) return l;
+          try {
+            const r = JSON.parse(l) as ReceiptRecord;
+            if (r.file !== file) return l;
+            hit = true;
+            const { tierReason: _drop, ...rest } = r;
+            return JSON.stringify({ ...rest, tier: tier.tier, ...(tier.reason ? { tierReason: redact(tier.reason, this.secrets) } : {}) });
+          } catch {
+            return l;
+          }
+        });
+      if (hit) writeFileSync(this.indexPath, out.join("\n"), "utf8");
+      return hit;
+    } catch {
+      return false;
+    }
   }
 
   /**

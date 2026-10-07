@@ -329,6 +329,72 @@ describe("a turn done by an ACP agent", () => {
   });
 
   /**
+   * grok 1.0.46 hides MCP tools behind `search_tool` / `use_tool`: the call is
+   * announced as `use_tool` and the permission request names its target only
+   * in rawInput. Judged by name, every Maat call looked like Grok's own
+   * `use_tool` and was refused, so the turn ended having done nothing.
+   */
+  it("allows Maat's tools reached through grok's use_tool, and records them", async () => {
+    const dir = ws();
+    const { engine, agent } = engineIn(dir, [
+      {
+        search: true,
+        viaUseTool: [{ name: "write_file", args: { path: "via.txt", content: "via\n" } }],
+        text: "Wrote via.txt.",
+      },
+    ]);
+    const events = await drain(engine.run("create via.txt", allowAll));
+
+    assert.equal(readFileSync(join(dir, "via.txt"), "utf8"), "via\n", "the write must have landed");
+    assert.deepEqual(
+      agent.permissions.map((p) => [p.tool, p.outcome]),
+      [["molt__write_file", "yes"]],
+    );
+    const tool = events.find((e) => e.kind === "tool") as { name: string } | undefined;
+    assert.equal(tool?.name, "write_file", "the call is a Maat tool event, from the Maat ledger");
+    const result = events.find((e) => e.kind === "proof_result") as
+      | { result: { ok: boolean; results: unknown[] } }
+      | undefined;
+    assert.equal(result?.result.ok, true, JSON.stringify(result?.result.results));
+    const notes = events.filter((e) => e.kind === "info").map((e) => (e as { text?: string }).text ?? "");
+    assert.ok(
+      !notes.some((t) => /search_tool|use_tool/u.test(t)),
+      `Maat's own route must not be reported as an unaccounted builtin: ${JSON.stringify(notes)}`,
+    );
+  });
+
+  it("still refuses a use_tool aimed at anything that is not Maat's", async () => {
+    const dir = ws();
+    const { engine, agent } = engineIn(dir, [
+      {
+        viaUseToolOther: ["github__create_issue", "write_file", "use_tool"],
+        viaUseTool: [{ name: "write_file", args: { path: "ok.txt", content: "x\n" } }],
+        text: "Done.",
+      },
+    ]);
+    const events = await drain(engine.run("do the work", allowAll));
+    const denied = agent.permissions.filter((p) => p.outcome === "no").map((p) => p.tool);
+    assert.deepEqual(denied.sort(), ["github__create_issue", "use_tool", "write_file"]);
+    assert.deepEqual(
+      agent.permissions.filter((p) => p.outcome === "yes").map((p) => p.tool),
+      ["molt__write_file"],
+    );
+    const notes = events.filter((e) => e.kind === "info").map((e) => (e as { text?: string }).text ?? "");
+    assert.ok(notes.some((t) => /refused .*'github__create_issue'/u.test(t)), JSON.stringify(notes));
+  });
+
+  it("tells Grok how to reach Maat's tools, since its own list has none", async () => {
+    const dir = ws();
+    const { engine, agent } = engineIn(dir, [{ text: "hello" }]);
+    await drain(engine.run("say hello", allowAll));
+    const meta = (agent.sessionParams()._meta ?? {}) as Record<string, unknown>;
+    const sys = String(meta.systemPromptOverride);
+    assert.match(sys, /search_tool/u);
+    assert.match(sys, /use_tool/u);
+    assert.match(sys, /molt__/u);
+  });
+
+  /**
    * A subscription run is not metered, so the receipt says the plan paid for
    * it. A price that would be applied if anything applied one is configured
    * above; nothing should.
@@ -662,6 +728,16 @@ describe("the model a receipt names is the one that ran", () => {
 });
 
 describe("a one-shot question to a subscription agent is bounded", () => {
+  it("tells Grok it has no tools, not that every tool lives on an MCP server the question never has", async () => {
+    const { acpAsk } = await import("../src/acp.js");
+    const agent = scriptedAcpAgent([{ text: "{}" }]);
+    const r = await acpAsk({ spec: GROK, model: "", systemPrompt: "SYS", prompt: "p", spawnFn: agent.spawnFn, timeoutMs: 5_000 });
+    assert.equal(r.ok, true);
+    const meta = (agent.sessionParams()._meta ?? {}) as { systemPromptOverride?: string };
+    assert.match(meta.systemPromptOverride ?? "", /NO tools/);
+    assert.doesNotMatch(meta.systemPromptOverride ?? "", /TOOL ROUTING/);
+  });
+
   it("gives up on an ACP agent that takes the prompt and never answers", async () => {
     const { acpAsk } = await import("../src/acp.js");
     const agent = scriptedAcpAgent([{ hang: true }]);
@@ -672,4 +748,51 @@ describe("a one-shot question to a subscription agent is bounded", () => {
     assert.ok(Date.now() - t0 < 5_000, "the limit, not for ever");
   });
 
+});
+
+/**
+ * OpenCode over ACP. It spells a Maat tool `molt_<name>` (one underscore), so
+ * the permission gate has to read that as Maat's own — and still refuse every
+ * OpenCode builtin. Measured live on opencode 1.18.33: the first refusal was
+ * 'molt_write_file', which emptied the turn.
+ */
+describe("OpenCode as an ACP worker", () => {
+  const OPENCODE = ACP_AGENTS.find((a) => a.name === "opencode")!;
+
+  it("is the opencode CLI in acp mode with every permission on ask", () => {
+    assert.equal(acpAgentFor(OPENCODE.url)?.bin, "opencode");
+    assert.deepEqual([...OPENCODE.args], ["acp"]);
+    const cfg = JSON.parse(OPENCODE.env?.OPENCODE_CONFIG_CONTENT ?? "{}") as { permission?: Record<string, string> };
+    assert.equal(cfg.permission?.["*"], "ask");
+    assert.ok(!Object.values(cfg.permission ?? {}).some((v) => v !== "ask"));
+  });
+
+  it("allows molt_<tool>, refuses builtins, and the write lands in the ledger", async () => {
+    const dir = ws();
+    const agent = scriptedAcpAgent([
+      {
+        wirePrefix: "molt_",
+        builtins: ["write", "bash"],
+        calls: [{ name: "write_file", args: { path: "hello.txt", content: "hi\n" } }],
+        text: "Wrote hello.txt.",
+      },
+    ]);
+    const engine = new Engine({
+      baseUrl: OPENCODE.url,
+      model: "opencode/big-pickle",
+      provider: "opencode",
+      cwd: dir,
+      bar: BAR,
+      archive: new Archive(dir),
+      receipts: new Receipts(dir),
+      acpSpawn: agent.spawnFn,
+      maxProofAttempts: 2,
+    });
+    const events = await drain(engine.run("create hello.txt", allowAll));
+    assert.equal(readFileSync(join(dir, "hello.txt"), "utf8"), "hi\n");
+    assert.deepEqual(agent.permissions.filter((p) => p.outcome === "no").map((p) => p.tool).sort(), ["bash", "write"]);
+    assert.deepEqual(agent.permissions.filter((p) => p.outcome === "yes").map((p) => p.tool), ["molt_write_file"]);
+    const result = events.find((e) => e.kind === "proof_result") as { result: { ok: boolean } } | undefined;
+    assert.equal(result?.result.ok, true);
+  });
 });

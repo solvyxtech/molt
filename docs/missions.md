@@ -55,7 +55,7 @@ one JSON per worker attempt.
 
 ## What there is not
 
-**An orchestrator model.** Factory's missions put a frontier model in a loop
+**An orchestrator model.** A competitor's missions put a frontier model in a loop
 with seventeen tools to decide what runs next, read each worker's handoff,
 delegate a review of it to more subagents, and decide whether a milestone is
 done. It is the most expensive process in their system, and it is doing a job
@@ -63,7 +63,7 @@ a loop can do. Here the orchestrator is `src/mission.ts`. It reads a queue,
 starts a worker, reads a verdict the bar produced, and moves on. It costs no
 tokens.
 
-**Validators that are models.** Factory injects a "scrutiny validator" and a
+**Validators that are models.** A competitor injects a "scrutiny validator" and a
 "user-testing validator" at each milestone: subagents that read the work and
 say whether it is good. Their CTO, on the record: when the model cannot run
 something "it's going to validate this by just looking at it, and it will
@@ -71,7 +71,7 @@ fundamentally make a mistake." A milestone here is sealed by running the
 assertions. If an assertion cannot be a command, it is a note, it is on every
 receipt as stated intent, and it is never reported as passed.
 
-**A validation contract written in prose.** Factory's contract is a markdown
+**A validation contract written in prose.** A competitor's contract is a markdown
 checklist with "evidence requirements" a worker is asked to satisfy. Here an
 assertion is a command or it is not an assertion. That is the whole
 difference, and it is the difference between a checklist a model reads and a

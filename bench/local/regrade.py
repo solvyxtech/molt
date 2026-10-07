@@ -10,11 +10,12 @@ import json, os, sys
 from pathlib import Path
 from tasks import TASKS
 from tasks2 import TASKS2
+from tasks3 import TASKS3
 
 HERE = Path(__file__).resolve().parent
 out = HERE / os.environ.get("RESULTS", "results-v4.jsonl")
 WORK = Path(os.environ.get("BENCH_WORK", Path.home() / ".cache/maat-bench/work"))
-by = {T.name: T for T in TASKS + TASKS2}
+by = {T.name: T for T in TASKS + TASKS2 + TASKS3}
 rows = [json.loads(l) for l in out.read_text().splitlines()]
 changed = 0
 for r in rows:

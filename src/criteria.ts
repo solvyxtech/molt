@@ -22,9 +22,17 @@
  *    A sentence dressed as a check is worse than no check.
  */
 import { execFileSync } from "node:child_process";
-import { askModel } from "./ask.js";
-import { runCommand } from "./run.js";
+import { openSync, readSync, closeSync, realpathSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { isAbsolute, relative } from "node:path";
+import { topLevel } from "./brief.js";
+import { namedInputs, profileLine } from "./inspect.js";
+import { askModel, type AskOptions } from "./ask.js";
+import { runCommand, draftedShell, bashPath } from "./run.js";
+import { lintAll, readTree, type LintCtx } from "./checklint.js";
 import { diagnoseFailure } from "./bar.js";
+import { normalizeRequirements } from "./signout.js";
+import { evidenceTags } from "./tiers.js";
 
 /**
  * `surface`: the critic read it as only looking (a file exists, a word
@@ -32,7 +40,16 @@ import { diagnoseFailure } from "./bar.js";
  * check alone cannot carry a "verified" once the ones that ran it are retired.
  */
 export type DraftedCheck = { name: string; run: string; surface?: true };
-export type Draft = { checks: DraftedCheck[]; notes: string[] };
+export type Draft = {
+  checks: DraftedCheck[];
+  notes: string[];
+  /**
+   * The task's own stated requirements, verbatim quotes (src/signout.ts). Not
+   * checks: they are kept with the sealed criteria so an unattended turn can
+   * sign each one out before its claim is judged.
+   */
+  requirements?: string[];
+};
 
 /** Same bounds the drafter uses — applied again at `session:run`. */
 export const CRITERIA_MAX_CHECKS = 4;
@@ -60,7 +77,7 @@ export const CRITERIA_MAX_NOTE = 200;
  */
 export function sanitizeCriteria(raw: unknown): Draft {
   if (!raw || typeof raw !== "object") return { checks: [], notes: [] };
-  const o = raw as { checks?: unknown; notes?: unknown };
+  const o = raw as { checks?: unknown; notes?: unknown; requirements?: unknown };
   const checks: DraftedCheck[] = Array.isArray(o.checks)
     ? o.checks
         .filter(
@@ -86,7 +103,8 @@ export function sanitizeCriteria(raw: unknown): Draft {
         .slice(0, CRITERIA_MAX_NOTES)
         .map((n) => n.trim().slice(0, CRITERIA_MAX_NOTE))
     : [];
-  return { checks, notes };
+  const requirements = normalizeRequirements(Array.isArray(o.requirements) ? o.requirements : undefined);
+  return { checks, notes, ...(requirements.length ? { requirements } : {}) };
 }
 
 /**
@@ -107,6 +125,7 @@ export function taskChecksFrom(
     hidden?: boolean;
   }[];
   taskNotes: string[];
+  requirements?: string[];
 } {
   const drafted = sanitizeCriteria(raw);
   return {
@@ -116,10 +135,12 @@ export function taskChecksFrom(
       run: c.run,
       timeoutMs: 120_000,
       expectExit: 0,
-      tags: c.surface ? ["task", "surface"] : ["task"],
+      // surface from the critic, value from the command itself (evidence.ts).
+      tags: evidenceTags(c.run, c.surface),
       ...(opts.hidden ? { hidden: true } : {}),
     })),
     taskNotes: drafted.notes,
+    ...(drafted.requirements ? { requirements: drafted.requirements } : {}),
   };
 }
 
@@ -174,16 +195,82 @@ export function checkSelfError(output: string): string | null {
     [/unknown primary or operator/i, "a tool rejected the check's options"],
     [/^usage: git /im, "git rejected the check's command"],
     [/not a git repository/i, "the check runs git outside a git repository"],
+    // A check that compares against `git show HEAD:<file>` needs a commit that
+    // holds the file. Where the file is untracked, or the repository has no
+    // commit, git answers fatal and the check says nothing about the work: on
+    // the local suite 5 of the passing runs molt called unverified were
+    // refused by exactly this, in different checks. Only HEAD (or an empty
+    // revision left by a failed substitution) counts — a branch the work was
+    // meant to create and did not is the work's failure, not the check's.
+    [/fatal: path '[^']*' (?:does not exist|exists on disk, but not) in 'HEAD'/i, "the check reads a file from HEAD that no commit holds"],
+    [/fatal: (?:ambiguous argument '(?:HEAD)?': unknown revision|bad revision 'HEAD'|invalid object name 'HEAD')/i, "the check names a revision that does not exist"],
     [/\b(illegal|invalid|unrecognized) option\b/i, "a tool rejected the check's options"],
     [/illegal time specification|out of range or illegal time/i, "a tool rejected the check's date format"],
     [/syntax error near unexpected token|unexpected EOF while looking for/i, "the check's shell syntax is broken"],
   ];
   for (const [re, why] of tool) if (re.test(output)) return why;
+  // Compile errors of the check's own program. `python3 -c` with a syntax
+  // error prints `File "<string>", line 10` and `SyntaxError:` with no
+  // "Traceback" line at all, so the traceback rule below never saw it: a
+  // redact-secrets check with an unterminated f-string refused five correct
+  // solutions. jq and sqlite3 name their own compile errors.
+  // Only when the innermost frame is the inline program: `-c "import x"`
+  // over a deliverable with a syntax error names x.py last, and that is the
+  // work's fault.
+  const lastFrame = [...output.matchAll(/^\s*File "([^"]+)", line \d+/gm)].map((m) => m[1]).at(-1);
+  if ((lastFrame === "<string>" || lastFrame === "<stdin>") && /^(?:SyntaxError|IndentationError|TabError)\b/m.test(output)) return "the check's own program has a bug";
+  if (/^jq: error: syntax error|^jq: \d+ compile errors?/m.test(output)) return "the check's jq program does not compile";
+  if (/^(?:Parse error|Error): .*\n?.*syntax error/im.test(output) || /near ".*": syntax error/.test(output)) return "the check's SQL does not parse";
   if (/Traceback \(most recent call last\)/.test(output)) {
     const frames = [...output.matchAll(/File "([^"]+)", line \d+/g)].map((m) => m[1]);
     const inline = frames.length > 0 && (frames.at(-1) === "<string>" || frames.at(-1) === "<stdin>");
     if (inline && /^(NameError|SyntaxError|IndentationError|UnboundLocalError)\b/m.test(output)) return "the check's own program has a bug";
     if (/got an unexpected keyword argument|no such group|invalid group reference/.test(output)) return "the check's own program misuses a library call";
+    // Syntax-tree nodes belong to the standard library, not the deliverable: an
+    // attribute they lack (`FunctionDef.docstring`) is the check's mistake.
+    if (/^AttributeError: '(?:Module|FunctionDef|AsyncFunctionDef|ClassDef)' object has no attribute/m.test(output)) return "the check's own program misuses a library call";
+  }
+  return null;
+}
+
+/** Absolute prefixes of the system itself: tools, libraries, devices. Never the project's own files. */
+const SYSTEM_PATHS = ["/usr", "/bin", "/sbin", "/opt", "/lib", "/lib32", "/lib64", "/etc", "/dev", "/proc", "/sys", "/System", "/Library", "/Applications"];
+const TEMP_PATHS = ["/tmp", "/private/tmp", "/var/tmp", "/var/folders", "/private/var/folders"];
+
+function under(p: string, root: string): boolean {
+  return p === root || p.startsWith(root.endsWith("/") ? root : `${root}/`);
+}
+
+/**
+ * The first absolute path in a drafted command that points outside the
+ * project, or null. Allowed: anything under the working directory, the system
+ * temp directory (what `mktemp -d` returns), system locations (/usr/bin/env,
+ * /dev/null, /opt/homebrew/...), and a path the task text itself states.
+ *
+ * Seen in real runs: `python3 /wc.py` and `/home/user/data.csv` in checks
+ * drafted without any view of the project. They fail for ever, whatever the
+ * work does, and refuse correct work. Paths with a trailing slash are skipped
+ * (`awk '/x/'`, `sed 's/a/b/'` delimiters), as is anything glued to a word,
+ * `$VAR`, `./`, or `://` — those are relative paths, expansions and URLs —
+ * and so are closing tags (`</h1>`) and cron steps. A deliberately missing path
+ * (`/nonexistent`) tests error handling and is allowed.
+ */
+export function strayPath(run: string, opts: { cwd: string; task?: string }): string | null {
+  let real = opts.cwd;
+  try {
+    real = realpathSync(opts.cwd);
+  } catch {
+    /* a cwd that is not there: compare as given */
+  }
+  const roots = [opts.cwd, real, ...TEMP_PATHS, tmpdir(), ...SYSTEM_PATHS];
+  for (const m of run.matchAll(/(?<![\w.$}):/~<*+\]\\-])(\/[\w.@+-][^\s"'`;|&<>()*?\[\]{}$,=\\]*)/g)) {
+    const p = m[1]!;
+    if (p.endsWith("/")) continue;
+    // A path built to not exist is an error-handling test, not an invention.
+    if (/nonexist|no[-_]such|does[-_]?not[-_]?exist|missing/i.test(p)) continue;
+    if (roots.some((r) => under(p, r))) continue;
+    if (opts.task && opts.task.includes(p)) continue;
+    return p;
   }
   return null;
 }
@@ -202,15 +289,28 @@ export async function preflightCriteria(
      * evidence the task was done. The engine uses this to say so.
      */
     passed?: string[];
+    /**
+     * Set for DRAFTED checks: a command that reaches for an absolute path
+     * outside the project (see strayPath) is reported broken without being
+     * run. The task text is where a path the person stated is allowed from.
+     */
+    stray?: { task: string };
   },
 ): Promise<BrokenCriterion[]> {
   const broken: BrokenCriterion[] = [];
   for (const c of checks) {
     if (c.kind && c.kind !== "command") continue;
     if (!c.run) continue;
+    const stray = opts.stray ? strayPath(c.run, { cwd: opts.cwd, task: opts.stray.task }) : null;
+    if (stray) {
+      broken.push({ name: c.name, run: c.run, why: `it uses ${stray}, an absolute path outside the project (paths must be relative to the working directory)` });
+      continue;
+    }
     try {
       const r = await runCommand(c.run, {
         cwd: opts.cwd,
+        // Drafted checks (stray set) run under the shell the bar will use.
+        shell: draftedShell({ hidden: !!opts.stray, tags: ["task"] }),
         timeoutMs: opts.timeoutMs ?? 5_000,
         maxBuffer: 1024 * 1024,
         signal: opts.signal,
@@ -235,6 +335,59 @@ export async function preflightCriteria(
     }
   }
   return broken;
+}
+
+/** Caps for the project view the drafter and critic are shown. */
+export const VIEW_MAX_ENTRIES = 40;
+export const VIEW_MAX_LISTING = 2_000;
+export const VIEW_MAX_PROFILE = 1_500;
+
+function firstTextLine(abs: string): string {
+  try {
+    const fd = openSync(abs, "r");
+    try {
+      const buf = Buffer.alloc(400);
+      const n = readSync(fd, buf, 0, 400, 0);
+      const head = buf.subarray(0, n);
+      if (head.includes(0)) return "";
+      return (head.toString("utf8").split("\n")[0] ?? "").trim().slice(0, 100);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * What the worker is shown and the drafter used not to be: where the work
+ * happens, what is in it, and what the files the task names look like. Without
+ * it a drafter invents `python3 /wc.py` and hand-computes expected values it
+ * could have read from the input. Bounded (entries, characters) because the
+ * drafter often runs on a slow model. Empty when there is no directory.
+ */
+export function projectView(task: string, cwd?: string): string {
+  if (!cwd) return "";
+  const lines = [`Working directory: ${cwd}`];
+  let listing = topLevel(cwd, VIEW_MAX_ENTRIES + 1).filter((n) => n !== ".maat/" && n !== ".maat").slice(0, VIEW_MAX_ENTRIES).join(" ");
+  if (listing.length > VIEW_MAX_LISTING) listing = `${listing.slice(0, VIEW_MAX_LISTING)}…`;
+  lines.push(`Project files (top level): ${listing || "(empty)"}`);
+  let profile = "";
+  for (const abs of namedInputs(task, cwd, 6)) {
+    try {
+      if (!statSync(abs).isFile()) continue;
+      const rel = relative(cwd, abs);
+      let entry = profileLine(abs, isAbsolute(rel) || rel.startsWith("..") ? abs : rel).slice(0, 240);
+      const first = firstTextLine(abs);
+      if (first) entry += `\n    first line: ${first}`;
+      if (profile.length + entry.length > VIEW_MAX_PROFILE) break;
+      profile += `${profile ? "\n" : ""}  ${entry}`;
+    } catch {
+      /* unreadable: leave it out */
+    }
+  }
+  if (profile) lines.push(`Input files the task names:`, profile);
+  return lines.join("\n");
 }
 
 const SYSTEM = [
@@ -267,8 +420,16 @@ const SYSTEM = [
   "provides instead: the stated threshold on the data that IS here (accuracy >= 0.62",
   "on the provided test split), the fit's error against the measured points, the new",
   "query's time against the original's. Never hard-code an answer you had to guess.",
+  "Never write an expected value you worked out yourself — a date, a total, a count,",
+  "an output line the task does not state. Your own arithmetic is where checks go",
+  "wrong. Expected values come only from the task text; otherwise test what the task",
+  "states as a property: the stated number of lines, each strictly after the start,",
+  "the stated format, totals that add up, the same answer from two equivalent inputs.",
   "Checks must leave nothing behind: build and write into $(mktemp -d), never into",
   "a directory the task names.",
+  "Every path is relative to the working directory shown below. Never write an",
+  "absolute path outside it (no /wc.py, no /home/..) except $(mktemp -d) and system",
+  "tools; a check with one is dropped. Read expected values from the input files.",
   "",
   "notes are for anything a command cannot decide — how something looks, reads, or",
   "feels. They are recorded on the receipt as stated intent and never reported as",
@@ -347,6 +508,60 @@ function drafted(
   };
 }
 
+const EDGE_SYSTEM = [
+  "You review a task given to a coding agent BEFORE any work starts. You see only the task text and the files that exist.",
+  "Find the places where two reasonable readings of the task would make a correct-looking deliverable produce DIFFERENT OUTPUT on the same input.",
+  "List up to 6 probes. A probe is one concrete literal input (a value, a line, a date, a number), the two readings, and what each outputs for it.",
+  "Prefer boundary cases: off-by-one in what counts, inclusive/exclusive ranges, rounding and formatting, whole token vs substring, how two rules combine,",
+  "empty or malformed input, ordering and ties, what counts as a category. Only real divergence; no generic engineering concerns.",
+  "Quote the task words each reading rests on. Fewer is better than padding; an empty list is fine.",
+  'Reply with JSON only: {"probes":[{"input":"...","readingA":"...","outputA":"...","readingB":"...","outputB":"...","quote":"..."}]}',
+].join("\n");
+
+/**
+ * Edge cases where the task reads two ways (MAAT_EDGE_CHECKS=1), asked of the
+ * judge before the draft. They are handed to the drafter as candidates, not
+ * asked of anyone: a check is written only where the task text settles the
+ * reading. Asked as questions they were 90% noise (Bet 3); as check targets
+ * they cost one check each and found every trap the models kept failing.
+ */
+async function edgeProbes(opts: Parameters<typeof draftCriteria>[0], view: string | undefined): Promise<string> {
+  const asked = await askModel({
+    baseUrl: opts.baseUrl,
+    apiKey: opts.apiKey,
+    model: opts.model,
+    system: EDGE_SYSTEM,
+    prompt: [`Task: ${opts.task}`, ...(view ? ["", view] : [])].join("\n"),
+    cwd: opts.cwd,
+    what: "probing edge cases",
+    fetchFn: opts.fetchFn,
+    acpSpawn: opts.acpSpawn,
+    cliRun: opts.cliRun,
+    timeoutMs: opts.timeoutMs,
+    reasoningEffort: opts.reasoningEffort,
+    latency: opts.latency,
+  }).catch(() => null);
+  if (!asked?.ok) return "";
+  let probes: { input?: unknown; readingA?: unknown; outputA?: unknown; readingB?: unknown; outputB?: unknown; quote?: unknown }[] = [];
+  try {
+    const m = asked.text.match(/\{[\s\S]*\}/);
+    const parsed = m ? (JSON.parse(m[0]) as { probes?: unknown }) : {};
+    probes = Array.isArray(parsed.probes) ? (parsed.probes as typeof probes).slice(0, 6) : [];
+  } catch {
+    return "";
+  }
+  const lines = probes
+    .filter((p) => typeof p.input === "string" && p.input)
+    .map((p, i) => `${i + 1}. input ${JSON.stringify(p.input)} — reading A (${String(p.readingA ?? "")}) gives ${String(p.outputA ?? "")}; reading B (${String(p.readingB ?? "")}) gives ${String(p.outputB ?? "")}. Task words: "${String(p.quote ?? "")}"`);
+  if (!lines.length) return "";
+  return [
+    "Edge cases where the task could be read two ways (from a review of the task text):",
+    ...lines,
+    "For each one the task text SETTLES (quote it), add a check that feeds that literal input and asserts the settled output.",
+    "Skip any the task text does not settle: a check must never pick a side the task leaves open.",
+  ].join("\n");
+}
+
 export async function draftCriteria(opts: {
   task: string;
   scripts: string[];
@@ -359,11 +574,15 @@ export async function draftCriteria(opts: {
   fetchFn?: typeof fetch;
   /** How an ACP agent is spawned. Tests only; see `EngineConfig.acpSpawn`. */
   acpSpawn?: typeof import("node:child_process").spawn;
+  /** How a subscription CLI is run for a pre-turn question (opencode). Tests only. */
+  cliRun?: (cmd: string, args: string[], opts: object) => Promise<{ stdout: string }>;
   /** How long the HTTP question may wait for its answer; see askTimeoutMs. Tests only. */
   timeoutMs?: number;
   /** Pause before re-asking after empty replies (EMPTY_DRAFT_DELAY_MS). Tests only. */
   emptyRetryDelayMs?: number;
   reasoningEffort?: string;
+  /** Learns from completed asks (AskOptions.latency). */
+  latency?: AskOptions["latency"];
   /** What is installed, so a check never calls a command that is not (see commandsHere). */
   commands?: { present: string[]; missing: string[] };
   /**
@@ -372,8 +591,10 @@ export async function draftCriteria(opts: {
    */
   lessons?: string[];
 }): Promise<{ ok: true; draft: Draft } | { ok: false; error: string }> {
+  const view = projectView(opts.task, opts.cwd);
   const context = [
     `Task: ${opts.task}`,
+    ...(view ? ["", view] : []),
     "",
     `Scripts available: ${opts.scripts.length ? opts.scripts.join(", ") : "(none found)"}`,
     `The project already checks: ${opts.barChecks.length ? opts.barChecks.join(", ") : "(nothing)"}`,
@@ -390,18 +611,22 @@ export async function draftCriteria(opts: {
     "this task.",
   ].join("\n");
 
+  const edges = process.env.MAAT_EDGE_CHECKS === "1" ? await edgeProbes(opts, view) : "";
+  const prompted = edges ? `${context}\n\n${edges}` : context;
   const asked = await askModel({
     baseUrl: opts.baseUrl,
     apiKey: opts.apiKey,
     model: opts.model,
     system: SYSTEM,
-    prompt: context,
+    prompt: prompted,
     cwd: opts.cwd,
     what: "drafting criteria",
     fetchFn: opts.fetchFn,
     acpSpawn: opts.acpSpawn,
+    cliRun: opts.cliRun,
     timeoutMs: opts.timeoutMs,
     reasoningEffort: opts.reasoningEffort,
+    latency: opts.latency,
   });
   if (!asked.ok) return asked;
   const first = drafted(asked.text, asked.cutOff);
@@ -413,13 +638,15 @@ export async function draftCriteria(opts: {
     apiKey: opts.apiKey,
     model: opts.model,
     system: SYSTEM,
-    prompt: `${context}\n\nYour last reply could not be parsed as JSON. Reply with the JSON object only.`,
+    prompt: `${prompted}\n\nYour last reply could not be parsed as JSON. Reply with the JSON object only.`,
     cwd: opts.cwd,
     what: "drafting criteria",
     fetchFn: opts.fetchFn,
     acpSpawn: opts.acpSpawn,
+    cliRun: opts.cliRun,
     timeoutMs: opts.timeoutMs,
     reasoningEffort: opts.reasoningEffort,
+    latency: opts.latency,
   });
   if (!again.ok) return first;
   const second = drafted(again.text, again.cutOff);
@@ -440,8 +667,10 @@ export async function draftCriteria(opts: {
       what: "drafting criteria",
       fetchFn: opts.fetchFn,
         acpSpawn: opts.acpSpawn,
+        cliRun: opts.cliRun,
         timeoutMs: opts.timeoutMs,
       reasoningEffort: opts.reasoningEffort,
+      latency: opts.latency,
     });
     if (!more.ok) break;
     const d = drafted(more.text, more.cutOff);
@@ -495,9 +724,12 @@ export const CRITIC_SYSTEM = [
   "that state it, verbatim, at most two. Usually the list is empty: list one only when",
   "you are sure a wrong result would pass every check.",
   "",
+  "Finally list the task's stated requirements, each a short verbatim quote (at most ten):",
+  "every concrete thing the finished work must do or contain, in the task's own words.",
+  "",
   "Reply with JSON only:",
   '{"checks":[{"name":"...","verdict":"invents|guesses|surface|runs","quote":"verbatim task words, or empty"}],',
-  ' "uncovered":["verbatim task words"]}',
+  ' "uncovered":["verbatim task words"], "requirements":["verbatim task words"]}',
 ].join("\n");
 
 export type Critique = {
@@ -511,6 +743,12 @@ export type Critique = {
    * hold a requirement nobody stated.
    */
   uncovered: string[];
+  /**
+   * Every stated requirement the critic quoted, plus the quotes of its drops
+   * and uncovered findings — all string-matched against the task, deduplicated,
+   * at most REQUIREMENTS_MAX (src/signout.ts).
+   */
+  requirements: string[];
 };
 
 function norm(s: string): string {
@@ -553,7 +791,11 @@ export function applyCritique(draft: Draft, reply: string, task: string): Critiq
     .map((q) => String(q ?? "").trim())
     .filter((q) => norm(q).length >= 8 && t.includes(norm(q)))
     .slice(0, CRITIC_MAX_UNCOVERED);
-  return { kept, dropped, surfaceOnly: runs === 0 && kept.length > 0, uncovered };
+  const stated = (Array.isArray((raw as { requirements?: unknown }).requirements) ? (raw as { requirements: unknown[] }).requirements : [])
+    .map((q) => String(q ?? "").trim())
+    .filter((q) => norm(q).length >= 8 && t.includes(norm(q)));
+  const requirements = normalizeRequirements([...stated, ...uncovered, ...dropped.map((d) => d.quote).filter((q) => norm(q).length >= 8)]);
+  return { kept, dropped, surfaceOnly: runs === 0 && kept.length > 0, uncovered, requirements };
 }
 
 /** How long the uncovered-requirement step may add to drafting. */
@@ -574,32 +816,110 @@ export async function draftCriteriaCritiqued(
     /** Bound on the step that adds checks for uncovered requirements (COVER_MAX_MS). */
     coverMaxMs?: number;
   },
+): Promise<{ ok: true; draft: Draft; critique: string[]; lint?: LintDrop[] } | { ok: false; error: string }> {
+  // The critic's list of stated requirements rides on whatever draft comes
+  // back, however many ways the function below returns.
+  const sink: Sink = { requirements: [], lint: [] };
+  const withReqs = (d: Draft): Draft => (sink.requirements.length ? { ...d, requirements: sink.requirements } : d);
+  const r = await critiqued({ ...opts, onProgress: opts.onProgress && ((d) => opts.onProgress!(withReqs(d))) }, sink);
+  return r.ok ? { ...r, draft: withReqs(r.draft), ...(sink.lint.length ? { lint: sink.lint } : {}) } : r;
+}
+
+/** A drafted check the seal-time lint retired (src/checklint.ts), for the journal. */
+export type LintDrop = { name: string; run: string; rule: string; why: string; redraft: boolean };
+type Sink = { requirements: string[]; lint: LintDrop[] };
+
+async function critiqued(
+  opts: Parameters<typeof draftCriteria>[0] & {
+    /** Called with the best draft so far — the reviewed checks once there are any. */
+    onProgress?: (d: Draft) => void;
+    /** Bound on the step that adds checks for uncovered requirements (COVER_MAX_MS). */
+    coverMaxMs?: number;
+  },
+  sink: Sink,
 ): Promise<{ ok: true; draft: Draft; critique: string[] } | { ok: false; error: string }> {
   const fix = (d: Draft): Draft =>
     opts.commands ? { ...d, checks: d.checks.map((c) => ({ ...c, run: fixInterpreters(c.run, opts.commands!) })) } : d;
+  const view = projectView(opts.task, opts.cwd);
+  // The project as it is now, before the model has changed anything.
+  const lintCtx: LintCtx = {
+    task: opts.task,
+    shell: bashPath() ? "bash" : "sh",
+    ...(opts.cwd ? { cwd: opts.cwd, tree: readTree(opts.cwd) } : {}),
+  };
+  const said: string[] = [];
+  /** Split a draft's checks into the ones that pass the lint and the ones that do not. Drops are recorded, never silent. */
+  const lintSplit = (checks: DraftedCheck[], redraft: boolean): { ok: DraftedCheck[]; bad: LintDrop[] } => {
+    const ok: DraftedCheck[] = [];
+    const bad: LintDrop[] = [];
+    for (const c of checks) {
+      // Off unless MAAT_CHECK_LINT=1: in the v13 paired run the lint left fewer, shallower
+      // checks sealed (the redraft lands after the seal), which cost passes and let wrong work through.
+      const hit = process.env.MAAT_CHECK_LINT === "1" ? lintAll(c.run, lintCtx)[0] : undefined;
+      if (!hit) ok.push(c);
+      else bad.push({ name: c.name, run: c.run, rule: hit.rule, why: hit.why, redraft });
+    }
+    return { ok, bad };
+  };
+  const drop = (bad: LintDrop[], where: string) => {
+    for (const b of bad) {
+      sink.lint.push(b);
+      said.push(`dropped ${b.name} (${b.run}) ${where}: ${b.why} [${b.rule}]`);
+    }
+  };
   const drafted1 = await draftCriteria(opts);
-  const first = drafted1.ok ? { ...drafted1, draft: fix(drafted1.draft) } : drafted1;
-  if (!first.ok || !first.draft.checks.length) return first.ok ? { ...first, critique: [] } : first;
+  let first = drafted1.ok ? { ...drafted1, draft: fix(drafted1.draft) } : drafted1;
+  if (first.ok && first.draft.checks.length) {
+    const l1 = lintSplit(first.draft.checks, false);
+    if (l1.bad.length) {
+      // Sent back once with the reasons. What passes the lint is already ready
+      // to seal while that second ask runs.
+      first = { ...first, draft: { ...first.draft, checks: l1.ok } };
+      if (l1.ok.length) opts.onProgress?.(first.draft);
+      const findings = l1.bad.map((b) => `"${b.name}" was dropped: ${b.why}.`).join(" ");
+      const again = await draftCriteria({
+        ...opts,
+        task: `${opts.task}\n\n(Review of an earlier draft of the checks: ${findings} Draft replacement checks that avoid this. Checks run under bash.)`,
+      });
+      const have = new Set(l1.ok.map((c) => c.name));
+      const ran = new Set(l1.ok.map((c) => c.run));
+      const l2 = again.ok ? lintSplit(fix(again.draft).checks, true) : { ok: [] as DraftedCheck[], bad: [] as LintDrop[] };
+      drop(l1.bad, "before sealing");
+      drop(l2.bad, "from the redraft");
+      const added = l2.ok.filter((c) => !have.has(c.name) && !ran.has(c.run)).slice(0, Math.max(0, CRITERIA_MAX_CHECKS - l1.ok.length));
+      if (added.length) said.push(`redrafted for the dropped checks: ${added.map((c) => c.name).join(", ")}`);
+      first = { ...first, draft: { ...first.draft, checks: [...l1.ok, ...added], notes: first.draft.notes.length ? first.draft.notes : again.ok ? again.draft.notes : [] } };
+    }
+  }
+  if (!first.ok || !first.draft.checks.length) return first.ok ? { ...first, critique: said } : first;
+  const lintCover = (checks: DraftedCheck[]): DraftedCheck[] => {
+    const l = lintSplit(checks, false);
+    drop(l.bad, "from the cover draft");
+    return l.ok;
+  };
   const critic = async (d: Draft) => {
     const asked = await askModel({
       baseUrl: opts.baseUrl,
       apiKey: opts.apiKey,
       model: opts.model,
       system: CRITIC_SYSTEM,
-      prompt: `TASK TEXT:\n${opts.task}\n\nCHECKS:\n${d.checks.map((c) => `- ${c.name}: ${c.run}`).join("\n")}`,
+      prompt: `TASK TEXT:\n${opts.task}\n\n${view ? `${view}\n\n` : ""}CHECKS:\n${d.checks.map((c) => `- ${c.name}: ${c.run}`).join("\n")}`,
       cwd: opts.cwd,
       what: "reviewing the drafted checks",
       fetchFn: opts.fetchFn,
         acpSpawn: opts.acpSpawn,
+        cliRun: opts.cliRun,
         timeoutMs: opts.timeoutMs,
       reasoningEffort: opts.reasoningEffort,
+      latency: opts.latency,
     });
     return asked.ok ? applyCritique(d, asked.text, opts.task) : null;
   };
-  const said: string[] = [];
+  
   opts.onProgress?.(first.draft);
   const c1 = await critic(first.draft);
-  if (!c1) return { ...first, critique: ["the checks could not be reviewed; sealed as drafted"] };
+  if (!c1) return { ...first, critique: [...said, "the checks could not be reviewed; sealed as drafted"] };
+  sink.requirements = c1.requirements;
   if (c1.kept.length) opts.onProgress?.({ ...first.draft, checks: c1.kept });
   const runOf = (name: string) => first.draft.checks.find((c) => c.name === name)?.run ?? "";
   for (const d of c1.dropped) said.push(`dropped ${d.name} (${runOf(d.name)}): it ${d.verdict === "invents" ? "demands what the task does not state" : "guesses an answer the task does not give"} — "${d.quote}"`);
@@ -619,7 +939,7 @@ export async function draftCriteriaCritiqued(
           `Nothing tests these stated requirements yet: ${c1.uncovered.map((q) => `"${q}"`).join("; ")}. ` +
           `Draft checks for these requirements only.)`,
       });
-      const extra = cover.ok ? fix(cover.draft).checks : [];
+      const extra = cover.ok ? lintCover(fix(cover.draft).checks) : [];
       return extra.length ? await critic({ checks: extra, notes: [] }) : null;
     };
     let coverTimer: NodeJS.Timeout | undefined;
@@ -646,7 +966,12 @@ export async function draftCriteriaCritiqued(
     c1.surfaceOnly || !c1.kept.length ? "No check runs the deliverable on an input and tests what it produces. Add one." : "",
   ].filter(Boolean).join(" ");
   const drafted2 = await draftCriteria({ ...opts, task: `${opts.task}\n\n(Review of an earlier draft of the checks: ${findings})` });
-  const second = drafted2.ok ? { ...drafted2, draft: fix(drafted2.draft) } : drafted2;
+  let second = drafted2.ok ? { ...drafted2, draft: fix(drafted2.draft) } : drafted2;
+  if (second.ok) {
+    const l = lintSplit(second.draft.checks, false);
+    drop(l.bad, "from the redraft");
+    second = { ...second, draft: { ...second.draft, checks: l.ok } };
+  }
   if (second.ok && second.draft.checks.length) {
     const c2 = await critic(second.draft);
     const kept = c2 ? c2.kept : second.draft.checks;

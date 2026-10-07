@@ -9,7 +9,7 @@
  * knowable before the first request, for free, and it is the same few hundred
  * tokens on step thirty because it sits in the cached prefix.
  *
- * Factory's Terminal-Bench write-up names bootstrapping "each new session with
+ * A competitor's Terminal-Bench write-up names bootstrapping "each new session with
  * a broad range of salient system information" as one of the changes that
  * moved their score. It is a cheap change, and this is it.
  *

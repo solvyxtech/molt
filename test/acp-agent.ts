@@ -19,6 +19,11 @@ import type { spawn } from "node:child_process";
 export type ScriptedAcpTurn = {
   /** Tools it calls before answering, in order. */
   calls?: { name: string; args: Record<string, unknown> }[];
+  /**
+   * How the agent spells a Maat tool on the wire, before the tool name. Default `mcp__molt__`;
+   * OpenCode says `molt_` and calls the MCP server by the bare name.
+   */
+  wirePrefix?: string;
   /** Builtins it asks about, which molt is supposed to refuse. */
   builtins?: string[];
   /**
@@ -26,6 +31,17 @@ export type ScriptedAcpTurn = {
    * so these never reach molt's refusal and are the gap the header names.
    */
   autoTools?: string[];
+  /**
+   * Maat tools called the way grok 1.0.46 really does it: the model only sees
+   * `search_tool` and `use_tool`, so each call is announced as `use_tool` and
+   * the permission request names the target in `rawInput.tool_name` (qualified
+   * `molt__<name>`), with no `toolName` and the real tool in `_meta`.
+   */
+  viaUseTool?: { name: string; args: Record<string, unknown> }[];
+  /** `use_tool` calls aimed at something that is not Maat's (raw `tool_name`). */
+  viaUseToolOther?: string[];
+  /** Runs `search_tool` first (announced and completed, never asks). */
+  search?: boolean;
   /** What it says once the calls are done. Becomes the turn's claim. */
   text?: string;
   /** Stop the turn this way instead of answering. */
@@ -255,8 +271,72 @@ export function scriptedAcpAgent(turns: ScriptedAcpTurn[], models: AgentModels =
             await ask(b);
           }
 
+          if (script.search) {
+            write({
+              jsonrpc: "2.0",
+              method: "session/update",
+              params: {
+                sessionId: "s1",
+                update: { sessionUpdate: "tool_call", toolCallId: "s_search", title: "search_tool", rawInput: { query: "molt" } },
+              },
+            });
+            write({
+              jsonrpc: "2.0",
+              method: "session/update",
+              params: { sessionId: "s1", update: { sessionUpdate: "tool_call_update", toolCallId: "s_search", status: "completed" } },
+            });
+          }
+
+          const viaUse = [
+            ...(script.viaUseTool ?? []).map((c) => ({ target: `molt__${c.name}`, bare: c.name, args: c.args })),
+            ...(script.viaUseToolOther ?? []).map((t) => ({ target: t, bare: undefined, args: {} })),
+          ];
+          for (const c of viaUse) {
+            const id = reqId++;
+            write({
+              jsonrpc: "2.0",
+              method: "session/update",
+              params: {
+                sessionId: "s1",
+                update: {
+                  sessionUpdate: "tool_call",
+                  toolCallId: `u_${id}`,
+                  title: "use_tool",
+                  rawInput: { tool_name: c.target, tool_input: c.args },
+                },
+              },
+            });
+            const done = new Promise<unknown>((resolve) => pending.set(id, resolve));
+            write({
+              jsonrpc: "2.0",
+              id,
+              method: "session/request_permission",
+              params: {
+                sessionId: "s1",
+                toolCall: {
+                  toolCallId: `u_${id}`,
+                  kind: "other",
+                  title: c.target,
+                  rawInput: { variant: "UseTool", tool_name: c.target, tool_input: c.args },
+                  _meta: { "x.ai/tool": { version: 1, name: "use_tool", kind: "use_tool" } },
+                },
+                options: [
+                  { optionId: "yes", kind: "allow_once", name: "Allow" },
+                  { optionId: "no", kind: "reject_once", name: "Reject" },
+                ],
+              },
+            });
+            const res = (await done) as { outcome?: { outcome?: string; optionId?: string } };
+            const outcome = res?.outcome?.optionId ?? res?.outcome?.outcome ?? "cancelled";
+            permissions.push({ tool: c.target, outcome });
+            if (outcome === "yes" && endpoint && c.bare) {
+              // Grok unqualifies the name on the way to the MCP server.
+              await mcpCall(endpoint, "tools/call", { name: c.bare, arguments: c.args }, mcpId++);
+            }
+          }
+
           for (const c of script.calls ?? []) {
-            const wire = `mcp__molt__${c.name}`;
+            const wire = `${script.wirePrefix ?? "mcp__molt__"}${c.name}`;
             write({
               jsonrpc: "2.0",
               method: "session/update",
@@ -273,7 +353,7 @@ export function scriptedAcpAgent(turns: ScriptedAcpTurn[], models: AgentModels =
             });
             if ((await ask(wire)) !== "yes") continue;
             if (endpoint) {
-              await mcpCall(endpoint, "tools/call", { name: wire, arguments: c.args }, mcpId++);
+              await mcpCall(endpoint, "tools/call", { name: script.wirePrefix ? c.name : wire, arguments: c.args }, mcpId++);
             }
           }
 

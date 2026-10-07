@@ -30,6 +30,10 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
+# Shared with bench/local/scoreboard.py (Wilson intervals, one definition).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "local"))
+from stats import rate  # noqa: E402
+
 
 def outcome_of(trial: Path) -> str | None:
     """
@@ -215,6 +219,15 @@ def main(argv: list[str]) -> int:
         return f"{100 * h['claimed_right'] / (h['claimed_right'] + h['claimed_wrong']):.0f}%"
 
     print(f"{'  done was true':16} {prec(ha):>{w}}  {prec(hb):>{w}}")
+    def pr(h, kind):
+        if h is None:
+            return "—"
+        r, wr, un = h["claimed_right"], h["claimed_wrong"], h["passed_unclaimed"]
+        return rate(r, r + wr) if kind == "p" else rate(r, r + un)
+
+    # Wilson 95% intervals: at 89 tasks a 5-task gap is noise, so say how wide.
+    print(f"{'precision':16} {pr(ha, 'p')}  |  {pr(hb, 'p')}   P(pass | said done)")
+    print(f"{'recall':16} {pr(ha, 'r')}  |  {pr(hb, 'r')}   P(said done | pass)")
     only_a, only_b = sorted(set(ta) - set(tb)), sorted(set(tb) - set(ta))
     if only_a or only_b:
         print(f"not compared — only in {na}: {len(only_a)} task(s); only in {nb}: {len(only_b)} task(s)")

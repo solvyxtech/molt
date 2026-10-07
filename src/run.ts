@@ -17,6 +17,7 @@
  * process gets to keep breathing while it waits.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
 
 export type RunOptions = {
   cwd: string;
@@ -25,6 +26,8 @@ export type RunOptions = {
   /** Cap on captured output, per stream. */
   maxBuffer?: number;
   env?: NodeJS.ProcessEnv;
+  /** The shell to run it with: `true` is the platform's `sh` (the default); a path runs `<path> -c command`. */
+  shell?: string | true;
   /** Kills the command when it aborts, so a turn can be cancelled mid-command. */
   signal?: AbortSignal;
 };
@@ -55,6 +58,28 @@ const KILL_GRACE_MS = 2_000;
  */
 export const DRAIN_GRACE_MS = 1_000;
 
+let bashFound: string | null | undefined;
+
+/**
+ * Where bash is, or null. Drafted checks run under it rather than `sh`: on a
+ * Debian image `/bin/sh` is dash, which has no job control (`kill %1` after a
+ * backgrounded server), no `[[`, no `<<<`. Replayed under bash, every
+ * `kill %1` check that dash refused passed (reports/checkquality-2026-10-06).
+ * `MAAT_CHECK_SHELL=sh` turns it off.
+ */
+export function bashPath(): string | null {
+  if (process.platform === "win32") return null;
+  if ((process.env.MAAT_CHECK_SHELL ?? process.env.MOLT_CHECK_SHELL) === "sh") return null;
+  if (bashFound !== undefined) return bashFound;
+  bashFound = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash", "/opt/homebrew/bin/bash"].find((p) => existsSync(p)) ?? null;
+  return bashFound;
+}
+
+/** The shell a drafted (hidden, task-tagged) check runs under; anything else keeps `sh`. */
+export function draftedShell(check: { hidden?: boolean; tags?: readonly string[] }): string | true {
+  return check.hidden === true && check.tags?.includes("task") ? (bashPath() ?? true) : true;
+}
+
 /**
  * Run a command through the shell and resolve with what it did.
  *
@@ -68,7 +93,7 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
     try {
       child = spawn(command, {
         cwd: opts.cwd,
-        shell: true,
+        shell: opts.shell ?? true,
         env: opts.env,
         stdio: ["ignore", "pipe", "pipe"],
         // Its own process group, so a timeout can kill everything the command
