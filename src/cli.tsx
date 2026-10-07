@@ -162,6 +162,11 @@ options
                      gate; "verified" then needs a drafted check that asserts a
                      value, ran the work, and failed before the work began
                      (also MAAT_REVIEW_ADVISORY=1)
+  --review-executable  experimental: every --review objection must carry a
+                     read-only command that demonstrates it; Maat runs it on a
+                     copy of the tree and an objection whose command is missing,
+                     mutates, or passes on the work is a note, not a veto
+                     (also MAAT_REVIEW_EXECUTABLE=1)
   --signout          before an unattended claim is judged, put each stated
                      requirement to the model once beside the commands it ran
                      (off by default: 60 rounds rescued no task)
@@ -279,6 +284,8 @@ type Args = {
   revealStuck?: boolean;
   /** `--review-advisory`: see EngineConfig.reviewAdvisory. */
   reviewAdvisory?: boolean;
+  /** `--review-executable`: see EngineConfig.reviewExecutable. */
+  reviewExecutable?: boolean;
   /** `--signout`: see EngineConfig.signOut. */
   signout?: boolean;
   /** `--arbiter-model` / `--dispute-votes`: see EngineConfig.dispute. */
@@ -514,6 +521,9 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         break;
       case "--review-advisory":
         out.reviewAdvisory = true;
+        break;
+      case "--review-executable":
+        out.reviewExecutable = true;
         break;
       case "--signout":
         out.signout = true;
@@ -822,6 +832,7 @@ function engineFor(args: Args, session = false, extra: { files?: FileAccess } = 
     batch: args.batch === true,
     ...(args.revealStuck === true ? { revealOnStuck: true } : args.revealStuck === false ? { revealOnStuck: false } : {}),
     ...(args.reviewAdvisory || env("REVIEW_ADVISORY") === "1" ? { reviewAdvisory: true } : {}),
+    ...(args.reviewExecutable || env("REVIEW_EXECUTABLE") === "1" ? { reviewExecutable: true } : {}),
     ...(args.signout ? { signOut: true } : {}),
     ...(args.arbiterModel || args.disputeVotes ? { dispute: { model: args.arbiterModel, votes: args.disputeVotes } } : {}),
     ...(args.review ? { review: { votes: args.review, reasoningEffort: args.reasoningChecks ?? args.reasoning } } : {}),
