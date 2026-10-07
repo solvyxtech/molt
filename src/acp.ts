@@ -1,34 +1,37 @@
 /**
- * Agent Client Protocol as a backend, so a Grok or Gemini subscription can
- * drive molt's loop the way a Claude one already does.
+ * Agent Client Protocol as a backend, so a Grok subscription can drive
+ * molt's loop.
  *
- * ## Why this is the same argument claude-code.ts makes
+ * ## Why a plan is not a key
  *
  * `providers.ts` says of every metered API: hold a key, pay per token. A
- * SuperGrok or Google AI Pro plan is not that. It is an entitlement to run
- * *their CLI*, and a client that lifts the OAuth token out of `~/.grok/auth.json`
- * and posts it to `cli-chat-proxy.grok.com` is repackaging one as the other.
+ * SuperGrok plan is not that. It is an entitlement to run *their CLI*, and a
+ * client that lifts the OAuth token out of `~/.grok/auth.json` and posts it
+ * to `cli-chat-proxy.grok.com` is repackaging one as the other.
  *
  * So molt does not hold the token, see it, or send it. It spawns the CLI you
  * installed and logged in — `grok agent stdio` —
  * and that process authenticates itself. molt is the client on the other end
- * of a documented protocol. Same arrangement as claude-code.ts, one layer
- * lower: there the vendor shipped an SDK, here the vendor shipped a protocol.
+ * of a documented protocol the vendor shipped for exactly this.
  *
- * ## Why one file covers both
+ * Grok Build is the only CLI driven this way. The Claude Code, Antigravity
+ * and Gemini CLI backends were removed over those vendors' terms on running
+ * a third-party harness on a plan; see `docs/provider-terms.md`.
+ *
+ * ## Why the agent is a table row
  *
  * ACP is JSON-RPC over stdio with a fixed method set — `initialize`,
  * `session/new`, `session/prompt`, and `session/update` notifications coming
- * back. Grok Build and Gemini CLI both speak it, so the difference between
- * them is a binary name, an argv, and a model list. That is `ACP_AGENTS`, and
- * adding a third agent is a row in it rather than another 900-line backend.
+ * back. What differs between agents that speak it is a binary name, an argv,
+ * and a model list. That is `ACP_AGENTS`, and another agent whose terms allow
+ * it is a row in it rather than another 900-line backend.
  *
  * ## Keeping the ledger complete, which is the whole problem
  *
  * `tree-accounted` refuses a claim when the working tree holds a change no
  * ledger entry explains. So the agent must not write anything molt did not
- * run. claude-code.ts gets this for free — the SDK takes `tools: []`. ACP has
- * no such switch, so this file stacks three, in decreasing order of trust:
+ * run. ACP has no switch that says "bring no tools", so this file stacks
+ * three levers, in decreasing order of trust:
  *
  *   1. **molt's tools arrive as an MCP server** it hosts in-process, on
  *      loopback, behind a per-session bearer token. That is the only tool
@@ -377,9 +380,9 @@ export class AcpConnection {
       stdio: ["pipe", "pipe", "pipe"],
       // The subprocess environment REPLACES rather than merges, so the spread
       // is load-bearing: without it a Finder-launched molt hands the CLI an
-      // empty PATH and it cannot find its own helpers. Same trap as
-      // claude-code.ts; `electron/login-path.ts` has already repaired
-      // process.env.PATH by the time anything gets here.
+      // empty PATH and it cannot find its own helpers.
+      // `electron/login-path.ts` has already repaired process.env.PATH by the
+      // time anything gets here.
       env: { ...process.env },
     });
     this.child = child;
@@ -602,9 +605,9 @@ export class McpToolServer<H> {
 /**
  * A one-writer, one-reader queue.
  *
- * Same shape and same reason as the one in claude-code.ts: the backend has two
- * event sources that must interleave in real time — the agent's notification
- * stream, and molt's own tool handlers, which run *inside* it over HTTP — and
+ * The backend has two event sources that must interleave in real time — the
+ * agent's notification stream, and molt's own tool handlers, which run
+ * *inside* it over HTTP — and
  * a generator that only pulled between notifications would hold a `tool_start`
  * until after the tool it announces had finished.
  */

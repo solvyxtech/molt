@@ -106,7 +106,8 @@ function parseReceipt(body) {
   const outputs = {};
   for (const m of body.matchAll(/^### (.+?) — (pass|FAIL)\n[\s\S]*?```\n([\s\S]*?)\n```/gm)) outputs[m[1]] = m[3];
   const meta = Object.fromEntries([...body.matchAll(/^- ([a-z ]+): (.+)$/gm)].map((m) => [m[1], m[2]]));
-  const verdict = /^# molt receipt \d+ — (\w+)/m.exec(body)?.[1];
+  // "# Maat receipt 0007 — refused" today; "# molt receipt …" before the rename.
+  const verdict = /^# (?:molt|maat) receipt \d+ — (\w+)/im.exec(body)?.[1];
   return { verdict, claim, changed, ran, checks, outputs, meta };
 }
 
@@ -158,12 +159,22 @@ function renderTranscript(transcript) {
 const rows = new Map(); // receipt sha -> row
 const excludedIds = new Set(); // receipt sha of an attempt left out by provider
 let seenFiles = 0;
-for (const root of roots) {
-  const dir = join(root, ".molt", "receipts");
+/**
+ * Where a project keeps its records: `.maat/` now, `.molt/` under the
+ * engine's old name (src/statedir.ts). Both are read when both exist — a
+ * project that gained a `.maat/` still has its earlier receipts in `.molt/`,
+ * and reading only one name is how every run since the rename went missing
+ * from the dataset. The receipt hash dedupes anything present in both.
+ */
+const STATE_DIRS = [".maat", ".molt"];
+const sources = roots.flatMap((root) => STATE_DIRS.map((d) => ({ root, state: join(root, d) })));
+const countedIn = new Map(); // receipt sha -> roots already named in its provenance
+for (const { root, state } of sources) {
+  const dir = join(state, "receipts");
   if (!existsSync(dir)) continue;
   const journals = new Map();
-  for (const f of existsSync(join(root, ".molt", "log")) ? readdirSync(join(root, ".molt", "log")) : []) {
-    if (f.endsWith(".jsonl")) journals.set(f.replace(/\.jsonl$/, ""), readJsonl(join(root, ".molt", "log", f)));
+  for (const f of existsSync(join(state, "log")) ? readdirSync(join(state, "log")) : []) {
+    if (f.endsWith(".jsonl")) journals.set(f.replace(/\.jsonl$/, ""), readJsonl(join(state, "log", f)));
   }
   const index = readJsonl(join(dir, "index.jsonl"));
   const captures = capturesIn(root);
@@ -171,7 +182,11 @@ for (const root of roots) {
     seenFiles++;
     const body = readFileSync(join(dir, f), "utf8");
     const id = sha(body);
-    if (rows.has(id)) { rows.get(id).provenance.roots.push(basename(root)); continue; }
+    if (rows.has(id)) {
+      // The same receipt under both folder names of one root is one copy, not two.
+      if (!countedIn.get(id).has(root)) { countedIn.get(id).add(root); rows.get(id).provenance.roots.push(basename(root)); }
+      continue;
+    }
     if (excludedIds.has(id)) continue;
     const r = parseReceipt(body);
     const idx = index.filter((x) => x.file === f).at(-1) ?? {};
@@ -186,6 +201,7 @@ for (const root of roots) {
     // never ran. Training a verdict predictor on it would teach "not accepted"
     // for work nothing refused.
     if ((r.verdict ?? idx.verdict) === "undetermined") continue;
+    countedIn.set(id, new Set([root]));
     rows.set(id, {
       provenance: { roots: [basename(root)], receipt: f, receiptSha256: id, session, journal: turn ? { from: turn.from, to: turn.to } : null },
       model: r.meta["model"] ?? idx.model ?? null,
