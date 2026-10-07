@@ -242,13 +242,24 @@ describe("runCommand", () => {
   it("kills what a timed-out command started, not only the shell", async () => {
     const dir = ws();
     const started = Date.now();
-    const r = await runCommand("sh -c 'sleep 30; echo late > survived' & sleep 30", { cwd: dir, timeoutMs: 300 });
+    // Unique token in the grandchild argv so (a) leftovers from another suite
+    // cannot pass and (b) Linux `pgrep -f` does not match the `sh -c` that
+    // runs pgrep itself (whose argv would otherwise contain a fixed pattern).
+    const marker = `molt-kill-${process.pid}-${started}`;
+    const r = await runCommand(
+      `sh -c 'sleep 30; echo late > survived; : ${marker}' & sleep 30`,
+      { cwd: dir, timeoutMs: 300 },
+    );
     assert.ok(Date.now() - started < 6_000, `hung ${Date.now() - started}ms after the timeout`);
     assert.equal(r.timedOut, true);
     // The child got the group's signal: no grandchild is left sleeping.
+    // `[m]olt-…` keeps pgrep from matching the shell that invokes it.
     const { execSync } = await import("node:child_process");
-    const left = execSync("pgrep -f 'echo late > survived' || true").toString().trim();
+    const left = execSync(`pgrep -f '[m]olt-kill-${process.pid}-${started}' || true`).toString().trim();
     assert.equal(left, "", `the server outlived the timeout: pids ${left}`);
+    // And the background write never landed after the group was killed.
+    const { existsSync } = await import("node:fs");
+    assert.equal(existsSync(`${dir}/survived`), false);
   });
 });
 
