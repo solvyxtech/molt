@@ -3,7 +3,9 @@ name: check
 on:
   push:
     branches: [main]
+  # Stacked work is reviewed as PRs into claude/* branches, not only main.
   pull_request:
+    branches: [main, "claude/**"]
 
 jobs:
   typecheck-and-test:

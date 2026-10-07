@@ -1037,6 +1037,16 @@ export type RunOptions = {
   /** Overrides how long a claim waits for checks still drafting after the time budget's cut. Tests only. */
   lateCriteriaWaitMs?: number;
   /**
+   * The drafter's inputs, frozen before the first step (criteria.ts
+   * drafterSnapshot): `sha` is their hash, `used` the hash each drafter stage
+   * computed over what it actually put in its prompt. When every stage used
+   * the snapshot, the drafts are independent of the work, and a claim of done
+   * may wait for them until the time budget's safety margin
+   * (claimWaitForDraftsMs). A mismatch means a stage read the folder the work
+   * changed: its checks are not joined.
+   */
+  draftInputs?: { sha: string; used: () => string[] };
+  /**
    * Criteria stated in words rather than as commands.
    *
    * Recorded on the receipt and shown to the model, never treated as passed.
@@ -1171,6 +1181,23 @@ export function referenceWaitMs(timeLeftMs: number | undefined): number {
 export function lateCriteriaWaitMs(timeLeftMs: number | undefined): number {
   if (timeLeftMs === undefined) return 120_000;
   return Math.max(0, Math.min(120_000, Math.round(timeLeftMs * 0.6)));
+}
+
+/**
+ * How long a claim of done waits for drafted checks still on their way, when
+ * the drafter's inputs are known to be sealed before the work (RunOptions
+ * .draftInputs): until what is left of the time budget, less a margin for
+ * running the checks and the review — the larger of 60 s and 15% of the
+ * budget. Never shorter than lateCriteriaWaitMs. A separate judge (Grok at
+ * 170–300 s, a local model past 6 min) routinely finished after the fixed
+ * two minutes, and correct work was labelled unverified. No budget, the old
+ * two minutes.
+ */
+export function claimWaitForDraftsMs(timeLeftMs: number | undefined, budgetMs: number): number {
+  const floor = lateCriteriaWaitMs(timeLeftMs);
+  if (timeLeftMs === undefined || !budgetMs) return floor;
+  const margin = Math.max(60_000, Math.round(budgetMs * 0.15));
+  return Math.max(floor, timeLeftMs - margin);
 }
 
 /**
@@ -4990,7 +5017,7 @@ export class Engine {
     let lateCriteria: typeof pendingCriteria;
     let draftInputs = "";
     if (pendingCriteria && !opts.ask) {
-      draftInputs = draftInputsHash(userText, listProject(this.cwd));
+      draftInputs = opts.draftInputs?.sha ?? draftInputsHash(userText, listProject(this.cwd));
       log?.append("note", { kind: "draft-inputs", text: "drafter inputs fixed at turn start", inputsSha: draftInputs });
     }
     /** Sealed mid-step: tell the model once this step's tool results are in. */
@@ -5165,6 +5192,17 @@ export class Engine {
       ? withoutWriteChecks(withTaskChecks(this.cfg.bar, taskChecks))
       : withTaskChecks(this.cfg.bar, taskChecks);
     /**
+     * Whether the drafted checks are known to be independent of the work:
+     * the caller froze the drafter's inputs before the first step, and every
+     * drafter stage so far used exactly those.
+     */
+    const draftsIndependent = (): boolean =>
+      opts.draftInputs !== undefined && opts.draftInputs.used().every((h) => h === draftInputs);
+    /** How long a claim waits for checks still drafting (see claimWaitForDraftsMs). */
+    const lateWait = (): number =>
+      opts.lateCriteriaWaitMs ??
+      (draftsIndependent() ? claimWaitForDraftsMs(self.timeLeftMs(), self.turnDeadlineMs) : lateCriteriaWaitMs(self.timeLeftMs()));
+    /**
      * Seal criteria that were still being drafted. Called before the first
      * call that changes anything and before the first claim, so the checks
      * still predate every change; only the reading overlapped their drafting.
@@ -5199,7 +5237,7 @@ export class Engine {
               kind: "info",
               text:
                 `checks were still being drafted after ${Math.round(cap / 1000)}s of the time budget and none was ready; ` +
-                `not sealing an empty set — the first claim waits up to ${Math.round((opts.lateCriteriaWaitMs ?? lateCriteriaWaitMs(self.timeLeftMs())) / 1000)}s for them and judges with them if they arrive`,
+                `not sealing an empty set — the first claim waits up to ${Math.round(lateWait() / 1000)}s for them and judges with them if they arrive`,
             };
           } else {
             yield {
@@ -5276,7 +5314,9 @@ export class Engine {
     async function* joinLateCriteria(): AsyncGenerator<EngineEvent> {
       const p = lateCriteria;
       if (!p) return;
-      const wait = opts.lateCriteriaWaitMs ?? lateCriteriaWaitMs(self.timeLeftMs());
+      const independent = draftsIndependent();
+      const wait = lateWait();
+      const began = Date.now();
       let timer: NodeJS.Timeout | undefined;
       const late = Symbol("late");
       const got = await Promise.race([
@@ -5284,11 +5324,36 @@ export class Engine {
         new Promise<typeof late>((r) => { timer = setTimeout(() => r(late), wait); }),
       ]);
       clearTimeout(timer);
+      const waited = Math.round((Date.now() - began) / 1000);
+      const budgetNote = independent && self.turnDeadlineMs ? " (waited to the time budget's margin: the drafter's inputs were sealed before the work)" : "";
       if (got === late) {
-        yield { kind: "info", text: `the drafted checks did not arrive within ${Math.round(wait / 1000)}s; this claim is judged without them, so it cannot be verified by task checks` };
+        log?.append("note", { kind: "late-checks", text: `drafted checks did not arrive after ${waited}s`, waitedMs: Date.now() - began, arrived: false, inputsSha: draftInputs });
+        yield {
+          kind: "info",
+          text: `waited ${waited}s for the drafted checks${budgetNote}; they did not arrive within ${Math.round(wait / 1000)}s, so this claim is judged without them and cannot be verified by task checks`,
+        };
         return;
       }
       lateCriteria = undefined;
+      // Recomputed from what the drafter stages actually used, now that they
+      // are done: a stage that read the changed folder shows here.
+      const used = opts.draftInputs?.used() ?? [];
+      const strays = used.filter((h) => h !== draftInputs);
+      if (opts.draftInputs && strays.length) {
+        log?.append("note", {
+          kind: "late-checks",
+          text: "late drafted checks NOT joined: a drafter stage used inputs that differ from the turn-start snapshot",
+          inputsSha: draftInputs,
+          used,
+          arrived: true,
+          waitedMs: Date.now() - began,
+        });
+        yield {
+          kind: "info",
+          text: `the drafted checks arrived after ${waited}s but were drafted from a view of the project that differs from the one taken before the work; they are not joined, so this claim cannot be verified by task checks`,
+        };
+        return;
+      }
       const have = new Set(taskChecks.map((c) => c.name));
       const added = (got?.taskChecks ?? [])
         .map((c) => Object.freeze({ ...c, name: c.name.startsWith("task:") ? c.name : `task:${c.name}` }))
@@ -5305,14 +5370,16 @@ export class Engine {
       bar = withTaskChecks(self.cfg.bar, taskChecks);
       log?.append("note", {
         kind: "late-checks",
-        text: `late drafted checks joined the sealed checks: ${added.length} check(s)`,
-        inputsSha: draftInputs,
+        text: `late drafted checks joined the sealed checks: ${added.length} check(s) after ${waited}s`,
+        inputsSha: used.length ? used[used.length - 1] : draftInputs,
+        waitedMs: Date.now() - began,
+        arrived: true,
         seal: taskSeal,
         checks: added.map((c) => c.name),
       });
       yield {
         kind: "info",
-        text: `${added.length} drafted check(s) joined this turn's checks — written from the task text and the project as it was before the work`,
+        text: `waited ${waited}s for the drafted checks${budgetNote}; ${added.length} arrived and joined this turn's checks — written from the task text and the project as it was before the work`,
       };
       self.transcript.push({
         role: "user",

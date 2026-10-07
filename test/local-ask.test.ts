@@ -88,7 +88,17 @@ describe("an ask to a self-hosted server", () => {
       });
       return new Response(body, { headers: { "content-type": "text/event-stream" } });
     }) as unknown as typeof fetch;
-    const r = await askModel({ baseUrl: LOCAL, model: "m", system: "s", prompt: "p", fetchFn, timeoutMs: 30 });
+    // AbortSignal.timeout's timer does not hold the event loop open, and a
+    // mock stream has no socket that would. On Node 22 the loop emptied before
+    // the 30 ms were up and the test runner cancelled the rest of the file.
+    // A real request's socket keeps the process alive; this stands in for it.
+    const keepAlive = setInterval(() => {}, 1000);
+    let r: Awaited<ReturnType<typeof askModel>>;
+    try {
+      r = await askModel({ baseUrl: LOCAL, model: "m", system: "s", prompt: "p", fetchFn, timeoutMs: 30 });
+    } finally {
+      clearInterval(keepAlive);
+    }
     assert.equal(aborted, true);
     assert.match(!r.ok ? r.error : "", /did not answer within/);
   });

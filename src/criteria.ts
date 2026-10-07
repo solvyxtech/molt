@@ -22,14 +22,15 @@
  *    A sentence dressed as a check is worse than no check.
  */
 import { execFileSync } from "node:child_process";
-import { openSync, readSync, closeSync, realpathSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { openSync, readSync, closeSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, relative } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { topLevel } from "./brief.js";
 import { namedInputs, profileLine } from "./inspect.js";
 import { askModel, type AskOptions } from "./ask.js";
 import { runCommand, draftedShell, bashPath } from "./run.js";
-import { lintAll, readTree, type LintCtx } from "./checklint.js";
+import { lintAll, readTree, type LintCtx, type Tree } from "./checklint.js";
 import { diagnoseFailure } from "./bar.js";
 import { normalizeRequirements } from "./signout.js";
 import { evidenceTags } from "./tiers.js";
@@ -390,6 +391,61 @@ export function projectView(task: string, cwd?: string): string {
   return lines.join("\n");
 }
 
+/**
+ * Everything the drafter reads about the project, taken once, before the first
+ * step. Every drafter stage — the first draft, the lint redraft, the critic,
+ * the cover step, the redraft after review, and a whole second try — reads
+ * this and never the live folder: those stages run while the worker is
+ * already changing files, and a redraft that re-read the tree once saw the
+ * worker's out.txt and could have sealed its answer as the check.
+ */
+export type DrafterInputs = {
+  /** The task text as given, before any review findings are appended. */
+  readonly task: string;
+  /** projectView(task, cwd) at turn start. */
+  readonly view: string;
+  /** readTree(cwd) at turn start, for the seal-time lint. */
+  readonly tree?: Tree;
+  readonly commands?: { present: string[]; missing: string[] };
+  readonly scripts: readonly string[];
+  readonly lessons: readonly string[];
+};
+
+/** Take the drafter's inputs now. */
+export function drafterSnapshot(
+  task: string,
+  cwd: string | undefined,
+  rest: { commands?: { present: string[]; missing: string[] }; scripts?: string[]; lessons?: string[] },
+): DrafterInputs {
+  return Object.freeze({
+    task,
+    view: projectView(task, cwd),
+    ...(cwd ? { tree: readTree(cwd) } : {}),
+    ...(rest.commands ? { commands: { present: [...rest.commands.present], missing: [...rest.commands.missing] } } : {}),
+    scripts: Object.freeze([...(rest.scripts ?? [])]),
+    lessons: Object.freeze([...(rest.lessons ?? [])]),
+  });
+}
+
+/**
+ * A hash of the drafter's inputs. Taken at turn start over the snapshot, and
+ * again by each drafter stage over the values it actually put in its prompt,
+ * so "drafted without sight of the work" is a comparison the record can fail.
+ */
+export function drafterInputsHash(d: DrafterInputs): string {
+  const h = createHash("sha256");
+  const part = (k: string, v: string) => h.update(`\0${k}\0${v}`, "utf8");
+  part("task", d.task);
+  part("view", d.view);
+  part("files", d.tree ? [...d.tree.files].sort().join("\n") : "");
+  part("text", d.tree?.text ?? "");
+  part("present", (d.commands?.present ?? []).join(","));
+  part("missing", (d.commands?.missing ?? []).join(","));
+  part("scripts", d.scripts.join("\n"));
+  part("lessons", d.lessons.join("\n"));
+  return h.digest("hex").slice(0, 16);
+}
+
 const SYSTEM = [
   "You draft acceptance criteria for one coding task. You are not doing the task",
   "and you will not judge whether it was done — a person approves what you write",
@@ -532,7 +588,7 @@ async function edgeProbes(opts: Parameters<typeof draftCriteria>[0], view: strin
     model: opts.model,
     system: EDGE_SYSTEM,
     prompt: [`Task: ${opts.task}`, ...(view ? ["", view] : [])].join("\n"),
-    cwd: opts.cwd,
+    cwd: opts.askCwd ?? opts.cwd,
     what: "probing edge cases",
     fetchFn: opts.fetchFn,
     acpSpawn: opts.acpSpawn,
@@ -590,21 +646,42 @@ export async function draftCriteria(opts: {
    * the mistakes not to seal again.
    */
   lessons?: string[];
+  /**
+   * The project as it was before the work (drafterSnapshot). When given, the
+   * view, scripts, commands and lessons come from it and the folder is not
+   * read again; without it they are read now.
+   */
+  snapshot?: DrafterInputs;
+  /** Called with drafterInputsHash of what this call put in its prompt. */
+  onInputs?: (sha: string) => void;
+  /**
+   * Where a subprocess (ACP) drafter is started. Kept apart from the work
+   * folder so the agent answering cannot open the worker's files.
+   */
+  askCwd?: string;
 }): Promise<{ ok: true; draft: Draft } | { ok: false; error: string }> {
-  const view = projectView(opts.task, opts.cwd);
+  const snap = opts.snapshot;
+  const view = snap ? snap.view : projectView(opts.task, opts.cwd);
+  const scripts = snap ? [...snap.scripts] : opts.scripts;
+  const commands = snap ? snap.commands : opts.commands;
+  const lessons = snap ? [...snap.lessons] : opts.lessons;
+  opts.onInputs?.(
+    drafterInputsHash({ task: snap?.task ?? opts.task, view, ...(snap?.tree ? { tree: snap.tree } : {}), ...(commands ? { commands } : {}), scripts, lessons: lessons ?? [] }),
+  );
+  const askCwd = opts.askCwd ?? opts.cwd;
   const context = [
     `Task: ${opts.task}`,
     ...(view ? ["", view] : []),
     "",
-    `Scripts available: ${opts.scripts.length ? opts.scripts.join(", ") : "(none found)"}`,
+    `Scripts available: ${scripts.length ? scripts.join(", ") : "(none found)"}`,
     `The project already checks: ${opts.barChecks.length ? opts.barChecks.join(", ") : "(nothing)"}`,
-    ...(opts.commands ? [`Commands on this machine: ${opts.commands.present.join(", ")}${opts.commands.missing.length ? ` (not installed: ${opts.commands.missing.join(", ")})` : ""}`] : []),
+    ...(commands ? [`Commands on this machine: ${commands.present.join(", ")}${commands.missing.length ? ` (not installed: ${commands.missing.join(", ")})` : ""}`] : []),
     ...(process.platform === "darwin"
       ? ["This is macOS: BSD tools, not GNU. No `find -printf`, no `stat -c`, no GNU `touch -d`, `sed -i ''` needs the empty argument. Prefer python3 for anything beyond plain shell."]
       : []),
     "`.maat/` is Maat's own folder in the project: a check that lists or counts files must ignore it.",
-    ...(opts.lessons?.length
-      ? ["", "A person ruled these earlier drafted checks wrong in this project. Do not make the same mistake:", ...opts.lessons.map((l) => `- ${l}`)]
+    ...(lessons?.length
+      ? ["", "A person ruled these earlier drafted checks wrong in this project. Do not make the same mistake:", ...lessons.map((l) => `- ${l}`)]
       : []),
     "",
     "Do not repeat what the project already checks. Add only what is specific to",
@@ -619,7 +696,7 @@ export async function draftCriteria(opts: {
     model: opts.model,
     system: SYSTEM,
     prompt: prompted,
-    cwd: opts.cwd,
+    cwd: askCwd,
     what: "drafting criteria",
     fetchFn: opts.fetchFn,
     acpSpawn: opts.acpSpawn,
@@ -639,7 +716,7 @@ export async function draftCriteria(opts: {
     model: opts.model,
     system: SYSTEM,
     prompt: `${prompted}\n\nYour last reply could not be parsed as JSON. Reply with the JSON object only.`,
-    cwd: opts.cwd,
+    cwd: askCwd,
     what: "drafting criteria",
     fetchFn: opts.fetchFn,
     acpSpawn: opts.acpSpawn,
@@ -663,7 +740,7 @@ export async function draftCriteria(opts: {
       model: opts.model,
       system: SYSTEM,
       prompt: context,
-      cwd: opts.cwd,
+      cwd: askCwd,
       what: "drafting criteria",
       fetchFn: opts.fetchFn,
         acpSpawn: opts.acpSpawn,
@@ -821,8 +898,21 @@ export async function draftCriteriaCritiqued(
   // back, however many ways the function below returns.
   const sink: Sink = { requirements: [], lint: [] };
   const withReqs = (d: Draft): Draft => (sink.requirements.length ? { ...d, requirements: sink.requirements } : d);
-  const r = await critiqued({ ...opts, onProgress: opts.onProgress && ((d) => opts.onProgress!(withReqs(d))) }, sink);
-  return r.ok ? { ...r, draft: withReqs(r.draft), ...(sink.lint.length ? { lint: sink.lint } : {}) } : r;
+  // Every stage below reads the project as it is now, not as the worker
+  // leaves it: the later stages run while the work is under way.
+  const snapshot =
+    opts.snapshot ?? drafterSnapshot(opts.task, opts.cwd, { commands: opts.commands, scripts: opts.scripts, lessons: opts.lessons });
+  // A subprocess drafter starts in an empty folder of its own, not the work.
+  const ownDir = opts.askCwd === undefined ? mkdtempSync(join(tmpdir(), "maat-draft-")) : undefined;
+  try {
+    const r = await critiqued(
+      { ...opts, snapshot, askCwd: opts.askCwd ?? ownDir, onProgress: opts.onProgress && ((d) => opts.onProgress!(withReqs(d))) },
+      sink,
+    );
+    return r.ok ? { ...r, draft: withReqs(r.draft), ...(sink.lint.length ? { lint: sink.lint } : {}) } : r;
+  } finally {
+    if (ownDir) rmSync(ownDir, { recursive: true, force: true });
+  }
 }
 
 /** A drafted check the seal-time lint retired (src/checklint.ts), for the journal. */
@@ -838,14 +928,17 @@ async function critiqued(
   },
   sink: Sink,
 ): Promise<{ ok: true; draft: Draft; critique: string[] } | { ok: false; error: string }> {
+  const snap = opts.snapshot ?? drafterSnapshot(opts.task, opts.cwd, { commands: opts.commands, scripts: opts.scripts, lessons: opts.lessons });
+  opts = { ...opts, snapshot: snap };
+  const commands = snap.commands;
   const fix = (d: Draft): Draft =>
-    opts.commands ? { ...d, checks: d.checks.map((c) => ({ ...c, run: fixInterpreters(c.run, opts.commands!) })) } : d;
-  const view = projectView(opts.task, opts.cwd);
-  // The project as it is now, before the model has changed anything.
+    commands ? { ...d, checks: d.checks.map((c) => ({ ...c, run: fixInterpreters(c.run, commands) })) } : d;
+  const view = snap.view;
+  // The project as it was before the model changed anything (the snapshot).
   const lintCtx: LintCtx = {
     task: opts.task,
     shell: bashPath() ? "bash" : "sh",
-    ...(opts.cwd ? { cwd: opts.cwd, tree: readTree(opts.cwd) } : {}),
+    ...(opts.cwd ? { cwd: opts.cwd, tree: snap.tree ?? readTree(opts.cwd) } : {}),
   };
   const said: string[] = [];
   /** Split a draft's checks into the ones that pass the lint and the ones that do not. Drops are recorded, never silent. */
@@ -904,7 +997,7 @@ async function critiqued(
       model: opts.model,
       system: CRITIC_SYSTEM,
       prompt: `TASK TEXT:\n${opts.task}\n\n${view ? `${view}\n\n` : ""}CHECKS:\n${d.checks.map((c) => `- ${c.name}: ${c.run}`).join("\n")}`,
-      cwd: opts.cwd,
+      cwd: opts.askCwd ?? opts.cwd,
       what: "reviewing the drafted checks",
       fetchFn: opts.fetchFn,
         acpSpawn: opts.acpSpawn,
