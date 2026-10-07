@@ -65,6 +65,22 @@ typically under a permissive licence. The **model weights** you load are under
 whatever licence the model publisher set. You are responsible for that licence
 and for any Acceptable Use rules attached to the weights.
 
+## Training on model output
+
+`finetune/extract.mjs` builds a dataset from past runs, and each row carries
+the model's own words. Some providers forbid using their output to develop
+machine learning models at all (xAI's Acceptable Use Policy does), and others
+forbid training models that compete with theirs. The extractor leaves xAI
+attempts out by default; `--exclude-provider` adds more. Check the terms of
+every provider whose runs you intend to train on.
+
+## Benchmarking other agents
+
+This repository benchmarks Maat and openly licensed reference agents only.
+Several commercial coding agents forbid benchmarking them, analysing them
+competitively, or publishing performance figures about them, so no adapter
+or result for such a product is kept here.
+
 ## Questions
 
 If a provider’s terms and this note ever conflict, the provider’s terms win.

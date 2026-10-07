@@ -46,6 +46,20 @@ train and valid. Writes:
 
 Nothing is invented: a field the record does not hold is absent.
 
+### Whose output is left out
+
+A training row carries the model's claim verbatim, so the provider's terms
+decide whether the row may exist. xAI's Acceptable Use Policy forbids using
+its output to develop machine learning models, so attempts made on xAI — the
+metered API, a plan driven through Grok Build, or a Grok model behind a
+reseller — are skipped by `extract.mjs` and appear in no file it writes. The
+manifest records how many were left out. `--exclude-provider a,b` adds more.
+
+The default list is what has been checked, not a clearance for the rest:
+read a provider's terms before adding its rows. Anthropic permits training
+specialised, non-competing models on its output and forbids using that output
+as a training target; here the target is always the bar's verdict.
+
 ### The first target: refusal prediction
 
 Input: task, model, tool calls in order, files changed, the claim, the checks

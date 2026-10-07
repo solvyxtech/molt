@@ -21,9 +21,13 @@
  *  - The rendered training target is the bar's verdict, never a judgement.
  *    A model trained on this learns to PREDICT what molt's checks will say,
  *    which is adjudicated by running them. It is never asked to decide.
+ *  - Attempts made by a provider whose terms bar using its output to develop
+ *    machine learning models are left out entirely — not in records.jsonl,
+ *    not in a split. See EXCLUDED_PROVIDERS below.
  *
  * Usage:
- *   node finetune/extract.mjs [--out finetune/data/<date>] [--valid 0.15] <project-root>...
+ *   node finetune/extract.mjs [--out finetune/data/<date>] [--valid 0.15]
+ *        [--exclude-provider a,b] <project-root>...
  *
  * Output:
  *   records.jsonl   one structured row per unique receipt (all fields, provenance)
@@ -35,6 +39,27 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 
+/**
+ * Providers whose output does not go into training data.
+ *
+ * xAI's Acceptable Use Policy forbids "using the Service or any Output to
+ * develop (or assist anyone in developing) machine learning models", and a
+ * training row carries the model's claim verbatim. That holds for the metered
+ * API (`xai`) and for a plan driven through Grok Build (`grok-build`) alike,
+ * and for a Grok model reached through a reseller, which is why the model id
+ * is checked as well as the provider.
+ *
+ * `--exclude-provider a,b` adds to this list. Nothing removes from it: a
+ * provider belongs here because of its terms, and those are not a per-run
+ * choice. Read a provider's terms before training on its rows; the default
+ * list is what has been checked, not a promise about everything left in.
+ */
+const EXCLUDED_PROVIDERS = new Set(["xai", "x.ai", "api.x.ai", "grok-build", "grok build"]);
+const EXCLUDED_MODEL = /(^|\/)grok-/iu;
+function isExcluded(provider, model) {
+  return EXCLUDED_PROVIDERS.has(String(provider ?? "").trim().toLowerCase()) || EXCLUDED_MODEL.test(String(model ?? ""));
+}
+
 const args = process.argv.slice(2);
 let out = "";
 let validFrac = 0.15;
@@ -42,6 +67,7 @@ const roots = [];
 for (let i = 0; i < args.length; i++) {
   if (args[i] === "--out") out = args[++i];
   else if (args[i] === "--valid") validFrac = Number(args[++i]);
+  else if (args[i] === "--exclude-provider") for (const p of String(args[++i] ?? "").split(",")) { if (p.trim()) EXCLUDED_PROVIDERS.add(p.trim().toLowerCase()); }
   else roots.push(resolve(args[i]));
 }
 if (!roots.length) roots.push(process.cwd());
@@ -130,6 +156,7 @@ function renderTranscript(transcript) {
 }
 
 const rows = new Map(); // receipt sha -> row
+const excludedIds = new Set(); // receipt sha of an attempt left out by provider
 let seenFiles = 0;
 for (const root of roots) {
   const dir = join(root, ".molt", "receipts");
@@ -145,8 +172,12 @@ for (const root of roots) {
     const body = readFileSync(join(dir, f), "utf8");
     const id = sha(body);
     if (rows.has(id)) { rows.get(id).provenance.roots.push(basename(root)); continue; }
+    if (excludedIds.has(id)) continue;
     const r = parseReceipt(body);
     const idx = index.filter((x) => x.file === f).at(-1) ?? {};
+    // Left out before anything is built from it, so no field of an excluded
+    // attempt reaches records.jsonl either.
+    if (isExcluded(r.meta["provider"] ?? idx.provider, r.meta["model"] ?? idx.model)) { excludedIds.add(id); continue; }
     // Which session: the index row says, or a journal names this receipt.
     let session = idx.session ?? null;
     if (!session) for (const [sid, es] of journals) if (es.some((e) => e.kind === "receipt" && basename(String(e.data.file ?? "")) === f)) { session = sid; break; }
@@ -241,7 +272,9 @@ const manifest = {
   roots,
   receiptFilesSeen: seenFiles,
   uniqueReceipts: all.length,
-  duplicatesDropped: seenFiles - all.length,
+  duplicatesDropped: seenFiles - all.length - excludedIds.size,
+  excludedProviders: [...EXCLUDED_PROVIDERS].sort(),
+  excludedReceipts: excludedIds.size,
   withJournalTurn: all.filter((r) => r.calls).length,
   withCapturedTranscript: all.filter((r) => r.transcript).length,
   verdicts: Object.fromEntries(["accepted", "refused", "exhausted"].map((v) => [v, all.filter((r) => r.verdict === v).length])),
@@ -254,5 +287,6 @@ const manifest = {
 };
 writeFileSync(join(out, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
 console.log(`${all.length} unique receipts from ${seenFiles} files across ${roots.length} root(s) → ${out}`);
+if (excludedIds.size) console.log(`left out ${excludedIds.size} receipt(s) from providers whose terms bar training on their output`);
 console.log(`train ${train.length} · valid ${valid.length} (${validSessions.size} held-out session(s)) · with journal turn ${manifest.withJournalTurn}`);
 console.log(`verdicts ${JSON.stringify(manifest.verdicts)} · failing checks ${JSON.stringify(manifest.failingChecks)}`);
