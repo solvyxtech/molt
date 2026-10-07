@@ -338,6 +338,57 @@ export type Overflow = {
   sent: number;
 };
 
+/**
+ * A refusal where the completion reserve, not the prompt, overflowed.
+ *
+ * vLLM-style servers count `max_tokens` against the window. GMI Cloud serves
+ * qwen3-235b with a 131,072-token TOTAL window, and the request went out with
+ * the model's full listed output (an OpenAI-shaped request with no max_tokens
+ * is given that by the router), so a 2,454-token prompt was refused:
+ *
+ *     maximum context length of 131072 tokens. You requested a total of
+ *     133526 tokens: 2454 tokens from the input messages and 131072 tokens
+ *     for the completion.
+ *
+ * Shedding history can never fix that. Returns the window, the input and the
+ * completion the server counted, or null when the body does not say all three.
+ */
+export function completionOverflow(body: string): { window: number; input: number; completion: number } | null {
+  const win = /maximum context length (?:is|of) (\d+)/i.exec(body);
+  const parts =
+    /(\d+) tokens? from the input messages and (\d+) tokens? for the completion/i.exec(body) ??
+    /\((\d+) in the messages,\s*(\d+) in the completion\)/i.exec(body);
+  if (!win || !parts) return null;
+  const r = { window: Number(win[1]), input: Number(parts[1]), completion: Number(parts[2]) };
+  return r.window > 0 && r.input >= 0 && r.completion > 0 ? r : null;
+}
+
+/** The most an unasked output cap grows to after replies hit it. */
+export const OUTPUT_CAP_MAX = 131_072;
+
+/**
+ * A 400 that refuses the `max_tokens` field itself, as opposed to its value.
+ * Narrow on purpose: it must name the field and say it is unsupported.
+ */
+export function refusedMaxTokens(body: string): boolean {
+  return /max_tokens/i.test(body) && /unsupported|not supported|unrecognized|unknown (field|parameter)|extra inputs are not permitted|use 'max_completion_tokens'|max_completion_tokens/i.test(body);
+}
+
+/** Room left between the prompt and the window, kept free of the completion reserve. */
+export const COMPLETION_MARGIN = 256;
+/** A completion cap below this is no reply worth asking for; the prompt is what has to shrink. */
+export const MIN_COMPLETION = 1_024;
+
+/**
+ * The completion cap that fits, when lowering it alone fixes the overflow:
+ * the window less the input and a margin. Null when even the smallest useful
+ * reply does not fit (the history is the problem, and shedding is the fix).
+ */
+export function fittedCompletion(o: { window: number; input: number; completion: number }): number | null {
+  const fit = o.window - o.input - Math.max(COMPLETION_MARGIN, Math.round(o.window * 0.01));
+  return fit >= MIN_COMPLETION && fit < o.completion ? fit : null;
+}
+
 export function contextOverflow(body: string): Overflow | null {
   // Overflow wording, not the bare word "context": a pinned OpenRouter provider
   // answered a rate-limit retry with a 400 that merely mentioned context, and a
@@ -352,11 +403,15 @@ export function contextOverflow(body: string): Overflow | null {
   const win =
     /"n_ctx"\s*:\s*(\d+)/.exec(body) ??
     /context size \((\d+)\s*tokens?\)/i.exec(body) ??
-    /maximum context length is (\d+)/i.exec(body);
+    /maximum context length (?:is|of) (\d+)/i.exec(body);
+  // The prompt's own count where the server separates it from the completion:
+  // that is what molt's estimate is compared with.
   const sent =
     /"n_prompt_tokens"\s*:\s*(\d+)/.exec(body) ??
     /request \((\d+)\s*tokens?\)/i.exec(body) ??
-    /you requested (\d+)/i.exec(body);
+    /(\d+) tokens? from the input messages/i.exec(body) ??
+    /\((\d+) in the messages,/i.exec(body) ??
+    /you requested (?:a total of )?(\d+)/i.exec(body);
   return { window: win ? Number(win[1]) : 0, sent: sent ? Number(sent[1]) : 0 };
 }
 
@@ -1978,10 +2033,24 @@ export class Engine {
    */
   private modelMaxTokens?: number;
 
+  /**
+   * The output cap this session settled on without being asked: the default
+   * (DEFAULT_MAX_TOKENS, not the model's whole listed output), doubled each
+   * time a reply is cut off at it, up to OUTPUT_CAP_MAX.
+   */
+  private outputCap = DEFAULT_MAX_TOKENS;
+  /**
+   * The completion reserve a server said fits its window beside the prompt
+   * (completionOverflow). Sticky for the session: the prompt only grows.
+   */
+  private fittedCompletion?: number;
+  /** Set once a provider refuses `max_tokens` outright; it is then not sent. */
+  private maxTokensUnsupported = false;
+
   /** What to send as `max_tokens`: what was asked for, bounded by what fits. */
   private maxTokensFor(): number {
-    const asked = this.cfg.maxTokens ?? DEFAULT_MAX_TOKENS;
-    return this.modelMaxTokens ? Math.min(asked, this.modelMaxTokens) : asked;
+    const asked = this.cfg.maxTokens ?? this.outputCap;
+    return Math.min(asked, this.modelMaxTokens ?? Infinity, this.fittedCompletion ?? Infinity);
   }
   /**
    * These three are derived from the endpoint, and the endpoint moves.
@@ -2291,6 +2360,8 @@ export class Engine {
       // Output maximums are per-model, and the last one's says nothing
       // about this one. Discovered again on the next refusal if it matters.
       this.modelMaxTokens = undefined;
+      this.fittedCompletion = undefined;
+      this.maxTokensUnsupported = false;
     }
     this.cfg.model = m;
   }
@@ -6080,6 +6151,10 @@ export class Engine {
                 // ignored (see selfHostedThinking). Nothing on a cloud endpoint.
                 ...selfHostedThinking(this.cfg.baseUrl, this.effortNow),
                 ...openRouterProvider(this.cfg.baseUrl, this.cfg.model),
+                // Always a cap. Without one a router fills in the model's whole
+                // listed output, and a server that counts it against the window
+                // refuses every request (completionOverflow).
+                ...(this.maxTokensUnsupported ? {} : { max_tokens: this.maxTokensFor() }),
                 ...(stream ? { stream: true } : {}),
                 ...(withUsage ? { stream_options: { include_usage: true } } : {}),
               };
@@ -6215,7 +6290,7 @@ export class Engine {
             // so, and says what the maximum is. Same shape as the two
             // fallbacks above: retry once, and only believe the ceiling was
             // the problem if that works.
-            if (!res.ok && res.status === 400 && this.native && this.modelMaxTokens === undefined) {
+            if (!res.ok && res.status === 400 && this.modelMaxTokens === undefined && !this.maxTokensUnsupported) {
               const cap = outputCeiling(body);
               if (cap && cap < this.maxTokensFor()) {
                 const was = this.maxTokensFor();
@@ -6234,6 +6309,45 @@ export class Engine {
                 res = retry;
                 body = res.ok ? "" : (await res.text().catch(() => ""));
               }
+            }
+
+            // The completion reserve overflowed, not the prompt: ask for a
+            // smaller reply and send the same history again. Shedding cannot
+            // fix this one, and it was ending runs "too large and nothing left
+            // to shed" on a 2,454-token prompt.
+            for (let i = 0; i < 2 && !res.ok && res.status === 400; i++) {
+              const co = completionOverflow(body);
+              const fit = co ? fittedCompletion(co) : null;
+              if (!co || fit === null || fit >= this.maxTokensFor()) break;
+              const was = this.maxTokensFor();
+              this.fittedCompletion = fit;
+              log?.append("note", {
+                body: body.slice(0, 600),
+                text:
+                  `the completion reserve overflowed the ${co.window}-token window (${co.input} input + ` +
+                  `${co.completion} completion) — max_tokens ${was} → ${fit}, retried without shedding`,
+              });
+              yield {
+                kind: "info",
+                text: `this endpoint counts the reply against its ${co.window}-token window — asking for at most ${fit} output tokens instead of ${was}.`,
+              };
+              res = await send(askForUsage && !this.streamUsageUnsupported);
+              body = res.ok ? "" : (await res.text().catch(() => ""));
+            }
+
+            // A provider that will not take `max_tokens` at all (OpenAI's
+            // reasoning models want max_completion_tokens). Try once without;
+            // only believe the field was the problem if that works.
+            if (!res.ok && res.status === 400 && !this.native && !this.maxTokensUnsupported && refusedMaxTokens(body)) {
+              this.maxTokensUnsupported = true;
+              const retry = await send(askForUsage && !this.streamUsageUnsupported);
+              if (retry.ok) {
+                log?.append("note", { text: "provider refused max_tokens — sending requests without an output cap" });
+              } else {
+                this.maxTokensUnsupported = false;
+              }
+              res = retry;
+              body = res.ok ? "" : (await res.text().catch(() => ""));
             }
 
             if (!res.ok) {
@@ -7077,6 +7191,11 @@ export class Engine {
       // sentence.
       if (finishReason === "length" && truncatedTurns < TRUNCATED_TURN_RETRIES) {
         truncatedTurns += 1;
+        // A reply that actually hit the default cap earns a larger one; a cap
+        // the person set, or one the server said is all that fits, stays.
+        if (this.cfg.maxTokens === undefined && this.outputCap < OUTPUT_CAP_MAX && this.maxTokensFor() === this.outputCap) {
+          this.outputCap = Math.min(OUTPUT_CAP_MAX, this.outputCap * 2);
+        }
         log?.append("note", {
           text: `reply cut off at the ${this.maxTokensFor()}-token output ceiling`,
           step,
