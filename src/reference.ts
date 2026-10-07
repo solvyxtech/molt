@@ -42,10 +42,10 @@
  */
 import { createHash } from "node:crypto";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { askModel, jsonIn, type AskOptions } from "./ask.js";
 import { runCommand } from "./run.js";
+import { checkTmpDir, privSep } from "./privsep.js";
 import { STATE_DIRS } from "./statedir.js";
 import type { Check } from "./types.js";
 
@@ -250,7 +250,7 @@ export type Snapshot = { dir: string; files: number; bytes: number; hash: string
  * work. Null when the project is too large to copy quickly — the reference is
  * an extra, never a reason for a slow start.
  */
-export function snapshotProject(cwd: string, root = mkdtempSync(join(tmpdir(), "ref-"))): Snapshot | null {
+export function snapshotProject(cwd: string, root = mkdtempSync(join(checkTmpDir(), "ref-"))): Snapshot | null {
   const files: string[] = [];
   let bytes = 0;
   const walk = (dir: string): boolean => {
@@ -349,7 +349,7 @@ async function writeAndTry(opts: Ask, prompt: string): Promise<Reference | { ok:
   writeFileSync(join(dir, "driver.py"), DRIVER);
   // Every try runs on a scratch copy of the untouched project, never on the
   // project: by now the work may have begun.
-  const scratch = mkdtempSync(join(tmpdir(), "ref-try-"));
+  const scratch = mkdtempSync(join(checkTmpDir(), "ref-try-"));
   cpSync(before, scratch, { recursive: true });
   const compiled = await runCommand(`${python} -m py_compile '${file}'`, { cwd: scratch, timeoutMs: 30_000, maxBuffer: 256 * 1024 });
   if (compiled.code !== 0) {
@@ -394,7 +394,13 @@ async function writeAndTry(opts: Ask, prompt: string): Promise<Reference | { ok:
     tags: ["task", "reference", "value"],
     hidden: true,
   };
-  const tried = await runCommand(check.run, { cwd: scratch, timeoutMs: REFERENCE_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
+  // The reference check's files are readable by the check account (and not
+  // the worker, which cannot enter the check folder), and the try runs as
+  // the check account the way the bar will run it (--check-user).
+  const ps = privSep();
+  ps?.shareWithCheck(dir);
+  ps?.giveToCheck(scratch);
+  const tried = await runCommand(check.run, { cwd: scratch, timeoutMs: REFERENCE_TIMEOUT_MS, maxBuffer: 1024 * 1024, asCheck: "copy" });
   if (tried.timedOut) return { ok: false, why: "the references did not finish on the untouched project" };
   if (tried.code === REFERENCE_SELF_ERROR) {
     const said = lastLines(`${tried.stdout}\n${tried.stderr}`);

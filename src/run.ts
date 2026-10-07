@@ -36,6 +36,16 @@ export type RunOptions = {
    * runs as the worker user. Without privilege separation this changes nothing.
    */
   asWorker?: boolean;
+  /**
+   * This is a check run. Under privilege separation with a check account
+   * (`--check-user`): "copy" runs it as the check account (it is in a copy of
+   * the tree Maat made for it), "in-place" runs it as the worker (it runs in
+   * the worker's own tree: a project check, a mutation run). Either way it
+   * gets its own PID namespace and private /tmp when Maat can make them
+   * (`PrivSep.checkSpec`). Without a check account this changes nothing:
+   * checks run as Maat, as before.
+   */
+  asCheck?: "copy" | "in-place";
 };
 
 export type RunResult = {
@@ -96,9 +106,22 @@ export function draftedShell(check: { hidden?: boolean; tags?: readonly string[]
 export function runCommand(command: string, opts: RunOptions): Promise<RunResult> {
   return new Promise<RunResult>((resolve, reject) => {
     let child: ChildProcess;
+    let cleanup: (() => void) | undefined;
     try {
-      const ps = opts.asWorker ? privSep() : undefined;
-      if (ps) {
+      const sep = privSep();
+      const ps = opts.asWorker ? sep : undefined;
+      if (opts.asCheck && sep?.check) {
+        const made = sep.checkSpec(command, opts.shell ?? true, opts.cwd, opts.asCheck === "copy" ? "check" : "worker", opts.env ?? process.env);
+        cleanup = made.cleanup;
+        const spec = made.spec;
+        child = spawn(spec.file, spec.args, {
+          cwd: opts.cwd,
+          env: spec.env,
+          stdio: ["ignore", "pipe", "pipe"],
+          detached: true,
+          ...(spec.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
+        });
+      } else if (ps) {
         const spec = ps.commandSpec(command, opts.shell ?? true, opts.cwd, opts.env);
         child = spawn(spec.file, spec.args, {
           cwd: opts.cwd,
@@ -119,6 +142,7 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
         });
       }
     } catch (e) {
+      cleanup?.();
       reject(e as Error);
       return;
     }
@@ -199,6 +223,7 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
       if (killTimer) clearTimeout(killTimer);
       if (drainTimer) clearTimeout(drainTimer);
       opts.signal?.removeEventListener("abort", onAbort);
+      cleanup?.();
       if (heldOpen) {
         child.stdout?.destroy();
         child.stderr?.destroy();
@@ -222,6 +247,7 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
       if (killTimer) clearTimeout(killTimer);
       if (drainTimer) clearTimeout(drainTimer);
       opts.signal?.removeEventListener("abort", onAbort);
+      cleanup?.();
       reject(e);
     });
   });

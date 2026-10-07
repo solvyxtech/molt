@@ -14,6 +14,7 @@ import { MIN_SECRET_CHARS, redact } from "./redact.js";
 import type { BarResult } from "./types.js";
 import { stateDir } from "./statedir.js";
 import { WITHHELD, maskDeep, maskText } from "./withhold.js";
+import { isolationLine } from "./privsep.js";
 
 /** Where a receipt's full text goes when hidden commands were masked in it (src/withhold.ts). */
 export const FULL_DIR = "full";
@@ -531,6 +532,10 @@ export class Receipts {
             "",
           ]
         : []),
+      // Under --worker-user, the isolation that was actually in effect while
+      // this was judged: which uid ran the worker and the checks, and whether
+      // there was a PID namespace (src/privsep.ts). Absent when nobody asked.
+      ...(isolationLine() ? [isolationLine()!, ""] : []),
       "## What the model claimed",
       "",
       "> " + (args.claim.trim() || "(no final message)").split("\n").join("\n> "),

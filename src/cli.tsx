@@ -54,7 +54,7 @@ import { stateDir } from "./statedir.js";
 import { draftReference, snapshotProject } from "./reference.js";
 import { env } from "./env.js";
 import { fileURLToPath } from "node:url";
-import { disablePrivSep, enablePrivSep, workerUserFrom, type PrivSep } from "./privsep.js";
+import { checkUserFrom, disablePrivSep, enablePrivSep, setIsolationLine, workerUserFrom, type PrivSep } from "./privsep.js";
 
 /**
  * The version, from the manifest that npm actually publishes.
@@ -239,6 +239,16 @@ options
                      to a private state dir (MAAT_STATE_DIR) and are copied
                      into .maat/ when the job ends. For containers and
                      unattended runs. (MAAT_WORKER_USER)
+  --check-user <u>   with --worker-user: task checks (hidden, drafted, mission)
+                     run as user <u> in their copy of the tree, with only PATH,
+                     a fresh HOME, LANG and TERM, and (root with CAP_SYS_ADMIN)
+                     their own PID namespace and /tmp. Checks that run in the
+                     project itself, and mutation runs, run as the worker.
+                     (MAAT_CHECK_USER)
+  --worker-strict    with --worker-user: refuse to start unless the worker
+                     account, the check account and the PID namespace can all
+                     be set up. Without it Maat carries on and every receipt
+                     and the journal say which isolation was in effect.
   --json             machine-readable output (run/prove/stats/receipts)
   --version          print the version and exit
   --no-stream        disable token streaming (default: streaming on)
@@ -315,6 +325,10 @@ type Args = {
   sandbox?: boolean;
   /** `--worker-user <name>`: the worker's tools run as that user (src/privsep.ts). */
   workerUser?: string;
+  /** `--check-user <name>`: task checks run as that account (src/privsep.ts). */
+  checkUser?: string;
+  /** `--worker-strict`: refuse to start unless worker account, check account and PID namespace are all in place. */
+  workerStrict?: boolean;
   /** `molt mission run --features n`: stop after n worker runs. */
   features?: number;
   /** Files the model may read and never write. `--read`, repeatable. */
@@ -697,6 +711,12 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         break;
       case "--worker-user":
         out.workerUser = next();
+        break;
+      case "--check-user":
+        out.checkUser = next();
+        break;
+      case "--worker-strict":
+        out.workerStrict = true;
         break;
       case "--json":
         out.json = true;
@@ -2238,34 +2258,54 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   // Privilege separation, when asked for: before any record is opened, so
   // every one of them is made in the private state dir (src/privsep.ts).
   const worker = workerUserFrom(args.workerUser);
+  const checker = checkUserFrom(args.checkUser);
   const separates = args.cmd === "run" || args.cmd === "ask" || (args.cmd === "mission" && (args.task ?? "").split(" ")[0] === "run");
+  if (!worker && separates && (checker || args.workerStrict)) {
+    process.stderr.write(`maat: ${args.workerStrict ? "--worker-strict" : "--check-user"} needs --worker-user (MAAT_WORKER_USER)\n`);
+    return 2;
+  }
   if (worker && separates) {
-    let ps: PrivSep;
+    let ps: PrivSep | undefined;
     try {
       ps = enablePrivSep({
         user: worker,
         project: args.cwd,
         helper: fileURLToPath(new URL("./fs-helper.js", import.meta.url)),
         notice: (t) => process.stderr.write(`maat: ${t}\n`),
+        ...(checker ? { checkUser: checker } : {}),
+        strict: args.workerStrict === true,
       });
     } catch (e) {
-      process.stderr.write(`maat: ${(e as Error).message}\n`);
-      return 2;
+      // --worker-strict, or MAAT_WORKER_PIDNS=1, means refuse. Otherwise the
+      // job goes on unseparated, and every receipt and the journal say so.
+      if (args.workerStrict || process.env.MAAT_WORKER_PIDNS === "1") {
+        process.stderr.write(`maat: ${(e as Error).message}\n`);
+        return 2;
+      }
+      process.stderr.write(`maat: ${(e as Error).message}; carrying on WITHOUT privilege separation (--worker-strict refuses instead)\n`);
+      setIsolationLine(`isolation: none (worker tools and checks run as Maat, uid ${process.getuid?.() ?? "?"}: ${(e as Error).message})`);
     }
-    process.stderr.write(
-      `maat: worker tools run as ${ps.worker.name} (uid ${ps.worker.uid})` +
-        `${ps.pidns ? " in their own PID namespace" : ""}; Maat's records are in ${ps.stateRoot} until the job ends\n`,
-    );
+    if (ps) {
+      process.stderr.write(
+        `maat: worker tools run as ${ps.worker.name} (uid ${ps.worker.uid})` +
+          `${ps.pidns ? " in their own PID namespace" : ""}` +
+          `${ps.check ? `; task checks run as ${ps.check.name} (uid ${ps.check.uid})` : ""}; Maat's records are in ${ps.stateRoot} until the job ends\n` +
+          `maat: ${ps.isolation()}\n`,
+      );
+    }
     try {
       return args.cmd === "mission" ? await cmdMission(args) : await cmdRun(args, args.cmd === "ask");
     } finally {
-      try {
-        const dest = ps.publish();
-        process.stderr.write(`maat: records copied to ${dest}\n`);
-      } catch (e) {
-        process.stderr.write(`maat: could not copy the records from ${ps.stateRoot} into the project: ${(e as Error).message}\n`);
+      if (ps) {
+        try {
+          const dest = ps.publish();
+          process.stderr.write(`maat: records copied to ${dest}\n`);
+        } catch (e) {
+          process.stderr.write(`maat: could not copy the records from ${ps.stateRoot} into the project: ${(e as Error).message}\n`);
+        }
       }
       disablePrivSep();
+      setIsolationLine(undefined);
     }
   }
   switch (args.cmd) {

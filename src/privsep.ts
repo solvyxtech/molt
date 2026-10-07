@@ -26,12 +26,21 @@
  *    mode 700, owned by Maat (MAAT_STATE_DIR, default /var/lib/maat/<session>
  *    as root, ~/.local/state/maat/<session> otherwise). At the end of the job
  *    they are copied into the project's `.maat/` as before;
- *  - the judge and ask subprocesses and the hidden checks stay Maat's: same
- *    uid, a HOME the worker cannot read, checks run in the copy-on-run tree;
+ *  - the judge and ask subprocesses stay Maat's: same uid, a HOME the worker
+ *    cannot read. Task checks (hidden, drafted, mission) run in the
+ *    copy-on-run tree as Maat, or, with `--check-user <name>`, as that third
+ *    account, with an allowlisted environment and (root with CAP_SYS_ADMIN)
+ *    a PID namespace and private /tmp of their own per run. Checks that must
+ *    run in the project itself, and mutation runs, then run as the worker;
  *  - where the kernel allows it (root with CAP_SYS_ADMIN), the worker's
  *    commands share one PID namespace of their own with a private /proc, so
  *    `ps` shows them nothing of Maat's. Without it the process list stays
  *    visible: see docs/privilege-separation.md.
+ *
+ * `--worker-strict` refuses to start unless the worker account, the check
+ * account and the PID namespace are all in place. Without it a missing piece
+ * is reported, and `isolationLine()` names what is actually in effect; every
+ * receipt and the journal carry that line.
  *
  * Off (the default) nothing here runs and nothing changes.
  */
@@ -50,11 +59,14 @@ import {
   readFileSync,
   readdirSync,
   readlinkSync,
+  lchownSync,
+  mkdtempSync,
   realpathSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { GrepResult, WalkOptions, WalkResult } from "./files.js";
 import { redirectState, stateDirName } from "./statedir.js";
@@ -198,7 +210,56 @@ export type PrivSepOptions = {
    * it is looked for beside the running script.
    */
   helper?: string;
+  /**
+   * The account task checks run as (`--check-user`, MAAT_CHECK_USER): not
+   * root, not Maat's user, not the worker, and in a group the worker is not
+   * in. Left out, task checks run as Maat, as before.
+   */
+  checkUser?: string;
+  /**
+   * `--worker-strict`: throw unless the check account and the PID namespace
+   * can both be set up (a worker account that cannot be set up always throws
+   * here). Without it, a check account or namespace that cannot be made is
+   * reported through `notice` and in `isolation()`, and the job goes on.
+   */
+  strict?: boolean;
 };
+
+/** Temp dirs a check run gets a private, empty tmpfs on, when it has a mount namespace. */
+const PRIVATE_TMP_DIRS = ["/tmp", "/var/tmp", "/dev/shm"];
+
+/** True when `p` is `dir` or inside it. */
+function under(p: string, dir: string): boolean {
+  const r = relative(dir, p);
+  return r === "" || (!r.startsWith("..") && !isAbsolute(r));
+}
+
+/** Names of the users listed as members of group `gid` in /etc/group. */
+function groupMembers(gid: number): string[] {
+  try {
+    for (const line of readFileSync("/etc/group", "utf8").split("\n")) {
+      const f = line.trim().split(":");
+      if (f.length >= 4 && Number(f[2]) === gid) return f[3]!.split(",").filter(Boolean);
+    }
+  } catch {
+    /* no group file */
+  }
+  return [];
+}
+
+/**
+ * The shell run as the init of a check's own PID namespace: it mounts an
+ * empty tmpfs on each temp dir it is given (a private /tmp), then drops to the
+ * check's account with no capabilities and no way to gain one, enters the
+ * working directory and runs the command. Arguments: the temp dirs as one
+ * colon-separated word, uid, gid, cwd, then the program and its arguments.
+ */
+const CHECK_INIT = [
+  "set -e",
+  'dirs=$1 uid=$2 gid=$3 wd=$4; shift 4',
+  'IFS=:; for d in $dirs; do [ -n "$d" ] && mount -t tmpfs -o mode=1777,nosuid,nodev maat-check-tmp "$d"; done; unset IFS',
+  'exec setpriv --reuid="$uid" --regid="$gid" --clear-groups --no-new-privs --bounding-set=-all -- /bin/sh -c \'cd -- "$0" && exec "$@"\' "$wd" "$@"',
+].join("\n");
 
 export class PrivSep {
   readonly worker: WorkerUser;
@@ -209,6 +270,22 @@ export class PrivSep {
   readonly mode: "root" | "sudo";
   readonly pidns: boolean;
   readonly helperScript: string;
+  /** The check account, when one was asked for and could be set up. */
+  readonly check?: WorkerUser;
+  /**
+   * Where check copies and reference-check files go when there is a check
+   * account: `<state dir>.check`, owned by Maat, group the check account,
+   * mode 710. The check account can pass through it to the folders made for
+   * it; the worker (neither owner nor group) cannot enter it at all.
+   */
+  readonly checkRoot?: string;
+  /** Each check run gets its own PID namespace (and a private /tmp, see `checkTmpDirs`). */
+  readonly checkNs: boolean;
+  /** The temp dirs each check run gets an empty tmpfs on. */
+  readonly checkTmpDirs: readonly string[];
+  /** Why a check account that was asked for is not in use. */
+  readonly checkProblem?: string;
+  readonly strict: boolean;
   /** The project as it was when the job started, so a swapped folder is never walked. */
   private readonly projectReal: string;
   private readonly projectId: { dev: number; ino: number };
@@ -243,6 +320,23 @@ export class PrivSep {
       );
     }
 
+    this.strict = opts.strict === true;
+    if (this.strict && (opts.pidns === false || envFlag("MAAT_WORKER_PIDNS") === false)) {
+      throw new PrivSepError("--worker-strict needs a PID namespace, and MAAT_WORKER_PIDNS=0 turns it off");
+    }
+    let check: WorkerUser | undefined;
+    let checkProblem: string | undefined;
+    if (opts.checkUser) {
+      try {
+        check = this.resolveCheck(opts.checkUser);
+      } catch (e) {
+        if (this.strict) throw e;
+        checkProblem = (e as Error).message;
+      }
+    } else if (this.strict) {
+      throw new PrivSepError("--worker-strict needs a check account (--check-user): without one, task checks would run as Maat");
+    }
+
     const session = `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomBytes(6).toString("hex")}`;
     const wanted = opts.stateDir ?? process.env.MAAT_STATE_DIR ?? defaultStateRoot(session);
     this.stateRoot = resolve(wanted);
@@ -253,11 +347,54 @@ export class PrivSep {
     this.makePrivate(this.stateRoot);
     this.makePrivate(join(this.stateRoot, "tmp"));
 
-    const want = opts.pidns ?? envFlag("MAAT_WORKER_PIDNS");
+    if (check) {
+      const root = `${this.stateRoot}.check`;
+      const usedDefault = !opts.stateDir && !process.env.MAAT_STATE_DIR;
+      try {
+        this.makeCheckRoot(root, check, usedDefault);
+        this.checkRoot = root;
+      } catch (e) {
+        try {
+          rmSync(root, { recursive: true, force: true });
+        } catch {
+          /* nothing made */
+        }
+        if (this.strict) throw e;
+        checkProblem = (e as Error).message;
+        check = undefined;
+      }
+    }
+    this.check = check;
+    this.checkProblem = checkProblem;
+
+    const want = this.strict ? true : (opts.pidns ?? envFlag("MAAT_WORKER_PIDNS"));
     this.pidns = want === false ? false : this.startNamespace();
     if (want === true && !this.pidns) {
-      throw new PrivSepError("MAAT_WORKER_PIDNS=1 but a PID namespace could not be made (needs root with CAP_SYS_ADMIN, unshare, nsenter and setpriv)");
+      if (this.checkRoot) rmSync(this.checkRoot, { recursive: true, force: true });
+      throw new PrivSepError(
+        `${this.strict ? "--worker-strict" : "MAAT_WORKER_PIDNS=1"} but a PID namespace could not be made (needs root with CAP_SYS_ADMIN, unshare, nsenter and setpriv)`,
+      );
     }
+    // A check run's namespace is made per run (`checkSpec`); probed here, once,
+    // with the mount it needs for a private /tmp.
+    this.checkNs = !!this.check && this.pidns && this.probeCheckNamespace();
+    if (this.strict && this.check && !this.checkNs) {
+      this.killNamespace();
+      if (this.checkRoot) rmSync(this.checkRoot, { recursive: true, force: true });
+      throw new PrivSepError("--worker-strict but a check run's PID namespace with a private /tmp could not be made (mount -t tmpfs failed inside unshare)");
+    }
+    this.checkTmpDirs = this.checkNs
+      ? PRIVATE_TMP_DIRS.filter((d) => {
+          try {
+            if (!statSync(d).isDirectory()) return false;
+          } catch {
+            return false;
+          }
+          // A tmpfs over a folder Maat's own records live in would hide them
+          // from the check (MAAT_STATE_DIR under /tmp, say): that dir is left shared.
+          return !under(this.stateRoot, d) && !(this.checkRoot && under(this.checkRoot, d));
+        })
+      : [];
     process.on("exit", this.onExit);
 
     // Maat's own temp files (reference tries, check copies, drafts, judge
@@ -279,6 +416,186 @@ export class PrivSep {
           "so its commands get their own PID namespace (docs/privilege-separation.md)",
       );
     }
+    if (opts.checkUser && !this.check) notice(`task checks run as Maat, not ${opts.checkUser}: ${this.checkProblem}`);
+    else if (this.check && !this.checkNs) {
+      notice("check runs share the PID namespace and /tmp with the rest of the machine (needs root with CAP_SYS_ADMIN)");
+    }
+  }
+
+  /**
+   * The one line every receipt and the journal carry under privilege
+   * separation: the isolation actually in effect, not the one asked for.
+   * For example "isolation: worker uid 1001, check uid 1002, pid namespace on".
+   */
+  isolation(): string {
+    const parts = [`worker uid ${this.worker.uid}`];
+    parts.push(this.check ? `check uid ${this.check.uid}` : `check uid none (task checks run as Maat, uid ${this.maatUid})`);
+    if (!this.pidns) parts.push("pid namespace off");
+    else if (this.check && !this.checkNs) parts.push("pid namespace on (worker only; check runs have none)");
+    else parts.push("pid namespace on");
+    if (this.checkNs && !this.checkTmpDirs.includes("/tmp")) parts.push("private /tmp off (the state dir is under /tmp)");
+    return `isolation: ${parts.join(", ")}`;
+  }
+
+  /** The check account by name, refused unless it is a fourth party to Maat, root and the worker. */
+  private resolveCheck(name: string): WorkerUser {
+    const c = lookupUser(name);
+    if (c.uid === 0) throw new PrivSepError("--check-user must not be root");
+    if (c.uid === this.maatUid) throw new PrivSepError(`--check-user ${name} is the user Maat runs as; the check account must be a different user`);
+    if (c.uid === this.worker.uid) throw new PrivSepError(`--check-user ${name} is the worker; the check account must be a different user`);
+    // Reference-check files are shared with the check account through its
+    // primary group, so the worker must not be in that group.
+    if (c.gid === this.worker.gid || groupMembers(c.gid).includes(this.worker.name)) {
+      throw new PrivSepError(`--check-user ${name}: its group (gid ${c.gid}) includes the worker ${this.worker.name}; give it a group of its own`);
+    }
+    if (this.mode === "sudo" && spawnSync("sudo", ["-n", "-u", name, "--", "true"], { stdio: "ignore" }).status !== 0) {
+      throw new PrivSepError(`--check-user needs Maat to run as root, or passwordless sudo to ${name} (sudo -n -u ${name} true failed)`);
+    }
+    return c;
+  }
+
+  /**
+   * The folder check copies and reference files go in: Maat's, group the
+   * check account, mode 710. Its parent must let the check account through;
+   * the default parent (/var/lib/maat), when Maat made it, is opened to 711
+   * for that (each session's own dirs stay closed to everyone else). The
+   * check account is then asked to enter it; a refusal means checks cannot
+   * run as that account here.
+   */
+  private makeCheckRoot(root: string, check: WorkerUser, usedDefault: boolean): void {
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const st = lstatSync(root);
+    if (!st.isDirectory() || st.uid !== this.maatUid) throw new PrivSepError(`${root} is not a folder of Maat's`);
+    if (this.mode === "root") lchownSync(root, this.maatUid, check.gid);
+    chmodSync(root, 0o710);
+    if (usedDefault) {
+      const parent = dirname(this.stateRoot);
+      const pst = statSync(parent);
+      if (pst.uid === this.maatUid && (pst.mode & 0o001) === 0) chmodSync(parent, (pst.mode & 0o7777) | 0o011);
+    }
+    const probe =
+      this.mode === "root"
+        ? spawnSync("/bin/sh", ["-c", 'cd -- "$0"', root], { stdio: "ignore", uid: check.uid, gid: check.gid, cwd: "/" })
+        : spawnSync("sudo", ["-n", "-u", check.name, "--", "/bin/sh", "-c", 'cd -- "$0"', root], { stdio: "ignore", cwd: "/" });
+    if (probe.status !== 0) {
+      throw new PrivSepError(`the check account ${check.name} cannot reach ${root} (a folder above it is closed to it; set MAAT_STATE_DIR under one it can pass through)`);
+    }
+  }
+
+  /** Can a check run get its own PID namespace, /proc and an empty tmpfs? */
+  private probeCheckNamespace(): boolean {
+    if (process.platform !== "linux" || this.mode !== "root" || !which("setpriv")) return false;
+    const r = spawnSync("unshare", ["--pid", "--fork", "--mount-proc", "/bin/sh", "-c", "mount -t tmpfs -o mode=1777 maat-check-tmp /tmp"], {
+      stdio: "ignore",
+      timeout: 10_000,
+    });
+    return r.status === 0;
+  }
+
+  /**
+   * The environment a check run as the check account gets: an allowlist,
+   * not a scrub. PATH, HOME (a fresh empty folder per run), LANG and TERM;
+   * nothing else of Maat's, so no provider key or Maat setting reaches it.
+   */
+  checkEnv(home: string, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { PATH: base.PATH || "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", HOME: home };
+    if (base.LANG) env.LANG = base.LANG;
+    if (base.TERM) env.TERM = base.TERM;
+    return env;
+  }
+
+  /**
+   * A check, ready to spawn. `who` is "check" for a check in its copy (the
+   * check account, allowlisted environment, fresh HOME) and "worker" for one
+   * that must run in the project itself (a project check, a mutation run, a
+   * task check whose tree was too large to copy): the worker account and its
+   * scrubbed environment, because the tree is the worker's.
+   *
+   * With `checkNs` each run is the init of its own PID namespace, with its
+   * own /proc and an empty tmpfs on /tmp, /var/tmp and /dev/shm (except one
+   * that holds the working directory or Maat's state), and drops to the
+   * account with no capabilities and no-new-privs. Everything it starts dies
+   * with it, and nothing it leaves in a temp dir outlives it. Without a
+   * namespace the check account runs directly with its uid (root) or through
+   * `sudo -n -u` (sudo mode), and a worker-run check enters the worker's own
+   * namespace when there is one.
+   *
+   * Call `cleanup` when the run is over: it removes the fresh HOME.
+   */
+  checkSpec(command: string, shell: string | true, cwd: string, who: "check" | "worker", base: NodeJS.ProcessEnv = process.env): { spec: SpawnSpec; cleanup: () => void } {
+    const sh = shell === true ? "/bin/sh" : shell;
+    const user = who === "check" ? this.check : this.worker;
+    if (!user) throw new PrivSepError("no check account");
+    let runDir: string | undefined;
+    const cleanup = () => {
+      if (runDir) rmSync(runDir, { recursive: true, force: true });
+      runDir = undefined;
+    };
+    let env: NodeJS.ProcessEnv;
+    if (who === "check") {
+      runDir = mkdtempSync(join(this.checkRoot ?? tmpdir(), "run-"));
+      const home = join(runDir, "home");
+      mkdirSync(home, { mode: 0o700 });
+      if (this.mode === "root") {
+        lchownSync(runDir, this.maatUid, user.gid);
+        chmodSync(runDir, 0o710);
+        lchownSync(home, user.uid, user.gid);
+      } else {
+        // sudo mode: Maat cannot chown, so the check gets an empty HOME it
+        // can read but not write.
+        chmodSync(runDir, 0o711);
+        chmodSync(home, 0o711);
+      }
+      env = this.checkEnv(home, base);
+    } else {
+      env = this.workerEnv(base);
+    }
+    if (this.checkNs) {
+      const tmps = this.checkTmpDirs.filter((d) => !under(cwd, d));
+      return {
+        spec: {
+          file: "unshare",
+          args: ["--pid", "--fork", "--mount-proc", "--kill-child", "/bin/sh", "-c", CHECK_INIT, "maat-check", tmps.join(":"), String(user.uid), String(user.gid), cwd, sh, "-c", command],
+          env,
+        },
+        cleanup,
+      };
+    }
+    if (who === "worker") return { spec: this.execSpec(sh, ["-c", command], cwd, base), cleanup };
+    if (this.mode === "sudo") {
+      const pairs = Object.entries(env).map(([k, v]) => `${k}=${v}`);
+      return { spec: { file: "sudo", args: ["-n", "-u", user.name, "--", "env", "-i", ...pairs, sh, "-c", command], env }, cleanup };
+    }
+    return { spec: { file: sh, args: ["-c", command], env, uid: user.uid, gid: user.gid }, cleanup };
+  }
+
+  /**
+   * Hand a folder Maat made for a check (a copy of the tree, a reference
+   * try's scratch dir) to the check account, so the check can write in it as
+   * it would in the project. Only folders Maat made under `checkRoot`, which
+   * the worker cannot enter; symlinks are re-owned, never followed. No-op
+   * without a check account, or when Maat cannot chown (sudo mode).
+   */
+  giveToCheck(dir: string): void {
+    const c = this.check;
+    if (!c || !this.checkRoot || this.mode !== "root" || !under(resolve(dir), this.checkRoot)) return;
+    walkOwn(dir, (p) => lchownSync(p, c.uid, c.gid));
+  }
+
+  /**
+   * Let the check account read a folder of Maat's (the reference check's
+   * programs and its snapshot of the project): owner Maat, group the check
+   * account, folders 750 and files 640. The worker is neither, and cannot
+   * enter `checkRoot` in the first place.
+   */
+  shareWithCheck(dir: string): void {
+    const c = this.check;
+    if (!c || !this.checkRoot || !under(resolve(dir), this.checkRoot)) return;
+    walkOwn(dir, (p, st) => {
+      if (this.mode === "root") lchownSync(p, this.maatUid, c.gid);
+      if (st.isSymbolicLink()) return;
+      chmodSync(p, st.isDirectory() ? (this.mode === "root" ? 0o750 : 0o755) : this.mode === "root" ? 0o640 : 0o644);
+    });
   }
 
   private setEnv(k: string, v: string): void {
@@ -406,6 +723,16 @@ export class PrivSep {
     }
     chmodSync(home, st.mode & 0o700);
     notice(`tightened ${home} to mode 700 so ${this.worker.name} cannot read the judge's logins`);
+  }
+
+  private killNamespace(): void {
+    if (this.nsLeader?.pid) {
+      try {
+        process.kill(this.nsLeader.pid, "SIGKILL");
+      } catch {
+        /* gone */
+      }
+    }
   }
 
   /** One PID namespace with a private /proc for all of the worker's processes. */
@@ -699,11 +1026,12 @@ export class PrivSep {
     this.closed = true;
     process.removeListener("exit", this.onExit);
     this.helper?.stop();
-    if (this.nsLeader?.pid) {
+    this.killNamespace();
+    if (this.checkRoot) {
       try {
-        process.kill(this.nsLeader.pid, "SIGKILL");
+        rmSync(this.checkRoot, { recursive: true, force: true });
       } catch {
-        /* gone */
+        /* left for the OS */
       }
     }
     redirectState(null);
@@ -712,6 +1040,14 @@ export class PrivSep {
       else process.env[k] = v;
     }
   }
+}
+
+/** Every entry under `dir`, `dir` included, by lstat: links are visited, never followed. */
+function walkOwn(dir: string, fn: (p: string, st: import("node:fs").Stats) => void): void {
+  const st = lstatSync(dir);
+  fn(dir, st);
+  if (!st.isDirectory()) return;
+  for (const n of readdirSync(dir)) walkOwn(join(dir, n), fn);
 }
 
 function envFlag(name: string): boolean | undefined {
@@ -868,7 +1204,10 @@ export function privSep(): PrivSep | undefined {
 /** Turn it on for this process. Throws PrivSepError when it cannot be made safe. */
 export function enablePrivSep(opts: PrivSepOptions): PrivSep {
   active?.close();
+  active = undefined;
+  isolation = undefined;
   active = new PrivSep(opts);
+  isolation = active.isolation();
   return active;
 }
 
@@ -876,6 +1215,28 @@ export function enablePrivSep(opts: PrivSepOptions): PrivSep {
 export function disablePrivSep(): void {
   active?.close();
   active = undefined;
+  isolation = undefined;
+}
+
+let isolation: string | undefined;
+
+/**
+ * The isolation line for receipts and the journal, when separation was asked
+ * for: what `PrivSep.isolation()` says, or what the CLI set when it carried on
+ * without it. Undefined when nobody asked (the default changes nothing).
+ */
+export function isolationLine(): string | undefined {
+  return isolation;
+}
+
+/** Set (or clear) the isolation line; the CLI uses it when it carries on without separation. */
+export function setIsolationLine(line: string | undefined): void {
+  isolation = line;
+}
+
+/** Where a check's copy or a reference check's files go: the check folder when there is a check account, else Maat's temp dir. */
+export function checkTmpDir(): string {
+  return active?.checkRoot ?? tmpdir();
 }
 
 /**
@@ -905,5 +1266,11 @@ export function gitSync(args: readonly string[], cwd: string, opts: { timeout?: 
 /** The worker user asked for, from the flag or MAAT_WORKER_USER. */
 export function workerUserFrom(flag?: string): string | undefined {
   const v = (flag ?? process.env.MAAT_WORKER_USER ?? "").trim();
+  return v || undefined;
+}
+
+/** The check account asked for, from the flag or MAAT_CHECK_USER. */
+export function checkUserFrom(flag?: string): string | undefined {
+  const v = (flag ?? process.env.MAAT_CHECK_USER ?? "").trim();
   return v || undefined;
 }

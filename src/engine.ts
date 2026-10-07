@@ -131,7 +131,10 @@ import {
   type Spend,
 } from "./types.js";
 import { stateDir, stateDirName, stateRedirect } from "./statedir.js";
-import { gitSync, privSep, type WorkerFs } from "./privsep.js";
+import { gitSync, isolationLine, privSep, type WorkerFs } from "./privsep.js";
+
+/** Journals that already carry the isolation line (one per journal, however many engines share it). */
+const isolationNoted = new WeakSet<object>();
 import { env } from "./env.js";
 import { Judgments, caseReason, reasonText } from "./judgment.js";
 
@@ -2227,6 +2230,14 @@ export class Engine {
         session: cfg.journal.sessionId,
         journalRoot: cfg.journal.chainRoot(),
       });
+    }
+    // Under --worker-user, one line in the journal saying what isolation was
+    // actually in effect (src/privsep.ts), e.g.
+    // "isolation: worker uid 1001, check uid 1002, pid namespace on".
+    const isolation = isolationLine();
+    if (isolation && cfg.journal && !isolationNoted.has(cfg.journal)) {
+      isolationNoted.add(cfg.journal);
+      cfg.journal.append("note", { kind: "isolation", text: isolation });
     }
   }
 

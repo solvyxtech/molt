@@ -22,7 +22,10 @@ import { Receipts } from "../src/receipts.js";
 import { Integrity } from "../src/integrity.js";
 import { runCommand } from "../src/run.js";
 import { stateDir } from "../src/statedir.js";
-import { disablePrivSep, enablePrivSep, gitSync, privSep, safeRel, type PrivSep } from "../src/privsep.js";
+import { checkUserFrom, disablePrivSep, enablePrivSep, gitSync, isolationLine, privSep, safeRel, type PrivSep } from "../src/privsep.js";
+import { runCheck, type BarContext } from "../src/bar.js";
+import { runAssertions, type Contract } from "../src/mission.js";
+import { snapshotProject } from "../src/reference.js";
 import { listBackground, resetBackgroundRegistry, startBackground, type BackgroundProcess } from "../src/background.js";
 import { ACP_AGENTS } from "../src/acp.js";
 import type { Check, EngineEvent } from "../src/types.js";
@@ -33,6 +36,15 @@ const HELPER = fileURLToPath(new URL("../src/fs-helper.js", import.meta.url));
 
 const linuxRoot = process.platform === "linux" && process.getuid?.() === 0 && spawnSync("runuser", ["--help"]).status === 0;
 const WORKER = process.env.MAAT_TEST_WORKER_USER ?? "maattestw";
+const CHECKER = process.env.MAAT_TEST_CHECK_USER ?? "maattestc";
+/**
+ * CI's Linux job runs with CAP_SYS_ADMIN and sets this, so the namespace
+ * assertions fail there instead of being skipped when no namespace was made.
+ */
+const REQUIRE_PIDNS = process.env.MAAT_TEST_REQUIRE_PIDNS === "1";
+/** Can this machine make a PID namespace with a private /proc and a tmpfs (root with CAP_SYS_ADMIN)? */
+const nsAvailable =
+  linuxRoot && spawnSync("unshare", ["--pid", "--fork", "--mount-proc", "/bin/sh", "-c", "mount -t tmpfs t /tmp"], { stdio: "ignore" }).status === 0;
 
 /** Run a shell command as the worker user, the way an attacker in the worker would. */
 function asWorker(cmd: string): { status: number | null; out: string } {
@@ -43,6 +55,18 @@ function asWorker(cmd: string): { status: number | null; out: string } {
 function ensureWorker(): number {
   if (spawnSync("id", ["-u", WORKER]).status !== 0) execFileSync("useradd", ["-m", "-s", "/bin/sh", WORKER]);
   return Number(execFileSync("id", ["-u", WORKER], { encoding: "utf8" }).trim());
+}
+
+/** The check account: its own user and its own group, as the bench image makes `checker`. */
+function ensureChecker(): number {
+  if (spawnSync("id", ["-u", CHECKER]).status !== 0) execFileSync("useradd", ["-M", "-U", "-s", "/bin/sh", CHECKER]);
+  return Number(execFileSync("id", ["-u", CHECKER], { encoding: "utf8" }).trim());
+}
+
+/** Run a shell command as the check account. */
+function asChecker(cmd: string): { status: number | null; out: string } {
+  const r = spawnSync("runuser", ["-u", CHECKER, "--", "sh", "-c", cmd], { encoding: "utf8" });
+  return { status: r.status, out: `${r.stdout}${r.stderr}` };
 }
 
 /** A project folder the worker owns, as the bench hands one over. */
@@ -202,6 +226,7 @@ describe("privilege separation (Linux, root)", { skip: linuxRoot ? false : "need
     const joined = results.join("\n---\n");
     assert.ok(!joined.includes("sealed-check-42"), `a tool read the state dir:\n${joined}`);
     assert.match(joined, /EACCES|permission denied/i, "read_file was refused by the kernel");
+    if (REQUIRE_PIDNS) assert.ok(ps.pidns, "MAAT_TEST_REQUIRE_PIDNS=1 but the worker got no PID namespace");
     if (ps.pidns) {
       const pids = (results.at(-1) ?? "").trim().split(/\s+/).filter(Boolean).map(Number);
       assert.ok(pids.length > 0 && pids.length < 10, `the worker's /proc: ${pids.join(" ")}`);
@@ -444,6 +469,209 @@ describe("privilege separation (Linux, root)", { skip: linuxRoot ? false : "need
   });
 });
 
+describe("check account: --check-user and --worker-strict (Linux, root)", { skip: linuxRoot ? false : "needs Linux and root (CI's Linux job)" }, () => {
+  let wuid = 0;
+  let cuid = 0;
+  let dir = "";
+  let ps: PrivSep;
+  const roots: string[] = [];
+  const savedState = process.env.MAAT_STATE_DIR;
+  const saved: Record<string, string | undefined> = {};
+  /** Provider keys and Maat settings in Maat's own environment: none may reach a check. */
+  const PLANTED = { OPENAI_API_KEY: "sk-planted-openai", OPENROUTER_API_KEY: "sk-or-planted", MAAT_JUDGE_MODEL: "planted-judge", MOLT_API_KEY: "planted-molt" };
+  const hostTmpMarker = `/tmp/maat-host-tmp-marker-${process.pid}`;
+
+  const enable = (extra: { strict?: boolean } = {}): PrivSep => {
+    disablePrivSep();
+    ps = enablePrivSep({ user: WORKER, project: dir, helper: HELPER, checkUser: CHECKER, ...extra });
+    roots.push(ps.stateRoot);
+    return ps;
+  };
+
+  before(() => {
+    wuid = ensureWorker();
+    cuid = ensureChecker();
+    dir = project(wuid);
+    writeFileSync(join(dir, "out.txt"), "marker-77\n");
+    execFileSync("chown", ["-R", `${wuid}:${wuid}`, dir]);
+    delete process.env.MAAT_STATE_DIR;
+    for (const [k, v] of Object.entries(PLANTED)) {
+      saved[k] = process.env[k];
+      process.env[k] = v;
+    }
+    writeFileSync(hostTmpMarker, "host\n");
+    enable();
+  });
+
+  after(() => {
+    disablePrivSep();
+    for (const r of roots) {
+      rmSync(r, { recursive: true, force: true });
+      rmSync(`${r}.check`, { recursive: true, force: true });
+    }
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    if (savedState !== undefined) process.env.MAAT_STATE_DIR = savedState;
+    rmSync(hostTmpMarker, { force: true });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Run a check through the bar's own runCheck and return its output (the probe fails on purpose so the output is kept). */
+  const probe = async (check: Partial<Check>): Promise<string> => {
+    const ctx = { cwd: dir, record: [], ledger: [], archivedBatches: 0 } as unknown as BarContext;
+    const full: Check = { name: "task:probe", kind: "command", run: "true", timeoutMs: 20_000, expectExit: 0, tags: ["task"], hidden: true, ...check } as Check;
+    const r = await runCheck(full, ctx);
+    assert.equal(r.ok, false, "the probe check is built to fail so its output is kept");
+    return r.output;
+  };
+
+  it("a task check runs as the check account, in its copy, with only PATH, HOME, LANG and TERM", async () => {
+    assert.ok(privSep()?.check, `no check account: ${privSep()?.checkProblem}`);
+    const out = await probe({
+      run:
+        'echo "uid=$(id -u)"; grep -q marker-77 out.txt && echo saw-work; echo "home=$HOME"; echo "homefiles=$(ls -A "$HOME" | wc -l)"; ' +
+        `test -e ${hostTmpMarker} && echo host-tmp-visible; echo "procs=$(ls /proc | grep -cE '^[0-9]+$')"; ` +
+        "echo ENV-BEGIN; env; echo ENV-END; exit 7",
+    });
+    assert.match(out, new RegExp(`^uid=${cuid}$`, "m"), `the check did not run as the check account:\n${out}`);
+    assert.match(out, /^saw-work$/m, "the check could not read its copy of the work");
+    assert.match(out, /^homefiles=0$/m, "HOME was not a fresh empty folder");
+    assert.ok(!out.includes(`home=/home/${WORKER}`), "the check got the worker's HOME");
+    const env = (out.split("ENV-BEGIN\n")[1] ?? "").split("\nENV-END")[0]!.split("\n").map((l) => l.split("=")[0]!).filter(Boolean);
+    // The shell itself adds PWD, SHLVL and _; nothing else may be there.
+    const allowed = new Set(["PATH", "HOME", "LANG", "TERM", "PWD", "OLDPWD", "SHLVL", "_"]);
+    assert.deepEqual(env.filter((k) => !allowed.has(k)), [], `variables beyond the allowlist reached the check: ${env.join(" ")}`);
+    for (const [k, v] of Object.entries(PLANTED)) {
+      assert.ok(!out.includes(k), `${k} reached the check`);
+      assert.ok(!out.includes(v), `the value of ${k} reached the check`);
+    }
+    if (REQUIRE_PIDNS) assert.ok(ps.checkNs, "MAAT_TEST_REQUIRE_PIDNS=1 but check runs got no namespace");
+    if (ps.checkNs) {
+      assert.ok(!out.includes("host-tmp-visible"), "the check saw the host's /tmp: it has no private /tmp");
+      const procs = Number(/^procs=(\d+)$/m.exec(out)?.[1]);
+      assert.ok(procs > 0 && procs < 10, `the check sees ${procs} processes: no PID namespace of its own`);
+    }
+  });
+
+  it("a project check, which runs in the project itself, runs as the worker", async () => {
+    const out = await probe({ name: "tests", tags: [], hidden: false, run: 'echo "uid=$(id -u)"; exit 7' });
+    assert.match(out, new RegExp(`^uid=${wuid}$`, "m"), `a project check did not run as the worker:\n${out}`);
+  });
+
+  it("a mission assertion runs as the check account", async () => {
+    const contract = { version: 1, assertions: [{ id: "who", run: `test "$(id -u)" = ${cuid} && grep -q marker-77 out.txt` }] } as unknown as Contract;
+    const [r] = await runAssertions(contract, ["who"], dir);
+    assert.equal(r?.ok, true, r?.output);
+  });
+
+  it("the reference check's files are readable by the check account and not by the worker", () => {
+    const snap = snapshotProject(dir);
+    assert.ok(snap, "no snapshot");
+    assert.ok(snap.dir.startsWith(ps.checkRoot!), `the reference folder ${snap.dir} is not in the check folder ${ps.checkRoot}`);
+    writeFileSync(join(snap.dir, "check.py"), "SEALED = 'reference-marker-99'\n");
+    ps.shareWithCheck(snap.dir);
+    const read = asWorker(`cat '${join(snap.dir, "check.py")}'`);
+    assert.notEqual(read.status, 0, "the worker read the reference check");
+    assert.ok(!read.out.includes("reference-marker-99"), "the worker read the reference check");
+    assert.match(read.out, /Permission denied/);
+    assert.notEqual(asWorker(`ls '${snap.dir}'`).status, 0, "the worker listed the reference folder");
+    assert.notEqual(asWorker(`ls '${ps.checkRoot}'`).status, 0, "the worker listed the check folder");
+    assert.notEqual(asWorker(`cd '${ps.checkRoot}'`).status, 0, "the worker entered the check folder");
+    const asC = asChecker(`cat '${join(snap.dir, "check.py")}'`);
+    assert.equal(asC.status, 0, asC.out);
+    assert.match(asC.out, /reference-marker-99/);
+  });
+
+  it("puts the isolation in effect in the receipt and the journal", async () => {
+    const ws = project(wuid);
+    disablePrivSep();
+    const ps2 = enablePrivSep({ user: WORKER, project: ws, helper: HELPER, checkUser: CHECKER });
+    roots.push(ps2.stateRoot);
+    try {
+      const line = isolationLine();
+      assert.equal(line, ps2.isolation());
+      assert.match(line!, new RegExp(`^isolation: worker uid ${wuid}, check uid ${cuid}, pid namespace (on|off)`));
+      if (REQUIRE_PIDNS) assert.equal(line, `isolation: worker uid ${wuid}, check uid ${cuid}, pid namespace on`);
+      const provider = scriptedProvider([{ calls: [{ name: "write_file", args: { path: "out.txt", content: "hello\n" } }] }, { text: "Done." }]);
+      const journal = new Journal(ws);
+      const receipts = new Receipts(ws);
+      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high", journal, receipts });
+      const check: Check = { name: "task:out", kind: "command", run: `grep -q hello out.txt && test "$(id -u)" = ${cuid}`, timeoutMs: 10_000, expectExit: 0, tags: ["task", "value"], hidden: true };
+      const events: EngineEvent[] = [];
+      for await (const ev of engine.run("write out.txt saying hello", allowAll, { taskChecks: [check] })) events.push(ev);
+      const end = events.find((e) => e.kind === "job_end");
+      assert.ok(end && end.kind === "job_end" && end.outcome === "verified", `outcome ${end && end.kind === "job_end" ? end.outcome : "none"}`);
+      const rdir = join(ps2.stateRoot, "receipts");
+      const md = readdirSync(rdir).filter((f) => f.endsWith(".md"));
+      assert.ok(md.length > 0, "no receipt");
+      for (const f of md) assert.ok(readFileSync(join(rdir, f), "utf8").split("\n").includes(line!), `${f} does not carry the isolation line`);
+      const log = readFileSync(journal.path, "utf8").split("\n").filter((l) => l.includes(line!));
+      assert.equal(log.length, 1, "the journal must carry the isolation line exactly once");
+    } finally {
+      disablePrivSep();
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("has a PID namespace for the worker and each check run where the container allows it", { skip: REQUIRE_PIDNS || nsAvailable ? false : "no CAP_SYS_ADMIN here (CI's Linux job requires it)" }, () => {
+    const p = enable();
+    assert.ok(p.pidns, "no PID namespace for the worker");
+    assert.ok(p.checkNs, "no PID namespace for check runs");
+    assert.match(p.isolation(), /pid namespace on$/);
+  });
+
+  it("--worker-strict refuses to start when no PID namespace can be made", () => {
+    // No unshare on PATH stands in for a container without CAP_SYS_ADMIN;
+    // without the capability, the plain call below refuses too.
+    const emptyBin = mkdtempSync(join(tmpdir(), "maat-nobin-"));
+    const path = process.env.PATH;
+    disablePrivSep();
+    try {
+      process.env.PATH = emptyBin;
+      assert.throws(() => enablePrivSep({ user: WORKER, project: dir, helper: HELPER, checkUser: CHECKER, strict: true }), /--worker-strict.*PID namespace/);
+      assert.equal(privSep(), undefined);
+      assert.equal(isolationLine(), undefined);
+      // Without --worker-strict the same machine carries on and says so.
+      const p = enablePrivSep({ user: WORKER, project: dir, helper: HELPER, checkUser: CHECKER });
+      roots.push(p.stateRoot);
+      assert.equal(p.pidns, false);
+      assert.equal(isolationLine(), `isolation: worker uid ${wuid}, check uid ${cuid}, pid namespace off`);
+    } finally {
+      process.env.PATH = path;
+      disablePrivSep();
+      rmSync(emptyBin, { recursive: true, force: true });
+      for (const d of readdirSync("/var/lib/maat")) if (d.endsWith(".check") && !existsSync(join("/var/lib/maat", d.slice(0, -6)))) rmSync(join("/var/lib/maat", d), { recursive: true, force: true });
+    }
+    if (!nsAvailable) {
+      assert.throws(() => enablePrivSep({ user: WORKER, project: dir, helper: HELPER, checkUser: CHECKER, strict: true }), /--worker-strict.*PID namespace/);
+    }
+    // And it refuses without a check account at all.
+    assert.throws(() => enablePrivSep({ user: WORKER, project: dir, helper: HELPER, strict: true }), /--worker-strict needs a check account/);
+    // The CLI turns the refusal into exit 2 before any work starts.
+    const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+    const r = spawnSync(process.execPath, [cli, "run", "--worker-user", WORKER, "--check-user", CHECKER, "--worker-strict", "--cwd", dir, "say hi"], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: "/nonexistent-maat-bin", MOLT_API_KEY: "x" },
+      timeout: 30_000,
+    });
+    assert.equal(r.status, 2, `${r.stdout}${r.stderr}`);
+    assert.match(r.stderr, /--worker-strict.*PID namespace/);
+  });
+
+  it("refuses a check account that is the worker, or shares the worker's group", () => {
+    disablePrivSep();
+    assert.throws(() => enablePrivSep({ user: WORKER, project: dir, helper: HELPER, checkUser: WORKER, strict: true }), /is the worker/);
+    // Not strict: the job goes on with checks as Maat, and the line says so.
+    const p = enablePrivSep({ user: WORKER, project: dir, helper: HELPER, checkUser: WORKER });
+    roots.push(p.stateRoot);
+    assert.equal(p.check, undefined);
+    assert.match(p.isolation(), /check uid none \(task checks run as Maat, uid 0\)/);
+    disablePrivSep();
+  });
+});
+
 describe("privilege separation off (the default)", () => {
   it("changes nothing: records in the project, commands and files as Maat's own user", async () => {
     assert.equal(privSep(), undefined);
@@ -481,6 +709,21 @@ describe("privilege separation off (the default)", () => {
     const oc = ACP_AGENTS.find((a) => a.name === "opencode");
     assert.deepEqual(oc?.workerCredentialEnv, ["OPENCODE_API_KEY"]);
     for (const a of ACP_AGENTS) for (const k of a.workerCredentialEnv ?? []) assert.match(k, new RegExp(`^${a.name}_`, "i"));
+  });
+
+  it("reads the check account from --check-user or MAAT_CHECK_USER", () => {
+    const saved = process.env.MAAT_CHECK_USER;
+    try {
+      delete process.env.MAAT_CHECK_USER;
+      assert.equal(checkUserFrom(), undefined);
+      assert.equal(checkUserFrom(" checker "), "checker");
+      process.env.MAAT_CHECK_USER = "from-env";
+      assert.equal(checkUserFrom(), "from-env");
+      assert.equal(isolationLine(), undefined, "no isolation line unless separation was asked for");
+    } finally {
+      if (saved === undefined) delete process.env.MAAT_CHECK_USER;
+      else process.env.MAAT_CHECK_USER = saved;
+    }
   });
 
   it("refuses a worker user that cannot be switched to", () => {

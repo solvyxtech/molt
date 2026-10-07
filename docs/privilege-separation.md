@@ -96,11 +96,13 @@ worker and Maat writes nothing into the worker's tree. If a copy cannot be
 written with the worker's permissions, Maat says so and the records stay in
 the state dir, which is always kept.
 
-**The judge and the checks stay Maat's.** Judge and ask subprocesses
-(OpenCode, a Grok judge, an HTTP judge) run as Maat with Maat's HOME. If that
-HOME is readable by the worker, Maat tightens it to 700 when it owns it and
-refuses to start otherwise. Hidden checks run as Maat in the copy-on-run
-tree, never as the worker. A check that ran in place (a project check, or a
+**The judge stays Maat's; the checks run as Maat or as the check account.**
+Judge and ask subprocesses (OpenCode, a Grok judge, an HTTP judge) run as
+Maat with Maat's HOME. If that HOME is readable by the worker, Maat tightens
+it to 700 when it owns it and refuses to start otherwise. Without
+`--check-user`, hidden checks run as Maat in the copy-on-run tree, never as
+the worker; with it, they run as the check account (next section). A check
+that ran in place as Maat (a project check, or a
 tree too large to copy) can leave files owned by Maat in the project. After
 every bar run, those are handed back to the worker, so the worker can keep
 editing its own tree. The worker may be changing the tree while that runs,
@@ -115,6 +117,90 @@ is Linux-only; elsewhere root-made files stay Maat's. Maat's own git calls in th
 because the repository and its config belong to the worker. Maat does not set
 `safe.directory`, so its own git keeps refusing a repository another user
 owns.
+
+## The check account: `--check-user`
+
+```sh
+maat run --worker-user agent --check-user checker --worker-strict ...
+```
+
+`--check-user <name>` (or `MAAT_CHECK_USER`) needs `--worker-user`. Task
+checks then run as a third account instead of as Maat: hidden checks, drafted
+task checks (`--criteria auto`), `--criterion` checks, the reference check
+and its try on the untouched project (the compile and probe steps before it,
+which run only the reference program, stay Maat's), mission assertions in the bar and at a
+milestone seal, and the tries of drafted criteria before the work. A check is
+model-written and runs the worker's code, so it no longer runs as root.
+
+What it guarantees:
+
+- **The account.** The check account must not be root, Maat's user or the
+  worker, and its primary group must not contain the worker. Maat runs as
+  root (it spawns the check with that uid and gid and no supplementary
+  groups), or has passwordless `sudo -n -u <name>`.
+- **The environment is an allowlist.** `PATH`, `HOME`, `LANG` and `TERM`, and
+  nothing else of Maat's. `HOME` is a fresh, empty folder made for that one
+  run and removed after it. No provider key, no `MAAT_*` setting, no `TMPDIR`
+  (the check uses `/tmp`).
+- **Its own PID namespace and /tmp.** When Maat is root with `CAP_SYS_ADMIN`,
+  each check run is started with `unshare --pid --fork --mount-proc`, so it is
+  the init of a PID namespace with its own `/proc` (it sees none of Maat's or
+  the worker's processes, and everything it starts dies with it). Inside, an
+  empty tmpfs is mounted on `/tmp`, `/var/tmp` and `/dev/shm` (except one that
+  holds its working directory or Maat's state dir), and the check then drops to
+  its account with `setpriv --clear-groups --no-new-privs --bounding-set=-all`.
+  Nothing it writes to a temp dir outlives it, so it cannot leave the
+  reference check where the worker can read it.
+- **Its copy is its own.** The copy-on-run tree is made in
+  `<state dir>.check` (owner Maat, group the check account, mode 710) and
+  handed to the check account, so it can build, write caches and commit in it
+  as it would in the project. The worker is neither owner nor group of that
+  folder, so it cannot enter it.
+- **The reference check is readable by the check account and not the
+  worker.** Its programs (`check.py`, `second.py`, `driver.py`) and its
+  snapshot of the untouched project live in the same check folder, group the
+  check account, folders 750 and files 640.
+
+Checks that must run in the project itself run as the **worker**, because the
+tree is the worker's: a project's own `done.yml` command checks, a task check
+whose tree was too large to copy, and the mutation builtin's runs. They get
+the worker's scrubbed environment, and with `CAP_SYS_ADMIN` their own PID
+namespace and private /tmp per run too (a hidden check that fell back to
+running in place is not visible in the worker's process list). Nothing in the
+project is then made by Maat, so there is nothing to hand back.
+
+The check account's folder must be reachable: with the default state dir
+(`/var/lib/maat/<session>`), Maat opens `/var/lib/maat` to 711 when it made
+it (each session's own folder stays 700). With `MAAT_STATE_DIR`, a folder
+above it closed to the check account means the check account cannot be used
+(Maat says so; `--worker-strict` refuses). In sudo mode Maat cannot chown, so
+the check gets read-only copies and the default state dir under Maat's HOME
+(700) is not reachable: set `MAAT_STATE_DIR`.
+
+## `--worker-strict` and the isolation line
+
+`--worker-strict` refuses to start, with exit 2 and a message naming what is
+missing, unless all three are in place: the worker account, the check account
+(`--check-user` must be given and usable) and the PID namespace (for the
+worker, and for each check run with its private /tmp). It also refuses
+`MAAT_WORKER_PIDNS=0`.
+
+Without it, Maat carries on with whatever could be set up: a check account
+that cannot be used leaves the checks running as Maat, a missing namespace
+leaves the process list visible, and a worker account that cannot be used
+leaves the whole job unseparated (unless `MAAT_WORKER_PIDNS=1`, which still
+refuses). Each case is said on stderr. Every receipt and the journal (one
+`note` entry with `kind: "isolation"`) then carry one line with the isolation
+actually in effect, for example:
+
+```
+isolation: worker uid 1001, check uid 1002, pid namespace on
+isolation: worker uid 1001, check uid none (task checks run as Maat, uid 0), pid namespace off
+isolation: none (worker tools and checks run as Maat, uid 0: no such user: agent)
+```
+
+The line is there whenever `--worker-user` was given, strict or not, and
+absent otherwise.
 
 ## The process list
 
@@ -153,8 +239,10 @@ process entirely.
 
 `bench/local/container/run-in-container.sh` turns this on by default:
 
-- `run.py` runs Maat as root with `--worker-user agent`. `BENCH_PRIVSEP=0`
-  runs the whole of Maat as `agent`, as before.
+- `run.py` runs Maat as root with `--worker-user agent --check-user checker`.
+  The image has both users: `agent` (uid 1001) and `checker` (uid 1002, its
+  own group, no home). `BENCH_PRIVSEP=0` runs the whole of Maat as `agent`,
+  as before.
 - The container gets `--cap-add=SYS_ADMIN` for the PID namespace.
   `BENCH_PIDNS=0` drops it.
 - The worker's Grok credential is copied to `/home/agent/.grok`. A Grok
@@ -169,7 +257,10 @@ process entirely.
   is a host bind mount, and on OrbStack and Docker Desktop a bind mount
   ignores `chown` and does not enforce file modes for other users, so a lock
   placed there would not hold.
-- The graders and reference solutions stay root-only, as before.
+- The graders and reference solutions stay root-only, as before. The graders
+  (and `crosscheck.py`'s re-grades and check re-runs) work on a root-owned
+  copy whose repositories are cut to their format lines, without hooks or
+  attributes; nothing sets `safe.directory`.
 
 To check it from outside a running job:
 
@@ -178,13 +269,31 @@ docker exec maat-bench-<name> sh -c 'ls /var/lib/maat'
 docker exec maat-bench-<name> runuser -u agent -- cat /var/lib/maat/<session>/log/<file>   # Permission denied
 ```
 
-## What is still open
+## Known limitations
 
-- A worker with network access can still reach whatever the network lets it
-  reach. Privilege separation is about the local machine.
-- In sudo mode (Maat not root) there is no PID namespace. The worker's
-  environment is passed on sudo's command line (it is already scrubbed of
-  credentials).
+- **The network is shared between accounts.** The worker, the check account
+  and Maat use the same network. A check (which runs the worker's code) can
+  send what it can read, the reference check included, to anything it can
+  reach, and the worker can fetch it from there. Privilege separation is
+  about the local machine; run the container with no network, or a
+  restricted one, to close this.
+- **Snapshot and mutation code still read worker files by path.** Maat, as
+  root, copies the worker's tree for each check (`src/scratch.ts`), snapshots
+  it for the reference check (`snapshotProject`), lists it to see what a
+  command created, and the mutation builtin reads and rewrites source files
+  in the project by path. Those reads follow what the worker left there (a
+  symlink is copied as a symlink, but a mutation target is opened by name).
+  Only the hand-back walk and the records copy work by descriptor or as the
+  worker.
+- **The agent user's HOME and /tmp are shared between bench tasks in one
+  container.** Every task in a bench container runs its worker as the same
+  `agent` user, with the same `/home/agent` and the same `/tmp` (the worker's
+  own PID namespace has no private /tmp). A later task's worker can read what
+  an earlier one left there. Task folders and logs are locked after grading;
+  HOME and /tmp are not cleared between tasks.
+- In sudo mode (Maat not root) there is no PID namespace, for the worker or
+  the checks. The environment is passed on sudo's command line (already
+  scrubbed for the worker, allowlisted for checks).
 - The ACP worker's MCP connection to Maat's tools is a loopback port behind a
   per-session bearer token held by the worker's own agent. Through it the
   worker reaches only Maat's tools, which run as the worker.

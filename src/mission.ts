@@ -28,6 +28,8 @@ import { parse as parseYaml, stringify as toYaml } from "yaml";
 import { askModel, jsonIn, notJson, type AskOptions } from "./ask.js";
 import type { Engine } from "./engine.js";
 import { runCommand } from "./run.js";
+import { privSep } from "./privsep.js";
+import { copyTree } from "./scratch.js";
 import { diagnoseFailure } from "./bar.js";
 import type { Check, Confirm, EngineEvent, JobOutcome, Spend } from "./types.js";
 import { estTokens } from "./types.js";
@@ -451,23 +453,32 @@ export async function runAssertions(
     const a = byId.get(id);
     if (!a?.run) continue;
     const t0 = Date.now();
+    // With a check account (--check-user) an assertion is a task check like
+    // any other: it runs as that account in a copy of the tree, or as the
+    // worker in the tree itself when no copy can be taken. Without one it
+    // runs in place as Maat, as it always has.
+    const copy = privSep()?.check && process.env.MAAT_CHECK_COPY !== "0" ? await copyTree(cwd) : null;
     try {
       const r = await runCommand(a.run, {
-        cwd,
+        cwd: copy?.dir ?? cwd,
         timeoutMs: a.timeoutMs ?? DEFAULT_ASSERTION_TIMEOUT_MS,
         maxBuffer: 256 * 1024,
         signal,
+        asCheck: copy ? "copy" : "in-place",
       });
       const d = diagnoseFailure(r.code ?? 0, r.stdout, r.stderr);
+      const text = `${r.stdout}${r.stderr}`;
       out.push({
         id,
         ok: !r.timedOut && r.code === 0,
-        output: (r.timedOut ? "timed out\n" : "") + `${r.stdout}${r.stderr}`.slice(-4000),
+        output: (r.timedOut ? "timed out\n" : "") + (copy ? copy.unmap(text) : text).slice(-4000),
         didNotRun: d.didNotRun,
         ms: Date.now() - t0,
       });
     } catch (e) {
       out.push({ id, ok: false, output: String(e), didNotRun: true, ms: Date.now() - t0 });
+    } finally {
+      await copy?.cleanup();
     }
   }
   return out;
