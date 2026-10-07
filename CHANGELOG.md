@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- **`--review-executable`** (experimental, also `MAAT_REVIEW_EXECUTABLE=1`):
+  every `--review` objection must carry a read-only command that demonstrates
+  it. Maat runs it on a throwaway copy of the tree; an objection counts only
+  when its command exits non-zero or prints the value it named. Any non-zero
+  exit counts, so a demonstrated objection shows the command failed, not that
+  it tested what the objection says. With no copy of the tree available the
+  command is not run, and the objection is recorded as not counted.
+
 ### Changed
 
 - **OpenCode runs OpenCode Zen models only.** The OpenCode backend (worker and

@@ -19,7 +19,7 @@
  *  - Nothing is summarized by a model, ever.
  */
 import { bashPath, runCommand } from "./run.js";
-import { copyTree } from "./scratch.js";
+import { copyTreeOrWhy } from "./scratch.js";
 import { describeStart, listBackground, startBackground, stopBackground } from "./background.js";
 import { objectionLine, reviewClaim, type ExecutableReview, type ObjectionRun, type Review } from "./review.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
@@ -3606,21 +3606,32 @@ export class Engine {
    * Run one reviewer's objection command as a task check runs: in a throwaway
    * copy of the tree (src/scratch.ts), under bash, never past the turn's clock.
    * The command has already passed lint L15 (it does not change the work).
+   *
+   * Never on the work itself. A reviewer's command is written by a model that
+   * read the task text, which may be anyone's, and it exists to probe the
+   * work, not to protect it; the lint is a reading of the command, not a
+   * guarantee. With no copy (a worktree's .git pointer, a tree over the copy
+   * limits, MAAT_CHECK_COPY=0) the objection is not run and does not count:
+   * "could not be run safely".
    */
   private async runObjection(command: string): Promise<ObjectionRun> {
-    const copy = process.env.MAAT_CHECK_COPY === "0" ? null : copyTree(this.cwd);
+    const tried = process.env.MAAT_CHECK_COPY === "0" ? { why: "MAAT_CHECK_COPY=0 turns throwaway copies off" } : copyTreeOrWhy(this.cwd);
+    if ("why" in tried) {
+      return { code: null, stdout: "", stderr: "", notRun: `could not be run safely: no throwaway copy of the tree (${tried.why})` };
+    }
+    const copy = tried;
     try {
       const left = this.timeLeftMs();
       const r = await runCommand(command, {
-        cwd: copy?.dir ?? this.cwd,
+        cwd: copy.dir,
         shell: bashPath() ?? true,
         timeoutMs: left !== undefined ? Math.max(1_000, Math.min(30_000, left)) : 30_000,
         maxBuffer: 1024 * 1024,
       });
-      const fix = (t: string) => (copy ? copy.unmap(t) : t);
+      const fix = (t: string) => copy.unmap(t);
       return { code: r.code, stdout: fix(r.stdout), stderr: fix(r.stderr), timedOut: r.timedOut };
     } finally {
-      copy?.cleanup();
+      copy.cleanup();
     }
   }
 
@@ -3628,7 +3639,8 @@ export class Engine {
   private *unsubstantiated(review: Review | null): Generator<EngineEvent> {
     for (const o of review?.objections ?? []) {
       if (o.result === "demonstrated") continue;
-      yield { kind: "info", text: `unsubstantiated objection (reviewer ${o.vote}, not counted): ${objectionLine(o)}` };
+      // The reviewer's command and its output can quote a hidden check.
+      yield { kind: "info", text: this.maskWithheld(`unsubstantiated objection (reviewer ${o.vote}, not counted): ${objectionLine(o)}`) };
     }
   }
 

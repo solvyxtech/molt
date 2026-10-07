@@ -184,7 +184,14 @@ export type Objection = Violation & {
   why?: string;
 };
 
-export type ObjectionRun = { code: number | null; stdout: string; stderr: string; timedOut?: boolean };
+export type ObjectionRun = {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut?: boolean;
+  /** Not run at all, and why: there was no safe place to run it (no throwaway copy of the tree). */
+  notRun?: string;
+};
 
 /** How an executable review runs a command: on a throwaway copy of the tree (src/scratch.ts). */
 export type ExecutableReview = {
@@ -220,6 +227,7 @@ export function judgeObjectionRun(
   r: ObjectionRun,
   shows: string | undefined,
 ): { result: ObjectionResult; why?: string } {
+  if (r.notRun) return { result: "did-not-run", why: r.notRun };
   if (r.timedOut) return { result: "did-not-run", why: "the command timed out" };
   if (r.code === null) return { result: "did-not-run", why: "the command was killed" };
   if (r.code !== 0) {

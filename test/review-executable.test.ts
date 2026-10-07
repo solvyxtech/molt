@@ -4,7 +4,7 @@
  * with ran on the work and demonstrated the failure.
  */
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import { Engine } from "../src/engine.js";
 import { Receipts } from "../src/receipts.js";
@@ -127,6 +127,9 @@ describe("executable objections: reviewClaim", () => {
     assert.ok(systems.length === 3 && systems.every((s) => s === REVIEW_SYSTEM), "the off prompt is the one it always was");
     assert.notEqual(REVIEW_SYSTEM_EXECUTABLE, REVIEW_SYSTEM);
     assert.match(REVIEW_SYSTEM_EXECUTABLE, /"command"/);
+    // Built by dropping REVIEW_SYSTEM's reply-format block; an edit there must
+    // not leave the executable prompt with two reply formats.
+    assert.equal(REVIEW_SYSTEM_EXECUTABLE.split("Reply with JSON only").length - 1, 1);
   });
 });
 
@@ -193,6 +196,43 @@ describe("executable objections in a turn", () => {
       ws.cleanup();
     }
   });
+
+  for (const [what, setup] of [
+    ["a worktree's .git pointer", (dir: string) => writeFileSync(`${dir}/.git`, "gitdir: /nowhere/.git/worktrees/x\n")],
+    ["MAAT_CHECK_COPY=0", () => (process.env.MAAT_CHECK_COPY = "0")],
+  ] as const) {
+    it(`with no throwaway copy (${what}) an objection is never run on the work and does not count`, async () => {
+      const ws = workspace();
+      const was = process.env.MAAT_CHECK_COPY;
+      const marker = `/tmp/maat-objection-ran-${process.pid}-${Date.now()}`;
+      try {
+        setup(ws.dir);
+        // Would demonstrate (it fails on the work) — if it ran. The marker says whether it did.
+        const v = objection(`echo ran >> ${marker}; test "$(wc -l < out.txt)" -eq 365`);
+        const { engine } = engineFor(ws.dir, [
+          { calls: [{ name: "write_file", args: { path: "out.txt", content: "x\n" } }] },
+          { text: "Wrote out.txt." },
+          { text: v }, { text: v }, { text: v },
+        ], true);
+        const events = await drain(engine.run(TASK, allowAll, { taskChecks: [check] }));
+        assert.equal(existsSync(marker), false, "the objection's command ran");
+        const end = events.find((e) => e.kind === "job_end");
+        assert.ok(end && end.kind === "job_end");
+        assert.equal(end.outcome, "verified");
+        assert.deepEqual([end.review?.confirmed, end.review?.votes], [true, "0/3"]);
+        assert.equal(end.review?.objections?.length, 3);
+        for (const o of end.review?.objections ?? []) {
+          assert.equal(o.result, "did-not-run");
+          assert.match(o.why ?? "", /could not be run safely: no throwaway copy of the tree/);
+        }
+      } finally {
+        if (was === undefined) delete process.env.MAAT_CHECK_COPY;
+        else process.env.MAAT_CHECK_COPY = was;
+        rmSync(marker, { force: true });
+        ws.cleanup();
+      }
+    });
+  }
 
   it("with the option off a turn is unchanged: prose objections veto and nothing is run or recorded", async () => {
     const ws = workspace();
