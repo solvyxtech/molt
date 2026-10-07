@@ -545,7 +545,9 @@ export class Receipts {
     const rows = args.result.results.map((r) => {
       // The finding, not the label. "pass" is a header; "2 files modified and
       // verified byte-for-byte on disk" is the reason to believe it.
-      const finding = r.output.trim().split("\n")[0]?.slice(0, 90) ?? "";
+      // Masked before it is cut and escaped: a cut command is a prefix, and an
+      // escaped `\|` is not the command's `|`; neither matches the mask after.
+      const finding = maskText(r.output.trim(), this.withheld).split("\n")[0]?.slice(0, 90) ?? "";
       // "did not run" is not a softer FAIL, it is a different fact: the
       // command was never executed, so this row is evidence of nothing. A
       // receipt that prints it as a failure invites the reader to believe
@@ -595,6 +597,7 @@ export class Receipts {
         `check: ${r.name}`,
         `kind: ${r.kind}`,
         `command: ${r.detail}`,
+        ...(r.ranInPlace ? [`ran in place: no throwaway copy of the tree — ${r.ranInPlace}`] : []),
         `exit: ${r.exitCode ?? "n/a"}`,
         `result: ${
           r.skipped

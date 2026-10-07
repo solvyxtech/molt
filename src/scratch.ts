@@ -8,7 +8,10 @@
  * (src/checkwrites.ts) catches the commands it can read; this is the half
  * that does not depend on reading them. Each task check runs in a fresh copy
  * of the tree, `.git` included, and the copy is deleted afterwards, so what
- * a check writes, moves or commits never reaches the work it is judging.
+ * a check writes, moves or commits in the project's own files and history
+ * never reaches the work it is judging. Linked dependency folders (below)
+ * are the exception: they are the real folders, so a check that installs
+ * into `node_modules` or builds into `target` still writes there.
  *
  * Cost is kept down three ways:
  *  - files are cloned where the filesystem can (APFS, btrfs, XFS reflinks),
@@ -21,8 +24,8 @@
  *    read from the original, and git never deletes from an alternate.
  * A tree too big to copy within the limits below (or a `.git` that is a
  * pointer file, as in a worktree, which a copy cannot detach from) runs in
- * place, as every check did before this existed; `copyTree` returns null and
- * the caller says so.
+ * place, as every check did before this existed; `copyTree` returns null,
+ * `whyNoCopy` says why, and the caller records it on the result.
  */
 import {
   constants,
@@ -139,6 +142,15 @@ function countUpTo(root: string, cap: number): number {
  * the limits or cannot be copied; the caller then runs in place.
  */
 export function copyTree(root: string, limits: { maxFiles?: number; maxBytes?: number } = {}): TreeCopy | null {
+  const r = copyTreeOrWhy(root, limits);
+  return "why" in r ? null : r;
+}
+
+/** Why the last tree had no copy, for a caller that got null. */
+export function copyTreeOrWhy(
+  root: string,
+  limits: { maxFiles?: number; maxBytes?: number } = {},
+): TreeCopy | { why: string } {
   const t0 = Date.now();
   const maxFiles = limits.maxFiles ?? COPY_MAX_FILES;
   const maxBytes = limits.maxBytes ?? COPY_MAX_BYTES;
@@ -148,15 +160,15 @@ export function copyTree(root: string, limits: { maxFiles?: number; maxBytes?: n
   } catch {
     /* no .git */
   }
-  if (gitLink) return null;
+  if (gitLink) return { why: "its .git is a pointer file (a worktree or submodule), which a copy cannot detach from" };
   // Counted first, names only: a tree over the limit is found out in a
   // fraction of what copying up to the limit and throwing it away costs.
-  if (countUpTo(root, maxFiles) > maxFiles) return null;
+  if (countUpTo(root, maxFiles) > maxFiles) return { why: `the tree has over ${maxFiles} files` };
   let tmp: string;
   try {
     tmp = mkdtempSync(join(tmpdir(), "maat-check-"));
-  } catch {
-    return null;
+  } catch (e) {
+    return { why: `no temporary directory (${e instanceof Error ? e.message : String(e)})` };
   }
   const dest = join(tmp, basename(root) || "work");
   let files = 0;
@@ -228,9 +240,13 @@ export function copyTree(root: string, limits: { maxFiles?: number; maxBytes?: n
   };
   try {
     copyDir(root, dest, true, false);
-  } catch {
+  } catch (e) {
     cleanup();
-    return null;
+    return {
+      why: e instanceof TooBig
+        ? `the tree is over ${maxFiles} files or ${Math.round(maxBytes / 1024 / 1024)} MB`
+        : `the copy failed (${e instanceof Error ? e.message : String(e)})`,
+    };
   }
   let realDest = dest;
   let realRoot = root;

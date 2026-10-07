@@ -50,6 +50,11 @@ export function maskText(text: string, list: readonly string[]): string {
     // A multi-line command can be printed trimmed, or with its lines joined.
     const t = s.trim();
     if (t !== s && t.length >= WITHHELD_MIN_CHARS && out.includes(t)) out = out.split(t).join(WITHHELD);
+    // In a markdown table cell a command's `|` is written `\|`.
+    if (s.includes("|")) {
+      const esc = s.replace(/\|/g, "\\|");
+      if (out.includes(esc)) out = out.split(esc).join(WITHHELD);
+    }
   }
   return out;
 }

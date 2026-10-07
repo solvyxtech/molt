@@ -94,6 +94,33 @@ function tempVars(cmd: string): Set<string> {
   return out;
 }
 
+/**
+ * The value a shell gives one word: single quotes kept verbatim, double
+ * quotes with their backslash escapes undone, bare backslashes dropped.
+ * Enough to read a `bash -c '…'` payload; not a full shell.
+ */
+function shellWordValue(word: string): string {
+  let out = "";
+  for (let i = 0; i < word.length; i++) {
+    const ch = word[i]!;
+    if (ch === "'") {
+      const end = word.indexOf("'", i + 1);
+      out += word.slice(i + 1, end < 0 ? word.length : end);
+      i = end < 0 ? word.length : end;
+    } else if (ch === '"') {
+      let j = i + 1;
+      for (; j < word.length && word[j] !== '"'; j++) {
+        if (word[j] === "\\" && /["\\$`]/.test(word[j + 1] ?? "")) j++;
+        out += word[j];
+      }
+      i = j;
+    } else if (ch === "\\") {
+      out += word[++i] ?? "";
+    } else out += ch;
+  }
+  return out;
+}
+
 function unquote(word: string): string {
   return word.replace(/^(["'])(.*)\1$/s, "$2").replace(/["']/g, "");
 }
@@ -163,9 +190,12 @@ const isFlag = (w: string) => /^-/.test(w);
  * Why this command would change the work, or null when it only reads (as far
  * as reading the command can tell).
  */
-export function checkMutates(cmd: string): string | null {
+export function checkMutates(cmd: string, outer?: { temps: Set<string>; depth: number }): string | null {
   const masked = maskQuoted(cmd);
   const temps = tempVars(cmd);
+  // A nested shell sees the variables the outer command filled from mktemp.
+  for (const t of outer?.temps ?? []) temps.add(t);
+  const depth = outer?.depth ?? 0;
 
   // Where the command has `cd`-ed into a scratch directory, and for how long:
   // a subshell's cd ends with the subshell.
@@ -227,6 +257,15 @@ export function checkMutates(cmd: string): string | null {
         return `it writes to ${unquote(target)} with a redirect; a check only reads (write to a mktemp directory instead)`;
       }
     }
+    // Input redirects (`< file`, `<< EOF`, `<<< word`) only read, and their
+    // target is not an operand: `xargs rm < files.txt` deletes what the file
+    // lists, not a file called `<`.
+    for (const r of seg.masked.matchAll(/(\d*)(<<<|<<-?|<)(?![<>&(])(\s*)/g)) {
+      const start = (r.index ?? 0) + r[0].length;
+      const tm = /^\S+/.exec(seg.masked.slice(start));
+      const end = start + (tm ? tm[0].length : 0);
+      for (let k = r.index ?? 0; k < end; k++) consumed.add(k);
+    }
     // The words of the command, without its redirects.
     const keptRaw = seg.raw.split("").map((c, k) => (consumed.has(k) ? " " : c)).join("");
     const keptMasked = seg.masked.split("").map((c, k) => (consumed.has(k) ? " " : c)).join("");
@@ -268,6 +307,22 @@ export function checkMutates(cmd: string): string | null {
     const quoteOne = (w: Word | undefined) => (w ? unquote(w.text) : "its input");
     // xargs supplies the operands from a pipe: nothing can be said about them.
     const allScratch = (ops: Word[]) => !viaXargs && ops.every(scratch);
+
+    // A shell run on a string, and eval: the payload is a command of its own,
+    // quoted here and so invisible to everything above. Read it the same way.
+    if (!here && depth < 4) {
+      let payload: string | undefined;
+      if (/^(ba|da|z|k)?sh$/.test(name)) {
+        const c = args.findIndex((a) => /^-[a-zA-Z]*c[a-zA-Z]*$/.test(a.text));
+        if (c >= 0 && args[c + 1]) payload = shellWordValue(args[c + 1]!.text);
+      } else if (name === "eval") {
+        payload = args.map((a) => shellWordValue(a.text)).join(" ");
+      }
+      if (payload !== undefined && payload.trim()) {
+        const inner = checkMutates(payload, { temps, depth: depth + 1 });
+        if (inner) return `${inner} (inside \`${name === "eval" ? "eval" : `${name} -c`}\`)`;
+      }
+    }
 
     switch (name) {
       case "rm":

@@ -19,7 +19,8 @@ import { assertionsIn, fingerprint, isTestPath, treeChanges, type TreeSnapshot }
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { copyTree, runsInCopy } from "./scratch.js";
+import { copyTreeOrWhy, runsInCopy } from "./scratch.js";
+import { maskText } from "./withhold.js";
 import { dirname, join, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { ArchiveLike } from "./archive.js";
@@ -2180,7 +2181,11 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
   let timedOut = false;
   // A task check runs in a throwaway copy of the tree, so a check that writes,
   // commits or deletes cannot change the work it judges (src/scratch.ts).
-  const copy = runsInCopy(check) ? copyTree(ctx.cwd) : null;
+  const tried = runsInCopy(check) ? copyTreeOrWhy(ctx.cwd) : null;
+  const copy = tried && !("why" in tried) ? tried : null;
+  // Said on the result (and so in the receipt and the journal's bar_run), not
+  // left silent: this check ran on the work itself.
+  const ranInPlace = tried && "why" in tried ? tried.why : undefined;
   try {
     // Not execSync: a bar check is the longest thing molt runs (`npm test`,
     // two minutes by default) and running it synchronously froze the terminal
@@ -2229,6 +2234,7 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
     ...(check.hidden ? { hidden: true } : {}),
     ...(diagnosis.didNotRun ? { didNotRun: true } : {}),
     ...(timedOut ? { timedOut: true } : {}),
+    ...(ranInPlace ? { ranInPlace } : {}),
     tags: check.tags,
     kind: "command",
     detail: check.run,
@@ -2242,7 +2248,10 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
       ? // A hidden check is named, not quoted: this line is cut to fit a receipt's
         // table, and a cut command is a prefix no mask can match (src/withhold.ts).
         `\`${check.hidden ? check.name : check.run}\` exited ${exitCode} in ${Date.now() - t0}ms`
-      : truncate(output),
+      : // A failing hidden check whose output echoes its own command (a shell's
+        // `line 1: …`, `set -x`, a runner printing its argv) is masked before
+        // the cut, for the same reason.
+        truncate(check.hidden ? maskText(output, [check.run]) : output),
     durationMs: Date.now() - t0,
   };
 }

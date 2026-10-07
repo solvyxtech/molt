@@ -24,8 +24,8 @@ import { preflightCriteria } from "../src/criteria.js";
 import { checkMutates } from "../src/checkwrites.js";
 import { lintAll } from "../src/checklint.js";
 import { copyTree } from "../src/scratch.js";
-import { WITHHELD } from "../src/withhold.js";
-import type { Check, EngineEvent } from "../src/types.js";
+import { WITHHELD, maskText } from "../src/withhold.js";
+import type { BarResult, Check, CheckResult, EngineEvent } from "../src/types.js";
 import { allowAll, scriptedProvider, workspace } from "./helpers.js";
 
 const TASK = "Write out.txt containing the greeting the release notes ask for.";
@@ -173,6 +173,52 @@ describe("hidden checks are not on disk while the job runs", () => {
   });
 });
 
+describe("a hidden command is masked before it is cut or escaped", () => {
+  // A command with a pipe, long enough that the receipt's 90-character cell
+  // cuts it: the cut leaves a prefix, and the cell escapes `|` to `\|`.
+  const CMD = "python3 -c 'import sys; print(sys.argv)' zebra-quantum-42 | grep -q 'zebra-quantum-42' && test -s out.txt && echo ok-long-tail";
+
+  it("maskText matches a command whose pipes were escaped for a table", () => {
+    assert.equal(maskText(`| x | ${CMD.replace(/\|/g, "\\|")} |`, [CMD]), `| x | ${WITHHELD} |`);
+  });
+
+  it("a failing hidden check whose output echoes its command shows the mask, not a prefix", async () => {
+    const ws = workspace();
+    try {
+      const run = `cat echo.txt; exit 1; # ${CMD}`;
+      writeFileSync(join(ws.dir, "echo.txt"), `bash: line 1: ${run}\n`);
+      const ctx = { cwd: ws.dir, record: [], ledger: [], archivedBatches: 0 } as unknown as BarContext;
+      const r = await runCheck({ name: "task:echo", kind: "command", run, timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true }, ctx);
+      assert.equal(r.ok, false);
+      assert.ok(r.output.includes(WITHHELD), r.output);
+      assert.ok(!r.output.includes("zebra-quantum-42"), r.output);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("a receipt's table cell is masked before the cut and the escape", () => {
+    const ws = workspace();
+    try {
+      const receipts = new Receipts(ws.dir);
+      receipts.withhold([CMD]);
+      const failed: CheckResult = {
+        name: "task:greets", hidden: true, kind: "command", detail: CMD, ok: false, exitCode: 1, durationMs: 3,
+        output: `${CMD}\n`,
+      } as CheckResult;
+      const result = { ok: false, results: [failed], durationMs: 3 } as unknown as BarResult;
+      const rec = receipts.write({ claim: "done", result, attempt: 0, verdict: "refused", model: "m", provider: "p", sessionTokens: 0, shedBatches: 0 });
+      const text = readFileSync(rec.path, "utf8");
+      assert.ok(!text.includes("zebra-quantum-42"), text);
+      assert.ok(!text.includes("python3 -c 'import sys"), "no prefix of the command survives the cut");
+      const index = readFileSync(join(ws.dir, ".maat", "receipts", "index.jsonl"), "utf8");
+      assert.ok(!index.includes("zebra-quantum-42"), index);
+    } finally {
+      ws.cleanup();
+    }
+  });
+});
+
 describe("checks cannot change the work", () => {
   const MUTATING: [string, string][] = [
     ["git checkout", "git checkout master && git merge --no-ff -m 'Merge about page changes' about.md"],
@@ -192,6 +238,10 @@ describe("checks cannot change the work", () => {
     ["python -m pip install", "python3 -m pip install -q pytest"],
     ["npm install", "npm install && npm test"],
     ["apt-get install", "apt-get install -y jq"],
+    ["git checkout inside bash -c", "bash -c 'git checkout main' && grep -q x a.txt"],
+    ["rm inside sh -c", 'sh -c "rm -rf src"'],
+    ["a write inside eval", "eval 'echo x > notes.md'"],
+    ["a nested bash -c", `bash -c "sh -c 'git merge feature'"`],
   ];
   for (const [what, run] of MUTATING) {
     it(`the lint flags ${what}`, () => {
@@ -212,15 +262,30 @@ describe("checks cannot change the work", () => {
       "t=$(mktemp -d) && git clone -q . \"$t/r\" && cd \"$t/r\" && git merge -q feature && grep -q x a.txt",
       "python3 app.py 2>&1 >/dev/null | grep -q Traceback; test $? -eq 1",
       "python3 wc.py | tee /dev/null | grep -q 3",
+      "bash -c 'grep -q x a.txt && git log -1'",
+      "d=$(mktemp -d) && bash -c \"echo x > $d/out\" && test -s \"$d/out\"",
+      "eval 'test -f a.txt'",
     ]) {
       assert.equal(checkMutates(run), null, run);
     }
+  });
+
+  it("says which shell a nested write is in, and reads xargs input as input", () => {
+    assert.match(checkMutates("bash -c 'git checkout main'") ?? "", /git checkout.*inside `bash -c`/);
+    assert.match(checkMutates("eval 'rm -f a.txt'") ?? "", /deletes a\.txt.*inside `eval`/);
+    assert.equal(checkMutates("xargs rm < files.txt"), "it deletes its input (`rm`); a check only reads");
+    assert.equal(checkMutates("grep -c x < a.txt"), null);
   });
 
   function repo(): { dir: string; cleanup: () => void } {
     const ws = workspace();
     const git = (...a: string[]) => execFileSync("git", a, { cwd: ws.dir, stdio: "ignore", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
     git("init", "-q", "-b", "master");
+    // The checks below commit and merge with the ambient environment. On a
+    // machine with no global git identity that failed ("Committer identity
+    // unknown"); the repo's own config is copied into the throwaway tree.
+    git("config", "user.name", "t");
+    git("config", "user.email", "t@t");
     writeFileSync(join(ws.dir, "about.md"), "# About\nI am a student.\n");
     writeFileSync(join(ws.dir, "index.md"), "welcome\n");
     mkdirSync(join(ws.dir, "docs"));
@@ -263,6 +328,25 @@ describe("checks cannot change the work", () => {
       const before = treeHash(ws.dir);
       await preflightCriteria([{ name: "task:merged", kind: "command", run: MUTATOR, expectExit: 0 }], { cwd: ws.dir, timeoutMs: 20_000 });
       assert.equal(treeHash(ws.dir), before);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("a task check with no throwaway copy says it ran in place, in the result and the receipt", async () => {
+    const ws = workspace();
+    try {
+      // A worktree's .git is a pointer file, which a copy cannot detach from.
+      writeFileSync(join(ws.dir, ".git"), "gitdir: /nowhere/.git/worktrees/x\n");
+      const ctx = { cwd: ws.dir, record: [], ledger: [], archivedBatches: 0 } as unknown as BarContext;
+      const r = await runCheck({ name: "task:reads", kind: "command", run: "true", timeoutMs: 5_000, expectExit: 0, tags: ["task"] }, ctx);
+      assert.equal(r.ok, true);
+      assert.match(r.ranInPlace ?? "", /pointer file/);
+      const receipts = new Receipts(ws.dir);
+      const rec = receipts.write({ claim: "done", result: { ok: true, results: [r], durationMs: 1 } as unknown as BarResult, attempt: 0, verdict: "accepted", model: "m", provider: "p", sessionTokens: 0, shedBatches: 0 });
+      assert.match(readFileSync(rec.path, "utf8"), /ran in place: no throwaway copy of the tree — .*pointer file/);
+      const plain = await runCheck({ name: "build", kind: "command", run: "true", timeoutMs: 5_000, expectExit: 0, tags: [] }, ctx);
+      assert.equal(plain.ranInPlace, undefined, "a project check is meant to run in place, and says nothing");
     } finally {
       ws.cleanup();
     }

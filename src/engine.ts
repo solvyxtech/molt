@@ -5602,7 +5602,9 @@ export class Engine {
             ? "the reference check failed in its own code"
             : (checkSelfError(r.output) ?? "");
         retired.set(bare(r.name), { name: bare(r.name), upheld: true, votes: timeout ? "timeout" : "own error", reason: why });
-        log?.append("note", { text: `check ${bare(r.name)} retired: ${why}`, output: r.output.slice(-500) });
+        // Masked before the cut: the journal masks what it writes, but not a
+        // command whose start the slice has already dropped.
+        log?.append("note", { text: `check ${bare(r.name)} retired: ${why}`, output: self.maskWithheld(r.output).slice(-500) });
         yield {
           kind: "info",
           text: timeout
@@ -5660,6 +5662,7 @@ export class Engine {
         endedBy: why,
         checks: result.results.map((r) => ({
           name: r.name, kind: r.kind, detail: r.detail, ok: r.ok, exitCode: r.exitCode ?? null, ms: r.durationMs, cached: r.cached === true,
+          ...(r.ranInPlace ? { ranInPlace: r.ranInPlace } : {}),
         })),
       });
       const undetermined =
@@ -7362,6 +7365,8 @@ export class Engine {
           // A reused result is evidence of a different kind, and the record
           // has to say which kind it is.
           cached: r.cached === true,
+          // A task check that ran on the work itself, not a throwaway copy.
+          ...(r.ranInPlace ? { ranInPlace: r.ranInPlace } : {}),
         })),
       });
       // A bar failing in exactly the same way it failed last time is a bar the

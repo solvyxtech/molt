@@ -301,6 +301,12 @@ export type CheckResult = {
   /** Carried from the check: the command is withheld from the model. */
   hidden?: boolean;
   /**
+   * A task check that should have run in a throwaway copy of the tree ran in
+   * the project itself, and why (src/scratch.ts). What it wrote, it wrote to
+   * the work.
+   */
+  ranInPlace?: string;
+  /**
    * True when this result was reused rather than re-run.
    *
    * Surfaced everywhere a result is, because a reused pass presented as a
