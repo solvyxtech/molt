@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { MIN_SECRET_CHARS, redact } from "./redact.js";
 import type { BarResult, CheckAuthor } from "./types.js";
-import { authorWords, claimLabel, resultAuthorWords } from "./tiers.js";
+import { authorWords, claimLabel, noteCoverage, resultAuthorWords, UNTESTED_CLAIM, type Tier } from "./tiers.js";
 import { stateDir } from "./statedir.js";
 import { WITHHELD, maskDeep, maskText } from "./withhold.js";
 
@@ -86,7 +86,7 @@ export type ReceiptRecord = {
    * (`amendTier`), so the index row is the last word and the receipt file,
    * hash-bound when it was written, is never rewritten.
    */
-  tier?: "verified" | "passed-checks" | "passed-own-checks";
+  tier?: Tier;
   tierReason?: string;
   /** The claim in words (src/tiers.ts claimLabel), e.g. "verified (independent checks: m)". */
   claim?: string;
@@ -372,7 +372,7 @@ export class Receipts {
     /** True when that figure rests on molt's own token estimate. */
     costEstimated?: boolean;
     /** The tier the passing checks earned, before any independent review (src/tiers.ts). */
-    tier?: { tier: "verified" | "passed-checks" | "passed-own-checks"; reason?: string; evidence: string; basis?: "person" | "independent" | "own"; by?: string[]; worker?: string };
+    tier?: { tier: Tier; reason?: string; evidence: string; basis?: "person" | "independent" | "own"; by?: string[]; worker?: string };
     /**
      * Who wrote each check, by check name, recorded at seal time: the worker
      * model, a separate judge, a person, or the reference writer. A check not
@@ -450,8 +450,16 @@ export class Receipts {
         ? `\n\nEvidence: ${args.tier.evidence}. A passing check of this class earns the word "verified".`
         : args.tier.tier === "passed-own-checks"
           ? `\n\nPassed own checks, not verified: ${args.tier.reason}. A model never judges its own work; a check from a person or another model is needed for "verified".`
-          : `\n\nPassed its checks, not verified: ${args.tier.reason}. The strongest passing check is ${args.tier.evidence}.`;
-      verdictLine += `\n\nClaim: ${args.tier.tier === "passed-checks" ? "passed its checks, not verified" : claimLabel("verified", args.tier)}.`;
+          : args.tier.tier === "passed-untested"
+            ? `\n\nPassed checks that did not test this work, not verified: ${args.tier.reason}. A check that passes on the tree as it was before the work cannot tell this work from none; "verified" needs one that failed before the work and passes now.`
+            : `\n\nPassed its checks, not verified: ${args.tier.reason}. The strongest passing check is ${args.tier.evidence}.`;
+      verdictLine += `\n\nClaim: ${
+        args.tier.tier === "passed-checks"
+          ? "passed its checks, not verified"
+          : args.tier.tier === "passed-untested"
+            ? UNTESTED_CLAIM
+            : claimLabel("verified", args.tier)
+      }.`;
     }
     if (args.revealed?.length) {
       verdictLine += `\n\nThe command of ${args.revealed.map((n) => `\`${n}\``).join(", ")} was shown to the model after it failed the same way twice; the work was judged against a check the model had read.`;
@@ -486,8 +494,29 @@ export class Receipts {
           "because they were asked for, and Maat will not report them as met:",
           "",
         );
-        for (const n of task.notes) asked.push(`- ${n}`);
-        asked.push("");
+        // Coverage, display only: which of these a check that failed before
+        // the work and passes now plausibly speaks to, matched by shared words.
+        const disc = args.result.results.filter((r) => r.ok && r.beforeWork === "failed");
+        const commandOf = (name: string) => {
+          const bare = name.replace(/^task:/, "");
+          const line = task.checks.find((c) => c === bare || c.startsWith(`${bare}: `) || c === name || c.startsWith(`${name}: `));
+          return line ? line.slice(line.indexOf(": ") + 2) : "";
+        };
+        const cover = noteCoverage(task.notes, disc.map((r) => ({ name: r.name, text: `${commandOf(r.name)} ${r.detail ?? ""}` })));
+        for (const c of cover) {
+          asked.push(
+            `- ${c.note} — ${
+              c.by.length
+                ? `plausibly covered by ${c.by.map((b) => `\`${b}\``).join(", ")}, which failed before the work and passes now`
+                : "not matched to any check that failed before the work and passes now"
+            }`,
+          );
+        }
+        asked.push(
+          "",
+          "Coverage is matched by shared words, for the reader only; it gates nothing.",
+          "",
+        );
       }
     }
 
@@ -613,6 +642,17 @@ export class Receipts {
         `check: ${r.name}`,
         `kind: ${r.kind}`,
         `written by: ${resultAuthorWords(r, args.authors?.[r.name])}`,
+        ...(r.beforeWork
+          ? [
+              `before the work: ${
+                r.beforeWork === "failed"
+                  ? "failed (this check can tell the work from none)"
+                  : r.beforeWork === "passed"
+                    ? "passed (a guard: it cannot tell the work from none)"
+                    : "not tried (it could not run then, or joined later), so it cannot tell the work from none"
+              }`,
+            ]
+          : []),
         `command: ${r.detail}`,
         ...(r.ranInPlace ? [`ran in place: no throwaway copy of the tree — ${r.ranInPlace}`] : []),
         `exit: ${r.exitCode ?? "n/a"}`,
@@ -740,7 +780,7 @@ export class Receipts {
    * is hash-bound and stays byte for byte as written. A row that is not
    * there, or an index that cannot be read, is left alone.
    */
-  amendTier(file: string, tier: { tier: "verified" | "passed-checks" | "passed-own-checks"; reason?: string; claim?: string }): boolean {
+  amendTier(file: string, tier: { tier: Tier; reason?: string; claim?: string }): boolean {
     try {
       if (!existsSync(this.indexPath)) return false;
       let hit = false;

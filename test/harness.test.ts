@@ -488,7 +488,7 @@ describe("self-checked work", () => {
     const ws = workspace();
     try {
       const hidden = { name: "own", kind: "command" as const, run: "grep -qx x x.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: { kind: "judge" as const, model: "judge-j" } };
-      const shown = { ...hidden, name: "chosen", hidden: undefined };
+      const shown = { ...hidden, name: "chosen", hidden: undefined, author: { kind: "person" as const } };
       const a = engineFor(ws.dir, [{ calls: [{ name: "write_file", args: { path: "x.txt", content: "x" } }] }, { text: "done" }]);
       const ea = await drain(a.engine.run("make x", allowAll, { taskChecks: [hidden] }));
       const ja = ea.find((e) => e.kind === "job_end");

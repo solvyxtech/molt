@@ -1,7 +1,8 @@
 /**
  * Experimental review-advisory mode (`--review-advisory`, MAAT_REVIEW_ADVISORY=1):
- * the review is recorded and does not gate; "verified" additionally needs a
- * drafted runs+value check that did not already pass before the work.
+ * the review is recorded and does not gate. The rule that "verified" needs a
+ * drafted runs+value check that failed before the work holds here as in
+ * every mode.
  * Default behaviour is pinned beside it.
  */
 import assert from "node:assert/strict";
@@ -13,7 +14,11 @@ describe("tierOf, review advisory", () => {
   const ck = (name: string, tags: string[]) => ({ name, ok: true, hidden: true as const, tags });
   const strong = ck("task:counts", ["task", "value"]);
   // Drafted by a separate judge; tierOf's authorship rule has its own tests (independent-checks.test.ts).
-  const J = { worker: "worker-m", authors: new Map(["task:counts", "task:other", "task:a"].map((n) => [n, { kind: "judge" as const, model: "judge-j" }])) };
+  const J = {
+    worker: "worker-m",
+    authors: new Map(["task:counts", "task:other", "task:a"].map((n) => [n, { kind: "judge" as const, model: "judge-j" }])),
+    failedBefore: new Set(["task:counts", "task:other", "task:a"]),
+  };
 
   it("the review is recorded and does not gate", () => {
     const review = { votes: "2/3", violations: [] };
@@ -25,14 +30,16 @@ describe("tierOf, review advisory", () => {
     assert.equal(tierOf({ ...J, results: [strong], unreviewed: true }).tier, "passed-checks", "default unchanged");
   });
 
-  it("needs a value check that did not already pass before the work", () => {
+  it("needs a value check that failed before the work, in this mode as in every other", () => {
     const guards = new Set(["task:counts"]);
-    assert.equal(tierOf({ ...J, results: [strong], guards }).tier, "verified", "off by default: guards are ignored");
-    const r = tierOf({ ...J, results: [strong], guards, reviewAdvisory: true });
-    assert.equal(r.tier, "passed-checks");
-    assert.match(r.reason!, /also passed before the work/);
-    const two = tierOf({ ...J, results: [strong, ck("task:other", ["task", "value"])], guards, reviewAdvisory: true });
-    assert.equal(two.tier, "verified", "another value check that failed on the pristine tree carries it");
+    const failedBefore = new Set(["task:other"]);
+    for (const reviewAdvisory of [false, true]) {
+      const r = tierOf({ ...J, results: [strong], guards, failedBefore, reviewAdvisory });
+      assert.equal(r.tier, "passed-untested");
+      assert.match(r.reason!, /`task:counts` passed before the work began too/);
+      const two = tierOf({ ...J, results: [strong, ck("task:other", ["task", "value"])], guards, failedBefore, reviewAdvisory });
+      assert.equal(two.tier, "verified", "another value check that failed on the pristine tree carries it");
+    }
   });
 
   it("a surface-only or value-less pass is still not verified", () => {

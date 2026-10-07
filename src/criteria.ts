@@ -304,6 +304,15 @@ export async function preflightCriteria(
      */
     passed?: string[];
     /**
+     * Filled with the names of criteria that RAN before the work and did not
+     * pass: they parsed, executed, did not err in their own code, and exited
+     * otherwise than expected (or ran out of time). Only such a criterion can
+     * tell the finished task from the untouched tree (src/tiers.ts
+     * `failedBefore`). One that was broken, skipped or could not be spawned is
+     * in neither list: it was not tried.
+     */
+    failed?: string[];
+    /**
      * Set for DRAFTED checks: a command that reaches for an absolute path
      * outside the project (see strayPath) is reported broken without being
      * run. The task text is where a path the person stated is allowed from.
@@ -347,6 +356,7 @@ export async function preflightCriteria(
       else if (unparsed) {
         broken.push({ name: c.name, run: c.run, why: `the shell could not parse it: ${firstLine(copy ? copy.unmap(r.stderr) : r.stderr)}` });
       } else if (selfError) broken.push({ name: c.name, run: c.run, why: selfError }); else if (!r.timedOut && r.code === (c.expectExit ?? 0)) opts.passed?.push(c.name);
+      else opts.failed?.push(c.name);
     } catch {
       // Failing to spawn it here is molt's problem, not the criterion's.
       // Reporting it as broken would block work for the wrong reason.

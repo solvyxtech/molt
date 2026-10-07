@@ -56,7 +56,7 @@ async function provider(): Promise<string> {
  * criteria drafter gets one check that the work satisfies, and the critic
  * judges it a real run of the deliverable.
  */
-async function draftingProvider(): Promise<string> {
+async function draftingProvider(check = "[ \"$(cat a.txt)\" = \"a\" ]"): Promise<string> {
   let n = 0;
   const server: Server = createServer((req, res) => {
     let body = "";
@@ -67,7 +67,7 @@ async function draftingProvider(): Promise<string> {
         res.end(JSON.stringify({ choices: [{ message: content, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 5 } }));
       };
       if (body.includes("You draft acceptance criteria")) {
-        return reply({ role: "assistant", content: JSON.stringify({ checks: [{ name: "made", run: "[ \"$(cat a.txt)\" = \"a\" ]" }], notes: [] }) });
+        return reply({ role: "assistant", content: JSON.stringify({ checks: [{ name: "made", run: check }], notes: [] }) });
       }
       if (body.includes("You review acceptance checks")) {
         return reply({ role: "assistant", content: JSON.stringify({ checks: [{ name: "made", verdict: "runs", quote: "" }] }) });
@@ -166,6 +166,13 @@ describe("molt run's exit code", () => {
     const same = await molt(["run", "write a.txt", "--url", url, "--model", "m", "--key", "k",
       "--cwd", project(), "--no-stream", "--yes", "--criteria", "auto", "--judge", "openrouter/m:free"]);
     assert.equal(same, 3);
+  });
+
+  it("is 3 when the only independent check met also passed before the work (it did not test this work)", async () => {
+    const url = await draftingProvider("[ \"$(echo a)\" = \"a\" ]");
+    const code = await molt(["run", "write a.txt", "--url", url, "--model", "m", "--key", "k",
+      "--cwd", project(), "--no-stream", "--yes", "--criteria", "auto", "--judge", "j"]);
+    assert.equal(code, 3);
   });
 
   it("is 3 when required checks were left out, not 1 as though something failed", async () => {

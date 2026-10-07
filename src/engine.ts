@@ -22,7 +22,7 @@ import { runCommand } from "./run.js";
 import { describeStart, listBackground, startBackground, stopBackground } from "./background.js";
 import { reviewClaim, type Review } from "./review.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
-import { authorKey, authorWords, claimLabel, tierOf, withAuthor } from "./tiers.js";
+import { authorKey, authorWords, claimLabel, tierOf, withAuthor, type Tier } from "./tiers.js";
 import { recordGoldens, valueUnproven } from "./golden.js";
 import { arbitrate, parseDisputes, type Ruling } from "./dispute.js";
 import { createHash } from "node:crypto";
@@ -43,6 +43,7 @@ import {
   barPath,
 } from "./bar.js";
 import { checkSelfError, preflightCriteria } from "./criteria.js";
+import { copyTree, type TreeCopy } from "./scratch.js";
 import {
   AUTONOMY_SUMMARY,
   DEFAULT_AUTONOMY,
@@ -2195,6 +2196,24 @@ export class Engine {
    * proves no value.
    */
   private goldensBefore: Map<string, string | null> = new Map();
+  /**
+   * Task criteria that ran before the work began and FAILED there.
+   *
+   * The only checks whose pass at the end shows this work did something: one
+   * that passed on the untouched tree too, or was never tried there (broken
+   * then, or joined after the work began), cannot tell the work from none.
+   * "verified" needs a passing independent value check from this set
+   * (src/tiers.ts `failedBefore`).
+   */
+  private failedBeforeWork: ReadonlySet<string> = new Set();
+  /**
+   * A copy of the project taken at turn start, before any request, kept only
+   * while checks are still to join late (drafts past the time cut, the
+   * reference check). A late check is tried against it as it joins, so it
+   * gets the same pre-work try as one sealed up front. Null when nothing is
+   * pending or the tree is too big to copy: a late check is then untried.
+   */
+  private preWorkTree: TreeCopy | null = null;
   /** True only while `proveNow` runs: a bar with no turn behind it. */
   private standalone = false;
   private barHash: string | null;
@@ -3674,9 +3693,49 @@ export class Engine {
     return this.markGuards(await runBar(bar, this.barContext(claim)));
   }
 
-  /** tierOf's advisory-review arguments: empty unless `reviewAdvisory`. */
-  private advisoryTier(): { reviewAdvisory?: true; guards?: ReadonlySet<string> } {
-    return this.cfg.reviewAdvisory === true ? { reviewAdvisory: true, guards: this.passedBeforeWork } : {};
+  /** Pass a turn's events through, and remove the pre-work copy however it ends. */
+  private async *dropPreWorkTreeAfter(inner: AsyncGenerator<EngineEvent>): AsyncGenerator<EngineEvent> {
+    try {
+      yield* inner;
+    } finally {
+      await this.preWorkTree?.cleanup();
+      this.preWorkTree = null;
+    }
+  }
+
+  /**
+   * Try checks that joined after the work began against the pre-work copy,
+   * as sealCriteria tries the ones sealed up front. Without a copy they stay
+   * untried, and an untried check cannot earn "verified".
+   */
+  private async tryLateBeforeWork(checks: readonly Check[], log?: Journal): Promise<void> {
+    const tree = this.preWorkTree;
+    if (!tree || !checks.length) return;
+    const passed: string[] = [];
+    const failed: string[] = [];
+    this.running = new AbortController();
+    try {
+      await preflightCriteria(checks, { cwd: tree.dir, signal: this.running.signal, passed, failed });
+    } catch {
+      return;
+    } finally {
+      this.running = undefined;
+    }
+    const asTask = (n: string) => (n.startsWith("task:") ? n : `task:${n}`);
+    this.passedBeforeWork = new Set([...this.passedBeforeWork, ...passed.map(asTask)]);
+    this.failedBeforeWork = new Set([...this.failedBeforeWork, ...failed.map(asTask)]);
+    log?.append("note", {
+      kind: "pre-work-try",
+      text: `late checks tried on the copy taken before the work: ${failed.length} failed, ${passed.length} passed`,
+      late: true,
+      failed: failed.map(asTask),
+      passed: passed.map(asTask),
+    });
+  }
+
+  /** tierOf's advisory-review argument: empty unless `reviewAdvisory`. */
+  private advisoryTier(): { reviewAdvisory?: true } {
+    return this.cfg.reviewAdvisory === true ? { reviewAdvisory: true } : {};
   }
 
   /** Who wrote each sealed check, keyed by the name it runs under in the bar (and its bare name). */
@@ -3695,16 +3754,19 @@ export class Engine {
     return [...new Set([this.cfg.model, this.modelOfRecord()].filter((m): m is string => typeof m === "string" && m.trim().length > 0))];
   }
 
-  /** Everything tierOf weighs beside the results: advisory mode, the worker, who wrote each check, and which golden files predate the work. */
+  /** Everything tierOf weighs beside the results: advisory mode, the worker, who wrote each check, what the pre-work try found, and which golden files predate the work. */
   private tierContext(): {
     reviewAdvisory?: true;
-    guards?: ReadonlySet<string>;
+    guards: ReadonlySet<string>;
+    failedBefore: ReadonlySet<string>;
     worker: string[];
     authors: Map<string, CheckAuthor>;
     valueUnproven: Set<string>;
   } {
     return {
       ...this.advisoryTier(),
+      guards: this.passedBeforeWork,
+      failedBefore: this.failedBeforeWork,
       worker: this.workerNames(),
       authors: this.sealedAuthors(),
       valueUnproven: valueUnproven(this.sealedChecks.map((c) => ({ name: c.name, run: c.kind === "command" ? c.run : undefined, tags: c.tags })), this.cwd, this.goldensBefore),
@@ -3716,23 +3778,36 @@ export class Engine {
     return Object.fromEntries(this.sealedAuthors());
   }
 
-  /** See `passedBeforeWork`. Only a passing command criterion is relabelled. */
+  /**
+   * See `passedBeforeWork` and `failedBeforeWork`. Only a passing command
+   * criterion is relabelled; every sealed task check is stamped with how it
+   * fared on the tree before the work, for the receipt.
+   */
   private markGuards(result: BarResult): BarResult {
-    if (this.passedBeforeWork.size === 0) return result;
+    if (this.sealedChecks.length === 0 && this.passedBeforeWork.size === 0) return result;
+    const sealed = new Set(this.sealedChecks.map((c) => (c.name.startsWith("task:") ? c.name : `task:${c.name}`)));
     return {
       ...result,
-      results: result.results.map((r) =>
-        r.ok && r.kind === "command" && this.passedBeforeWork.has(r.name)
+      results: result.results.map((r) => {
+        const beforeWork: CheckResult["beforeWork"] = this.passedBeforeWork.has(r.name)
+          ? "passed"
+          : this.failedBeforeWork.has(r.name)
+            ? "failed"
+            : sealed.has(r.name)
+              ? "untried"
+              : undefined;
+        const stamped = beforeWork ? { ...r, beforeWork } : r;
+        return r.ok && r.kind === "command" && this.passedBeforeWork.has(r.name)
           ? {
-              ...r,
+              ...stamped,
               established: false,
               output:
                 "passed before the work began too, so it guards against a regression and " +
                 "does not show this task was done · " +
                 r.output,
             }
-          : r,
-      ),
+          : stamped;
+      }),
     };
   }
 
@@ -4352,7 +4427,7 @@ export class Engine {
     let receiptPath: string | undefined;
     let exhaustedResult: BarResult | undefined;
     let lastProof: BarResult | undefined;
-    for await (const ev of this.runTurn(userText, confirm, job, opts)) {
+    for await (const ev of this.dropPreWorkTreeAfter(this.runTurn(userText, confirm, job, opts))) {
       switch (ev.kind) {
         case "receipt":
           receiptPath = ev.path;
@@ -4531,7 +4606,7 @@ export class Engine {
     // right 7/7 where everything else carrying the word was right 28/50. What
     // passed without earning it is reported as what it is. After the judgment
     // case above, which is opened on what the reviewers said.
-    let tier: "verified" | "passed-checks" | "passed-own-checks" | undefined;
+    let tier: Tier | undefined;
     let tierReason: string | undefined;
     let claim: string | undefined;
     if (outcome === "verified" && lastProof) {
@@ -4553,6 +4628,14 @@ export class Engine {
         tierReason = t.reason;
         claim = claimLabel(outcome, t);
         yield { kind: "info", text: `${claim}: ${t.reason}. Use --judge <another model>, or approve the checks yourself, for "verified".` };
+      } else if (t.tier === "passed-untested") {
+        // Independent checks passed, but every one of them passed on the
+        // untouched tree too or was never tried there: they guard against a
+        // regression and cannot tell this work from none.
+        outcome = "unverified";
+        tierReason = t.reason;
+        claim = claimLabel(outcome, t);
+        yield { kind: "info", text: `${claim}: ${t.reason}.` };
       } else {
         claim = claimLabel(outcome, t);
       }
@@ -5308,7 +5391,14 @@ export class Engine {
     let signedOut = false;
     this.passedBeforeWork = new Set();
     this.goldensBefore = new Map();
+    this.failedBeforeWork = new Set();
     const log = this.cfg.journal;
+    await this.preWorkTree?.cleanup();
+    // The copy is taken asynchronously, and a draft can fail while it is
+    // taken: mark the pending draft handled now (it is awaited, and its
+    // failure reported, further down) so that is not an unhandled rejection.
+    opts.pendingCriteria?.catch(() => {});
+    this.preWorkTree = (opts.pendingCriteria || opts.referenceCheck) && !opts.ask ? await copyTree(this.cwd) : null;
     /**
      * This turn's criteria, copied and sealed before anything runs.
      *
@@ -5382,16 +5472,26 @@ export class Engine {
         self.running = new AbortController();
         let broken: Awaited<ReturnType<typeof preflightCriteria>> = [];
         const passed: string[] = [];
+        const failed: string[] = [];
         const beforeTry = self.cfg.unattended ? listProject(self.cwd) : null;
         try {
           broken = await preflightCriteria(taskChecks, {
             cwd: self.cwd,
             signal: self.running.signal,
             passed,
+            failed,
           });
-          self.passedBeforeWork = new Set(
-            passed.map((n) => (n.startsWith("task:") ? n : `task:${n}`)),
-          );
+          const asTask = (n: string) => (n.startsWith("task:") ? n : `task:${n}`);
+          self.passedBeforeWork = new Set(passed.map(asTask));
+          self.failedBeforeWork = new Set(failed.map(asTask));
+          // Journalled so a replay can tell a check that discriminates from one
+          // that only guards (src/tiers.ts failedBefore).
+          log?.append("note", {
+            kind: "pre-work-try",
+            text: `tried before the work: ${failed.length} failed, ${passed.length} passed`,
+            failed: [...self.failedBeforeWork],
+            passed: [...self.passedBeforeWork],
+          });
         } finally {
           self.running = undefined;
           if (self.cfg.unattended) {
@@ -5614,6 +5714,7 @@ export class Engine {
         withAuthor({ ...got.check, name: got.check.name.startsWith("task:") ? got.check.name : `task:${got.check.name}` }, self.cfg.model),
       );
       if (taskChecks.some((c) => c.name === check.name)) return;
+      await self.tryLateBeforeWork([check], log);
       taskChecks = Object.freeze([...taskChecks, check]) as Check[];
       self.sealedChecks = taskChecks;
       self.withholdChecks([check]);
@@ -5693,6 +5794,7 @@ export class Engine {
         log?.append("note", { kind: "late-checks", text: "the drafter finished with no checks to join", inputsSha: draftInputs });
         return;
       }
+      await self.tryLateBeforeWork(added, log);
       taskChecks = Object.freeze([...taskChecks, ...added]) as Check[];
       taskNotes = Object.freeze([...taskNotes, ...(got?.taskNotes ?? [])]) as string[];
       taskSeal = sealOf(taskChecks, taskNotes);

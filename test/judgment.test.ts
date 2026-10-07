@@ -81,7 +81,7 @@ describe("which jobs open a case", () => {
   it("verified: the scale settled it, no case", async () => {
     const ws = workspace();
     try {
-      const { end } = await jobEnd(engineIn(ws.dir, writesThenClaims()), "make a", [check("fine", "true", true)]);
+      const { end } = await jobEnd(engineIn(ws.dir, writesThenClaims()), "make a", [check("fine", "grep -qx 1 a.txt", true)]);
       assert.equal(end.outcome, "verified");
       assert.equal(end.case, undefined);
       assert.equal(new Judgments(ws.dir).all().length, 0);

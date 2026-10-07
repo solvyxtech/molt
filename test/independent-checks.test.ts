@@ -61,6 +61,8 @@ describe("independentOf", () => {
 describe("tierOf: who wrote the checks", () => {
   const value = (name: string) => ({ name, ok: true, hidden: true as const, kind: "command" as const, tags: ["task", "value"] });
   const by = (a: CheckAuthor, name = "task:v") => new Map([[name, a]]);
+  // Every check here failed before the work: the discrimination rule has its own tests.
+  const failedBefore = new Set(["task:v", "task:own", "task:judged"]);
 
   it("worker-authored checks only: not verified", () => {
     const t = tierOf({ results: [value("task:v")], worker: "m", authors: by({ kind: "worker", model: "m" }) });
@@ -76,7 +78,7 @@ describe("tierOf: who wrote the checks", () => {
   });
 
   it("judge-authored: verified, and the label names the judge", () => {
-    const t = tierOf({ results: [value("task:v")], worker: "m", authors: by({ kind: "judge", model: "judge-j" }) });
+    const t = tierOf({ results: [value("task:v")], worker: "m", authors: by({ kind: "judge", model: "judge-j" }), failedBefore });
     assert.deepEqual([t.tier, t.basis, t.by], ["verified", "independent", ["judge-j"]]);
     assert.equal(claimLabel("verified", t), "verified (independent checks: judge-j)");
   });
@@ -104,7 +106,7 @@ describe("tierOf: who wrote the checks", () => {
       ["task:own", { kind: "worker", model: "m" }],
       ["task:judged", { kind: "judge", model: "j" }],
     ]);
-    const t = tierOf({ results: [value("task:own"), value("task:judged")], worker: "m", authors });
+    const t = tierOf({ results: [value("task:own"), value("task:judged")], worker: "m", authors, failedBefore });
     assert.equal(claimLabel("verified", t), "verified (independent checks: j)");
     // ...but an independent check that asserted no value does not carry it.
     const weak = tierOf({
@@ -141,12 +143,14 @@ describe("tierOf: who wrote the checks", () => {
 
   it("review-advisory: a contradicted or missing review qualifies every label", () => {
     const judged = by({ kind: "judge", model: "j" });
-    const contradicted = tierOf({ results: [value("task:v")], worker: "m", authors: judged, review: { votes: "2/3", violations: [] }, reviewAdvisory: true });
+    // Advisory mode also needs the check to have failed before the work (#34).
+    const fb = { failedBefore: new Set(["task:v"]) };
+    const contradicted = tierOf({ results: [value("task:v")], worker: "m", authors: judged, review: { votes: "2/3", violations: [] }, reviewAdvisory: true, ...fb });
     assert.deepEqual([contradicted.tier, contradicted.reviewGap], ["verified", "unconfirmed"]);
     assert.equal(claimLabel("verified", contradicted), "verified (independent checks: j), unconfirmed");
-    const missing = tierOf({ results: [value("task:v")], worker: "m", authors: judged, unreviewed: true, reviewAdvisory: true });
+    const missing = tierOf({ results: [value("task:v")], worker: "m", authors: judged, unreviewed: true, reviewAdvisory: true, ...fb });
     assert.equal(claimLabel("verified", missing), "verified (independent checks: j), unreviewed");
-    const fine = tierOf({ results: [value("task:v")], worker: "m", authors: judged, review: { votes: "0/3", violations: [] }, reviewAdvisory: true });
+    const fine = tierOf({ results: [value("task:v")], worker: "m", authors: judged, review: { votes: "0/3", violations: [] }, reviewAdvisory: true, ...fb });
     assert.equal(claimLabel("verified", fine), "verified (independent checks: j)");
     const own = tierOf({ results: [value("task:v")], worker: "m", review: { votes: "2/3", violations: [] }, reviewAdvisory: true });
     assert.equal(claimLabel("unverified", own), "passed own checks (m), not verified, unconfirmed");
@@ -166,7 +170,7 @@ describe("tierOf: who wrote the checks", () => {
   });
 
   it("a reviewer contradiction still outranks authorship", () => {
-    const t = tierOf({ results: [value("task:v")], worker: "m", authors: by({ kind: "judge", model: "j" }), review: { votes: "2/3", violations: [] } });
+    const t = tierOf({ results: [value("task:v")], worker: "m", authors: by({ kind: "judge", model: "j" }), review: { votes: "2/3", violations: [] }, failedBefore });
     assert.equal(t.tier, "passed-checks");
     assert.equal(claimLabel("unverified", t), "unverified");
   });
