@@ -35,7 +35,7 @@ import { mutatesSession } from "../electron/limits.js";
 import { fmtCost } from "../src/format.js";
 import { COMMANDS, matchCommands } from "../src/commands.js";
 import { providerName, endpointProblem as fromProviders } from "../src/providers.js";
-import { CLAUDE_CODE_URL, endpointProblem, expandEndpointShorthand, typedEndpointProblem } from "../src/endpoint.js";
+import { GROK_BUILD_URL, endpointProblem, expandEndpointShorthand, typedEndpointProblem, removedSubscriptionProblem } from "../src/endpoint.js";
 import {
   INTERVIEW_MAX_ROUNDS,
   applyBarAdds,
@@ -351,9 +351,9 @@ describe("starting the work after the interview", () => {
   });
 });
 
-describe("logging in to Claude Code from the window", () => {
+describe("logging in to Grok Build from the window", () => {
   /**
-   * Reported as "in the desktop app it is not possible to login to claude
+   * Reported as "in the desktop app it is not possible to login to a
    * code". The TUI grew a `/login` row for the backend and the window did
    * not — the seventh capability to exist on one surface and not the other.
    *
@@ -368,10 +368,12 @@ describe("logging in to Claude Code from the window", () => {
     const preload = readFileSync(path.join(repoRoot(), "electron", "preload.ts"), "utf8");
     const main = readFileSync(path.join(repoRoot(), "electron", "main.ts"), "utf8");
 
-    assert.match(html, /id="set-claude-code"/, "Settings needs a way in");
-    assert.match(ui, /\$\("set-claude-code"\)\.addEventListener/, "the button must be wired");
-    assert.match(preload, /claudeCodeHealth/, "the renderer cannot reach main without a bridge");
-    assert.match(main, /ipcMain\.handle\("claudeCode:health"/, "and main must answer it");
+    assert.match(html, /id="set-grok"/, "Settings needs a way in");
+    assert.match(ui, /\$\("set-grok"\)\.addEventListener/, "the button must be wired");
+    assert.match(preload, /acpHealth/, "the renderer cannot reach main without a bridge");
+    assert.match(main, /ipcMain\.handle\("acp:health"/, "and main must answer it");
+    assert.doesNotMatch(html, /id="set-claude-code"/);
+    assert.doesNotMatch(html, /id="set-agy"/);
   });
 
   /**
@@ -1606,19 +1608,18 @@ describe("a bad endpoint is refused where it is typed", () => {
    * so typing it into Settings was refused as "not an endpoint" — the exact
    * complaint this test would have caught before it shipped.
    */
-  it("expands the 'claude-code' shorthand the same way everywhere", () => {
-    assert.equal(expandEndpointShorthand("claude-code"), CLAUDE_CODE_URL);
-    assert.equal(expandEndpointShorthand("  claude-code  "), CLAUDE_CODE_URL);
+  it("expands the 'grok-build' shorthand the same way everywhere", () => {
+    assert.equal(expandEndpointShorthand("grok-build"), GROK_BUILD_URL);
+    assert.equal(expandEndpointShorthand("  grok  "), GROK_BUILD_URL);
     // Only the short spelling is rewritten; the long one and anything else
     // pass through untouched.
-    assert.equal(expandEndpointShorthand(CLAUDE_CODE_URL), CLAUDE_CODE_URL);
+    assert.equal(expandEndpointShorthand(GROK_BUILD_URL), GROK_BUILD_URL);
     assert.equal(expandEndpointShorthand("https://api.openai.com/v1"), "https://api.openai.com/v1");
     assert.equal(expandEndpointShorthand(""), "");
-    // The bug: typed and handed to `endpointProblem` unexpanded, "claude-code"
-    // is not a URL at all.
-    assert.match(endpointProblem("claude-code") ?? "", /is not an endpoint/);
-    // Expanded first, as every caller must, it is accepted.
-    assert.equal(endpointProblem(expandEndpointShorthand("claude-code")), null);
+    // Removed subscription shorthands fail clearly — not as "not an endpoint".
+    assert.match(endpointProblem("claude-code") ?? "", /removed|no longer supported/i);
+    assert.match(removedSubscriptionProblem("gemini-cli://subscription") ?? "", /removed|no longer supported/i);
+    assert.equal(endpointProblem(expandEndpointShorthand("grok-build")), null);
   });
 
   it("expands the shorthand in the window before it is judged or used", () => {
@@ -1626,7 +1627,7 @@ describe("a bad endpoint is refused where it is typed", () => {
     assert.match(
       ui,
       /return expandEndpointShorthand\(/,
-      "the window stopped expanding 'claude-code' before using the box",
+      "the window stopped expanding shorthand before using the box",
     );
     /**
      * Judged by running it, not by matching the line that implements it.
@@ -1637,8 +1638,9 @@ describe("a bad endpoint is refused where it is typed", () => {
      * pinned behaviour, and `mutation` could not catch it, because it ran
      * against a string read off disk rather than executed code.
      */
-    assert.equal(typedEndpointProblem("claude-code"), null, "the shorthand must be accepted");
-    assert.equal(typedEndpointProblem("  claude-code  "), null, "however it is spaced");
+    assert.equal(typedEndpointProblem("grok-build"), null, "the shorthand must be accepted");
+    assert.equal(typedEndpointProblem("  grok  "), null, "however it is spaced");
+    assert.match(typedEndpointProblem("claude-code") ?? "", /removed|no longer supported/i);
     assert.equal(typedEndpointProblem("https://api.openai.com/v1"), null);
     assert.equal(typedEndpointProblem(""), null, "an empty box is not a problem yet");
     assert.match(
@@ -1652,7 +1654,7 @@ describe("a bad endpoint is refused where it is typed", () => {
     assert.match(
       body,
       /const baseUrl = endpointFieldValue\(\);/,
-      "typing 'claude-code' and opening would send the literal word to the engine",
+      "typing a shorthand and opening would send the literal word to the engine",
     );
   });
 
@@ -1771,11 +1773,11 @@ describe("a backend molt knows is dead is refused at the door", () => {
       /await backendRefusal\(opts\.baseUrl\)/,
       "session:open must ask before it opens",
     );
-    // The three CLI backends, so door and button can never disagree.
+    // ACP health (Grok Build) plus clear refusal for removed backends.
     const fn = main.slice(main.indexOf("async function backendRefusal"));
-    for (const probe of ["claudeCodeHealth", "agyHealth", "acpHealth"]) {
-      assert.match(fn.slice(0, 900), new RegExp(probe), `${probe} is not consulted`);
-    }
+    assert.match(fn.slice(0, 900), /acpHealth/, "acpHealth is not consulted");
+    assert.match(fn.slice(0, 900), /removedSubscriptionProblem/, "removed backends must be named");
+    assert.doesNotMatch(fn.slice(0, 1200), /claudeCodeHealth|agyHealth/);
   });
 
   /** A health check that cannot run is not a reason to refuse a workspace. */

@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { parseArgs } from "../src/cli.js";
-import { CLAUDE_CODE_URL } from "../src/claude-code.js";
+import { GROK_BUILD_URL } from "../src/endpoint.js";
 
 describe("parseArgs", () => {
   it("defaults to local Ollama", () => {
@@ -16,12 +16,12 @@ describe("parseArgs", () => {
     assert.equal(a.yes, false);
   });
 
-  it("expands the 'claude-code' shorthand to the sentinel the backend checks for", () => {
+  it("expands the 'grok-build' shorthand to the sentinel the backend checks for", () => {
     // The expansion itself moved to src/endpoint.ts, beside endpointProblem,
     // so this pins that the flag parser still goes through it rather than
     // having grown a second copy that only this file knows.
-    const a = parseArgs(["run", "x", "--url", "claude-code"]);
-    assert.equal(a.url, CLAUDE_CODE_URL);
+    const a = parseArgs(["run", "x", "--url", "grok-build"]);
+    assert.equal(a.url, GROK_BUILD_URL);
   });
 
   it("reads a subcommand and its task", () => {

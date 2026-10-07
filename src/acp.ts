@@ -10,7 +10,7 @@
  * and posts it to `cli-chat-proxy.grok.com` is repackaging one as the other.
  *
  * So molt does not hold the token, see it, or send it. It spawns the CLI you
- * installed and logged in — `grok agent stdio`, `gemini --experimental-acp` —
+ * installed and logged in — `grok agent stdio` —
  * and that process authenticates itself. molt is the client on the other end
  * of a documented protocol. Same arrangement as claude-code.ts, one layer
  * lower: there the vendor shipped an SDK, here the vendor shipped a protocol.
@@ -69,28 +69,26 @@
  * surfaces it as an `info` event rather than discovering it in a receipt.
  */
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import { errorText } from "./format.js";
 import { RpcPeer, type RpcMessage } from "./jsonrpc.js";
-import type { BackendEvent, MoltTool, ToolRunner } from "./claude-code.js";
-import { GEMINI_CLI_URL, GROK_BUILD_URL } from "./endpoint.js";
+import type { BackendEvent, MoltTool, ToolRunner } from "./backend.js";
+import { GROK_BUILD_URL } from "./endpoint.js";
 import { estTokens } from "./types.js";
-import { env } from "./env.js";
 
 const exec = promisify(execFile);
 
 /**
  * One CLI molt can drive, and everything that differs between them.
  *
- * `url` is a scheme rather than an address for the reason `CLAUDE_CODE_URL`
+ * `url` is a scheme rather than an address for the reason `GROK_BUILD_URL`
  * is: every seam molt has — `config.json`, `/endpoint`, `keyForUrl`, the
  * receipt's `endpoint` field — is keyed by a URL, and a second way to say
  * "where does the model live" is a second thing to keep in step. Nothing
@@ -112,10 +110,8 @@ export type AcpAgentSpec = {
    * How this agent can be handed molt's tool server.
    *
    * Grok says `mcpCapabilities: { http: true }` at `initialize` and takes a
-   * URL. Gemini advertises no MCP capabilities and has a standing bug against
-   * servers passed to `session/new`, and an ignored entry does not fail — it
-   * produces an agent with no tools at all. stdio is the transport every MCP
-   * client supports, so that one gets a bridge; see mcp-bridge.ts.
+   * URL. The `"stdio"` variant existed for Gemini CLI (via mcp-bridge); with
+   * that backend removed, only `"http"` is used.
    */
   readonly mcpTransport: "http" | "stdio";
   /**
@@ -154,26 +150,6 @@ export const ACP_AGENTS: readonly AcpAgentSpec[] = [
       systemPromptOverride: systemPrompt,
       agentProfile: GROK_MOLT_PROFILE,
     }),
-  },
-  {
-    name: "gemini-cli",
-    label: "Gemini CLI",
-    url: GEMINI_CLI_URL,
-    bin: "gemini",
-    // `--experimental-acp` was renamed to `--acp` during 2026. Both are
-    // passed: the older builds ignore an unknown long flag rather than
-    // refusing to start, and a molt that only knew one name would be broken
-    // for whichever half of the world had the other.
-    args: ["--acp"],
-    models: ["gemini-3-pro", "gemini-3-flash"],
-    installHint: "npm install -g @google/gemini-cli",
-    loginHint: "gemini  (then choose 'Login with Google')",
-    credentialPath: ".gemini/oauth_creds.json",
-    mcpTransport: "stdio",
-    // Gemini exposes no documented per-session system-prompt override, so
-    // molt's prompt goes in as the first user message instead — see
-    // `AcpSession.start`. Saying so here beats a silently dropped prompt.
-    sessionMeta: () => ({}),
   },
 ];
 
@@ -665,79 +641,16 @@ export class Channel<T> {
 }
 
 /**
- * How this agent is told where molt's tools are.
+ * Hand molt's tool server to an ACP agent.
  *
- * The stdio form spawns `mcp-bridge.ts` under the same runtime molt is already
- * running — `ELECTRON_RUN_AS_NODE` because in the packaged app `execPath` is
- * Electron, and without it the bridge would start a second window instead of a
- * script.
+ * Grok Build takes HTTP MCP. The former stdio bridge (`mcp-bridge`) existed
+ * for Gemini CLI and is gone with that backend.
  */
-/**
- * Where `mcp-bridge.js` actually is, on each of the three layouts molt ships.
- *
- * `import.meta.url` looks like the obvious answer and is a trap: esbuild
- * replaces `import.meta` with an empty object when it bundles for CommonJS, so
- * in the packaged app the expression evaluates to `new URL("./mcp-bridge.js",
- * undefined)` and throws — after the tool server is already listening, on the
- * one backend that has no other way to be given tools. The bundle sets
- * `MOLT_MCP_BRIDGE` from its own `__dirname` instead, which is the only thing
- * in scope there that knows.
- *
- * Verified rather than assumed. A path handed to an agent that does not
- * resolve produces a spawn failure the agent reports as "no tools" and molt
- * never sees — the exact silence this file exists to avoid, so it is caught
- * here where it can still name itself.
- */
-export function shippedScript(name: string): string {
-  /**
-   * `MOLT_MCP_BRIDGE` names the *directory* the scripts sit in when it points
-   * at one; it was a file path first, and both are honoured so the packaged
-   * app's existing setting keeps working.
-   */
-  const override = env("MCP_BRIDGE")?.trim();
-  const candidates: string[] = [];
-  if (override) {
-    candidates.push(override.endsWith(".js") ? join(dirname(override), name) : join(override, name));
-  }
-  const here = (import.meta as { url?: string }).url;
-  if (typeof here === "string") candidates.push(fileURLToPath(new URL(`./${name}`, here)));
-  const found = candidates.find((c) => existsSync(c));
-  if (!found) {
-    throw new Error(
-      `maat cannot find ${name}` +
-        (candidates.length ? ` (looked in ${candidates.join(", ")})` : "") +
-        " — set MOLT_MCP_BRIDGE to the directory holding it",
-    );
-  }
-  return found;
-}
-
-export function bridgePath(): string {
-  return shippedScript("mcp-bridge.js");
-}
-
 export function mcpEntry(
-  spec: AcpAgentSpec,
+  _spec: AcpAgentSpec,
   endpoint: { url: string; headers: { name: string; value: string }[] },
 ): Record<string, unknown> {
-  if (spec.mcpTransport === "http") {
-    return { type: "http", name: "molt", url: endpoint.url, headers: endpoint.headers };
-  }
-  const token = (endpoint.headers.find((h) => /^authorization$/iu.test(h.name))?.value ?? "").replace(
-    /^Bearer /u,
-    "",
-  );
-  return {
-    type: "stdio",
-    name: "molt",
-    command: process.execPath,
-    args: [bridgePath()],
-    env: [
-      { name: "MOLT_MCP_URL", value: endpoint.url },
-      { name: "MOLT_MCP_TOKEN", value: token },
-      { name: "ELECTRON_RUN_AS_NODE", value: "1" },
-    ],
-  };
+  return { type: "http", name: "molt", url: endpoint.url, headers: endpoint.headers };
 }
 
 /** The `models` block ACP agents return from `session/new` (unstable in the spec). */
@@ -760,7 +673,7 @@ export type AcpOptions<H> = {
 /**
  * An ACP session, alive for as long as molt's is.
  *
- * One session, not one per turn, for the reason claude-code.ts gives: the
+ * One session, not one per turn: the
  * alternative pays to re-establish the same context every turn. Every user
  * message molt records is forwarded through `send`, so the model sees exactly
  * what molt's transcript says it was told, in the order it was told.

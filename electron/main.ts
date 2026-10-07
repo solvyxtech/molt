@@ -21,14 +21,8 @@ import { join } from "node:path";
 
 import { resolveReceipt } from "./receipts-path.js";
 import { sessionOpenReject } from "./session-open.js";
-import {
-  CLAUDE_CODE_MODELS,
-  CLAUDE_CODE_URL,
-  claudeCodeHealth,
-  isClaudeCode,
-} from "../src/claude-code.js";
 import { ACP_AGENTS, acpAgentFor, acpHealth } from "../src/acp.js";
-import { AGY_URL, agyHealth, agyModels, isAgy } from "../src/agy.js";
+import { removedSubscriptionProblem } from "../src/endpoint.js";
 import { keyFor } from "./endpoint-key.js";
 import { commandsHere, draftCriteriaCritiqued, type Draft } from "./criteria.js";
 import {
@@ -363,14 +357,13 @@ function createWindow(): void {
           return;
         }
         /**
-         * Press the Claude Code button for real, before anything else.
+         * Press the Grok plan button for real, before anything else.
          *
-         * The complaint was that the window offered no way in at all, and a
-         * button whose handler throws looks identical to one that is missing.
+         * A button whose handler throws looks identical to one that is missing.
          * This clicks it through the preload bridge and both IPC hops and
          * requires an answer — either a version, or the command to run. Which
-         * one depends on whether the machine running the suite has Claude
-         * Code, so neither is asserted; silence is the failure.
+         * one depends on whether the machine running the suite has Grok Build
+         * installed, so neither wording is asserted; silence is the failure.
          */
         const askPlan = async (id: string): Promise<string> =>
           (await win!.webContents.executeJavaScript(`(async () => {
@@ -383,30 +376,10 @@ function createWindow(): void {
             return "";
           })()`)) as string;
 
-        /**
-         * Every plan button, clicked for real.
-         *
-         * What each one answers depends on which CLIs the machine running the
-         * suite has, so no wording is asserted — silence is the failure. A
-         * button whose handler throws looks identical to one that is missing,
-         * and that is the bug this whole check exists for.
-         */
-        const ccStatus = await askPlan("set-claude-code");
-        console.log(`[e2e] claude-code ${ccStatus || "NO ANSWER"}`);
-        for (const [id, name] of [
-          ["set-agy", "antigravity"],
-          ["set-grok", "grok-build"],
-        ] as const) {
-          const answer = await askPlan(id);
-          console.log(`[e2e] ${name} ${answer || "NO ANSWER"}`);
-          if (!answer) {
-            console.error(`[e2e] the ${name} button answered nothing`);
-            app.exit(1);
-            return;
-          }
-        }
-        if (!ccStatus) {
-          console.error("[e2e] the Claude Code button answered nothing");
+        const grokStatus = await askPlan("set-grok");
+        console.log(`[e2e] grok-build ${grokStatus || "NO ANSWER"}`);
+        if (!grokStatus) {
+          console.error("[e2e] the Grok plan button answered nothing");
           app.exit(1);
           return;
         }
@@ -858,7 +831,7 @@ function createWindow(): void {
       void win!.webContents
         .executeJavaScript(
           `(async () => {
-             const need = ["tabs","panels","stream","wire","judge-list","judge-doc","badge-judgment","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","set-claude-code","set-agy","set-grok","claude-code-status","autonomy","interview","criteria","ck-rows","ck-draft","ck-auto","spine","spine-list","jump","ctx","ctx-fill","ctx-line"];
+             const need = ["tabs","panels","stream","wire","judge-list","judge-doc","badge-judgment","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","set-grok","claude-code-status","autonomy","interview","criteria","ck-rows","ck-draft","ck-auto","spine","spine-list","jump","ctx","ctx-fill","ctx-line"];
              const missing = need.filter((id) => !document.getElementById(id));
              const tabs = [...document.querySelectorAll(".tab")].map((t) => t.dataset.tab);
              const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
@@ -867,15 +840,6 @@ function createWindow(): void {
                // A button with nothing behind it is the bug this whole check
                // exists for: the control shipped on one surface, the wire on
                // neither. Both halves, or it is not wired.
-               claudeCode:
-                 typeof window.molt.claudeCodeHealth === "function" &&
-                 !!document.getElementById("set-claude-code"),
-               // Same two halves for the other two plans. A button whose
-               // bridge method does not exist looks identical to one that
-               // works until somebody clicks it.
-               agy:
-                 typeof window.molt.agyHealth === "function" &&
-                 !!document.getElementById("set-agy"),
                grok:
                  typeof window.molt.acpHealth === "function" &&
                  !!document.getElementById("set-grok"),
@@ -984,8 +948,6 @@ function createWindow(): void {
             r.autoCriteriaDefault === false &&
             (r.criteriaRows as { distinct: boolean; converted: boolean }).distinct === true &&
             (r.criteriaRows as { distinct: boolean; converted: boolean }).converted === true &&
-            r.claudeCode === true &&
-            r.agy === true &&
             r.grok === true &&
             Number(r.paletteRows) >= 15 &&
             (r.csp as { script?: boolean; connect?: boolean } | undefined)?.script === true &&
@@ -1002,9 +964,7 @@ function createWindow(): void {
           );
           console.log(`[self-check] palette     ${r.paletteRows} command(s) on "/"`);
           console.log(
-            `[self-check] plan buttons claude ${r.claudeCode ? "ok" : "NOT WIRED"}` +
-              `, google ${r.agy ? "ok" : "NOT WIRED"}` +
-              `, grok ${r.grok ? "ok" : "NOT WIRED"}`,
+            `[self-check] plan button grok ${r.grok ? "ok" : "NOT WIRED"}`,
           );
           const ck = r.criteriaRows as { distinct: boolean; converted: boolean };
           console.log(
@@ -1167,15 +1127,9 @@ ipcMain.handle("app:theme", (_e, name: string) => {
  * can never disagree about whether a CLI is usable.
  */
 async function backendRefusal(baseUrl: string): Promise<string | null> {
+  const removed = removedSubscriptionProblem(baseUrl);
+  if (removed) return removed;
   try {
-    if (isClaudeCode(baseUrl)) {
-      const h = await claudeCodeHealth();
-      return h.ok ? null : `${h.detail}${h.fix ? ` — run: ${h.fix}` : ""}`;
-    }
-    if (isAgy(baseUrl)) {
-      const h = await agyHealth();
-      return h.ok ? null : `${h.detail}${h.fix ? ` — run: ${h.fix}` : ""}`;
-    }
     const spec = acpAgentFor(baseUrl);
     if (spec) {
       const h = await acpHealth(spec);
@@ -1619,53 +1573,14 @@ ipcMain.handle("auth:endpoint", (_e, baseUrl: string, model: string) =>
 );
 ipcMain.handle("auth:stored", () => storedEndpoint(configDir()));
 /**
- * Whether this machine can run turns on a Claude subscription, and as whom.
- *
- * Settings' only other credential control is "paste an API key", which is the
- * wrong question for this backend — there is no key, and what it needs is a
- * command run somewhere else. Reported as "in the desktop app it is not
- * possible to login to claude code": the TUI grew a `/login` row for it and
- * the window did not. The seventh thing to exist on one surface and not the
- * other, and the reason `run-options.ts` and `session-commands.ts` exist.
- */
-ipcMain.handle("claudeCode:health", async () => ({
-  ...(await claudeCodeHealth()),
-  url: CLAUDE_CODE_URL,
-  models: [...CLAUDE_CODE_MODELS],
-}));
-
-/**
- * The same question for the other subscriptions molt can drive.
- *
- * A separate channel rather than a widened `claudeCode:health`, because the
- * window asks that one for a single backend and answers it with a single
- * button; this one answers with a list, and a caller that got an array where
- * it expected an object would render an empty panel and say nothing.
+ * Whether this machine can run turns on subscription CLIs molt still drives
+ * (currently Grok Build over ACP).
  *
  * Every agent is probed, installed or not: "Grok Build is not on PATH" with
  * the install command beside it is the answer somebody deciding whether to buy
  * a subscription actually wants, and hiding the row until it works means the
  * feature is invisible to everyone who does not already have it.
  */
-/**
- * Where the packaged app keeps the MCP stdio bridge.
- *
- * `acp.ts` cannot work this out for itself here: esbuild replaces
- * `import.meta` with an empty object in a CommonJS bundle, and `__dirname` —
- * which does know — only exists in this file. Set once, at load, so the answer
- * is already there the first time a Gemini session opens rather than being
- * discovered as a spawn failure with no tools behind it.
- */
-process.env.MOLT_MCP_BRIDGE ??= join(__dirname, "mcp-bridge.js");
-
-ipcMain.handle("agy:health", async () => ({
-  ...(await agyHealth()),
-  name: "antigravity",
-  label: "Antigravity",
-  url: AGY_URL,
-  models: await agyModels(),
-}));
-
 ipcMain.handle("acp:health", async () =>
   Promise.all(
     ACP_AGENTS.map(async (a) => ({

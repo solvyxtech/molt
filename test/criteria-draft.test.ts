@@ -9,9 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { CLAUDE_CODE_URL } from "../src/claude-code.js";
 import { draftCriteria } from "../src/criteria.js";
-import { scriptedClaudeCode } from "./helpers.js";
 
 function replying(content: string | null, finish = "stop"): typeof fetch {
   return (async () =>
@@ -57,17 +55,16 @@ describe("a criteria draft", () => {
     assert.deepEqual(r, { ok: true, draft: { checks: [], notes: [] } });
   });
 
-  it("fails the same way on a subscription backend", async () => {
-    const cc = scriptedClaudeCode([{ text: "I would suggest running the tests." }]);
+  it("fails clearly on a removed subscription backend", async () => {
     const r = await draftCriteria({
       task: "x",
       scripts: [],
       barChecks: [],
-      baseUrl: CLAUDE_CODE_URL,
+      baseUrl: "claude-code://subscription",
       model: "opus",
-      claudeCodeSdk: cc.sdk,
     });
     assert.equal(r.ok, false);
+    assert.match(r.ok ? "" : r.error, /removed|no longer supported/i);
   });
 });
 

@@ -13,7 +13,6 @@
  * molt's tools over the real loopback MCP server. Nothing spawns `grok`.
  */
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -25,13 +24,11 @@ import {
   isAcp,
   McpToolServer,
   mcpEntry,
-  bridgePath,
   permissionsDisarmed,
-  shippedScript,
 } from "../src/acp.js";
 import { Archive } from "../src/archive.js";
 import { parseBar } from "../src/bar.js";
-import { CLAUDE_CODE_URL } from "../src/claude-code.js";
+import { removedSubscriptionProblem } from "../src/endpoint.js";
 import { draftCriteria } from "../src/criteria.js";
 import { Engine } from "../src/engine.js";
 import { interviewTurn } from "../src/interview.js";
@@ -50,7 +47,6 @@ checks:
 `);
 
 const GROK = ACP_AGENTS.find((a) => a.name === "grok-build")!;
-const GEMINI = ACP_AGENTS.find((a) => a.name === "gemini-cli")!;
 
 const cleanups: (() => void)[] = [];
 after(() => cleanups.forEach((c) => c()));
@@ -83,13 +79,13 @@ function engineIn(dir: string, turns: ScriptedAcpTurn[], url = GROK.url, models?
 describe("which backend an endpoint names", () => {
   it("recognises each ACP URL and nothing else", () => {
     assert.equal(isAcp(GROK.url), true);
-    assert.equal(isAcp(GEMINI.url), true);
     assert.equal(isAcp("grok-build://anything"), true);
-    assert.equal(isAcp(CLAUDE_CODE_URL), false);
+    assert.equal(isAcp("claude-code://subscription"), false);
+    assert.ok(removedSubscriptionProblem("claude-code://subscription"));
+    assert.ok(removedSubscriptionProblem("gemini-cli://subscription"));
     assert.equal(isAcp("https://api.x.ai/v1"), false);
     assert.equal(isAcp(undefined), false);
     assert.equal(acpAgentFor(GROK.url)?.bin, "grok");
-    assert.equal(acpAgentFor(GEMINI.url)?.bin, "gemini");
   });
 
   /**
@@ -112,7 +108,6 @@ describe("which backend an endpoint names", () => {
    */
   it("is not mistaken for a machine you run", () => {
     assert.equal(isSelfHosted(GROK.url), false);
-    assert.equal(isSelfHosted(GEMINI.url), false);
   });
 
   it("offers the models the CLI resolves, and no invented ones", () => {
@@ -220,106 +215,11 @@ describe("molt's tools, served over loopback MCP", () => {
   });
 });
 
-/**
- * The transport Gemini needs, because it cannot take the one Grok takes.
- *
- * An HTTP entry Gemini ignores does not fail — it produces an agent with no
- * tools at all, wondering why it cannot write anything. The bridge is the
- * difference between that and a working backend, so it is spawned for real
- * here rather than described.
- */
-describe("the stdio bridge to molt's tool server", () => {
-  it("hands each agent the transport it can actually use", async () => {
+describe("molt hands Grok an HTTP MCP entry", () => {
+  it("uses HTTP for Grok Build (stdio bridge removed with Gemini CLI)", () => {
     const endpoint = { url: "http://127.0.0.1:1/mcp", headers: [{ name: "Authorization", value: "Bearer t" }] };
     assert.equal(mcpEntry(GROK, endpoint).type, "http");
     assert.equal(mcpEntry(GROK, endpoint).url, endpoint.url);
-
-    const stdio = mcpEntry(GEMINI, endpoint);
-    assert.equal(stdio.type, "stdio");
-    const env = stdio.env as { name: string; value: string }[];
-    assert.equal(env.find((e) => e.name === "MOLT_MCP_TOKEN")?.value, "t", "the Bearer prefix is not part of the token");
-    assert.equal(env.find((e) => e.name === "MOLT_MCP_URL")?.value, endpoint.url);
-  });
-
-  /**
-   * A path handed to an agent that does not resolve produces a spawn failure
-   * the agent reports as "no tools" and molt never sees. So whatever comes
-   * back must exist — and when nothing does, it says so by name rather than
-   * handing over a guess.
-   */
-  it("never returns a path that is not there", () => {
-    const before = process.env.MOLT_MCP_BRIDGE;
-    process.env.MOLT_MCP_BRIDGE = join(ws(), "nowhere", "mcp-bridge.js");
-    try {
-      // A bad override falls back to the copy shipped beside this module
-      // rather than failing: a working script beats an honoured typo.
-      assert.ok(existsSync(bridgePath()), "the resolved bridge must exist on disk");
-      // But a script that exists nowhere at all is named, not guessed at.
-      assert.throws(() => shippedScript("no-such-script.js"), /no-such-script\.js|MOLT_MCP_BRIDGE/u);
-    } finally {
-      if (before === undefined) delete process.env.MOLT_MCP_BRIDGE;
-      else process.env.MOLT_MCP_BRIDGE = before;
-    }
-  });
-
-  it("forwards a real tool call over a real pipe", async () => {
-    const ran: string[] = [];
-    const server = new McpToolServer<never>(
-      [
-        {
-          type: "function" as const,
-          function: { name: "grep", description: "search", parameters: { type: "object" } },
-        },
-      ],
-      async (name) => {
-        ran.push(name);
-        return "found nothing";
-      },
-      () => {},
-    );
-    const endpoint = await server.listen();
-    const entry = mcpEntry(GEMINI, endpoint);
-    const env = Object.fromEntries(
-      (entry.env as { name: string; value: string }[]).map((e) => [e.name, e.value]),
-    );
-    const child = spawn(process.execPath, entry.args as string[], {
-      env: { ...process.env, ...env },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    const replies: Record<string, unknown>[] = [];
-    const done = new Promise<void>((resolve) => {
-      let buf = "";
-      child.stdout.setEncoding("utf8");
-      child.stdout.on("data", (d: string) => {
-        buf += d;
-        for (;;) {
-          const i = buf.indexOf("\n");
-          if (i < 0) break;
-          const line = buf.slice(0, i).trim();
-          buf = buf.slice(i + 1);
-          if (line) replies.push(JSON.parse(line) as Record<string, unknown>);
-        }
-        if (replies.length >= 2) resolve();
-      });
-    });
-    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })}\n`);
-    child.stdin.write(
-      `${JSON.stringify({
-        jsonrpc: "2.0",
-        id: 2,
-        method: "tools/call",
-        params: { name: "mcp__molt__grep", arguments: { pattern: "x" } },
-      })}\n`,
-    );
-    await done;
-    child.kill();
-    await server.close();
-
-    const listed = replies.find((r) => r.id === 1)?.result as { tools?: { name: string }[] };
-    assert.deepEqual((listed?.tools ?? []).map((t) => t.name), ["grep"]);
-    assert.deepEqual(ran, ["grep"], "the call must reach molt's handler, not a copy of it");
-    const called = replies.find((r) => r.id === 2)?.result as { content?: { text?: string }[] };
-    assert.equal(called?.content?.[0]?.text, "found nothing");
   });
 });
 
@@ -773,16 +673,4 @@ describe("a one-shot question to a subscription agent is bounded", () => {
     assert.ok(Date.now() - t0 < 5_000, "the limit, not for ever");
   });
 
-  it("gives up on a Claude Code CLI that never answers", async () => {
-    const { claudeCodeAsk } = await import("../src/claude-code.js");
-    const sdk = {
-      query: () =>
-        (async function* () {
-          await new Promise(() => {});
-        })(),
-    } as unknown as Parameters<typeof claudeCodeAsk>[0]["sdk"];
-    const r = await claudeCodeAsk({ model: "sonnet", systemPrompt: "s", prompt: "p", sdk, timeoutMs: 200 });
-    assert.equal(r.ok, false);
-    assert.match(r.ok ? "" : r.error, /did not answer within/);
-  });
 });

@@ -8,8 +8,6 @@
  * harness without a human watching.
  */
 import { acpAgentFor, acpHealth } from "./acp.js";
-import { agyHealth, isAgy } from "./agy.js";
-import { claudeCodeHealth, isClaudeCode } from "./claude-code.js";
 import { expandEndpointShorthand } from "./endpoint.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { formatWithOptions } from "node:util";
@@ -130,8 +128,9 @@ options
                      any server speaking the OpenAI shape: Ollama, llama.cpp,
                      vLLM, on this machine or another. /endpoint in the TUI.
                      default http://localhost:11434/v1
-                     claude-code  runs your own logged-in Claude Code, so a
-                     Pro/Max plan pays for the turn instead of an API key
+                     grok-build   runs your own logged-in Grok Build CLI over
+                     ACP, so a SuperGrok / X Premium+ plan pays for the turn
+                     instead of an API key (Maat does not store that login)
   --model <id>       model id                     (MOLT_MODEL)
                      no default — /model or --model picks one
   --key <secret>     api key, if the endpoint needs one   (MOLT_API_KEY)
@@ -1368,13 +1367,9 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         (b.costUsd === undefined
           ? // "no price" is true of a subscription run but reads as a gap in
             // molt's knowledge. It is not one: nothing was charged.
-            isClaudeCode(engine.cfg.baseUrl)
-            ? " · your Claude plan, not metered"
-            : isAgy(engine.cfg.baseUrl)
-              ? " · your Google AI plan, not metered"
-              : acpAgentFor(engine.cfg.baseUrl)
-                ? ` · your ${acpAgentFor(engine.cfg.baseUrl)!.label} plan, not metered`
-                : " · no price for this model"
+            acpAgentFor(engine.cfg.baseUrl)
+            ? ` · your ${acpAgentFor(engine.cfg.baseUrl)!.label} plan, not metered`
+            : " · no price for this model"
           : ` · ${b.costEstimated ? "~" : ""}${fmtCost(b.costUsd)}`) +
         "\n",
     );
@@ -1433,7 +1428,7 @@ async function cmdAcp(args: Args): Promise<number> {
   );
   const norm = (u: string) => u.trim().replace(/\/+$/, "");
   /**
-   * `MOLT_ACP_SUBSCRIPTIONS=claude-code,grok-build` lists exactly those
+   * `MOLT_ACP_SUBSCRIPTIONS=grok-build` lists exactly those
    * subscription backends without probing them. The probes spawn each CLI
    * and open a session with it; this skips that, for a machine where the
    * answer is known — and for tests, which must not depend on whose laptop
@@ -1445,8 +1440,6 @@ async function cmdAcp(args: Args): Promise<number> {
       const names = declared.split(",").map((n) => n.trim()).filter(Boolean);
       return names.some((n) => PROVIDERS[n]?.url === url);
     }
-    if (isClaudeCode(url)) return (await claudeCodeHealth()).ok;
-    if (isAgy(url)) return (await agyHealth()).ok;
     const spec = acpAgentFor(url);
     return spec ? (await acpHealth(spec)).ok : false;
   };

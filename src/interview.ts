@@ -13,8 +13,7 @@ import { stringify } from "yaml";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { acpAgentFor, acpAsk } from "./acp.js";
-import { agyAsk, isAgy } from "./agy.js";
-import { claudeCodeAsk, isClaudeCode, type Sdk } from "./claude-code.js";
+import { removedSubscriptionProblem } from "./endpoint.js";
 import { errorText } from "./format.js";
 import { askError, askTimeoutMs, probeSignal } from "./watchdog.js";
 import { authHeaders } from "./providers.js";
@@ -271,14 +270,11 @@ export async function interviewTurn(opts: {
   baseUrl: string;
   apiKey?: string;
   model: string;
-  /** Where the interview runs. Only the Claude Code transport reads it. */
+  /** Where the interview runs. Subprocess transports read it. */
   cwd?: string;
   fetchFn?: typeof fetch;
-  claudeCodeSdk?: Sdk;
   /** How an ACP agent is spawned. Tests only; see `EngineConfig.acpSpawn`. */
   acpSpawn?: typeof import("node:child_process").spawn;
-  /** How `agy` is run for a pre-turn question. Tests only. */
-  agyRun?: (cmd: string, args: string[], opts: object) => Promise<{ stdout: string }>;
   /** How long the HTTP question may wait for its answer; see askTimeoutMs. Tests only. */
   timeoutMs?: number;
 }): Promise<InterviewTurn> {
@@ -306,37 +302,10 @@ export async function interviewTurn(opts: {
   ].join("\n");
 
   /**
-   * The Claude Code backend has no endpoint, so it is asked through the CLI.
-   *
-   * This used to refuse — "the interview needs an HTTP endpoint" — which was
-   * true of the transport and false of the backend: molt already runs a model
-   * here, and spec-first calls this on Run, so every first Run on a
-   * subscription ended in an apology and started no turn. `claudeCodeAsk`
-   * gives it a model with no tools; everything after the reply is unchanged,
-   * including that nothing is written until a person seals it.
+   * ACP backends (Grok Build) have no HTTP endpoint; ask through the CLI.
    */
-  /**
-   * The ACP backends have no endpoint either, for the same reason.
-   *
-   * Asked first, because `isClaudeCode` and `acpAgentFor` are both false for
-   * an HTTP endpoint and the order between them is arbitrary — but a reader
-   * looking for "what happens when there is no URL" should find both cases
-   * together rather than one here and one three screens down.
-   */
-  /**
-   * Antigravity has no endpoint either, and no way to ask for no tools — so
-   * `agyAsk` gives it an empty directory to be in instead. See its comment.
-   */
-  if (isAgy(opts.baseUrl)) {
-    const asked = await agyAsk({
-      model: opts.model,
-      systemPrompt: SYSTEM,
-      prompt: context,
-      ...(opts.agyRun ? { run: opts.agyRun } : {}),
-    });
-    if (!asked.ok) return { kind: "error", error: asked.error };
-    return parseInterviewReply(asked.text, opts.round);
-  }
+  const removed = removedSubscriptionProblem(opts.baseUrl);
+  if (removed) return { kind: "error", error: removed };
 
   const acp = acpAgentFor(opts.baseUrl);
   if (acp) {
@@ -349,19 +318,6 @@ export async function interviewTurn(opts: {
       prompt: context,
       cwd: opts.cwd,
       ...(opts.acpSpawn ? { spawnFn: opts.acpSpawn } : {}),
-    });
-    if (!asked.ok) return { kind: "error", error: asked.error };
-    return parseInterviewReply(asked.text, opts.round);
-  }
-
-  if (isClaudeCode(opts.baseUrl)) {
-    const asked = await claudeCodeAsk({
-      timeoutMs: askTimeoutMs(800, opts.timeoutMs),
-      model: opts.model,
-      systemPrompt: SYSTEM,
-      prompt: context,
-      cwd: opts.cwd,
-      sdk: opts.claudeCodeSdk,
     });
     if (!asked.ok) return { kind: "error", error: asked.error };
     return parseInterviewReply(asked.text, opts.round);

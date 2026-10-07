@@ -170,12 +170,14 @@ npm run pack:cli       # stage publishable @solvyx/molt under out-cli/ (do not p
 First run: `/login`, pick a provider, paste a key, `/model`, go. Keys live in
 `~/.config/molt/auth.json` at mode 0600.
 
-Or use a Claude Pro/Max plan instead of a key — `/login` → **claude code (your
-Pro/Max plan)** in the terminal, **Settings → Model → "Use my Claude plan"** in
-the window, or `--url claude-code` headless. molt runs the Claude Code you
-already logged in and never sees the credential; Claude Code is given none of
-its own tools, so every write still lands in molt's ledger and the bar can
-still refuse the claim. A plan is not a bill, so the meter shows tokens and no
+Or use a Grok subscription instead of a key — `/login` → **grok build (your
+xAI plan)** in the terminal, **Settings → Model → "Use my Grok plan"** in the
+window, or `--url grok-build` headless. Maat drives the official `grok` CLI over
+ACP; you sign in with your own SuperGrok / X Premium+ account, and Maat does not
+store subscription credentials. For metered use, point at `https://api.x.ai/v1`
+with your own API key. Maat is independent and not affiliated with or endorsed
+by SpaceXAI — you remain responsible for xAI's terms and acceptable use; do not
+pool or resell access. A plan is not a bill, so the meter shows tokens and no
 money.
 
 Headless, for CI or a script:

@@ -2,8 +2,8 @@
  * Nothing committed may depend on a file that was not committed.
  *
  * Earned on 2026-09-07 by breaking `main`. A commit staged src/criteria.ts,
- * src/interview.ts, src/cli.tsx and src/engine.ts and left src/acp.ts and
- * src/mcp-bridge.ts untracked — the modules all four import. A fresh clone
+ * src/interview.ts, src/cli.tsx and src/engine.ts and left src/acp.ts
+ * untracked — a module they import. A fresh clone
  * failed typecheck on four files.
  *
  * `npm run check` had passed at 1,296 tests minutes earlier and could not have

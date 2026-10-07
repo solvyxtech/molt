@@ -10,46 +10,31 @@
  */
 
 /**
- * The scheme that marks an endpoint as the Claude Code backend rather than an
- * HTTP address.
+ * The schemes that used to mark subscription CLIs molt no longer drives.
  *
- * Used to exist three times: the literal in `CLAUDE_CODE_URL` below, the
- * literal `isClaudeCode` in `claude-code.ts` compared every base URL against,
- * and the literal in `endpointProblem`'s allow-list a few lines down. Three
- * spellings of the same fact is three chances for one of them to be edited
- * and the other two forgotten, so this is the one place it is written down.
+ * Claude Code, Antigravity, and Gemini CLI were removed (ToS / product scope).
+ * Configs and flags that still name them must fail clearly — not fall through
+ * to another backend or look like a network fault.
  */
-const CLAUDE_CODE_SCHEME = "claude-code://";
+const REMOVED_SUBSCRIPTION_SCHEMES = [
+  "claude-code://",
+  "antigravity://",
+  "agy://",
+  "gemini-cli://",
+] as const;
 
-/**
- * The other CLIs molt spawns, written down once for the same reason.
- *
- * Each is a name for "a subscription is doing the work", not an address:
- * `grok agent stdio` and `agy` are processes, and `fetch` refuses the scheme
- * with six words that read as the network being down. Kept here beside
- * `CLAUDE_CODE_SCHEME` because `endpointProblem` has to know all of them and a
- * scheme it has not been told about is one it rejects — which is exactly how
- * `--url grok-build` came back as "molt cannot speak 'grok-build'" from a
- * build whose Grok backend was finished and working.
- */
+const REMOVED_SHORTHANDS = [
+  "claude-code",
+  "claude",
+  "antigravity",
+  "agy",
+  "gemini-cli",
+] as const;
+
+/** The one subscription CLI molt still spawns: Grok Build over ACP. */
 const GROK_BUILD_SCHEME = "grok-build://";
-const GEMINI_CLI_SCHEME = "gemini-cli://";
-const ANTIGRAVITY_SCHEME = "antigravity://";
 
-/**
- * The endpoint molt stores for the Claude Code backend.
- *
- * Lives here, not in `claude-code.ts`, for the same reason `endpointProblem`
- * does: it is a plain string, and `claude-code.ts` opens with six `node:`
- * imports that make it unusable from the window. `claude-code.ts` re-exports
- * this rather than holding a second copy, so the sentinel spelled `'claude-code'`
- * by a person and the one compared against by `isClaudeCode` cannot drift
- * apart from each other.
- */
-export const CLAUDE_CODE_URL = `${CLAUDE_CODE_SCHEME}subscription`;
 export const GROK_BUILD_URL = `${GROK_BUILD_SCHEME}subscription`;
-export const GEMINI_CLI_URL = `${GEMINI_CLI_SCHEME}subscription`;
-export const AGY_URL = `${ANTIGRAVITY_SCHEME}subscription`;
 
 /**
  * What someone types, and the sentinel it stands for.
@@ -59,34 +44,36 @@ export const AGY_URL = `${ANTIGRAVITY_SCHEME}subscription`;
  * and the two drifting apart is the bug this file was created to end.
  */
 const SHORTHAND: Readonly<Record<string, string>> = {
-  "claude-code": CLAUDE_CODE_URL,
-  claude: CLAUDE_CODE_URL,
   "grok-build": GROK_BUILD_URL,
   grok: GROK_BUILD_URL,
-  "gemini-cli": GEMINI_CLI_URL,
-  antigravity: AGY_URL,
-  agy: AGY_URL,
 };
 
-/** Is this endpoint the Claude Code backend rather than an HTTP API? */
-export function isClaudeCode(baseUrl: string | undefined): boolean {
-  return (baseUrl ?? "").trim().toLowerCase().startsWith(CLAUDE_CODE_SCHEME);
+/** Why a removed subscription backend cannot be used. */
+export function removedSubscriptionProblem(raw: string): string | null {
+  const v = (raw ?? "").trim().toLowerCase();
+  if (!v) return null;
+  if ((REMOVED_SHORTHANDS as readonly string[]).includes(v)) {
+    return removedBackendMessage(v);
+  }
+  for (const scheme of REMOVED_SUBSCRIPTION_SCHEMES) {
+    if (v.startsWith(scheme)) return removedBackendMessage(scheme.replace(/:\/\/$/u, ""));
+  }
+  return null;
+}
+
+function removedBackendMessage(name: string): string {
+  return (
+    `The '${name}' subscription backend was removed from Maat ` +
+    `(Claude Code, Antigravity/agy, and Gemini CLI are no longer supported). ` +
+    `Use 'grok-build' / 'grok' for the Grok Build ACP path, or an HTTP API ` +
+    `endpoint such as https://api.x.ai/v1 with your own key.`
+  );
 }
 
 /**
- * `'claude-code'`, typed at a URL box, expanded to the sentinel it stands for.
+ * `'grok-build'`, typed at a URL box, expanded to the sentinel it stands for.
  *
- * `--url claude-code` only ever worked in `src/cli.tsx`, which held the one
- * line that translated the word someone types into the address
- * `isClaudeCode` actually checks for. Every other caller of a base URL — the
- * engine, and the window's Settings panel — read whatever was typed as a
- * literal address, so `'claude-code'` there became a request to
- * `claude-code/chat/completions`: not a URL, not the sentinel, and reported as
- * the network being down. Moved beside `endpointProblem` so every caller
- * expands the same word into the same address, rather than the flag parser
- * being the one surface that had this and no other surface learning it.
- *
- * A string that already parses as `claude-code://…` is returned unchanged:
+ * A string that already parses as `grok-build://…` is returned unchanged:
  * this only rewrites the short spelling, never the long one.
  */
 export function expandEndpointShorthand(value: string): string {
@@ -97,19 +84,8 @@ export function expandEndpointShorthand(value: string): string {
 /**
  * Why this endpoint cannot be used, or null when it can.
  *
- * `fetch` is the only thing that ever judged this, and it judges late and
- * badly: `--url claude-code` (the shorthand, typed at a build that did not
- * have it) produced `TypeError: Failed to parse URL from
- * claude-code/chat/completions`, which molt classified as a network fault and
- * retried four times over seven seconds before giving up. A string that is not
- * an address does not become one on the second attempt.
- *
  * Kept pure because four callers need the same answer: the flag parser, the
  * engine before it retries, the doctor, and the window's Settings panel.
- *
- * The wording is deliberately surface-neutral. The empty case used to say
- * "pass --url", which is advice you cannot take in a window — the message is
- * shown beside a text box that is the very thing it is telling you to pass.
  */
 export function endpointProblem(baseUrl: string): string | null {
   const url = (baseUrl ?? "").trim();
@@ -119,6 +95,8 @@ export function endpointProblem(baseUrl: string): string | null {
       "or pick a provider"
     );
   }
+  const removed = removedSubscriptionProblem(url);
+  if (removed) return removed;
   let parsed: URL;
   try {
     parsed = new URL(url);
@@ -126,21 +104,14 @@ export function endpointProblem(baseUrl: string): string | null {
     return (
       `'${url}' is not an endpoint. Give a full base URL like ` +
       `https://api.openai.com/v1 or http://localhost:11434/v1, a provider name to ` +
-      `/login, or 'claude-code' to run your own logged-in Claude Code.`
+      `/login, or 'grok-build' to run your own logged-in Grok Build CLI.`
     );
   }
-  const allowed = [
-    "http:",
-    "https:",
-    ...[CLAUDE_CODE_SCHEME, GROK_BUILD_SCHEME, GEMINI_CLI_SCHEME, ANTIGRAVITY_SCHEME].map((s) =>
-      s.replace(/\/\/$/u, ""),
-    ),
-  ];
+  const allowed = ["http:", "https:", GROK_BUILD_SCHEME.replace(/\/\/$/u, "")];
   if (!allowed.includes(parsed.protocol)) {
     return (
       `'${url}' uses the scheme '${parsed.protocol.replace(":", "")}', which Maat cannot ` +
       `speak. Endpoints are http or https; ${Object.keys(SHORTHAND)
-        .filter((k) => k !== "claude")
         .map((k) => `'${k}'`)
         .join(", ")} run a CLI instead.`
     );
@@ -150,22 +121,6 @@ export function endpointProblem(baseUrl: string): string | null {
 
 /**
  * Why the text in an endpoint box cannot be used, or null when it can.
- *
- * The window had this inline, reading the DOM, so it could only ever be
- * asserted by matching the source text of the line that implemented it — and
- * a test that matches
- *
- *     /return typed \? endpointProblem\(endpointFieldValue\(\)\) : null;/
- *
- * still passes if `endpointFieldValue` quietly stops expanding the shorthand.
- * It pins a call site while reading like it pins behaviour, and `mutation`
- * cannot catch it, because the assertion runs against a string read off disk
- * rather than against executed code.
- *
- * So the decision moved here, where it can be run. Same pattern as
- * `ui/wait-words.ts` and `ui/markdown.ts`: the pure part is importable, and
- * what stays in `app.ts` is one line of wiring that a source assertion is the
- * honest tool for.
  *
  * An empty box is not a problem yet — nobody has said anything to be wrong
  * about — which is the one piece of behaviour the old inline `typed ? …` was

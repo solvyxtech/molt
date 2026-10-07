@@ -32,8 +32,9 @@ import { render } from "ink";
 import { App, renderApp } from "../src/app.js";
 import { Engine } from "../src/engine.js";
 import type { Msg } from "../src/types.js";
-import { scriptedClaudeCode, workspace } from "./helpers.js";
-import { CLAUDE_CODE_URL } from "../src/claude-code.js";
+import { workspace } from "./helpers.js";
+import { GROK_BUILD_URL } from "../src/endpoint.js";
+import { scriptedAcpAgent } from "./acp-agent.js";
 import { Receipts } from "../src/receipts.js";
 import { writeDefaultBar } from "../src/bar.js";
 import type { BarResult } from "../src/types.js";
@@ -2033,7 +2034,7 @@ describe("first-run empty-state", () => {
       await until(t, /No provider, no model/, 3_000);
       assert.match(t.stdout.lastFrame, /Login with a provider key/);
       assert.match(t.stdout.lastFrame, /Local or self-hosted endpoint/);
-      assert.match(t.stdout.lastFrame, /Claude plan/);
+      assert.match(t.stdout.lastFrame, /Grok plan/);
       assert.match(t.stdout.lastFrame, /Quit/);
     } finally {
       t.cleanup();
@@ -2054,16 +2055,16 @@ describe("first-run empty-state", () => {
 });
 
 describe("/login lists plan backends", () => {
-  it("offers Claude, Antigravity, and Grok Build beside local", async () => {
+  it("offers Grok Build beside local (Claude/agy removed)", async () => {
     const t = await mount();
     try {
       await submit(t.stdin, "/login");
       await tick(150);
       const frame = t.stdout.lastFrame;
-      assert.match(frame, /claude code \(your Pro\/Max plan\)/i);
-      assert.match(frame, /google plan \(Antigravity\)/i);
       assert.match(frame, /grok build \(your xAI plan\)/i);
       assert.match(frame, /local or self-hosted/i);
+      assert.doesNotMatch(frame, /claude code/i);
+      assert.doesNotMatch(frame, /Antigravity/i);
     } finally {
       t.cleanup();
     }
@@ -2147,17 +2148,18 @@ describe("pricing on a plan", () => {
     // "publishes no price for sonnet — /price <in> <out> to set one": a gap
     // in molt's knowledge, and advice to invent a rate, for a run that costs
     // no money at all.
+    const agent = scriptedAcpAgent([]);
     const t = await mount({
-      baseUrl: CLAUDE_CODE_URL,
-      provider: "claude-code",
-      model: "opus",
-      claudeCodeSdk: scriptedClaudeCode([]).sdk,
+      baseUrl: GROK_BUILD_URL,
+      provider: "grok-build",
+      model: "grok-4.6",
+      acpSpawn: agent.spawnFn,
       priceInPerMtok: undefined,
       priceOutPerMtok: undefined,
     });
     try {
-      await submit(t.stdin, "/model sonnet");
-      await until(t, /your Claude plan is paying for this — the meter shows tokens, not money/);
+      await submit(t.stdin, "/model grok-4.5");
+      await until(t, /your Grok Build plan is paying for this — the meter shows tokens, not money/);
       assert.doesNotMatch(t.stdout.text, /publishes no price/);
     } finally {
       t.cleanup();

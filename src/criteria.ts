@@ -21,7 +21,6 @@
  *  - Anything not mechanically checkable is a note, and is labelled as one.
  *    A sentence dressed as a check is worse than no check.
  */
-import type { Sdk } from "./claude-code.js";
 import { execFileSync } from "node:child_process";
 import { askModel } from "./ask.js";
 import { runCommand } from "./run.js";
@@ -358,11 +357,9 @@ export async function draftCriteria(opts: {
   /** Where the draft is asked for. Only the Claude Code transport reads it. */
   cwd?: string;
   fetchFn?: typeof fetch;
-  claudeCodeSdk?: Sdk;
   /** How an ACP agent is spawned. Tests only; see `EngineConfig.acpSpawn`. */
   acpSpawn?: typeof import("node:child_process").spawn;
   /** How `agy` is run for a pre-turn question. Tests only. */
-  agyRun?: (cmd: string, args: string[], opts: object) => Promise<{ stdout: string }>;
   /** How long the HTTP question may wait for its answer; see askTimeoutMs. Tests only. */
   timeoutMs?: number;
   /** Pause before re-asking after empty replies (EMPTY_DRAFT_DELAY_MS). Tests only. */
@@ -403,9 +400,7 @@ export async function draftCriteria(opts: {
     cwd: opts.cwd,
     what: "drafting criteria",
     fetchFn: opts.fetchFn,
-    claudeCodeSdk: opts.claudeCodeSdk,
     acpSpawn: opts.acpSpawn,
-    agyRun: opts.agyRun,
     timeoutMs: opts.timeoutMs,
     reasoningEffort: opts.reasoningEffort,
   });
@@ -423,9 +418,7 @@ export async function draftCriteria(opts: {
     cwd: opts.cwd,
     what: "drafting criteria",
     fetchFn: opts.fetchFn,
-    claudeCodeSdk: opts.claudeCodeSdk,
     acpSpawn: opts.acpSpawn,
-    agyRun: opts.agyRun,
     timeoutMs: opts.timeoutMs,
     reasoningEffort: opts.reasoningEffort,
   });
@@ -447,10 +440,8 @@ export async function draftCriteria(opts: {
       cwd: opts.cwd,
       what: "drafting criteria",
       fetchFn: opts.fetchFn,
-      claudeCodeSdk: opts.claudeCodeSdk,
-      acpSpawn: opts.acpSpawn,
-      agyRun: opts.agyRun,
-      timeoutMs: opts.timeoutMs,
+        acpSpawn: opts.acpSpawn,
+        timeoutMs: opts.timeoutMs,
       reasoningEffort: opts.reasoningEffort,
     });
     if (!more.ok) break;
@@ -600,10 +591,8 @@ export async function draftCriteriaCritiqued(
       cwd: opts.cwd,
       what: "reviewing the drafted checks",
       fetchFn: opts.fetchFn,
-      claudeCodeSdk: opts.claudeCodeSdk,
-      acpSpawn: opts.acpSpawn,
-      agyRun: opts.agyRun,
-      timeoutMs: opts.timeoutMs,
+        acpSpawn: opts.acpSpawn,
+        timeoutMs: opts.timeoutMs,
       reasoningEffort: opts.reasoningEffort,
     });
     return asked.ok ? applyCritique(d, asked.text, opts.task) : null;
