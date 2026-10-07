@@ -271,6 +271,19 @@ function readFile(p: string): string {
 }
 
 describe("what the checks leave behind", () => {
+  // Task checks run in a throwaway copy now (src/scratch.ts), so they leave
+  // nothing behind at all; the cleanup below is what still stands when the
+  // tree is too big to copy, which MAAT_CHECK_COPY=0 stands in for.
+  const inPlace = async <T>(f: () => Promise<T>): Promise<T> => {
+    const was = process.env.MAAT_CHECK_COPY;
+    process.env.MAAT_CHECK_COPY = "0";
+    try {
+      return await f();
+    } finally {
+      if (was === undefined) delete process.env.MAAT_CHECK_COPY;
+      else process.env.MAAT_CHECK_COPY = was;
+    }
+  };
   const leaves: Check = { name: "builds", kind: "command", run: "mkdir -p bin && touch bin/cmain made.o && test -f keep.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true };
   const turn = () => [{ calls: [{ name: "write_file", args: { path: "keep.txt", content: "k\n" } }] }, { text: "Done." }];
 
@@ -280,10 +293,25 @@ describe("what the checks leave behind", () => {
       writeFileSync(join(ws.dir, "made.o.orig"), "mine");
       const provider = scriptedProvider(turn());
       const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high", unattended: true });
-      const events = await drain(engine.run("make keep.txt", allowAll, { taskChecks: [leaves] }));
+      const events = await inPlace(() => drain(engine.run("make keep.txt", allowAll, { taskChecks: [leaves] })));
       assert.ok(!existsSync(join(ws.dir, "bin")) && !existsSync(join(ws.dir, "made.o")));
       assert.ok(existsSync(join(ws.dir, "keep.txt")) && existsSync(join(ws.dir, "made.o.orig")));
       assert.ok(events.some((e) => e.kind === "info" && /removed what the checks created in the project: .*made\.o/.test(e.text)));
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("is never made in the project when the checks run in a copy", async () => {
+    const ws = workspace();
+    try {
+      const provider = scriptedProvider(turn());
+      const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high" });
+      const events = await drain(engine.run("make keep.txt", allowAll, { taskChecks: [leaves] }));
+      assert.ok(!existsSync(join(ws.dir, "bin")) && !existsSync(join(ws.dir, "made.o")));
+      const end = events.find((e) => e.kind === "job_end");
+      assert.ok(!events.some((e) => e.kind === "proof_refused"), "and the check still saw keep.txt");
+      assert.ok(end && end.kind === "job_end" && end.outcome !== "not proven", JSON.stringify(end));
     } finally {
       ws.cleanup();
     }
@@ -294,7 +322,7 @@ describe("what the checks leave behind", () => {
     try {
       const provider = scriptedProvider(turn());
       const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high" });
-      await drain(engine.run("make keep.txt", allowAll, { taskChecks: [leaves] }));
+      await inPlace(() => drain(engine.run("make keep.txt", allowAll, { taskChecks: [leaves] })));
       assert.ok(existsSync(join(ws.dir, "made.o")));
     } finally {
       ws.cleanup();

@@ -30,6 +30,7 @@ import {
 import { join } from "node:path";
 import { MIN_SECRET_CHARS, redactData } from "./redact.js";
 import { stateDir } from "./statedir.js";
+import { maskDeep } from "./withhold.js";
 
 export const GENESIS = "0".repeat(64);
 
@@ -156,6 +157,25 @@ export class Journal {
     this.path = join(this.dir, `${sessionId}.jsonl`);
   }
 
+  /**
+   * Hidden check commands, masked in every entry until `release` (src/withhold.ts).
+   * The worker can read this file; while it works, the journal names a hidden
+   * check and never quotes it.
+   */
+  private withheld: string[] = [];
+
+  /** Mask these commands in every entry from here until `release()`. */
+  withhold(commands: readonly string[]): void {
+    for (const c of commands) if (c && !this.withheld.includes(c)) this.withheld.push(c);
+  }
+
+  /** Stop masking. Returns what was masked, so the caller can record it in full. */
+  release(): string[] {
+    const out = this.withheld;
+    this.withheld = [];
+    return out;
+  }
+
   /** Register a value to mask everywhere it appears. Idempotent. */
   protect(...values: (string | undefined)[]): void {
     for (const v of values) {
@@ -176,7 +196,7 @@ export class Journal {
       // read many times, often by something that is not molt — `cat`, a CI
       // artifact viewer, a git diff — so the only place a filter can be
       // trusted is before the bytes hit the file.
-      data: redactData(data, this.secrets),
+      data: maskDeep(redactData(data, this.secrets), this.withheld),
       prev: this.prev,
     };
     const entry: JournalEntry = { ...base, hash: hashEntry(base) };

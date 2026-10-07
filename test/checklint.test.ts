@@ -91,7 +91,7 @@ describe("check lint: shell and tool bugs", () => {
   it("L9 the shapes the bar itself refuses when they pass", () => {
     assert.deepEqual(rules("grep -q x out.txt || exit 0"), ["L9-swallows-exit"]);
     assert.deepEqual(rules("python3 check.py || true"), ["L9-swallows-exit"]);
-    assert.deepEqual(rules("rm -f x || true; grep -q x out.txt"), []);
+    assert.deepEqual(rules("rm -f /tmp/x || true; grep -q x out.txt"), []);
     assert.deepEqual(rules("python3 -m unittest discover | grep -q OK"), ["L9-pipe-no-pipefail"]);
     assert.deepEqual(rules("set -o pipefail; python3 -m unittest discover | grep -q OK"), []);
   });
@@ -104,7 +104,9 @@ describe("check lint: shell and tool bugs", () => {
 
   it("L15 a check that performs the work", () => {
     assert.deepEqual(rules("git checkout -q main && grep -q x a.txt", ctx({ task: "fix the page" })), ["L15-mutates"]);
-    assert.deepEqual(rules("git checkout -q main", ctx({ task: "merge the branch" })), []);
+    // No wording in the task excuses it: "merge the branch" is what the work must do.
+    assert.deepEqual(rules("git checkout -q main", ctx({ task: "merge the branch" })), ["L15-mutates"]);
+    assert.deepEqual(rules("git log --oneline | grep -q merge", ctx({ task: "merge the branch" })), []);
   });
 });
 

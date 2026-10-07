@@ -301,6 +301,12 @@ export type CheckResult = {
   /** Carried from the check: the command is withheld from the model. */
   hidden?: boolean;
   /**
+   * A task check that should have run in a throwaway copy of the tree ran in
+   * the project itself, and why (src/scratch.ts). What it wrote, it wrote to
+   * the work.
+   */
+  ranInPlace?: string;
+  /**
    * True when this result was reused rather than re-run.
    *
    * Surfaced everywhere a result is, because a reused pass presented as a
@@ -688,6 +694,11 @@ export type EngineEvent =
   | { kind: "receipt"; path: string }
   | { kind: "shed"; before: number; after: number; dropped: number; path: string }
   | { kind: "info"; text: string }
+  /**
+   * The hidden checks' commands, released once the work is over (src/withhold.ts).
+   * Until this event nothing Maat writes or prints quotes them.
+   */
+  | { kind: "checks_released"; seal: string; checks: { name: string; run: string }[]; receipts: string[] }
   | {
       kind: "error";
       text: string;

@@ -19,6 +19,8 @@ import { assertionsIn, fingerprint, isTestPath, treeChanges, type TreeSnapshot }
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { copyTreeOrWhy, runsInCopy } from "./scratch.js";
+import { maskText } from "./withhold.js";
 import { dirname, join, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { ArchiveLike } from "./archive.js";
@@ -2177,18 +2179,25 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
   let output = "";
   let diagnosis: CommandDiagnosis = { didNotRun: false };
   let timedOut = false;
+  // A task check runs in a throwaway copy of the tree, so a check that writes,
+  // commits or deletes cannot change the work it judges (src/scratch.ts).
+  const tried = runsInCopy(check) ? await copyTreeOrWhy(ctx.cwd) : null;
+  const copy = tried && !("why" in tried) ? tried : null;
+  // Said on the result (and so in the receipt and the journal's bar_run), not
+  // left silent: this check ran on the work itself.
+  const ranInPlace = tried && "why" in tried ? tried.why : undefined;
   try {
     // Not execSync: a bar check is the longest thing molt runs (`npm test`,
     // two minutes by default) and running it synchronously froze the terminal
     // for its whole duration — including the ctrl+C that would have stopped it.
     const r = await runCommand(check.run, {
-      cwd: ctx.cwd,
+      cwd: copy?.dir ?? ctx.cwd,
       shell: draftedShell(check),
       timeoutMs: check.timeoutMs,
       maxBuffer: 8 * 1024 * 1024,
       signal: ctx.signal,
     });
-    output = `${r.stdout}${r.stderr}`;
+    output = copy ? copy.unmap(`${r.stdout}${r.stderr}`) : `${r.stdout}${r.stderr}`;
     exitCode = r.code ?? 1;
     if (r.timedOut) {
       timedOut = true;
@@ -2200,6 +2209,8 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
   } catch (e) {
     exitCode = 1;
     output = String(e);
+  } finally {
+    await copy?.cleanup();
   }
   let passed = exitCode === check.expectExit;
   if (!passed && diagnosis.hint) {
@@ -2223,6 +2234,7 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
     ...(check.hidden ? { hidden: true } : {}),
     ...(diagnosis.didNotRun ? { didNotRun: true } : {}),
     ...(timedOut ? { timedOut: true } : {}),
+    ...(ranInPlace ? { ranInPlace } : {}),
     tags: check.tags,
     kind: "command",
     detail: check.run,
@@ -2233,8 +2245,13 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
     // command, this exit code, this long. A failure keeps its real output,
     // which is the whole point of a failure.
     output: passed
-      ? `\`${check.run}\` exited ${exitCode} in ${Date.now() - t0}ms`
-      : truncate(output),
+      ? // A hidden check is named, not quoted: this line is cut to fit a receipt's
+        // table, and a cut command is a prefix no mask can match (src/withhold.ts).
+        `\`${check.hidden ? check.name : check.run}\` exited ${exitCode} in ${Date.now() - t0}ms`
+      : // A failing hidden check whose output echoes its own command (a shell's
+        // `line 1: …`, `set -x`, a runner printing its argv) is masked before
+        // the cut, for the same reason.
+        truncate(check.hidden ? maskText(output, [check.run]) : output),
     durationMs: Date.now() - t0,
   };
 }
