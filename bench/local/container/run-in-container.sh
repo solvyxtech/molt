@@ -69,9 +69,12 @@ printf 'OPENROUTER_API_KEY=%s\n' "$key" > "$envf"
 # The graders and reference solutions are mounted where only root can reach (/root is 700),
 # copied to a root-only /opt/bench, and run.py runs from there as root; it runs the agent
 # as the unprivileged `agent` user (BENCH_AGENT_USER) and grades as root afterwards.
-# /work is 711: the worker can reach its own task folder by name but cannot list the others.
+# Tasks run in a container-local /var/lib/bench-work (711: the worker reaches its own task folder
+# by name but cannot list the others) and are copied to /work when run.py ends. /work is a host
+# bind mount, where chown is ignored and modes are not enforced, so nothing locked there would
+# stay locked from a later task's worker.
 privsep=${BENCH_PRIVSEP:-1}
-credmount=; startcmd='export MOLT_DIST_ABS=$(npm root -g)/@solvyx/molt/dist; mkdir -p /work && chmod 711 /work && rm -rf /opt/bench && cp -a /root/bench-src /opt/bench && chmod -R go-rwx /opt/bench && cd /opt/bench && python3 run.py "$@"'
+credmount=; startcmd='export MOLT_DIST_ABS=$(npm root -g)/@solvyx/molt/dist BENCH_WORK=/var/lib/bench-work BENCH_EXPORT=/work; mkdir -p /work $BENCH_WORK && chmod 711 $BENCH_WORK && rm -rf /opt/bench && cp -a /root/bench-src /opt/bench && chmod -R go-rwx /opt/bench && cd /opt/bench && python3 run.py "$@"'
 if [ "$SUBSCRIPTION" = grok ]; then
   credmount="-v $HOME/.grok/auth.json:/root/grok-cred/auth.json:ro"
   # The worker's grok runs as `agent`, so its credential copy lives in ITS home, owned by it,

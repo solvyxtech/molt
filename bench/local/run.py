@@ -28,6 +28,11 @@ HERE = Path(__file__).resolve().parent
 # Outside every git repository: a task folder inside this one let agents'
 # `git commit` walk up and commit task files into molt-desktop's main.
 WORK = Path(os.environ.get("BENCH_WORK", Path.home() / ".cache/maat-bench/work"))
+# BENCH_EXPORT: where the task folders and logs are copied when the whole run ends. The
+# container works in a container-local BENCH_WORK because a host bind mount (OrbStack, Docker
+# Desktop) ignores chown and does not enforce modes for other users: on /work a later task's
+# worker could read every earlier task's log and released checks however they were locked.
+EXPORT = os.environ.get("BENCH_EXPORT")
 # MOLT_DIST_ABS: an absolute path to the built Maat (the container mounts it at /maat).
 MOLT = (Path(os.environ["MOLT_DIST_ABS"]) if os.environ.get("MOLT_DIST_ABS") else Path.home() / os.environ.get("MOLT_DIST", "Documents/molt-desktop/dist-compare")) / "cli.js"
 LIMIT = int(os.environ.get("BENCH_LIMIT", "600"))  # seconds per task
@@ -225,6 +230,14 @@ def parse_arms(spec: str | None) -> list[tuple[str | None, dict]]:
 
 
 def main(which: str, repeats: int, task_filter: str | None) -> None:
+    try:
+        run_all(which, repeats, task_filter)
+    finally:
+        if EXPORT and Path(EXPORT).resolve() != WORK.resolve() and WORK.exists():
+            shutil.copytree(WORK, EXPORT, symlinks=True, dirs_exist_ok=True)
+
+
+def run_all(which: str, repeats: int, task_filter: str | None) -> None:
     from tasks2 import TASKS2  # noqa: PLC0415
     from tasks3 import TASKS3  # noqa: PLC0415
     agents = {"molt": run_molt}

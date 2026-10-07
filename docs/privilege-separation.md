@@ -136,11 +136,15 @@ process entirely.
 - The worker's Grok credential is copied to `/home/agent/.grok`. A Grok
   judge's credential is copied to `/root/.grok` and the OpenCode judge's to
   `/root/.local/share/opencode`. `/root` is mode 700.
-- `/work` is mode 711, so a worker can reach its own task folder by name but
-  cannot list the others. Each task's log is written mode 600, and after
-  grading the task folder is locked to root (700). This stops a later task
-  (a repeat of the same task, the other arm of a pair) from reading the
-  checks an earlier one released.
+- Tasks run in a container-local `/var/lib/bench-work` (mode 711), so a
+  worker can reach its own task folder by name but cannot list the others.
+  Each task's log is written mode 600, and after grading the task folder is
+  locked to root (700). This stops a later task (a repeat of the same task,
+  the other arm of a pair) from reading the checks an earlier one released.
+  Everything is copied to `/work` (`BENCH_EXPORT`) when `run.py` ends. `/work`
+  is a host bind mount, and on OrbStack and Docker Desktop a bind mount
+  ignores `chown` and does not enforce file modes for other users, so a lock
+  placed there would not hold.
 - The graders and reference solutions stay root-only, as before.
 
 To check it from outside a running job:

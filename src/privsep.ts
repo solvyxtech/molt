@@ -392,7 +392,6 @@ export class PrivSep {
           `--target=${this.nsInit}`,
           "--pid",
           "--mount",
-          `--wd=${cwd}`,
           "--",
           "setpriv",
           `--reuid=${uid}`,
@@ -404,6 +403,15 @@ export class PrivSep {
           "--no-new-privs",
           "--bounding-set=-all",
           "--",
+          // The working directory is entered inside the namespace, by path.
+          // nsenter --wd opens it before entering, and a cwd from the outer
+          // mount namespace is "unreachable" inside: getcwd() then fails with
+          // EACCES whenever a parent is not readable by the worker (bench:
+          // /var/lib/bench-work is 711), and git refuses to run at all.
+          "/bin/sh",
+          "-c",
+          'cd -- "$0" && exec "$@"',
+          cwd,
           file,
           ...args,
         ],

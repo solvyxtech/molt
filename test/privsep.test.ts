@@ -45,7 +45,13 @@ function ensureWorker(): number {
 
 /** A project folder the worker owns, as the bench hands one over. */
 function project(uid: number): string {
-  const dir = mkdtempSync(join("/tmp", "maat-priv-proj-"));
+  // Under a parent the worker may pass through but not read, as the bench's
+  // /var/lib/bench-work: a cwd that only works because "/tmp" is readable
+  // hid a getcwd() failure that broke every git command.
+  const parent = "/var/tmp/maat-priv-711";
+  mkdirSync(parent, { recursive: true });
+  chmodSync(parent, 0o711);
+  const dir = mkdtempSync(join(parent, "proj-"));
   chmodSync(dir, 0o755);
   chownSync(dir, uid, uid);
   return dir;
@@ -123,7 +129,7 @@ describe("privilege separation (Linux, root)", { skip: linuxRoot ? false : "need
     const provider = scriptedProvider([
       {
         calls: [
-          { name: "bash", args: { command: "id -u > who.txt; id -u" } },
+          { name: "bash", args: { command: "id -u > who.txt; pwd -P > where.txt; git init -q . && git status --short >/dev/null && echo git-ok >> where.txt" } },
           { name: "read_file", args: { path: secret } },
           { name: "write_file", args: { path: "made.txt", content: "mine\n" } },
           { name: "grep", args: { path: ".", pattern: "sealed" } },
@@ -139,6 +145,7 @@ describe("privilege separation (Linux, root)", { skip: linuxRoot ? false : "need
     }
     assert.equal(readFileSync(join(dir, "who.txt"), "utf8").trim(), String(uid), "bash ran as Maat's uid");
     assert.equal(statSync(join(dir, "who.txt")).uid, uid);
+    assert.equal(readFileSync(join(dir, "where.txt"), "utf8"), `${dir}\ngit-ok\n`, "the worker's commands cannot see their own cwd");
     assert.equal(statSync(join(dir, "made.txt")).uid, uid, "write_file wrote as Maat");
     const results = toolResults(provider);
     const joined = results.join("\n---\n");
