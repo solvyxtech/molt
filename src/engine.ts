@@ -4082,7 +4082,10 @@ export class Engine {
         provider: this.provider,
         task,
         claim,
-        transcript: this.transcript.wire(),
+        // What the model wrote, broken arguments included: the repair in
+        // wire() is for the provider, and a model's broken JSON is exactly
+        // what a training record must keep.
+        transcript: this.transcript.wire({ repairArgs: false }),
         ledger: this.sessionLedger(),
         turnLedger: this.turnLedger(),
         did: [...this.did],

@@ -19,6 +19,7 @@
  * No filesystem access here — archiving lives in archive.ts so this whole
  * module stays pure and testable.
  */
+import { parseLenient } from "./lenient-json.js";
 import { estTokens, type Bom, type Msg } from "./types.js";
 
 export const STALE_FAILURE_PREFIX = "[molt: superseded]";
@@ -145,7 +146,11 @@ export class Transcript {
    * Messages formatted for the wire: molt's own metadata removed, since
    * providers reject unknown fields with varying degrees of politeness.
    */
-  wire(): Omit<Msg, "molt">[] {
+  wire(opts: { repairArgs?: boolean } = {}): Omit<Msg, "molt">[] {
+    // Repaired tool-call arguments are for the request only (wireArgs). A
+    // record of what the model did (a capture) passes repairArgs: false and
+    // keeps the arguments exactly as the model wrote them.
+    const repair = opts.repairArgs !== false;
     // One system message, and it comes first. The pinned task and a shed's
     // digest were system messages of their own, which OpenAI-style APIs take
     // and strict chat templates refuse: Qwen's raises "System message must be
@@ -154,7 +159,7 @@ export class Transcript {
     // in order; a system message anywhere later goes as a user message.
     const out: Omit<Msg, "molt">[] = [];
     for (const { molt: _molt, ...m } of this.all()) {
-      if (m.role !== "system") out.push(m);
+      if (m.role !== "system") out.push(repair && Array.isArray(m.tool_calls) ? { ...m, tool_calls: m.tool_calls.map(wireCall) } : m);
       else if (out.length === 0) out.push({ ...m });
       else if (out.length === 1 && out[0]!.role === "system") out[0] = { ...out[0]!, content: `${out[0]!.content ?? ""}\n\n${m.content ?? ""}` };
       else out.push({ role: "user", content: m.content ?? "" });
@@ -616,4 +621,48 @@ export function toolDetail(name: string, args: Record<string, unknown>): string 
   // heredoc spread over twelve lines is a transcript nobody can scan.
   return raw.replace(/\s+/g, " ").trim();
 
+}
+
+/**
+ * A tool call as it goes back to the provider: arguments always valid JSON.
+ *
+ * Maat reads a model's slightly broken arguments leniently, which is right for
+ * running the call, but it sent the broken text back in the history. Strict
+ * providers then refuse every later request: DeepSeek V4 Pro on StreamLake
+ * answered "Assistant tool call function.arguments must be valid JSON" and
+ * ended 6 of 12 runs (2026-10-07). The transcript keeps what the model wrote;
+ * only the wire copy is repaired.
+ *
+ * Always a JSON object, the one shape the engine runs and the one chat
+ * templates that iterate `arguments | items` accept: blank or `null` is `{}`;
+ * anything else that is not an object (an array, a number, a string) or that
+ * cannot be read at all goes as `{"_unparsed": "<what the model wrote>"}`, so
+ * the next turn sees its own mistake rather than a call that seems to have
+ * sent nothing.
+ */
+export function wireArgs(text: string): string {
+  const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+  if (!text.trim()) return "{}";
+  let v: unknown;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    try {
+      const lenient = parseLenient(text);
+      if (isObject(lenient)) return JSON.stringify(lenient);
+    } catch {
+      /* fall through */
+    }
+    return JSON.stringify({ _unparsed: text });
+  }
+  if (isObject(v)) return text;
+  if (v === null) return "{}";
+  return JSON.stringify({ _unparsed: text });
+}
+
+function wireCall<T extends { function?: { arguments?: unknown } }>(c: T): T {
+  const a = c.function?.arguments;
+  if (typeof a !== "string") return c;
+  const fixed = wireArgs(a);
+  return fixed === a ? c : { ...c, function: { ...c.function!, arguments: fixed } };
 }
