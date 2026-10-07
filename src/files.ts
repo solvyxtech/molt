@@ -207,7 +207,7 @@ function* walkSteps(root: string, opts: WalkOptions, out: WalkResult): Generator
 
   // Bound every followed path against the real workspace, not the lexical
   // one. `statSync` resolves links, so a symlink to /etc or to
-  // ~/.config/molt/auth.json would otherwise be listed and grepped as if it
+  // ~/.config/maat/auth.json would otherwise be listed and grepped as if it
   // lived in the project. A root that cannot be resolved is not a tree we
   // can police, so the walk is empty rather than unbounded.
   let rootReal: string;
