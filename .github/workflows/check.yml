@@ -53,4 +53,9 @@ jobs:
       - uses: actions/checkout@v4
       - run: npm ci
       - run: npm run test:build && npm run build
+      # The job container's HOME is /github/home, a runner bind mount the
+      # worker can read and root does not own, so Maat (correctly) refuses it
+      # as the judge's HOME. root's own HOME is private.
       - run: node --test --test-reporter=spec dist-test/test/privsep.test.js
+        env:
+          HOME: /root
