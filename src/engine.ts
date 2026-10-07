@@ -21,7 +21,8 @@
 import { bashPath, runCommand } from "./run.js";
 import { copyTreeOrWhy } from "./scratch.js";
 import { describeStart, listBackground, startBackground, stopBackground } from "./background.js";
-import { objectionLine, reviewClaim, type ExecutableReview, type ObjectionRun, type Review } from "./review.js";
+import { objectionLine, readsTheWork, reviewClaim, type ExecutableReview, type ObjectionRun, type Review } from "./review.js";
+import { credentialFreeEnv } from "./credenv.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
 import { tierOf } from "./tiers.js";
 import { arbitrate, parseDisputes, type Ruling } from "./dispute.js";
@@ -3615,32 +3616,39 @@ export class Engine {
    * "could not be run safely".
    */
   private async runObjection(command: string): Promise<ObjectionRun> {
-    const tried = process.env.MAAT_CHECK_COPY === "0" ? { why: "MAAT_CHECK_COPY=0 turns throwaway copies off" } : copyTreeOrWhy(this.cwd);
+    const tried = process.env.MAAT_CHECK_COPY === "0" ? { why: "MAAT_CHECK_COPY=0 turns throwaway copies off" } : await copyTreeOrWhy(this.cwd);
     if ("why" in tried) {
       return { code: null, stdout: "", stderr: "", notRun: `could not be run safely: no throwaway copy of the tree (${tried.why})` };
     }
     const copy = tried;
     try {
       const left = this.timeLeftMs();
+      if (left !== undefined && left <= 0) {
+        return { code: null, stdout: "", stderr: "", notRun: "the time budget is spent" };
+      }
       const r = await runCommand(command, {
         cwd: copy.dir,
         shell: bashPath() ?? true,
-        timeoutMs: left !== undefined ? Math.max(1_000, Math.min(30_000, left)) : 30_000,
+        timeoutMs: left !== undefined ? Math.max(1, Math.min(30_000, left)) : 30_000,
         maxBuffer: 1024 * 1024,
+        // The reviewer's command never sees Maat's credentials (credentialFreeEnv).
+        env: credentialFreeEnv(process.env),
+        signal: this.running?.signal,
       });
       const fix = (t: string) => copy.unmap(t);
-      return { code: r.code, stdout: fix(r.stdout), stderr: fix(r.stderr), timedOut: r.timedOut };
+      return { code: r.code, stdout: fix(r.stdout), stderr: fix(r.stderr), timedOut: r.timedOut, readsWork: readsTheWork(command, copy.dir) };
     } finally {
-      copy.cleanup();
+      await copy.cleanup();
     }
   }
+
 
   /** Executable mode: every objection that did not count, as an info line each. */
   private *unsubstantiated(review: Review | null): Generator<EngineEvent> {
     for (const o of review?.objections ?? []) {
       if (o.result === "demonstrated") continue;
       // The reviewer's command and its output can quote a hidden check.
-      yield { kind: "info", text: this.maskWithheld(`unsubstantiated objection (reviewer ${o.vote}, not counted): ${objectionLine(o)}`) };
+      yield { kind: "info", text: this.maskWithheld(`objection not counted (reviewer ${o.vote}): ${objectionLine(o)}`) };
     }
   }
 

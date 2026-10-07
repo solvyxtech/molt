@@ -6,11 +6,14 @@
 
 - **`--review-executable`** (experimental, also `MAAT_REVIEW_EXECUTABLE=1`):
   every `--review` objection must carry a read-only command that demonstrates
-  it. Maat runs it on a throwaway copy of the tree; an objection counts only
-  when its command exits non-zero or prints the value it named. Any non-zero
-  exit counts, so a demonstrated objection shows the command failed, not that
-  it tested what the objection says. With no copy of the tree available the
-  command is not run, and the objection is recorded as not counted.
+  it. Maat runs it on a throwaway copy of the tree, with no API keys, tokens or
+  provider variables in its environment; an objection counts only when its
+  command reads the work (names a project path, or runs the project's tests or
+  build) and exits non-zero, or prints the value it named without that value
+  being in the command itself. A demonstrated objection shows the command
+  failed, not that it tested what the objection says. With no copy of the tree
+  available the command is not run. Each objection is recorded as counted,
+  refuted (the reviewer was wrong) or unchecked (it could not be run).
 
 ### Changed
 

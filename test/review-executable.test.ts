@@ -13,10 +13,13 @@ import {
   REVIEW_SYSTEM,
   REVIEW_SYSTEM_EXECUTABLE,
   judgeObjectionRun,
+  objectionLine,
+  readsTheWork,
   reviewClaim,
   type ExecutableReview,
   type ObjectionRun,
 } from "../src/review.js";
+import { credentialFreeEnv } from "../src/credenv.js";
 import { allowAll, drain, scriptedProvider, workspace, type ScriptedTurn } from "./helpers.js";
 
 const TASK = "Write out.txt containing exactly 365 lines. Do not create any other file.";
@@ -119,6 +122,46 @@ describe("executable objections: reviewClaim", () => {
     assert.equal(r!.votes, "1/2");
   });
 
+  it("a failure counts only from a command that reads the work, and an echoed line shows nothing", () => {
+    assert.equal(judgeObjectionRun({ code: 1, stdout: "", stderr: "", readsWork: false }, undefined, "false").result, "off-the-work");
+    assert.equal(judgeObjectionRun({ code: 1, stdout: "", stderr: "", readsWork: true }, undefined, "test -s out.txt").result, "demonstrated");
+    const echoed = judgeObjectionRun({ code: 0, stdout: "extra line\n", stderr: "" }, "extra line", 'echo "extra line"');
+    assert.equal(echoed.result, "off-the-work");
+    assert.match(echoed.why!, /in the command itself/);
+  });
+
+  it("knows which commands read the work", () => {
+    const ws = workspace();
+    try {
+      writeFileSync(`${ws.dir}/out.txt`, "x\n");
+      for (const c of ["false", "exit 1", "! true", "grep -q 'my regex'", "test 1 -eq 2", "echo hi | grep -q bye"]) {
+        assert.equal(readsTheWork(c, ws.dir), false, c);
+      }
+      for (const c of ['test "$(wc -l < out.txt)" -eq 365', "test -f missing.txt", "grep -rq TODO .", "npm test", "python3 -m pytest -q", "ls src/", "git log -1"]) {
+        assert.equal(readsTheWork(c, ws.dir), true, c);
+      }
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("the receipt tells a wrong reviewer from an objection that could not be checked", async () => {
+    const exec = runner({
+      "test -s out.txt": { code: 0, stdout: "", stderr: "" },
+      "test -f out.txt": { code: null, stdout: "", stderr: "", notRun: "could not be run safely: no throwaway copy of the tree (x)" },
+    });
+    const r = await reviewClaim({ task: TASK, receipt: "r", votes: 2, ask: ask([objection("test -s out.txt"), objection("test -f out.txt")]), executable: exec });
+    assert.deepEqual(r!.objections!.map((o) => o.standing), ["refuted", "unchecked"]);
+    assert.equal(r!.unchecked, 1);
+    assert.match(objectionLine(r!.objections![0]!), /unsubstantiated \(reviewer wrong\)/);
+    assert.match(objectionLine(r!.objections![1]!), /not checked \(could not run\)/);
+  });
+
+  it("a credential-free environment drops keys, tokens and provider variables, and keeps the rest", () => {
+    const env = credentialFreeEnv({ PATH: "/bin", HOME: "/h", LANG: "C", OPENROUTER_API_KEY: "k", GH_TOKEN: "t", MAAT_URL: "u", AWS_SECRET_ACCESS_KEY: "s", DATABASE_URL: "d", MY_PASSWORD: "p" });
+    assert.deepEqual(env, { PATH: "/bin", HOME: "/h", LANG: "C" });
+  });
+
   it("with the option off nothing changes: same prompt, prose objections still count, no objections field", async () => {
     const systems: string[] = [];
     const r = await reviewClaim({ task: TASK, receipt: "r", ask: ask([objection("true"), objection("true"), clean], systems) });
@@ -164,7 +207,7 @@ describe("executable objections in a turn", () => {
       assert.deepEqual([end.review?.confirmed, end.review?.votes], [true, "0/3"]);
       assert.deepEqual(end.review?.objections?.map((o) => [o.result, o.exit]), [["passed", 0], ["passed", 0], ["passed", 0]]);
       assert.equal(provider.calls, 5, "no nudge: two work steps, three reviews");
-      const notes = events.filter((e) => e.kind === "info" && e.text.startsWith("unsubstantiated objection"));
+      const notes = events.filter((e) => e.kind === "info" && e.text.startsWith("objection not counted"));
       assert.equal(notes.length, 3);
       const row = indexRows(ws.dir).at(-1)!;
       assert.equal((row.objections as { command: string }[])[0]!.command, 'test "$(wc -l < out.txt)" -eq 1', "the receipt row carries each objection and its command");
@@ -233,6 +276,33 @@ describe("executable objections in a turn", () => {
       }
     });
   }
+
+  it("an objection command never sees Maat's credentials", async () => {
+    const ws = workspace();
+    const was = process.env.REVIEW_TEST_API_KEY;
+    process.env.REVIEW_TEST_API_KEY = "s3cret-value";
+    try {
+      // Would print the key (and so "show" it) with Maat's environment.
+      const v = objection("printenv REVIEW_TEST_API_KEY; test -f out.txt", "s3cret-value");
+      const { engine } = engineFor(ws.dir, [
+        { calls: [{ name: "write_file", args: { path: "out.txt", content: "x\n" } }] },
+        { text: "Wrote out.txt." },
+        { text: v }, { text: v }, { text: v },
+      ], true);
+      const events = await drain(engine.run(TASK, allowAll, { taskChecks: [check] }));
+      const end = events.find((e) => e.kind === "job_end");
+      assert.ok(end && end.kind === "job_end");
+      assert.equal(end.outcome, "verified");
+      for (const o of end.review?.objections ?? []) {
+        assert.equal(o.result, "passed");
+        assert.ok(!(o.output ?? "").includes("s3cret"), o.output);
+      }
+    } finally {
+      if (was === undefined) delete process.env.REVIEW_TEST_API_KEY;
+      else process.env.REVIEW_TEST_API_KEY = was;
+      ws.cleanup();
+    }
+  });
 
   it("with the option off a turn is unchanged: prose objections veto and nothing is run or recorded", async () => {
     const ws = workspace();

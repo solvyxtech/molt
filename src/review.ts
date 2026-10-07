@@ -17,6 +17,8 @@
  * is unconfirmed only when a majority of independent reviews found a
  * grounded violation.
  */
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { askModel, jsonIn, type AskOptions } from "./ask.js";
 import { checkMutates } from "./checkwrites.js";
 import { diagnoseFailure } from "./bar.js";
@@ -49,6 +51,8 @@ export type Review = {
    * command and what running it showed. Only "demonstrated" ones were counted.
    */
   objections?: Objection[];
+  /** Executable mode: objections that could not be run at all, so neither counted nor refuted. */
+  unchecked?: number;
 };
 
 /** Lower-case, whitespace-collapsed, for the verbatim-quote check. */
@@ -113,7 +117,12 @@ export async function reviewClaim(opts: {
       votes: `${flagged.length}/${ok.length}`,
       // The evidence a person (and the worker, if nudged) reads names the command that showed it.
       violations: confirmed ? [] : flagged[0]!.map((o) => ({ quote: o.quote, evidence: `${o.evidence} [shown by \`${o.command}\`: ${o.exit !== 0 ? `exited ${o.exit}` : "printed the offending value"}]` })),
-      objections: judged.flat(),
+      objections: judged.flat().map((o) => ({ ...o, standing: objectionStanding(o.result) })),
+      // A review whose objections could not be run is not a review that found
+      // nothing; the receipt says how many there were.
+      ...(judged.flat().some((o) => objectionStanding(o.result) === "unchecked")
+        ? { unchecked: judged.flat().filter((o) => objectionStanding(o.result) === "unchecked").length }
+        : {}),
     };
   }
   const found = ok.map((r) => groundedViolations(r.text, opts.task));
@@ -169,7 +178,27 @@ export type ObjectionResult =
   /** It did not run: not found, could not open its input, timed out, killed. */
   | "did-not-run"
   /** Over the per-review command budget; never run. */
-  | "not-run";
+  | "not-run"
+  /**
+   * It failed, but it reads nothing of the work (`false`, `exit 1`, a
+   * pattern with no file): a failure that says nothing about what was built.
+   */
+  | "off-the-work";
+
+/**
+ * Where an objection stands, in one word a receipt can carry:
+ * `counted` — demonstrated on the work, so it vetoes;
+ * `refuted` — the reviewer was wrong: the command passed on the work, did not
+ *   read it, came with no command, or would have changed it;
+ * `unchecked` — it could not be run (no safe copy, timed out, over budget),
+ *   so nothing is known either way. Neither of the last two vetoes.
+ */
+export type ObjectionStanding = "counted" | "refuted" | "unchecked";
+
+export function objectionStanding(result: ObjectionResult): ObjectionStanding {
+  if (result === "demonstrated") return "counted";
+  return result === "did-not-run" || result === "not-run" ? "unchecked" : "refuted";
+}
 
 export type Objection = Violation & {
   /** Which reviewer (1-based) raised it. */
@@ -177,6 +206,8 @@ export type Objection = Violation & {
   command?: string;
   shows?: string;
   result: ObjectionResult;
+  /** objectionStanding(result), written out so a receipt row says it. */
+  standing?: ObjectionStanding;
   exit?: number | null;
   /** The command's output, cut short. */
   output?: string;
@@ -191,6 +222,12 @@ export type ObjectionRun = {
   timedOut?: boolean;
   /** Not run at all, and why: there was no safe place to run it (no throwaway copy of the tree). */
   notRun?: string;
+  /**
+   * Whether the command reads the work: names a file or folder of the project,
+   * or runs its tests or build (readsTheWork). False makes a failure prove
+   * nothing; left out, it is not checked.
+   */
+  readsWork?: boolean;
 };
 
 /** How an executable review runs a command: on a throwaway copy of the tree (src/scratch.ts). */
@@ -222,10 +259,43 @@ export function groundedObjections(reply: string, task: string): (Violation & { 
 
 const OUTPUT_CAP = 600;
 
+/** Commands that read the project without naming a file: its tests, its build, its history. */
+const READS_PROJECT = /^(npm|npx|pnpm|yarn|bun|make|cargo|go|pytest|tox|nox|mvn|gradle|\.\/gradlew|dotnet|mix|rake|bundle|composer|deno|git|swift|ctest|cmake|meson|ninja)$/;
+
+/**
+ * Does this command read the work? It names the project (`.`), a path in it
+ * (one that exists in `dir`, the copy it runs in, or one shaped like a path:
+ * a missing deliverable is a fair objection), or it runs the project's tests
+ * or build. Read
+ * from the words of the command, quotes and shell punctuation removed; a
+ * glob counts by the folder it starts in.
+ */
+export function readsTheWork(command: string, dir: string): boolean {
+  const words = command.split(/[\s;&|()<>`"'=,]+/).map((w) => w.replace(/^\$\(/, "").trim()).filter(Boolean);
+  for (const w of words) {
+    const head = w.replace(/^.*\//, "");
+    if (READS_PROJECT.test(w) || READS_PROJECT.test(head)) return true;
+    if (/^-/.test(w) || w.startsWith("/") || w.startsWith("~") || w.startsWith("$")) continue;
+    if (w === "." || w === "./") return true;
+    const path = w.replace(/^\.\//, "").replace(/[*?[{].*$/, "").replace(/[:/]+$/, "");
+    if (!path || path.startsWith("..")) continue;
+    // Shaped like a project path (a folder, or a name with an extension): a
+    // check that a file the task asks for is missing names a file that is not there.
+    if (/\//.test(w.replace(/^\.\//, "")) || /^[\w.-]*\w\.[A-Za-z0-9]{1,8}$/.test(path)) return true;
+    try {
+      if (existsSync(join(dir, path))) return true;
+    } catch {
+      /* not a path */
+    }
+  }
+  return false;
+}
+
 /** Judge one ran command: did it demonstrate the objection? */
 export function judgeObjectionRun(
   r: ObjectionRun,
   shows: string | undefined,
+  command?: string,
 ): { result: ObjectionResult; why?: string } {
   if (r.notRun) return { result: "did-not-run", why: r.notRun };
   if (r.timedOut) return { result: "did-not-run", why: "the command timed out" };
@@ -235,10 +305,19 @@ export function judgeObjectionRun(
     // A command that could not find or open what it reads demonstrates nothing
     // about the work: the objection names a path the reviewer guessed.
     if (d.didNotRun || d.hint) return { result: "did-not-run", why: d.hint ?? "the command did not run" };
+    // `false` and `exit 1` fail on any tree. A failure counts only from a
+    // command that read the work.
+    if (r.readsWork === false) {
+      return { result: "off-the-work", why: "it failed, but it reads no file of the project and runs none of its tests" };
+    }
     return { result: "demonstrated" };
   }
   if (shows !== undefined) {
     const want = shows.trim();
+    // `echo "the line"` prints whatever it is given.
+    if (want && command !== undefined && command.includes(want)) {
+      return { result: "off-the-work", why: "the line it names is in the command itself, so printing it shows nothing" };
+    }
     const lines = `${r.stdout}\n${r.stderr}`.split("\n").map((l) => l.trim());
     if (want && lines.includes(want)) return { result: "demonstrated" };
     return { result: "passed", why: `the command exited 0 and did not print the line it named (${JSON.stringify(shows.slice(0, 120))})` };
@@ -284,7 +363,7 @@ export async function substantiate(
         list.push({ ...base, result: "did-not-run", why: "the command could not be started" });
         continue;
       }
-      const j = judgeObjectionRun(r, v.shows);
+      const j = judgeObjectionRun(r, v.shows, v.command);
       const output = `${r.stdout}${r.stderr}`;
       list.push({
         ...base,
@@ -308,5 +387,7 @@ export function objectionLine(o: Objection): string {
         ? `exited ${o.exit}`
         : "printed the offending value"
       : o.why ?? o.result;
-  return `"${o.quote}" — ${o.evidence}${cmd} → ${o.result === "demonstrated" ? "demonstrated" : "unsubstantiated"}: ${res}`;
+  const standing = objectionStanding(o.result);
+  const label = standing === "counted" ? "demonstrated" : standing === "refuted" ? "unsubstantiated (reviewer wrong)" : "not checked (could not run)";
+  return `"${o.quote}" — ${o.evidence}${cmd} → ${label}: ${res}`;
 }

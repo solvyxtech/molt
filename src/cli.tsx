@@ -165,11 +165,13 @@ options
   --review-executable  experimental: every --review objection must carry a
                      read-only command that demonstrates it; Maat runs it on a
                      copy of the tree and an objection whose command is missing,
-                     mutates, or passes on the work is a note, not a veto;
-                     any non-zero exit counts, so it shows the command failed,
-                     not that it tested what the objection says. With no
-                     throwaway copy of the tree the command is not run and the
-                     objection does not count (also MAAT_REVIEW_EXECUTABLE=1)
+                     mutates, or passes on the work is a note, not a veto. A
+                     failure counts only from a command that reads the work
+                     (names a project path or runs its tests); it shows the
+                     command failed, not that it tested what the objection
+                     says. Commands run without Maat's credentials, and with
+                     no throwaway copy of the tree they are not run and do not
+                     count (also MAAT_REVIEW_EXECUTABLE=1)
   --signout          before an unattended claim is judged, put each stated
                      requirement to the model once beside the commands it ran
                      (off by default: 60 rounds rescued no task)
