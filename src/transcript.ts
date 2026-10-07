@@ -19,6 +19,7 @@
  * No filesystem access here — archiving lives in archive.ts so this whole
  * module stays pure and testable.
  */
+import { parseLenient } from "./lenient-json.js";
 import { estTokens, type Bom, type Msg } from "./types.js";
 
 export const STALE_FAILURE_PREFIX = "[molt: superseded]";
@@ -154,7 +155,7 @@ export class Transcript {
     // in order; a system message anywhere later goes as a user message.
     const out: Omit<Msg, "molt">[] = [];
     for (const { molt: _molt, ...m } of this.all()) {
-      if (m.role !== "system") out.push(m);
+      if (m.role !== "system") out.push(Array.isArray(m.tool_calls) ? { ...m, tool_calls: m.tool_calls.map(wireCall) } : m);
       else if (out.length === 0) out.push({ ...m });
       else if (out.length === 1 && out[0]!.role === "system") out[0] = { ...out[0]!, content: `${out[0]!.content ?? ""}\n\n${m.content ?? ""}` };
       else out.push({ role: "user", content: m.content ?? "" });
@@ -616,4 +617,36 @@ export function toolDetail(name: string, args: Record<string, unknown>): string 
   // heredoc spread over twelve lines is a transcript nobody can scan.
   return raw.replace(/\s+/g, " ").trim();
 
+}
+
+/**
+ * A tool call as it goes back to the provider: arguments always valid JSON.
+ *
+ * Maat reads a model's slightly broken arguments leniently, which is right for
+ * running the call, but it sent the broken text back in the history. Strict
+ * providers then refuse every later request: DeepSeek V4 Pro on StreamLake
+ * answered "Assistant tool call function.arguments must be valid JSON" and
+ * ended 6 of 12 runs (2026-10-07). The transcript keeps what the model wrote;
+ * only the wire copy is repaired, or replaced by {} when nothing can be read.
+ */
+export function wireArgs(text: string): string {
+  try {
+    JSON.parse(text);
+    return text;
+  } catch {
+    try {
+      const v = parseLenient(text);
+      if (v && typeof v === "object") return JSON.stringify(v);
+    } catch {
+      /* fall through */
+    }
+    return "{}";
+  }
+}
+
+function wireCall<T extends { function?: { arguments?: unknown } }>(c: T): T {
+  const a = c.function?.arguments;
+  if (typeof a !== "string") return c;
+  const fixed = wireArgs(a);
+  return fixed === a ? c : { ...c, function: { ...c.function!, arguments: fixed } };
 }
