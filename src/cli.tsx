@@ -29,7 +29,7 @@ import { draftMission, missionStatus, runMission, writePlan, type MissionSummary
 import { parseDuration } from "./session-commands.js";
 import { passedChecksWords } from "./tiers.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
-import { commandsHere,draftCriteriaCritiqued, preflightCriteria, taskChecksFrom, type Draft } from "./criteria.js";
+import { commandsHere, draftCriteriaCritiqued, drafterInputsHash, drafterSnapshot, preflightCriteria, taskChecksFrom, type Draft, type DrafterInputs } from "./criteria.js";
 import { listProject, removeNew } from "./leftovers.js";
 import { projectScripts } from "./interview.js";
 import {
@@ -1189,6 +1189,15 @@ async function cmdMission(args: Args): Promise<number> {
   }
 }
 
+/** What the criteria drafter may read, taken before the turn's first step. */
+function drafterSnapshotFor(args: Args): DrafterInputs {
+  return drafterSnapshot(args.task ?? "", args.cwd, {
+    commands: commandsHere(args.cwd),
+    scripts: projectScripts(args.cwd),
+    lessons: new Judgments(args.cwd).lessons(),
+  });
+}
+
 /**
  * `--criteria auto`: the model writes the exam, and is then held to it.
  *
@@ -1205,17 +1214,23 @@ async function autoDraft(
   engine: Engine,
   args: Args,
   soFar?: { draft?: Draft; sealed?: boolean; late?: boolean },
+  inputs?: { snapshot: DrafterInputs; used: string[] },
 ): Promise<ReturnType<typeof taskChecksFrom>> {
+  // Taken once, now, before the first step: the second try below and every
+  // stage of each draft read this and never the folder the work is changing.
+  const snapshot = inputs?.snapshot ?? drafterSnapshotFor(args);
   const none: ReturnType<typeof taskChecksFrom> = { taskChecks: [], taskNotes: [] };
   // Drafted, then read cold by a critic against the task text: a check that
   // invents or guesses is dropped (with a task quote), and a draft where
   // nothing runs the deliverable is asked for once more. See criteria.ts.
   const draftOnce = () =>
     draftCriteriaCritiqued({
-      commands: commandsHere(args.cwd),
-      lessons: new Judgments(args.cwd).lessons(),
+      snapshot,
+      ...(snapshot.commands ? { commands: snapshot.commands } : {}),
+      lessons: [...snapshot.lessons],
       task: args.task ?? "",
-      scripts: projectScripts(args.cwd),
+      scripts: [...snapshot.scripts],
+      onInputs: (sha) => inputs?.used.push(sha),
       barChecks: (engine.cfg.bar?.checks ?? []).map((c) => c.name),
       ...judgeTarget({ baseUrl: args.url, apiKey: args.key, model: args.model }),
       cwd: args.cwd,
@@ -1518,7 +1533,13 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   // Drafted while the model starts reading: the engine seals them before the
   // first change or claim, so they still predate the work (see RunOptions).
   const soFar: { draft?: Draft; sealed?: boolean; late?: boolean } = {};
-  const pendingCriteria = args.autoCriteria && !ask ? autoDraft(engine, args, soFar) : undefined;
+  // The drafter's inputs, frozen here; the engine journals their hash at turn
+  // start and compares it with what each drafter stage actually used.
+  const drafterInputs = args.autoCriteria && !ask ? { snapshot: drafterSnapshotFor(args), used: [] as string[] } : undefined;
+  const pendingCriteria = drafterInputs ? autoDraft(engine, args, soFar, drafterInputs) : undefined;
+  const draftInputs = drafterInputs
+    ? { sha: drafterInputsHash(drafterInputs.snapshot), used: () => [...drafterInputs.used] }
+    : undefined;
   const criteriaSoFar = pendingCriteria
     ? () => {
         // Nothing reviewed yet: leave the draft running to join at the claim
@@ -1535,7 +1556,7 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   // How long a timed turn waits for its drafted checks; for tests and debugging.
   const waitEnv = Number(env("CRITERIA_WAIT_MS"));
   const criteriaWait = Number.isFinite(waitEnv) && waitEnv > 0 ? { criteriaWaitMs: waitEnv } : {};
-  for await (const ev of engine.run(args.task, confirm, { ask, taskChecks, taskNotes, pendingCriteria, criteriaSoFar, referenceCheck, ...criteriaWait })) {
+  for await (const ev of engine.run(args.task, confirm, { ask, taskChecks, taskNotes, pendingCriteria, criteriaSoFar, referenceCheck, ...(draftInputs ? { draftInputs } : {}), ...criteriaWait })) {
     emit(ev);
     if (ev.kind === "proof_exhausted" && ev.result.undetermined?.length) undetermined = true;
     // The sentence that explains an undetermined bar arrives as an error, so

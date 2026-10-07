@@ -3,10 +3,12 @@
  * check that reaches outside the project is dropped before it is sealed.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { draftCriteria, draftCriteriaCritiqued, preflightCriteria, projectView, strayPath } from "../src/criteria.js";
+import { draftCriteria, draftCriteriaCritiqued, drafterInputsHash, drafterSnapshot, preflightCriteria, projectView, strayPath } from "../src/criteria.js";
+import { ACP_AGENTS } from "../src/acp.js";
+import { scriptedAcpAgent } from "./acp-agent.js";
 import { workspace } from "./helpers.js";
 
 function capturing(texts: string[]): { fetchFn: typeof fetch; prompts: string[] } {
@@ -135,6 +137,103 @@ describe("absolute paths in drafted checks", () => {
       // A person's own sealed check is not second-guessed.
       const own = await preflightCriteria([checks[0]!], { cwd: ws.dir });
       assert.ok(!own.some((b) => /outside the project/.test(b.why)));
+    } finally {
+      ws.cleanup();
+    }
+  });
+});
+
+/**
+ * The drafter's later stages (cover step, redraft after review, lint redraft,
+ * a whole second try) run while the worker is already changing files. They
+ * read the snapshot taken before the work, never the live folder: a redraft
+ * that re-read the tree once saw the worker's out.txt, and could have sealed
+ * its answer as the check.
+ */
+describe("the drafter's inputs are frozen before the work", () => {
+  const TASK = "Write the word count of input.txt to out.txt";
+  const draft = '{"checks":[{"name":"counts","run":"test \\"$(cat out.txt)\\" = 3"}],"notes":[]}';
+
+  /** A provider that writes the worker's out.txt the moment the first draft is in. */
+  function workerWritesAfterFirstDraft(dir: string, critique: string) {
+    const prompts: string[] = [];
+    const fetchFn = (async (_u: string, init?: RequestInit) => {
+      const msgs = (JSON.parse(String(init?.body)) as { messages: { role: string; content: string }[] }).messages;
+      const prompt = msgs.filter((m) => m.role !== "system").map((m) => m.content).join("\n");
+      prompts.push(prompt);
+      // The worker, past the seal, writes its answer while the drafter works.
+      if (prompts.length === 1) writeFileSync(join(dir, "out.txt"), "3\n");
+      const content = prompt.startsWith("TASK TEXT:") ? critique : draft;
+      return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content }, finish_reason: "stop" }] }), text: async () => "" } as unknown as Response;
+    }) as unknown as typeof fetch;
+    return { fetchFn, prompts };
+  }
+
+  for (const [path, critique] of [
+    ["the cover step", '{"checks":[{"name":"counts","verdict":"runs","quote":""}],"uncovered":["word count of input.txt"],"requirements":[]}'],
+    ["the redraft after review", '{"checks":[{"name":"counts","verdict":"surface","quote":""}],"uncovered":[],"requirements":[]}'],
+  ] as const) {
+    it(`${path} never shows the worker's out.txt (the word-count leak)`, async () => {
+      const ws = workspace();
+      try {
+        writeFileSync(join(ws.dir, "input.txt"), "a b c\n");
+        const snapshot = drafterSnapshot(TASK, ws.dir, { scripts: [], lessons: [] });
+        const used: string[] = [];
+        const { fetchFn, prompts } = workerWritesAfterFirstDraft(ws.dir, critique);
+        const r = await draftCriteriaCritiqued({ ...base, task: TASK, cwd: ws.dir, fetchFn, snapshot, onInputs: (h) => used.push(h) });
+        assert.ok(r.ok);
+        const drafts = prompts.filter((p) => p.startsWith("Task:"));
+        assert.ok(drafts.length >= 2, `a later drafter stage ran (${prompts.length} prompts)`);
+        assert.ok(existsSync(join(ws.dir, "out.txt")), "the worker's file is there while the later stages run");
+        // The live view would now show it; the drafter must not.
+        assert.match(projectView(TASK, ws.dir), /out\.txt: .*\n\s+first line: 3/);
+        for (const p of prompts) {
+          assert.ok(!/out\.txt: \d+ bytes/.test(p) && !/first line: 3/.test(p), `a drafter prompt saw the worker's out.txt:\n${p}`);
+          assert.ok(!/Project files \(top level\): .*out\.txt/.test(p), "nor lists it");
+        }
+        // Every stage hashed what it used, and it is the snapshot.
+        assert.ok(used.length >= 2);
+        for (const h of used) assert.equal(h, drafterInputsHash(snapshot));
+      } finally {
+        ws.cleanup();
+      }
+    });
+  }
+
+  it("the hash tells a live read from the snapshot, so the comparison can fail", async () => {
+    const ws = workspace();
+    try {
+      writeFileSync(join(ws.dir, "input.txt"), "a b c\n");
+      const snapshot = drafterSnapshot(TASK, ws.dir, { scripts: [], lessons: [] });
+      writeFileSync(join(ws.dir, "out.txt"), "3\n");
+      const reply = (async () =>
+        ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '{"checks":[],"notes":[]}' }, finish_reason: "stop" }] }), text: async () => "" }) as unknown as Response) as unknown as typeof fetch;
+      const frozen: string[] = [];
+      const live: string[] = [];
+      await draftCriteria({ ...base, task: TASK, cwd: ws.dir, fetchFn: reply, snapshot, onInputs: (h) => frozen.push(h) });
+      // A stage that reads the folder as it is now (the old behaviour).
+      await draftCriteria({ ...base, task: TASK, cwd: ws.dir, fetchFn: reply, onInputs: (h) => live.push(h) });
+      assert.deepEqual(frozen, [drafterInputsHash(snapshot)]);
+      assert.equal(live.length, 1);
+      assert.notEqual(live[0], drafterInputsHash(snapshot), "reading the changed folder shows in the hash");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("a subprocess (ACP) drafter is started in an empty folder of its own, not the work", async () => {
+    const ws = workspace();
+    try {
+      writeFileSync(join(ws.dir, "input.txt"), "a b c\n");
+      const agent = scriptedAcpAgent([{ text: '{"checks":[],"notes":[]}' }]);
+      const grok = ACP_AGENTS.find((a) => a.name === "grok-build")!;
+      const r = await draftCriteriaCritiqued({ ...base, baseUrl: grok.url, model: "grok-4.6", task: TASK, cwd: ws.dir, acpSpawn: agent.spawnFn });
+      assert.ok(r.ok, r.ok ? "" : r.error);
+      const cwd = String(agent.sessionParams().cwd ?? "");
+      assert.ok(cwd, "the session was opened with a folder");
+      assert.notEqual(cwd, ws.dir);
+      assert.ok(!cwd.startsWith(ws.dir), `drafter started inside the work: ${cwd}`);
+      assert.ok(!existsSync(cwd), "and the folder is removed afterwards");
     } finally {
       ws.cleanup();
     }
