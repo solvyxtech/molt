@@ -1,6 +1,6 @@
 {
   "name": "molt-desktop",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Maat Agent desktop \u2014 a coding agent that can't say done without proving it. Built on the molt engine. OpenAI-compatible and Anthropic APIs; Grok Build via ACP.",
   "license": "Apache-2.0",
   "repository": {

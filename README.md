@@ -138,7 +138,7 @@ Same engine, two install paths.
 
 ### Desktop
 
-Get **v0.2.0** from the [GitHub release](https://github.com/solvyxtech/molt/releases/tag/v0.2.0) (macOS, Windows, Linux).
+Get **v0.2.2** from the [GitHub release](https://github.com/solvyxtech/molt/releases/tag/v0.2.2) (macOS, Windows, Linux).
 
 macOS builds are unsigned on purpose. On first open, right-click the app, choose Open, then Open again.
 

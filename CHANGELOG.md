@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.2 — subscription backends removed
+
+### Removed
+
+- **Claude Code, Antigravity (agy), and Gemini CLI subscription backends.**
+  Third-party harness wrapping of those CLIs conflicted with provider ToS as
+  written. Stale `claude-code://`, `antigravity://`, `agy://`, and
+  `gemini-cli://` configs now fail with a clear removal message. Grok Build
+  (ACP) and the metered xAI API provider remain.
+- **Droid benchmarking** from the harbor/local bench path, and **xAI rows**
+  from the committed fine-tune dataset (provider-terms alignment). See
+  `docs/provider-terms.md`.
+
+### Changed
+
+- Desktop and CLI version **0.2.2**. Older **0.2.0** / **0.2.1** installers and
+  npm tags that still shipped the removed backends should not be used; upgrade
+  to this release.
+
 ## 0.2.1 — molt in the editor
 
 ### Changed
