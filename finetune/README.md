@@ -16,9 +16,9 @@ mechanical:
 
 | artifact | holds | used for |
 |---|---|---|
-| `.molt/receipts/*.md` | claim verbatim, files changed, every check's output, verdict | the target |
-| `.molt/log/*.jsonl` | every tool call in order, permissions, bar runs, hash-chained | the input |
-| `.molt/exuviae/*.md` | full transcripts that were shed | context, when present |
+| `.maat/receipts/*.md` | claim verbatim, files changed, every check's output, verdict | the target |
+| `.maat/log/*.jsonl` | every tool call in order, permissions, bar runs, hash-chained | the input |
+| `.maat/exuviae/*.md` | full transcripts that were shed | context, when present |
 | `--capture <dir>` | **one JSON per attempt: the whole wire transcript, ledger, bar result** | the input, in full, going forward |
 
 The journal deliberately records no message content, so historical data
@@ -33,7 +33,8 @@ disk is the file that quietly accumulates credentials.
 node finetune/extract.mjs --out finetune/data/$(date +%F) . ../other-project ~/scratch/copy
 ```
 
-Reads every root's `.molt/`, deduplicates attempts by receipt hash (copies of
+Reads every root's `.maat/` (and `.molt/`, the folder's old name, where a
+project still has one), deduplicates attempts by receipt hash (copies of
 a project do not count twice), joins each receipt to its journal turn, and
 splits **by session** so attempts that share a transcript never straddle
 train and valid. Writes:

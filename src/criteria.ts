@@ -354,12 +354,11 @@ export async function draftCriteria(opts: {
   baseUrl: string;
   apiKey?: string;
   model: string;
-  /** Where the draft is asked for. Only the Claude Code transport reads it. */
+  /** Where the draft is asked for. Only a subprocess (ACP) transport reads it. */
   cwd?: string;
   fetchFn?: typeof fetch;
   /** How an ACP agent is spawned. Tests only; see `EngineConfig.acpSpawn`. */
   acpSpawn?: typeof import("node:child_process").spawn;
-  /** How `agy` is run for a pre-turn question. Tests only. */
   /** How long the HTTP question may wait for its answer; see askTimeoutMs. Tests only. */
   timeoutMs?: number;
   /** Pause before re-asking after empty replies (EMPTY_DRAFT_DELAY_MS). Tests only. */

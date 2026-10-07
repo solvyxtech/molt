@@ -2339,7 +2339,7 @@ async function usePlan(
   look: () => Promise<PlanHealth | undefined>,
   prefer: string[],
 ): Promise<void> {
-  const status = $("claude-code-status");
+  const status = $("plan-status");
   status.textContent = `Looking for ${name}…`;
   const h = await look();
   if (!h) {

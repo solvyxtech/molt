@@ -2,7 +2,7 @@
  * Newline-delimited JSON-RPC 2.0, in both directions, over any byte stream.
  *
  * ACP is symmetric: whichever side molt is on, the other side both answers
- * molt's requests and makes its own. When molt drives Grok or Gemini, the
+ * molt's requests and makes its own. When molt drives Grok Build, the
  * agent asks molt for permission; when an editor drives molt, molt asks the
  * editor. A peer that only reads replies hangs the first time it is asked
  * something, so correlation, dispatch and framing live here once and both

@@ -369,7 +369,7 @@ function createWindow(): void {
           (await win!.webContents.executeJavaScript(`(async () => {
             document.getElementById(${JSON.stringify(id)}).click();
             for (let i = 0; i < 60; i++) {
-              const t = document.getElementById("claude-code-status").textContent || "";
+              const t = document.getElementById("plan-status").textContent || "";
               if (t && !/Looking for/.test(t)) return t;
               await new Promise((r) => setTimeout(r, 100));
             }
@@ -831,7 +831,7 @@ function createWindow(): void {
       void win!.webContents
         .executeJavaScript(
           `(async () => {
-             const need = ["tabs","panels","stream","wire","judge-list","judge-doc","badge-judgment","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","set-grok","claude-code-status","autonomy","interview","criteria","ck-rows","ck-draft","ck-auto","spine","spine-list","jump","ctx","ctx-fill","ctx-line"];
+             const need = ["tabs","panels","stream","wire","judge-list","judge-doc","badge-judgment","receipt-list","log","composer","prompt","send","status","crumb-model","picker","picker-list","set-model-pick","set-model","set-url","set-grok","plan-status","autonomy","interview","criteria","ck-rows","ck-draft","ck-auto","spine","spine-list","jump","ctx","ctx-fill","ctx-line"];
              const missing = need.filter((id) => !document.getElementById(id));
              const tabs = [...document.querySelectorAll(".tab")].map((t) => t.dataset.tab);
              const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
