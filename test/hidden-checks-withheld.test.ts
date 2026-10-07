@@ -54,6 +54,25 @@ function filesUnder(dir: string): { path: string; text: string }[] {
 const containing = (dir: string, needle: string) => filesUnder(dir).filter((f) => f.text.includes(needle)).map((f) => f.path);
 
 /** A fingerprint of every byte under `dir`, paths and modes included (.git too). */
+/** Every path under `dir` with its mode and content hash, for saying what a check changed. */
+function treeListing(dir: string): string[] {
+  const out: string[] = [];
+  const walk = (d: string) => {
+    for (const n of readdirSync(d).sort()) {
+      const p = join(d, n);
+      const st = lstatSync(p);
+      out.push(`${relative(dir, p)} ${st.mode} ${st.isFile() ? createHash("sha256").update(readFileSync(p)).digest("hex").slice(0, 12) : ""}`);
+      if (st.isDirectory()) walk(p);
+    }
+  };
+  walk(dir);
+  return out;
+}
+
+function changed(before: string[], after: string[]): string[] {
+  return [...after.filter((x) => !before.includes(x)).map((x) => `+ ${x}`), ...before.filter((x) => !after.includes(x)).map((x) => `- ${x}`)];
+}
+
 function treeHash(dir: string): string {
   const h = createHash("sha256");
   const walk = (d: string) => {
@@ -286,6 +305,9 @@ describe("checks cannot change the work", () => {
     // unknown"); the repo's own config is copied into the throwaway tree.
     git("config", "user.name", "t");
     git("config", "user.email", "t@t");
+    // No detached `gc --auto`/maintenance still writing under .git while a test copies it.
+    git("config", "gc.auto", "0");
+    git("config", "maintenance.auto", "false");
     writeFileSync(join(ws.dir, "about.md"), "# About\nI am a student.\n");
     writeFileSync(join(ws.dir, "index.md"), "welcome\n");
     mkdirSync(join(ws.dir, "docs"));
@@ -308,11 +330,13 @@ describe("checks cannot change the work", () => {
     const ws = repo();
     try {
       const before = treeHash(ws.dir);
+      const listed = treeListing(ws.dir);
       const check: Check = { name: "task:merged", kind: "command", run: MUTATOR, timeoutMs: 20_000, expectExit: 0, tags: ["task"], hidden: true };
       const ctx = { cwd: ws.dir, record: [], ledger: [], archivedBatches: 0 } as unknown as BarContext;
       const r = await runCheck(check, ctx);
       assert.equal(r.ok, true, r.output);
-      assert.equal(treeHash(ws.dir), before, "the check changed the real tree");
+      assert.equal(r.ranInPlace, undefined, "the check got no copy");
+      assert.equal(treeHash(ws.dir), before, `the check changed the real tree:\n${changed(listed, treeListing(ws.dir)).join("\n")}`);
       // And a check that only reads sees exactly the tree it judges.
       const read = await runCheck({ ...check, name: "task:reads", run: "git rev-parse --abbrev-ref HEAD | grep -qx master && grep -q student about.md && test -f docs/a.txt" }, ctx);
       assert.equal(read.ok, true, read.output);

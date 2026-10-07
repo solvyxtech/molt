@@ -87,6 +87,19 @@ export type TreeCopy = {
 
 class TooBig extends Error {}
 
+/**
+ * A file or folder that went away between being listed and being copied.
+ *
+ * git runs `maintenance --auto` / `gc --auto` detached after a commit, and it
+ * creates and removes files under `.git` while the copy is being taken. One
+ * vanished temp file failed the whole copy, and the check then ran in place —
+ * on the work. A path that is gone is simply not in the tree any more.
+ */
+function vanished(e: unknown): boolean {
+  const code = (e as { code?: string } | null)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
 /** Files and bytes under a directory, stopping once past either cap. */
 async function sizeUpTo(dir: string, capFiles: number, capBytes: number): Promise<{ files: number; bytes: number }> {
   const total = { files: 0, bytes: 0 };
@@ -181,23 +194,49 @@ export async function copyTreeOrWhy(
   let bytes = 0;
   const linked: string[] = [];
   const copyOne = async (s: string, d: string): Promise<void> => {
-    const st = await lstat(s);
+    let st;
+    try {
+      st = await lstat(s);
+    } catch (e) {
+      if (vanished(e)) return;
+      throw e;
+    }
     files += 1;
     bytes += st.size;
     if (files > maxFiles || bytes > maxBytes) throw new TooBig();
-    await copyFile(s, d, constants.COPYFILE_FICLONE);
-    // Same mtimes: `make`, git's index and a check that compares ages all read them.
-    await utimes(d, st.atime, st.mtime);
+    try {
+      await copyFile(s, d, constants.COPYFILE_FICLONE);
+      // Same mtimes: `make`, git's index and a check that compares ages all read them.
+      await utimes(d, st.atime, st.mtime);
+    } catch (e) {
+      if (!vanished(e)) throw e;
+      await rm(d, { force: true }).catch(() => {});
+    }
+  };
+  const copyLink = async (s: string, d: string): Promise<void> => {
+    try {
+      await symlink(await readlink(s), d);
+    } catch (e) {
+      if (!vanished(e)) throw e;
+    }
+  };
+  const list = async (src: string) => {
+    try {
+      return await readdir(src, { withFileTypes: true });
+    } catch (e) {
+      if (vanished(e)) return [];
+      throw e;
+    }
   };
   const copyDir = async (src: string, dst: string, top: boolean, inGit: boolean): Promise<void> => {
     await mkdir(dst, { recursive: true });
-    for (const ent of await readdir(src, { withFileTypes: true })) {
+    for (const ent of await list(src)) {
       const name = ent.name;
       if (top && (STATE_DIRS as readonly string[]).includes(name)) continue;
       const s = join(src, name);
       const d = join(dst, name);
       if (ent.isSymbolicLink()) {
-        await symlink(await readlink(s), d);
+        await copyLink(s, d);
         continue;
       }
       if (ent.isDirectory()) {
@@ -222,7 +261,7 @@ export async function copyTreeOrWhy(
   };
   const copyGit = async (src: string, dst: string): Promise<void> => {
     await mkdir(dst, { recursive: true });
-    for (const ent of await readdir(src, { withFileTypes: true })) {
+    for (const ent of await list(src)) {
       const s = join(src, ent.name);
       const d = join(dst, ent.name);
       if (ent.name === "objects" && ent.isDirectory() && (await sizeUpTo(s, Infinity, OBJECTS_COPY_MAX_BYTES)).bytes > OBJECTS_COPY_MAX_BYTES) {
@@ -233,7 +272,7 @@ export async function copyTreeOrWhy(
         await writeFile(join(d, "info", "alternates"), `${await realpath(s)}\n`);
         continue;
       }
-      if (ent.isSymbolicLink()) await symlink(await readlink(s), d);
+      if (ent.isSymbolicLink()) await copyLink(s, d);
       else if (ent.isDirectory()) await copyDir(s, d, false, true);
       else if (ent.isFile()) await copyOne(s, d);
     }
