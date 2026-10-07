@@ -30,7 +30,7 @@ import { topLevel } from "./brief.js";
 import { namedInputs, profileLine } from "./inspect.js";
 import { askModel, type AskOptions } from "./ask.js";
 import { runCommand, draftedShell, bashPath } from "./run.js";
-import { lintAll, readTree, type LintCtx, type Tree } from "./checklint.js";
+import { cannotFail, lintAll, readTree, type LintCtx, type Tree } from "./checklint.js";
 import { checkMutates } from "./checkwrites.js";
 import { copyTree } from "./scratch.js";
 import { diagnoseFailure } from "./bar.js";
@@ -313,6 +313,12 @@ export async function preflightCriteria(
      */
     failed?: string[];
     /**
+     * Filled with the names of criteria that exited as expected while printing
+     * a FAIL verdict (`FAIL`, `FAILED`): a script that reports failure in words
+     * and still exits 0 cannot fail, whatever it checks (checklint L16).
+     */
+    printedFail?: string[];
+    /**
      * Set for DRAFTED checks: a command that reaches for an absolute path
      * outside the project (see strayPath) is reported broken without being
      * run. The task text is where a path the person stated is allowed from.
@@ -355,7 +361,10 @@ export async function preflightCriteria(
       if (d.didNotRun) broken.push({ name: c.name, run: c.run, why: d.hint ?? "did not run" });
       else if (unparsed) {
         broken.push({ name: c.name, run: c.run, why: `the shell could not parse it: ${firstLine(copy ? copy.unmap(r.stderr) : r.stderr)}` });
-      } else if (selfError) broken.push({ name: c.name, run: c.run, why: selfError }); else if (!r.timedOut && r.code === (c.expectExit ?? 0)) opts.passed?.push(c.name);
+      } else if (selfError) broken.push({ name: c.name, run: c.run, why: selfError }); else if (!r.timedOut && r.code === (c.expectExit ?? 0)) {
+        opts.passed?.push(c.name);
+        if (/\bFAIL(?:ED)?\b/.test(`${r.stdout}\n${r.stderr}`)) opts.printedFail?.push(c.name);
+      }
       else opts.failed?.push(c.name);
     } catch {
       // Failing to spawn it here is molt's problem, not the criterion's.
@@ -927,6 +936,8 @@ export async function draftCriteriaCritiqued(
     onProgress?: (d: Draft) => void;
     /** Bound on the step that adds checks for uncovered requirements (COVER_MAX_MS). */
     coverMaxMs?: number;
+    /** A copy of the project taken before the work (see PreWork). Without it, no check is tried here. */
+    preWorkDir?: string;
   },
 ): Promise<{ ok: true; draft: Draft; critique: string[]; lint?: LintDrop[] } | { ok: false; error: string }> {
   // The critic's list of stated requirements rides on whatever draft comes
@@ -950,6 +961,13 @@ export async function draftCriteriaCritiqued(
   }
 }
 
+/** Why a drafted check that passes on the pre-work copy is sent back: the drafter reads this. */
+export const PASSES_BEFORE_WORK =
+  "this check passes before any work, so it cannot show the task was done; make it fail on the current tree";
+/** Why a drafted check that printed FAIL and exited 0 on the pre-work copy is sent back. */
+export const PRINTS_FAIL_EXITS_0 =
+  "it printed FAIL and still exited 0 before any work, so it can never fail; make a failure exit non-zero";
+
 /** A drafted check the seal-time lint retired (src/checklint.ts), for the journal. */
 export type LintDrop = { name: string; run: string; rule: string; why: string; redraft: boolean };
 type Sink = { requirements: string[]; lint: LintDrop[] };
@@ -960,6 +978,7 @@ async function critiqued(
     onProgress?: (d: Draft) => void;
     /** Bound on the step that adds checks for uncovered requirements (COVER_MAX_MS). */
     coverMaxMs?: number;
+    preWorkDir?: string;
   },
   sink: Sink,
 ): Promise<{ ok: true; draft: Draft; critique: string[] } | { ok: false; error: string }> {
@@ -984,8 +1003,17 @@ async function critiqued(
       // Off unless MAAT_CHECK_LINT=1: in the v13 paired run the lint left fewer, shallower
       // checks sealed (the redraft lands after the seal), which cost passes and let wrong work through.
       // Except L15: a check that changes the work it judges is never sealed (checkwrites.ts).
+      // And L16: a check that cannot fail cannot show the task was done (checklint.ts cannotFail).
       const writes = checkMutates(c.run);
-      const hit = process.env.MAAT_CHECK_LINT === "1" ? lintAll(c.run, lintCtx)[0] : writes ? { rule: "L15-mutates", why: writes } : undefined;
+      const never = cannotFail(c.run);
+      const hit =
+        process.env.MAAT_CHECK_LINT === "1"
+          ? lintAll(c.run, lintCtx)[0]
+          : writes
+            ? { rule: "L15-mutates", why: writes }
+            : never
+              ? { rule: "L16-cannot-fail", why: never }
+              : undefined;
       if (!hit) ok.push(c);
       else bad.push({ name: c.name, run: c.run, rule: hit.rule, why: hit.why, redraft });
     }
@@ -997,10 +1025,37 @@ async function critiqued(
       said.push(`dropped ${b.name} (${b.run}) ${where}: ${b.why} [${b.rule}]`);
     }
   };
+  /**
+   * The lint, then a try on the copy of the project taken before the work: a
+   * check that already passes there cannot show the task was done (P1), and
+   * one that exits 0 while printing FAIL cannot fail at all (L16).
+   */
+  const screen = async (checks: DraftedCheck[], redraft: boolean): Promise<{ ok: DraftedCheck[]; bad: LintDrop[] }> => {
+    const l = lintSplit(checks, redraft);
+    if (!opts.preWorkDir || !l.ok.length) return l;
+    const passed: string[] = [];
+    const printedFail: string[] = [];
+    try {
+      await preflightCriteria(
+        l.ok.map((c) => ({ name: c.name, kind: "command", run: c.run })),
+        { cwd: opts.preWorkDir, passed, printedFail },
+      );
+    } catch {
+      return l;
+    }
+    const ok: DraftedCheck[] = [];
+    const bad = [...l.bad];
+    for (const c of l.ok) {
+      if (printedFail.includes(c.name)) bad.push({ name: c.name, run: c.run, rule: "L16-printed-fail", why: PRINTS_FAIL_EXITS_0, redraft });
+      else if (passed.includes(c.name)) bad.push({ name: c.name, run: c.run, rule: "P1-passes-before-work", why: PASSES_BEFORE_WORK, redraft });
+      else ok.push(c);
+    }
+    return { ok, bad };
+  };
   const drafted1 = await draftCriteria(opts);
   let first = drafted1.ok ? { ...drafted1, draft: fix(drafted1.draft) } : drafted1;
   if (first.ok && first.draft.checks.length) {
-    const l1 = lintSplit(first.draft.checks, false);
+    const l1 = await screen(first.draft.checks, false);
     if (l1.bad.length) {
       // Sent back once with the reasons. What passes the lint is already ready
       // to seal while that second ask runs.
@@ -1013,7 +1068,7 @@ async function critiqued(
       });
       const have = new Set(l1.ok.map((c) => c.name));
       const ran = new Set(l1.ok.map((c) => c.run));
-      const l2 = again.ok ? lintSplit(fix(again.draft).checks, true) : { ok: [] as DraftedCheck[], bad: [] as LintDrop[] };
+      const l2 = again.ok ? await screen(fix(again.draft).checks, true) : { ok: [] as DraftedCheck[], bad: [] as LintDrop[] };
       drop(l1.bad, "before sealing");
       drop(l2.bad, "from the redraft");
       const added = l2.ok.filter((c) => !have.has(c.name) && !ran.has(c.run)).slice(0, Math.max(0, CRITERIA_MAX_CHECKS - l1.ok.length));
@@ -1022,8 +1077,8 @@ async function critiqued(
     }
   }
   if (!first.ok || !first.draft.checks.length) return first.ok ? { ...first, critique: said } : first;
-  const lintCover = (checks: DraftedCheck[]): DraftedCheck[] => {
-    const l = lintSplit(checks, false);
+  const lintCover = async (checks: DraftedCheck[]): Promise<DraftedCheck[]> => {
+    const l = await screen(checks, false);
     drop(l.bad, "from the cover draft");
     return l.ok;
   };
@@ -1070,7 +1125,7 @@ async function critiqued(
           `Nothing tests these stated requirements yet: ${c1.uncovered.map((q) => `"${q}"`).join("; ")}. ` +
           `Draft checks for these requirements only.)`,
       });
-      const extra = cover.ok ? lintCover(fix(cover.draft).checks) : [];
+      const extra = cover.ok ? await lintCover(fix(cover.draft).checks) : [];
       return extra.length ? await critic({ checks: extra, notes: [] }) : null;
     };
     let coverTimer: NodeJS.Timeout | undefined;
@@ -1099,7 +1154,7 @@ async function critiqued(
   const drafted2 = await draftCriteria({ ...opts, task: `${opts.task}\n\n(Review of an earlier draft of the checks: ${findings})` });
   let second = drafted2.ok ? { ...drafted2, draft: fix(drafted2.draft) } : drafted2;
   if (second.ok) {
-    const l = lintSplit(second.draft.checks, false);
+    const l = await screen(second.draft.checks, false);
     drop(l.bad, "from the redraft");
     second = { ...second, draft: { ...second.draft, checks: l.ok } };
   }

@@ -1414,6 +1414,16 @@ export type EngineConfig = {
    */
   reviewAdvisory?: boolean;
   /**
+   * Opt-in (`--require-discriminating`, MAAT_REQUIRE_DISCRIMINATING=1):
+   * "verified" needs a passing independent runs+value check that FAILED on
+   * the tree before the work (tiers.ts `requireDiscriminating`); otherwise the
+   * tier is passed-untested. Off by default: replayed over the 2026-10-07
+   * lanes it removed 2 wrong verifieds and denied 10 right ones (precision
+   * 18/22 -> 8/10). The cause is fixed at seal time instead (seal-time
+   * redraft of checks that pass before the work). `reviewAdvisory` implies it.
+   */
+  requireDiscriminating?: boolean;
+  /**
    * Requirement sign-out (src/signout.ts): one round per unattended turn that
    * lists each stated requirement beside the commands run for it. Off unless
    * `true` (`--signout`): it fired 60 times in one measured set of runs and
@@ -3734,8 +3744,11 @@ export class Engine {
   }
 
   /** tierOf's advisory-review argument: empty unless `reviewAdvisory`. */
-  private advisoryTier(): { reviewAdvisory?: true } {
-    return this.cfg.reviewAdvisory === true ? { reviewAdvisory: true } : {};
+  private advisoryTier(): { reviewAdvisory?: true; requireDiscriminating?: true } {
+    return {
+      ...(this.cfg.reviewAdvisory === true ? { reviewAdvisory: true as const } : {}),
+      ...(this.cfg.requireDiscriminating === true ? { requireDiscriminating: true as const } : {}),
+    };
   }
 
   /** Who wrote each sealed check, keyed by the name it runs under in the bar (and its bare name). */
@@ -3757,6 +3770,7 @@ export class Engine {
   /** Everything tierOf weighs beside the results: advisory mode, the worker, who wrote each check, what the pre-work try found, and which golden files predate the work. */
   private tierContext(): {
     reviewAdvisory?: true;
+    requireDiscriminating?: true;
     guards: ReadonlySet<string>;
     failedBefore: ReadonlySet<string>;
     worker: string[];

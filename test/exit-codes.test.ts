@@ -168,7 +168,7 @@ describe("molt run's exit code", () => {
     assert.equal(same, 3);
   });
 
-  it("is 3 when the only independent check met also passed before the work (it did not test this work)", async () => {
+  it("is 3 when the only drafted check already passes before the work: it is redrafted, then dropped", async () => {
     const url = await draftingProvider("[ \"$(echo a)\" = \"a\" ]");
     const code = await molt(["run", "write a.txt", "--url", url, "--model", "m", "--key", "k",
       "--cwd", project(), "--no-stream", "--yes", "--criteria", "auto", "--judge", "j"]);

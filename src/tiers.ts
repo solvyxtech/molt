@@ -358,8 +358,8 @@ export function contradictions(review: { votes: string; violations: unknown[] } 
  * The tier a passing turn has earned. "verified" needs (a) a passing check a
  * person wrote, or a passing drafted check that runs the deliverable (not
  * surface) AND asserts a value AND was written by someone other than the
- * worker model AND failed on the tree before the work began (it discriminates:
- * see `failedBefore`), and (b) an independent review, when one ran, that found no
+ * worker model (and, with `requireDiscriminating`, failed on the tree before
+ * the work began: see `failedBefore`), and (b) an independent review, when one ran, that found no
  * contradiction. (c) — the turn not ended by the clock or the provider — is
  * decided before this, by `passedAtEnd`.
  *
@@ -374,10 +374,10 @@ export function contradictions(review: { votes: string; violations: unknown[] } 
  * model reached another way), the best the turn earns is "passed-own-checks".
  * A check whose author was never recorded counts as the worker's.
  *
- * Never let a check that cannot tell the work from no work vouch for it:
- * when independent runs+value checks passed but none had failed before the
- * work, the turn earns "passed-untested" — they guard against a regression
- * and did not test this work.
+ * With `requireDiscriminating`, never let a check that cannot tell the work
+ * from no work vouch for it: when independent runs+value checks passed but
+ * none had failed before the work, the turn earns "passed-untested" — they
+ * guard against a regression and did not test this work.
  */
 export function tierOf(args: {
   results: readonly (Pick<CheckResult, "ok" | "hidden" | "advisory" | "skipped" | "tags"> & { name?: string; kind?: CheckResult["kind"] })[];
@@ -386,16 +386,25 @@ export function tierOf(args: {
   unreviewed?: boolean;
   /**
    * Experimental (MAAT_REVIEW_ADVISORY=1, `--review-advisory`): the review is
-   * recorded but gates nothing. (The evidence rule it once added here — the
-   * value check must have FAILED on the untouched project — now holds in every
-   * mode: see `failedBefore`.) reports/checkquality-2026-10-06.md §2.5 measured the 3-vote review as a
+   * recorded but gates nothing, and the evidence rule is stricter in return:
+   * it implies `requireDiscriminating`. reports/checkquality-2026-10-06.md §2.5 measured the 3-vote review as a
    * likelihood ratio of about 1.
    */
   reviewAdvisory?: boolean;
   /**
+   * Opt-in (MAAT_REQUIRE_DISCRIMINATING=1, `--require-discriminating`; implied
+   * by `reviewAdvisory`): only a check in `failedBefore` can earn "verified".
+   * Off, `failedBefore` is ignored and the tier is #32's. Replayed over the
+   * 2026-10-07 lanes the gate removed 2 wrong verifieds and denied 10 right
+   * ones, so the default fixes the cause at seal time instead: a drafted
+   * check that already passes before the work is redrafted or dropped.
+   */
+  requireDiscriminating?: boolean;
+  /**
    * Names (as in `results`) of checks that were tried on the tree before the
-   * work began and FAILED there. Only such a check discriminates: "verified"
-   * needs a passing independent runs+value check named here. A check that
+   * work began and FAILED there. Only such a check discriminates: with
+   * `requireDiscriminating`, "verified" needs a passing independent runs+value
+   * check named here. A check that
    * passed before the work, could not run then, or joined after the work
    * began (no try) is not named here and cannot earn the word. Absent means
    * no check was tried, so none discriminates.
@@ -437,7 +446,8 @@ export function tierOf(args: {
   const strong = strongAll.length > 0;
   // Of those, the ones that failed on the tree before the work and pass now:
   // the only passes that show THIS work did something.
-  const discriminating = strongIndependent.filter((r) => args.failedBefore?.has(r.name ?? "") === true);
+  const gate = args.requireDiscriminating === true || args.reviewAdvisory === true;
+  const discriminating = gate ? strongIndependent.filter((r) => args.failedBefore?.has(r.name ?? "") === true) : strongIndependent;
   const by = [...new Set(strongIndependent.map((r) => authorOf(r).model ?? "another model"))];
   const basis: TierVerdict["basis"] = person ? "person" : strongIndependent.length ? "independent" : strong ? "own" : undefined;
   const who = { ...(basis ? { basis } : {}), ...(by.length && !person ? { by } : {}), ...(worker ? { worker } : {}) };

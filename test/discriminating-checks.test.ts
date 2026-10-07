@@ -1,5 +1,8 @@
 /**
- * "verified" needs a check that tells this work from no work.
+ * With --require-discriminating (MAAT_REQUIRE_DISCRIMINATING=1), "verified"
+ * needs a check that tells this work from no work. Off by default: replayed
+ * over the 2026-10-07 lanes it removed 2 wrong verifieds and denied 10 right
+ * ones; the cause is fixed at seal time instead (criteria.ts screen).
  *
  * On the 2026-10-07 container bench a separate judge drafted
  * `python3 server.py 8080 & sleep 1; curl -f .../items || echo 'fail'` and two
@@ -15,6 +18,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { parseArgs } from "../src/cli.js";
 import { Engine } from "../src/engine.js";
 import { Journal } from "../src/journal.js";
 import { Receipts } from "../src/receipts.js";
@@ -31,7 +35,7 @@ describe("tierOf: a check that did not fail before the work cannot earn verified
   const worker = "qwen/qwen3-235b-a22b-2507";
 
   it("the http-json-server run: every independent value check passed before the work too, so not verified", () => {
-    const t = tierOf({ results: names.map(value), worker, authors, guards: new Set(names), failedBefore: new Set() });
+    const t = tierOf({ requireDiscriminating: true, results: names.map(value), worker, authors, guards: new Set(names), failedBefore: new Set() });
     assert.equal(t.tier, "passed-untested");
     assert.equal(t.basis, "independent", "the checks were independent; independence was not the problem");
     assert.match(t.reason!, /`task:get-all-items` passed before the work began too/);
@@ -40,30 +44,38 @@ describe("tierOf: a check that did not fail before the work cannot earn verified
   });
 
   it("a check that failed before the work and passes after: verified", () => {
-    const t = tierOf({ results: names.map(value), worker, authors, guards: new Set(names.slice(0, 2)), failedBefore: new Set([names[2]!]) });
+    const t = tierOf({ requireDiscriminating: true, results: names.map(value), worker, authors, guards: new Set(names.slice(0, 2)), failedBefore: new Set([names[2]!]) });
     assert.deepEqual([t.tier, t.basis, t.by], ["verified", "independent", ["qwen3-coder-30b-a3b"]]);
   });
 
   it("a check with no pre-work try (broken then, or joined late with no copy) does not discriminate", () => {
-    const t = tierOf({ results: [value(names[0]!)], worker, authors, failedBefore: new Set() });
+    const t = tierOf({ requireDiscriminating: true, results: [value(names[0]!)], worker, authors, failedBefore: new Set() });
     assert.equal(t.tier, "passed-untested");
     assert.match(t.reason!, /was not tried before the work began/);
-    assert.equal(tierOf({ results: [value(names[0]!)], worker, authors }).tier, "passed-untested", "no pre-work record at all: nothing discriminates");
+    assert.equal(tierOf({ requireDiscriminating: true, results: [value(names[0]!)], worker, authors }).tier, "passed-untested", "no pre-work record at all: nothing discriminates");
   });
 
   it("only independent value checks count: a discriminating check the worker wrote is still its own", () => {
     const mixed = new Map<string, CheckAuthor>([[names[0]!, JUDGE], [names[1]!, { kind: "worker", model: worker }]]);
-    const t = tierOf({ results: [value(names[0]!), value(names[1]!)], worker, authors: mixed, guards: new Set([names[0]!]), failedBefore: new Set([names[1]!]) });
+    const t = tierOf({ requireDiscriminating: true, results: [value(names[0]!), value(names[1]!)], worker, authors: mixed, guards: new Set([names[0]!]), failedBefore: new Set([names[1]!]) });
     assert.equal(t.tier, "passed-untested");
-    const own = tierOf({ results: [value(names[1]!)], worker, authors: mixed, failedBefore: new Set([names[1]!]) });
+    const own = tierOf({ requireDiscriminating: true, results: [value(names[1]!)], worker, authors: mixed, failedBefore: new Set([names[1]!]) });
     assert.equal(own.tier, "passed-own-checks", "the authorship rule is unchanged");
   });
 
   it("a failing or surface-only discriminating check carries nothing; a person's check still verifies", () => {
     const fb = new Set([names[0]!]);
-    assert.equal(tierOf({ results: [{ ...value(names[0]!), ok: false }], worker, authors, failedBefore: fb }).tier, "passed-checks");
-    assert.equal(tierOf({ results: [{ ...value(names[0]!), tags: ["task", "surface", "value"] }], worker, authors, failedBefore: fb }).tier, "passed-checks");
-    assert.equal(tierOf({ results: [{ name: "project", ok: true, kind: "command" as const, tags: [] }], worker }).tier, "verified");
+    assert.equal(tierOf({ requireDiscriminating: true, results: [{ ...value(names[0]!), ok: false }], worker, authors, failedBefore: fb }).tier, "passed-checks");
+    assert.equal(tierOf({ requireDiscriminating: true, results: [{ ...value(names[0]!), tags: ["task", "surface", "value"] }], worker, authors, failedBefore: fb }).tier, "passed-checks");
+    assert.equal(tierOf({ requireDiscriminating: true, results: [{ name: "project", ok: true, kind: "command" as const, tags: [] }], worker }).tier, "verified");
+  });
+});
+
+describe("tierOf without --require-discriminating: #32's tiering, unchanged", () => {
+  it("ignores the pre-work record", () => {
+    const authors = new Map([["task:v", JUDGE]]);
+    const t = tierOf({ results: [value("task:v")], worker: "w", authors, guards: new Set(["task:v"]), failedBefore: new Set() });
+    assert.deepEqual([t.tier, t.basis], ["verified", "independent"]);
   });
 });
 
@@ -90,7 +102,7 @@ describe("the rule in a turn", () => {
   const check = (name: string, run: string): Check =>
     ({ name, kind: "command", run, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: JUDGE }) as Check;
 
-  async function turn(checks: Check[], notes: string[] = []) {
+  async function turn(checks: Check[], notes: string[] = [], requireDiscriminating = true) {
     const ws = workspace();
     try {
       const provider = scriptedProvider(work);
@@ -98,6 +110,7 @@ describe("the rule in a turn", () => {
       const engine = new Engine({
         baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null,
         receipts: new Receipts(ws.dir), stream: false, autonomy: "high", journal,
+        ...(requireDiscriminating ? { requireDiscriminating: true } : {}),
       });
       const events = await drain(engine.run(TASK, allowAll, { taskChecks: checks, taskNotes: notes }));
       const end = events.find((e) => e.kind === "job_end");
@@ -124,6 +137,13 @@ describe("the rule in a turn", () => {
     assert.deepEqual(tried[0]!.data.passed, ["task:always"]);
   });
 
+  it("off by default: the same turn is verified as under #32, and the receipt still records the pre-work try", async () => {
+    const { end, receipt, tried } = await turn([check("always", `[ "$(echo ok)" = "ok" ] || echo fail`)], [], false);
+    assert.deepEqual([end.outcome, end.tier], ["verified", "verified"]);
+    assert.match(receipt, /before the work: passed \(a guard/);
+    assert.deepEqual(tried[0]!.data.passed, ["task:always"]);
+  });
+
   it("a check that failed before the work and passes after: verified, and the receipt says it discriminates", async () => {
     const { end, receipt, tried } = await turn([check("always", `[ "$(echo ok)" = "ok" ]`), check("greeting", "grep -qx hello out.txt")], ["out.txt holds exactly hello greeting"]);
     assert.deepEqual([end.outcome, end.tier, end.claim], ["verified", "verified", "verified (independent checks: qwen3-coder-30b-a3b)"]);
@@ -138,5 +158,12 @@ describe("the rule in a turn", () => {
     assert.deepEqual([end.outcome, end.tier], ["unverified", "passed-untested"]);
     assert.match(end.tierReason!, /`task:tool` was not tried before the work began/);
     assert.match(receipt, /before the work: not tried/);
+  });
+});
+
+describe("parseArgs --require-discriminating", () => {
+  it("is off unless asked for", () => {
+    assert.equal(parseArgs([]).requireDiscriminating, undefined);
+    assert.equal(parseArgs(["--require-discriminating"]).requireDiscriminating, true);
   });
 });

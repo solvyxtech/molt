@@ -1,8 +1,8 @@
 /**
  * Experimental review-advisory mode (`--review-advisory`, MAAT_REVIEW_ADVISORY=1):
- * the review is recorded and does not gate. The rule that "verified" needs a
- * drafted runs+value check that failed before the work holds here as in
- * every mode.
+ * the review is recorded and does not gate; "verified" additionally needs a
+ * drafted runs+value check that failed before the work (it implies
+ * --require-discriminating).
  * Default behaviour is pinned beside it.
  */
 import assert from "node:assert/strict";
@@ -30,16 +30,15 @@ describe("tierOf, review advisory", () => {
     assert.equal(tierOf({ ...J, results: [strong], unreviewed: true }).tier, "passed-checks", "default unchanged");
   });
 
-  it("needs a value check that failed before the work, in this mode as in every other", () => {
+  it("needs a value check that failed before the work", () => {
     const guards = new Set(["task:counts"]);
     const failedBefore = new Set(["task:other"]);
-    for (const reviewAdvisory of [false, true]) {
-      const r = tierOf({ ...J, results: [strong], guards, failedBefore, reviewAdvisory });
-      assert.equal(r.tier, "passed-untested");
-      assert.match(r.reason!, /`task:counts` passed before the work began too/);
-      const two = tierOf({ ...J, results: [strong, ck("task:other", ["task", "value"])], guards, failedBefore, reviewAdvisory });
-      assert.equal(two.tier, "verified", "another value check that failed on the pristine tree carries it");
-    }
+    assert.equal(tierOf({ ...J, results: [strong], guards, failedBefore }).tier, "verified", "off by default: the pre-work record is ignored");
+    const r = tierOf({ ...J, results: [strong], guards, failedBefore, reviewAdvisory: true });
+    assert.equal(r.tier, "passed-untested");
+    assert.match(r.reason!, /`task:counts` passed before the work began too/);
+    const two = tierOf({ ...J, results: [strong, ck("task:other", ["task", "value"])], guards, failedBefore, reviewAdvisory: true });
+    assert.equal(two.tier, "verified", "another value check that failed on the pristine tree carries it");
   });
 
   it("a surface-only or value-less pass is still not verified", () => {

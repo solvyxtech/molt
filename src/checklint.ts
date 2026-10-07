@@ -30,6 +30,12 @@
  *   L15 the check changes the work: git checkout/merge/commit/…, rm,
  *       mv, sed -i, tee or a redirect into the project, a package
  *       install (src/checkwrites.ts). Always on, MAAT_CHECK_LINT or not.
+ *   L16 the check cannot fail (cannotFail): a trailing `|| echo …`,
+ *       `|| true`, `; exit 0`; `find … -exec … \;`, whose status ignores
+ *       what -exec ran; a script that prints PASS/FAIL and never exits
+ *       non-zero. Always on. On 2026-10-07 a judge's `curl … || echo
+ *       'fail'` checks passed before server.py existed and earned a wrong
+ *       "verified".
  * Left out as noisy in the replay: hand-computed numbers (L14) and paths not
  * in the tree (L10) — each fired as often on good checks as on bad ones.
  */
@@ -360,7 +366,47 @@ export function lintAll(run: string, ctx: LintCtx): LintHit[] {
   // a check that does the merge passes on its own effort.
   const writes = checkMutates(cmd);
   if (writes) add("L15-mutates", writes);
+  const never = cannotFail(cmd);
+  if (never && !sw) add("L16-cannot-fail", never);
   return hits;
+}
+
+/** Mask quoted text so operators inside strings are not read as the shell's. */
+function maskQuotes(s: string): string {
+  return s.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, (m) => "_".repeat(m.length));
+}
+
+/**
+ * Why this command exits 0 whatever happens, or null. Read off the command
+ * alone, before anything runs:
+ *  - its last top-level step is `|| echo …`/`|| printf …`, or it ends in
+ *    `|| true`, `|| :`, `|| exit 0`, `; true`, `; exit 0` (evidence.ts);
+ *  - it ends in `find … -exec … \;` (or `';'`): find's own status ignores
+ *    what -exec ran, so `-exec sh -c '… exit 1' \;` reports nothing;
+ *  - it prints a literal PASS/FAIL verdict (`print('PASS' if … else 'FAIL')`,
+ *    `echo FAIL`) and nothing in it exits non-zero, asserts or raises.
+ */
+export function cannotFail(run: string): string | null {
+  const cmd = run.trim();
+  const masked = maskQuotes(cmd);
+  const sw = swallowsExit(cmd);
+  if (sw) return `it ends in \`${sw}\`, so it exits 0 whatever happened`;
+  const echoTail = /\|\|\s*(?:echo|printf)\b[^|;&]*$/.exec(masked);
+  if (echoTail) return `it ends in \`${cmd.slice(echoTail.index).trim()}\`, so a failure prints a word and still exits 0`;
+  const find = /(?:^|[;&|(]\s*)find\s[^|;]*-exec(?:dir)?\s/.exec(masked);
+  if (find) {
+    const rest = cmd.slice(find.index);
+    const end = /(?:\\;|';'|";")/.exec(rest);
+    const after = end ? maskQuotes(rest.slice(end.index + end[0].length)).trim() : "";
+    // Only when nothing after the find reads its output: `find … | grep -q .` is fine.
+    if (end && !/^\|(?!\|)/.test(after) && !/^[;&|]*\s*\S/.test(after.replace(/^&&\s*(?:echo|printf|true|:)\b.*$/, ""))) {
+      return "it ends in `find … -exec … \\;`, whose exit status ignores what -exec ran, so it passes whatever the files hold";
+    }
+  }
+  if (/\bFAIL(?:ED)?\b/.test(cmd) && /\bPASS(?:ED)?\b/.test(cmd) && !/\bexit\s*\(?\s*[1-9]|sys\.exit|\bassert\b|\braise\b|process\.exit|\bfalse\b/.test(cmd)) {
+    return "it prints PASS or FAIL but always exits 0, and only the exit status is read";
+  }
+  return null;
 }
 
 /** The first rule broken, or null. */
