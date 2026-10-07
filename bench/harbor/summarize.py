@@ -82,7 +82,9 @@ def trial_row(d: Path) -> dict | None:
         "molt_exit": exit_code,
         "molt_outcome": (
             "unconfirmed" if (je or {}).get("outcome") == "verified" and ((je or {}).get("review") or {}).get("confirmed") is False
-            else "self-checked" if (je or {}).get("outcome") == "verified" and (je or {}).get("selfChecked")
+            # Builds from 2026-10-07 say who wrote the checks in job_end's `claim`.
+            else "passed-own-checks" if (je or {}).get("tier") == "passed-own-checks"
+            else "self-checked" if (je or {}).get("outcome") == "verified" and (je or {}).get("selfChecked") and not (je or {}).get("claim")
             else (je or {}).get("outcome")
         ),
         "molt_steps": (je or {}).get("steps"),

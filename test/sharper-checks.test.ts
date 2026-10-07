@@ -67,8 +67,8 @@ describe("a disputed check, in a turn", () => {
   // An arbiter other than the worker: a same-model arbiter is skipped.
   const ARBITER = { model: "arbiter" };
   const checks: Check[] = [
-    { name: "made", kind: "command", run: "head -c 5 out.txt | grep -qx hello", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true },
-    { name: "too-strict", kind: "command", run: "grep -q 366 out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true },
+    { name: "made", kind: "command", run: "head -c 5 out.txt | grep -qx hello", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: { kind: "judge", model: "judge-j" } },
+    { name: "too-strict", kind: "command", run: "grep -q 366 out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true, author: { kind: "judge", model: "judge-j" } },
   ];
 
   it("an upheld dispute retires the check; the rest still judge the claim", async () => {
@@ -284,7 +284,7 @@ describe("what the checks leave behind", () => {
       else process.env.MAAT_CHECK_COPY = was;
     }
   };
-  const leaves: Check = { name: "builds", kind: "command", run: "mkdir -p bin && touch bin/cmain made.o && test -f keep.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true };
+  const leaves: Check = { name: "builds", kind: "command", run: "mkdir -p bin && touch bin/cmain made.o && test -f keep.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true, author: { kind: "judge", model: "judge-j" } };
   const turn = () => [{ calls: [{ name: "write_file", args: { path: "keep.txt", content: "k\n" } }] }, { text: "Done." }];
 
   it("is removed in an unattended run, and nothing that existed before is touched", async () => {
@@ -601,7 +601,7 @@ describe("a drafted check that fails in its own code", () => {
     const ws = workspace();
     try {
       const checks: Check[] = [
-        { name: "made", kind: "command", run: "head -c 5 out.txt | grep -qx hello", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true },
+        { name: "made", kind: "command", run: "head -c 5 out.txt | grep -qx hello", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: { kind: "judge", model: "judge-j" } },
         // Fails on the missing file before the work, so preflight keeps it; its own bug shows only after.
         { name: "broken-after", kind: "command", run: "test -f out.txt && python3 -c \"print(f'x {1')\"", timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true },
       ];

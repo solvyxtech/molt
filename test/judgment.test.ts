@@ -21,7 +21,7 @@ const check = (name: string, run: string, hidden: boolean): Check => ({
   timeoutMs: 5_000,
   expectExit: 0,
   tags: ["task", "value"],
-  ...(hidden ? { hidden: true } : {}),
+  ...(hidden ? { hidden: true, author: { kind: "judge", model: "judge-j" } } : {}),
 });
 
 const writesThenClaims = () => [

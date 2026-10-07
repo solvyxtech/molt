@@ -393,6 +393,8 @@ async function writeAndTry(opts: Ask, prompt: string): Promise<Reference | { ok:
     // independently written references: a run that asserts values.
     tags: ["task", "reference", "value"],
     hidden: true,
+    // Written by this model: independent of the work only when it is not the worker's.
+    author: { kind: "reference", model: opts.model },
   };
   const tried = await runCommand(check.run, { cwd: scratch, timeoutMs: REFERENCE_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
   if (tried.timedOut) return { ok: false, why: "the references did not finish on the untouched project" };

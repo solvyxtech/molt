@@ -178,11 +178,12 @@ describe("draftReference", () => {
 });
 
 describe("a reference check, in a turn", () => {
-  async function turn(content: string, opts: { second?: string; first?: string; waitMs?: number; extra?: Check[] } = {}) {
+  async function turn(content: string, opts: { second?: string; first?: string; waitMs?: number; extra?: Check[]; refModel?: string } = {}) {
     const w = workspace();
     const snapshot = snapshotProject(w.dir)!;
     const p = writers([opts.first ?? fenced(moduleA())], [opts.second ?? secondModule("str(n + n)")]);
-    const ref = await draftReference({ ...ask, task: "write double.py", snapshot, fetchFn: p.fetchFn });
+    // Written by a model other than the worker ("m"), unless a test says otherwise.
+    const ref = await draftReference({ ...ask, model: opts.refModel ?? "ref-model", task: "write double.py", snapshot, fetchFn: p.fetchFn });
     assert.ok(ref.ok, ref.ok ? "" : ref.why);
     const provider = scriptedProvider([
       { calls: [{ name: "write_file", args: { path: "double.py", content } }] },
@@ -202,8 +203,16 @@ describe("a reference check, in a turn", () => {
     );
     w.cleanup();
     const end = events.find((e) => e.kind === "job_end");
-    return { events, outcome: end && end.kind === "job_end" ? end.outcome : undefined };
+    return { events, outcome: end && end.kind === "job_end" ? end.outcome : undefined, end: end && end.kind === "job_end" ? end : undefined };
   }
+
+  it("records who wrote it, and a reference by the worker model is not independent", async () => {
+    const other = await turn("import sys\nprint(2 * int(sys.argv[1]))\n");
+    assert.equal(other.end?.checkAuthors?.["task:reference"], "reference ref-model");
+    assert.equal(other.end?.claim, "verified (independent checks: ref-model)");
+    const own = await turn("import sys\nprint(2 * int(sys.argv[1]))\n", { refModel: "m" });
+    assert.deepEqual([own.outcome, own.end?.tier, own.end?.claim], ["unverified", "passed-own-checks", "passed own checks (m), not verified"]);
+  });
 
   it("joins at the claim and refuses work both references disagree with, showing the input", async () => {
     const { events, outcome } = await turn("import sys\nn = int(sys.argv[1])\nprint(n + n if n < 4 else n * 3)\n");
@@ -225,7 +234,7 @@ describe("a reference check, in a turn", () => {
 
   it("is retired, not obeyed, when its own code fails at the claim; the other checks judge", async () => {
     const raises = "    if __import__('os').path.exists('double.py'):\n        raise KeyError('oops')\n    return 'missing'";
-    const made: Check = { name: "made", kind: "command", run: "[ \"$(python3 double.py)\" = \"1\" ]", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true };
+    const made: Check = { name: "made", kind: "command", run: "[ \"$(python3 double.py)\" = \"1\" ]", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: { kind: "judge", model: "judge-j" } };
     const { events, outcome } = await turn("print(1)\n", { first: fenced(moduleA("str(2 * n)", raises)), extra: [made] });
     assert.ok(events.some((e) => e.kind === "info" && /failed in its own code, not on the work/.test(e.text)));
     assert.equal(outcome, "verified", "judged by the check that remained");

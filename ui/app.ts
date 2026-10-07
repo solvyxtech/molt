@@ -1141,7 +1141,9 @@ molt.onEvent((ev) => {
       // The same words the terminal uses for the verdict (cli.tsx).
       const review = ev.review as { confirmed?: boolean } | undefined;
       const said =
-        ev.outcome === "verified" && review && review.confirmed === false
+        typeof ev.claim === "string" && (ev.tier === "passed-own-checks" || ev.outcome === "verified")
+          ? `${ev.claim}${ev.outcome === "verified" && review?.confirmed ? ", independently reviewed" : ""}`
+          : ev.outcome === "verified" && review && review.confirmed === false
           ? "passed its checks, unconfirmed"
           : ev.outcome === "verified" && review?.confirmed
             ? "verified, independently reviewed"

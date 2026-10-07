@@ -49,7 +49,7 @@ import {
   type StoredEndpoint,
 } from "./providers.js";
 import { Receipts } from "./receipts.js";
-import type { BarResult, Check, EngineEvent } from "./types.js";
+import type { BarResult, Check, CheckAuthor, EngineEvent } from "./types.js";
 import { stateDir } from "./statedir.js";
 import { draftReference, snapshotProject } from "./reference.js";
 import { env } from "./env.js";
@@ -178,6 +178,9 @@ options
                      A separate judge does not share the worker's misreadings;
                      it raised verified-on-correct-work on every worker tested
                      with no wrong verifieds. Same as MAAT_JUDGE_MODEL.
+                     Without one (or with the worker's own model), drafted
+                     checks are the worker's and the most a run earns is
+                     "passed own checks", never "verified".
   --judge-url <url>  where the judge runs, e.g. grok-build://subscription,
                      opencode://zen (OpenCode Zen models only, e.g.
                      opencode/big-pickle), or an OpenAI-style URL.
@@ -1327,7 +1330,11 @@ function startReference(args: Args, deadlineAt?: number): Promise<{ check: Check
 async function sealDraft(draft: Draft, args: Args, late = false): Promise<ReturnType<typeof taskChecksFrom>> {
   // Hidden: the model wrote these, and a model shown its own exam makes the
   // work equal the check. It gets the names, and the output on failure.
-  const sealed = taskChecksFrom(draft, { hidden: true });
+  // Who wrote them, recorded with the seal: the judge when one is set, else the
+  // worker itself. Whether that judge is really another model is tierOf's call.
+  const drafter = judgeTarget({ baseUrl: args.url, apiKey: args.key, model: args.model }).model;
+  const author: CheckAuthor = process.env.MAAT_JUDGE_MODEL?.trim() ? { kind: "judge", model: drafter } : { kind: "worker", model: args.model };
+  const sealed = taskChecksFrom(draft, { hidden: true, author });
   // Headless, the checks' own side effects are cleaned up (src/leftovers.ts).
   // A draft that joins at a claim (RunOptions.pendingCriteria, cut with no
   // checks ready) lands after the work began: trying it in the live folder
@@ -1444,8 +1451,12 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         const said =
           ev.tier === "passed-checks"
             ? passedChecksWords(ev.tierReason)
+            : ev.tier === "passed-own-checks" && ev.claim
+            ? ev.claim
             : ev.outcome === "verified" && ev.revealed?.length
             ? "verified (checks shown after a repeat failure)"
+            : ev.outcome === "verified" && ev.claim
+            ? `${ev.claim}${ev.review?.confirmed ? ", independently reviewed" : ""}`
             : ev.outcome === "verified" && ev.review && !ev.review.confirmed
             ? "passed its checks, unconfirmed"
             : ev.outcome === "verified" && ev.review?.confirmed

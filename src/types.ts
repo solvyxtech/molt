@@ -115,7 +115,24 @@ export type Advisory = {
    * back on failure; only the text of the command is withheld.
    */
   hidden?: boolean;
+  /**
+   * Who wrote this check, recorded when it is sealed. "verified" needs a
+   * passing check that ran the work and asserted a value from someone other
+   * than the worker model (src/tiers.ts). Absent: a visible check is a
+   * person's, a hidden one the worker's.
+   */
+  author?: CheckAuthor;
 };
+
+/**
+ * The author of a check. `worker`: the model doing the work drafted it.
+ * `judge`: a separate judge model (`--judge`, MAAT_JUDGE_MODEL) drafted it.
+ * `person`: done.yml, a mission contract, or criteria a person approved.
+ * `reference`: the reference check (src/reference.ts), written by `model`.
+ * Independence is decided by comparing `model` to the worker's, never by kind
+ * alone: a judge that is the worker model is not independent.
+ */
+export type CheckAuthor = { kind: "worker" | "judge" | "person" | "reference"; model?: string };
 
 export type Check = Advisory &
   (
@@ -663,8 +680,17 @@ export type EngineEvent =
        * check) and no reviewer contradicted it. "passed-checks" is the outcome
        * "unverified" with `tierReason` saying why the word was not earned.
        */
-      tier?: "verified" | "passed-checks";
+      tier?: "verified" | "passed-checks" | "passed-own-checks";
       tierReason?: string;
+      /**
+       * The claim in words, the same on every surface and in the bench's
+       * `claim` field: "verified (independent checks: <judge>)", "verified
+       * (your checks)", "passed own checks (<worker>), not verified", or the
+       * outcome word.
+       */
+      claim?: string;
+      /** Who wrote each sealed check, by name: "worker <model>", "judge <model>", "person", "reference <model>". */
+      checkAuthors?: Record<string, string>;
     }
   | {
       kind: "step_summary";
