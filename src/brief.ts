@@ -9,9 +9,8 @@
  * knowable before the first request, for free, and it is the same few hundred
  * tokens on step thirty because it sits in the cached prefix.
  *
- * A competitor's Terminal-Bench write-up names bootstrapping "each new session with
- * a broad range of salient system information" as one of the changes that
- * moved their score. It is a cheap change, and this is it.
+ * Bootstrapping each session with salient system information is a cheap
+ * harness change, and this is it.
  *
  * Two rules, the same ones the map keeps:
  *

@@ -84,7 +84,7 @@ import { errorText } from "./format.js";
 import { RpcPeer, type RpcMessage } from "./jsonrpc.js";
 import type { BackendEvent, MoltTool, ToolRunner } from "./backend.js";
 import { GROK_BUILD_URL, OPENCODE_URL } from "./endpoint.js";
-import { OPENCODE_CONFIG } from "./opencode.js";
+import { OPENCODE_CONFIG, OPENCODE_DEFAULT_MODEL, opencodeChildEnv, opencodeModel, opencodeModelProblem } from "./opencode.js";
 import { estTokens } from "./types.js";
 
 const exec = promisify(execFile);
@@ -106,6 +106,20 @@ export type AcpAgentSpec = {
   readonly args: readonly string[];
   /** Extra environment for the child, on top of the process's own. */
   readonly env?: Readonly<Record<string, string>>;
+  /**
+   * The child's environment built from the process's own, when the agent
+   * must not inherit all of it (OpenCode: other providers' credentials are
+   * scrubbed). `env` is still applied on top.
+   */
+  readonly childEnv?: (base: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
+  /**
+   * Why a model id may not run on this agent, or null. Checked before the
+   * CLI is spawned and again against the model the session reports, so a
+   * refused model never runs, as worker or judge.
+   */
+  readonly modelProblem?: (model: string) => string | null;
+  /** The model asked for when none is named, for an agent with `modelProblem`. */
+  readonly defaultModel?: string;
   /** Aliases the CLI resolves itself against whatever the account can reach. */
   readonly models: readonly string[];
   readonly installHint: string;
@@ -224,8 +238,14 @@ export const ACP_AGENTS: readonly AcpAgentSpec[] = [
     args: ["acp"],
     // Every permission is "ask": a deny breaks the free tier (see opencode.ts), and an ask
     // reaches `session/request_permission`, where Maat refuses all but its own tools.
+    // Only the Zen provider is enabled (OPENCODE_CONFIG), only Zen model ids are accepted,
+    // and other providers' credentials never reach the child: OpenCode can sign in to
+    // other vendors' consumer plans, and Maat does not route through them.
     env: { OPENCODE_CONFIG_CONTENT: OPENCODE_CONFIG },
-    models: ["opencode/big-pickle"],
+    childEnv: opencodeChildEnv,
+    modelProblem: opencodeModelProblem,
+    defaultModel: OPENCODE_DEFAULT_MODEL,
+    models: [OPENCODE_DEFAULT_MODEL],
     installHint: "npm install -g opencode-ai",
     loginHint: "opencode auth login",
     credentialPath: ".local/share/opencode/auth.json",
@@ -241,7 +261,23 @@ export function isAcp(baseUrl: string | undefined): boolean {
 
 export function acpAgentFor(baseUrl: string | undefined): AcpAgentSpec | undefined {
   const url = (baseUrl ?? "").trim().toLowerCase();
-  return ACP_AGENTS.find((a) => url.startsWith(a.url.replace(/subscription$/u, "")));
+  // By scheme: `opencode://zen` and the deprecated `opencode://subscription` are one agent.
+  return ACP_AGENTS.find((a) => url.startsWith(a.url.slice(0, a.url.indexOf("://") + 3)));
+}
+
+/**
+ * The model to ask this agent for, or why it may not run. An agent with a
+ * `modelProblem` gets its `defaultModel` when none is named, so the CLI's own
+ * default (which the user's config may point at another provider) is never
+ * what runs.
+ */
+export function acpModelFor(spec: AcpAgentSpec, model: string | undefined): { model?: string; problem?: string } {
+  const m = (model ?? "").trim();
+  if (!spec.modelProblem) return m ? { model: m } : {};
+  const problem = spec.modelProblem(m);
+  if (problem) return { problem };
+  if (!m) return spec.defaultModel ? { model: spec.defaultModel } : {};
+  return { model: spec.name === "opencode" ? opencodeModel(m) : m };
 }
 
 /** Every model any ACP backend offers, for a picker that has not chosen yet. */
@@ -460,7 +496,11 @@ export class AcpConnection {
       // empty PATH and it cannot find its own helpers.
       // `electron/login-path.ts` has already repaired process.env.PATH by the
       // time anything gets here.
-      env: { ...process.env, ...this.spec.env, ...(this.spec.env ? { PWD: this.opts.cwd ?? process.cwd() } : {}) },
+      env: {
+        ...(this.spec.childEnv ? this.spec.childEnv(process.env) : process.env),
+        ...this.spec.env,
+        ...(this.spec.env ? { PWD: this.opts.cwd ?? process.cwd() } : {}),
+      },
     });
     this.child = child;
     // A write to a child that has died raises EPIPE as an 'error' event on its
@@ -830,6 +870,10 @@ export class AcpSession<H> {
 
   private async start(): Promise<void> {
     const { spec, cwd, systemPrompt, tools, runTool } = this.opts;
+    // A model this agent may not run is refused before anything is spawned.
+    const pick = acpModelFor(spec, this.opts.model);
+    if (pick.problem) throw new Error(pick.problem);
+    this.want = pick.model;
     const mcp = new McpToolServer<H>(tools, runTool, (event) =>
       this.events.push({ kind: "host", event }),
     );
@@ -911,8 +955,13 @@ export class AcpSession<H> {
     return this.ran;
   }
 
+  /** The model to ask for: `opts.model`, or the agent's default (see `acpModelFor`). */
+  private want?: string;
+
   private async chooseModel(conn: AcpConnection, state: AcpModelState | undefined): Promise<void> {
-    const want = this.opts.model;
+    // For an agent with `modelProblem`, `want` is always set and already allowed, so the
+    // agent's own default (which its config may point at another provider) never runs.
+    const want = this.want ?? this.opts.model;
     const offered = (state?.availableModels ?? []).map((m) => m.modelId).filter(Boolean);
     if (state?.currentModelId && (!want || want === state.currentModelId)) {
       this.ran = state.currentModelId;
@@ -1211,6 +1260,10 @@ export type AcpAskOptions = {
 export async function acpAsk(
   opts: AcpAskOptions,
 ): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+  // A model this agent may not run is refused before anything is spawned.
+  const pick = acpModelFor(opts.spec, opts.model);
+  if (pick.problem) return { ok: false, error: pick.problem };
+  opts = { ...opts, ...(pick.model !== undefined ? { model: pick.model } : {}) };
   const conn = new AcpConnection(opts.spec, {
     cwd: opts.cwd ?? process.cwd(),
     ...(opts.spawnFn ? { spawnFn: opts.spawnFn } : {}),

@@ -1,5 +1,5 @@
 /**
- * The OpenCode ask path: `opencode://subscription` as a judge. The CLI is
+ * The OpenCode ask path: `opencode://zen` as a judge. The CLI is
  * stubbed; the facts the stubs encode (event shapes, the 403 on a denied
  * tool list, auto-rejected asks) were measured on opencode 1.18.33.
  */

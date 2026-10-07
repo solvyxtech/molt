@@ -1,7 +1,18 @@
 /**
  * OpenCode as a question-answerer, so its free "Big Pickle" model (or any
- * `opencode/<model>`) can be the judge: the model that drafts the hidden
- * checks and reviews the claim. `MAAT_JUDGE_URL=opencode://subscription`.
+ * OpenCode Zen `opencode/<model>`) can be the judge: the model that drafts the
+ * hidden checks and reviews the claim. `MAAT_JUDGE_URL=opencode://zen`.
+ *
+ * Only OpenCode Zen models are driven. OpenCode can also sign in to other
+ * vendors' consumer plans (Anthropic, GitHub Copilot, Gemini, ...); Maat never
+ * routes through them. Three locks, each enough on its own: any model id that
+ * is not `opencode/...` is refused before the CLI is spawned
+ * (`opencodeModelProblem`); the config Maat hands the CLI enables the
+ * `opencode` provider and no other (`enabled_providers`, which outranks the
+ * user's global and project configs: measured on 1.18.33, `opencode models`
+ * lists only `opencode/*` with ANTHROPIC_API_KEY and GEMINI_API_KEY set); and
+ * other providers' credentials are scrubbed from the child's environment
+ * (`opencodeChildEnv`).
  *
  * Only the real `opencode` CLI is driven. OpenCode's free tier refuses direct
  * HTTP ("can only be used from within OpenCode"), and nothing here imitates
@@ -30,15 +41,20 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { errorText } from "./format.js";
+import { isOpencodeUrl, opencodeModelProblem } from "./endpoint.js";
 
-export { OPENCODE_URL } from "./endpoint.js";
+export { OPENCODE_URL, opencodeModelProblem } from "./endpoint.js";
 
 export function isOpencode(baseUrl: string | undefined): boolean {
-  return (baseUrl ?? "").trim().toLowerCase().startsWith("opencode://");
+  return isOpencodeUrl(baseUrl);
 }
 
-/** Every permission "ask", which a headless run rejects. See the file comment. */
+/**
+ * Only the `opencode` (Zen) provider is enabled, and every permission is
+ * "ask", which a headless run rejects. See the file comment.
+ */
 export const OPENCODE_CONFIG = JSON.stringify({
+  enabled_providers: ["opencode"],
   permission: {
     "*": "ask",
     bash: "ask",
@@ -51,9 +67,18 @@ export const OPENCODE_CONFIG = JSON.stringify({
   },
 });
 
-/** `opencode/big-pickle`, or a bare `big-pickle` meaning the same. */
+/** The model run when none is named: OpenCode Zen's free Big Pickle. */
+export const OPENCODE_DEFAULT_MODEL = "opencode/big-pickle";
+
+/**
+ * `opencode/big-pickle`, or a bare `big-pickle` meaning the same. Throws for
+ * anything that is not an OpenCode Zen model (see `opencodeModelProblem`).
+ */
 export function opencodeModel(model: string): string {
+  const problem = opencodeModelProblem(model);
+  if (problem) throw new Error(problem);
   const m = model.trim();
+  if (!m) return OPENCODE_DEFAULT_MODEL;
   return m.includes("/") ? m : `opencode/${m}`;
 }
 
@@ -61,8 +86,32 @@ export function opencodeArgs(model: string, message: string, dir: string): strin
   return ["run", "-m", opencodeModel(model), "--format", "json", "--dir", dir, message];
 }
 
+/**
+ * Environment variables that would hand the OpenCode child another provider's
+ * credentials or a config of the user's choosing. OpenCode reads provider keys
+ * from the environment; with only Zen enabled they are unused, and with them
+ * gone they are unusable too.
+ */
+const FOREIGN_ENV =
+  /^(?:ANTHROPIC|CLAUDE|GITHUB|GH|COPILOT|GEMINI|GOOGLE|VERTEX|OPENAI|AZURE|AWS|XAI|GROK|OPENROUTER|GROQ|MISTRAL|DEEPSEEK|TOGETHER|FIREWORKS|CEREBRAS|HF|HUGGINGFACE|PERPLEXITY|COHERE|MOONSHOT|ZHIPU|DASHSCOPE|OLLAMA|LMSTUDIO|VERCEL|CLOUDFLARE|SAP|BEDROCK)_|_(?:API_KEY|AUTH_TOKEN|ACCESS_TOKEN|SECRET_ACCESS_KEY)$|^OPENCODE_CONFIG(?:_DIR)?$/u;
+
+/**
+ * The OpenCode child's environment: the caller's, minus every other provider's
+ * credentials and any config path, plus Maat's own config (Zen only).
+ */
+export function opencodeChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(base)) {
+    // OpenCode's own key (OPENCODE_API_KEY) is the Zen account, so it stays.
+    if (FOREIGN_ENV.test(k.toUpperCase()) && !/^OPENCODE_API_KEY$/iu.test(k)) continue;
+    out[k] = v;
+  }
+  out.OPENCODE_CONFIG_CONTENT = OPENCODE_CONFIG;
+  return out;
+}
+
 export function opencodeEnv(dir: string, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  return { ...base, PWD: dir, OPENCODE_CONFIG_CONTENT: OPENCODE_CONFIG };
+  return { ...opencodeChildEnv(base), PWD: dir };
 }
 
 export type OpencodeReply = { ok: true; text: string } | { ok: false; error: string; transient?: true };
@@ -168,6 +217,9 @@ function runCli(cmd: string, args: string[], opts: { cwd: string; env: NodeJS.Pr
  * answering, since that is the only way a free model "fails" a plain question.
  */
 export async function opencodeAsk(opts: OpencodeAskOptions): Promise<OpencodeReply> {
+  // Refused before anything is spawned: a non-Zen model never reaches the CLI.
+  const refused = opencodeModelProblem(opts.model);
+  if (refused) return { ok: false, error: refused };
   const injected = opts.run;
   const dir = injected ? tmpdir() : mkdtempSync(join(tmpdir(), "molt-opencode-ask-"));
   const message = `${opts.systemPrompt}\n\n${NO_TOOLS}\n\n${opts.prompt}`;

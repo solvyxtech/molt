@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **OpenCode runs OpenCode Zen models only.** The OpenCode backend (worker and
+  judge) accepts `opencode/<model>` (e.g. `opencode/big-pickle`) and refuses
+  any other provider at parse time and at run time; the CLI is handed a config
+  that enables only the `opencode` provider, and no other provider's
+  credentials.
+- **`opencode://zen`** is the OpenCode endpoint (short name `opencode`). The old
+  `opencode://subscription` still works for this release, with a deprecation
+  notice.
+
 ## 0.2.2 — subscription backends removed
 
 ### Removed
@@ -9,8 +22,8 @@
   written. Stale `claude-code://`, `antigravity://`, `agy://`, and
   `gemini-cli://` configs now fail with a clear removal message. Grok Build
   (ACP) and the metered xAI API provider remain.
-- **Competitor benchmarking** from the harbor/local bench path, and **xAI rows**
-  from the committed fine-tune dataset (provider-terms alignment). See
+- **xAI rows** from the committed fine-tune dataset, and third-party agent
+  adapters from the bench path (provider-terms alignment). See
   `docs/provider-terms.md`.
 
 ### Changed

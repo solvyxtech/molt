@@ -43,7 +43,7 @@ function receipt(seq: number, meta: Record<string, string>): string {
 
 const cases: { name: string; meta: Record<string, string>; kept: boolean }[] = [
   { name: "clean", meta: { provider: "openrouter", model: "inception/mercury-2.5" }, kept: true },
-  { name: "clean-judge", meta: { provider: "openrouter", model: "inception/mercury-2.5", judge: "opencode/big-pickle at opencode://subscription" }, kept: true },
+  { name: "clean-judge", meta: { provider: "openrouter", model: "inception/mercury-2.5", judge: "opencode/big-pickle at opencode://zen" }, kept: true },
   { name: "grok-worker-plan", meta: { provider: "grok-build", model: "grok-4.7" }, kept: false },
   { name: "grok-worker-reseller", meta: { provider: "openrouter", model: "x-ai/grok-4.1-fast" }, kept: false },
   { name: "grok-judge-model", meta: { provider: "openrouter", model: "inception/mercury-2.5", judge: "x-ai/grok-4.1-fast at https://openrouter.ai/api/v1" }, kept: false },

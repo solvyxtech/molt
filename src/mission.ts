@@ -9,11 +9,8 @@
  * feature in a milestone is done, every assertion in that milestone is run
  * again, together, and the milestone seals only if all of them still pass.
  *
- * What is deliberately NOT here: an orchestrator model. A competitor's missions
- * put a frontier model in a loop with seventeen tools to decide what runs
- * next and whether a worker's handoff was good; it is the most expensive
- * process in the system and it is doing a job a loop can do. Here the
- * orchestrator is this file. It reads a queue, starts a worker, reads a
+ * What is deliberately NOT here: an orchestrator model. Deciding what runs
+ * next is a job a loop can do, so the orchestrator is this file. It reads a queue, starts a worker, reads a
  * verdict the bar produced, and moves on. It never judges work — the
  * assertions do — and it never asks a model whether a milestone is done. The
  * model does only what a model is good at: proposing the plan (once, for a

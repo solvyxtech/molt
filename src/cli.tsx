@@ -8,7 +8,7 @@
  * harness without a human watching.
  */
 import { acpAgentFor, acpHealth } from "./acp.js";
-import { expandEndpointShorthand } from "./endpoint.js";
+import { endpointDeprecation, expandEndpointShorthand, isOpencodeUrl, opencodeModelProblem } from "./endpoint.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { formatWithOptions } from "node:util";
 import { resolve } from "node:path";
@@ -179,7 +179,8 @@ options
                      it raised verified-on-correct-work on every worker tested
                      with no wrong verifieds. Same as MAAT_JUDGE_MODEL.
   --judge-url <url>  where the judge runs, e.g. grok-build://subscription,
-                     opencode://subscription, or an OpenAI-style URL.
+                     opencode://zen (OpenCode Zen models only, e.g.
+                     opencode/big-pickle), or an OpenAI-style URL.
   --reasoning-checks <e>  effort for drafting checks and planning a mission only
                      (single calls outside the work loop). Defaults to --reasoning.
   --reasoning-retry <e>   effort for every step after the checks refuse a claim.
@@ -379,6 +380,15 @@ function positiveNum(flag: string, raw: string | undefined): number {
  * a local endpoint whether or not anything was running there — a claim it
  * had not checked, in a status line whose job is to be trustworthy.
  */
+/** Says once, on stderr, that an endpoint spelling is going away. */
+const deprecationsSaid = new Set<string>();
+function noteDeprecated(raw: string | undefined): void {
+  const note = endpointDeprecation(raw);
+  if (!note || deprecationsSaid.has(note)) return;
+  deprecationsSaid.add(note);
+  process.stderr.write(`maat: ${note}\n`);
+}
+
 export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
   const out: Args = {
     cmd: "",
@@ -447,6 +457,7 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
          * `endpointProblem`, so the engine and the window expand the same word
          * this flag does rather than each learning it separately.
          */
+        noteDeprecated(given);
         out.url = expandEndpointShorthand(given);
         /**
          * Refused here, not four retries later.
@@ -540,7 +551,9 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
       case "--judge-url": {
         // Same words as --url (`grok`, `opencode`), and refused here rather
         // than when the first check is drafted.
-        const judgeUrl = expandEndpointShorthand(next());
+        const givenJudgeUrl = next();
+        noteDeprecated(givenJudgeUrl);
+        const judgeUrl = expandEndpointShorthand(givenJudgeUrl);
         const wrong = endpointProblem(judgeUrl);
         if (wrong) throw new Error(`--judge-url: ${wrong}`);
         out.judgeUrl = judgeUrl;
@@ -689,6 +702,24 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
 
   out.cmd = positional[0] ?? "";
   out.task = positional.slice(1).join(" ") || undefined;
+
+  // A stored or MAAT_BASE_URL endpoint in the old OpenCode spelling still works, for one release.
+  noteDeprecated(out.url);
+  out.url = expandEndpointShorthand(out.url);
+  // OpenCode runs only OpenCode Zen models, as worker and as judge, refused here
+  // rather than when the CLI is spawned (where it is refused again).
+  if (isOpencodeUrl(out.url)) {
+    const wrong = opencodeModelProblem(out.model);
+    if (wrong) throw new Error(`--model: ${wrong}`);
+  }
+  const envJudgeUrl = process.env.MAAT_JUDGE_URL?.trim();
+  if (out.judgeUrl === undefined && envJudgeUrl) noteDeprecated(envJudgeUrl);
+  const judgeModel = out.judge ?? process.env.MAAT_JUDGE_MODEL?.trim();
+  const judgeUrl = out.judgeUrl ?? (envJudgeUrl ? expandEndpointShorthand(envJudgeUrl) : out.url);
+  if (judgeModel && isOpencodeUrl(judgeUrl)) {
+    const wrong = opencodeModelProblem(judgeModel);
+    if (wrong) throw new Error(`--judge: ${wrong}`);
+  }
 
   // Prices come last, because a stored price belongs to the model it was
   // fetched for and the model is not final until every flag has been read.

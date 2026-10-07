@@ -15,7 +15,7 @@ export function judgeTarget<T extends Target>(worker: T, env: NodeJS.ProcessEnv 
   const apiKey =
     env.MAAT_JUDGE_KEY?.trim() ||
     (baseUrl === worker.baseUrl ? worker.apiKey : undefined) ||
-    // A subscription worker (Grok Build, OpenCode) judged on OpenRouter uses the OpenRouter key.
+    // A CLI worker (Grok Build, OpenCode) judged on OpenRouter uses the OpenRouter key.
     (/^https:\/\/openrouter\.ai\//.test(baseUrl) ? env.OPENROUTER_API_KEY?.trim() || undefined : undefined);
   const { apiKey: _workerKey, ...rest } = worker;
   return { ...rest, baseUrl, model, ...(apiKey !== undefined ? { apiKey } : {}) } as T;

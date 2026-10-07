@@ -815,8 +815,8 @@ export const MAX_BASH_TIMEOUT_MS = 30 * 60_000;
  * A plan, as the model reads it back.
  *
  * Done steps are crossed off, the current one is marked, the rest are
- * pending. The marking exploits the same recency bias a competitor's write-up
- * describes: the last thing in the result is the next thing to do.
+ * pending. The marking leans on recency bias: the last thing in the result is
+ * the next thing to do.
  */
 export function renderPlan(steps: string[], current: number): string {
   const cur = Number.isFinite(current) ? Math.max(0, Math.min(steps.length, Math.floor(current))) : 0;

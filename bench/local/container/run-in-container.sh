@@ -14,9 +14,12 @@
 # modified; nothing else from ~/.grok is used. GROK_OWN_TOOLS=1 adds a generated
 # permission_mode=always-approve config (see below) so Grok works with its own tools. No OpenRouter key is passed in this mode.
 # OPENCODE=1 (combines with SUBSCRIPTION=grok): add the OpenCode CLI (Dockerfile.opencode,
-# image tag suffix -oc) and ~/.local/share/opencode/auth.json, mounted read-only outside HOME and
-# copied to /home/agent/.local/share/opencode/auth.json (mode 600). It is for the judge only:
-#   ARMS="oc:MAAT_JUDGE_MODEL=opencode/big-pickle,MAAT_JUDGE_URL=opencode://subscription"
+# image tag suffix -oc) and the OpenCode Zen entry of ~/.local/share/opencode/auth.json (only
+# the "opencode" key: any other provider OpenCode is signed in to stays on the Mac), written to
+# a mode-600 temp file, mounted read-only outside HOME and copied to
+# /home/agent/.local/share/opencode/auth.json (mode 600). Maat runs only opencode/... models
+# there. It is for the judge only:
+#   ARMS="oc:MAAT_JUDGE_MODEL=opencode/big-pickle,MAAT_JUDGE_URL=opencode://zen"
 # The key is never printed.
 set -e
 name=$1; tgz=${2:A}; shift 2; [ "$1" = "--" ] && shift
@@ -71,7 +74,10 @@ if [ "$SUBSCRIPTION" = grok ]; then
   [ -z "$GROK_OWN_TOOLS" ] || startcmd='install -d -o agent -g agent -m 700 /home/agent/.grok && printf "[ui]\npermission_mode = \"always-approve\"\n" > /home/agent/.grok/config.toml && chown agent:agent /home/agent/.grok/config.toml && '$startcmd
 fi
 if [ "$OPENCODE" = 1 ]; then
-  credmount="$credmount -v $HOME/.local/share/opencode/auth.json:/root/oc-cred/auth.json:ro"
+  # Only the Zen ("opencode") credential crosses into the container, never another provider's.
+  ocauth=$(mktemp); chmod 600 "$ocauth"; trap 'rm -f "$envf" "$ocauth"' EXIT
+  python3 -c 'import json,sys;a=json.load(open(sys.argv[1]));json.dump({k:v for k,v in a.items() if k=="opencode"},open(sys.argv[2],"w"))' ~/.local/share/opencode/auth.json "$ocauth"
+  credmount="$credmount -v $ocauth:/root/oc-cred/auth.json:ro"
   startcmd='install -d -o agent -g agent -m 700 /home/agent/.local /home/agent/.local/share /home/agent/.local/share/opencode && install -o agent -g agent -m 600 /root/oc-cred/auth.json /home/agent/.local/share/opencode/auth.json && '$startcmd
 fi
 echo "maat $img → $out/${RESULTS:-results.jsonl}"

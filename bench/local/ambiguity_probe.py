@@ -9,6 +9,8 @@ no grader). `run` builds each task's starting folder on the host (setup only; no
 the host), then runs ambiguity_probe_driver.mjs in a throwaway container named maat-bench-ab3-*
 with the owner's Grok login mounted read-only outside HOME (as run-in-container.sh does).
 Never run grok on the host: its config auto-approves its own tools.
+Output files hold raw Grok text: keep them in ambiguity-results/ (gitignored), never commit them
+(xAI's AUP forbids using its output to develop ML models).
 """
 from __future__ import annotations
 import json, os, subprocess, sys, tempfile

@@ -7,9 +7,7 @@
  * timeout kills the server, or the model backgrounds it with `&` and the
  * shell's stdout pipe holds the tool open anyway. Watching a model try
  * `nohup`, `setsid`, `disown` and `sleep 5 &&` in four consecutive steps is
- * what makes the case. A competitor's Terminal-Bench notes name "a controlled
- * background-execution primitive" as one of their harness changes for the same
- * reason.
+ * what makes the case for a controlled background-execution primitive.
  *
  * The rules:
  *
