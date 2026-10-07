@@ -26,7 +26,7 @@ import {
 } from "../src/acp-catalog.js";
 import { AcpConnection, type AcpAgentSpec } from "../src/acp.js";
 import { AcpServer, type ModelChoices } from "../src/acp-server.js";
-import { CLAUDE_CODE_URL, GROK_BUILD_URL } from "../src/endpoint.js";
+import { GROK_BUILD_URL } from "../src/endpoint.js";
 import { Engine } from "../src/engine.js";
 import { INVALID_PARAMS, INVALID_REQUEST, RpcError, RpcPeer } from "../src/jsonrpc.js";
 import { jsonBody, scriptServer, type Reply } from "./acp-provider.js";
@@ -51,7 +51,7 @@ describe("model values", () => {
       ["http://[::1]:8080/v1", "qwen3:30b-a3b"],
       ["https://openrouter.ai/api/v1", "inception/mercury-2.5-preview"],
       ["http://127.0.0.1:8080/v1", "odd#model"],
-      [CLAUDE_CODE_URL, "sonnet"],
+      [GROK_BUILD_URL, "grok-4.6"],
     ] as const) {
       const v = encodeModelValue(url, model);
       assert.deepEqual(decodeModelValue(v), { url, model });
@@ -82,7 +82,7 @@ describe("discovery", () => {
     stored: { baseUrl: "http://192.168.0.218:8080/v1", model: "qwen3.8-27b" },
     remembered: [{ url: "https://llm.example.com/v1/", lastModel: "house-model" }],
     listModels: async (url: string) => listings[url] ?? { ok: false as const, error: "unknown" },
-    subscriptionUsable: async (url: string) => url === CLAUDE_CODE_URL,
+    subscriptionUsable: async (url: string) => url === GROK_BUILD_URL,
     ...over,
   });
 
@@ -90,13 +90,13 @@ describe("discovery", () => {
     const found = await discoverModels(deps());
     const byUrl = Object.fromEntries(found.map((f) => [f.url, f]));
     assert.deepEqual(Object.keys(byUrl).sort(), [
-      CLAUDE_CODE_URL,
+      GROK_BUILD_URL,
       "http://192.168.0.218:8080/v1",
       "https://api.x.ai/v1",
       "https://llm.example.com/v1",
     ].sort());
-    assert.equal(byUrl[CLAUDE_CODE_URL]!.group, "subscriptions");
-    assert.deepEqual(byUrl[CLAUDE_CODE_URL]!.models, ["opus", "sonnet", "haiku"]);
+    assert.equal(byUrl[GROK_BUILD_URL]!.group, "subscriptions");
+    assert.deepEqual(byUrl[GROK_BUILD_URL]!.models, ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"]);
     assert.equal(byUrl["https://api.x.ai/v1"]!.group, "api-keys");
     assert.equal(byUrl["http://192.168.0.218:8080/v1"]!.group, "local");
     // Answered with an empty list: the model it was last used with stands.
@@ -120,17 +120,20 @@ describe("discovery", () => {
   it("leaves out a probe that does not answer in time, and says so", async () => {
     const logs: string[] = [];
     const t0 = Date.now();
+    // Slower than timeoutMs so `within` takes the fallback; still settles so
+    // the runner is not left with forever-pending promises.
+    const slow = <T,>(v: T) => new Promise<T>((r) => setTimeout(() => r(v), 200));
     const found = await discoverModels(
       deps({
         timeoutMs: 50,
-        subscriptionUsable: () => new Promise(() => {}),
-        listModels: () => new Promise(() => {}),
+        subscriptionUsable: () => slow(false),
+        listModels: () => slow({ ok: false as const, error: "still waiting" }),
         log: (l) => logs.push(l),
       }),
     );
     assert.deepEqual(found, []);
     assert.ok(Date.now() - t0 < 2_000);
-    assert.ok(logs.some((l) => /no answer in time/.test(l)));
+    assert.ok(logs.some((l) => /no answer in time|not usable here/.test(l)));
   });
 
   it("reads the window's remembered servers without writing them", () => {
@@ -414,8 +417,8 @@ describe("molt acp over stdio: choosing a second endpoint", { timeout: 60_000 },
           env: {
             ...process.env,
             MOLT_CONFIG_DIR: config,
-            // Detection mocked: Claude Code is declared usable, nothing is spawned.
-            MOLT_ACP_SUBSCRIPTIONS: "claude-code",
+            // Detection mocked: Grok Build is declared usable, nothing is spawned.
+            MOLT_ACP_SUBSCRIPTIONS: "grok-build",
             MOLT_ACP_DISCOVERY_WAIT_MS: "10000",
           },
         });
@@ -440,9 +443,10 @@ describe("molt acp over stdio: choosing a second endpoint", { timeout: 60_000 },
     const groups = groupsOf(model);
     assert.deepEqual(groups.map((g) => g.name), ["Subscriptions", "Local"]);
     assert.deepEqual(groups[0]!.options.map((o) => o.value), [
-      `${CLAUDE_CODE_URL}#opus`,
-      `${CLAUDE_CODE_URL}#sonnet`,
-      `${CLAUDE_CODE_URL}#haiku`,
+      `${GROK_BUILD_URL}#grok-4.7`,
+      `${GROK_BUILD_URL}#grok-4.7-build-fast`,
+      `${GROK_BUILD_URL}#grok-4.6`,
+      `${GROK_BUILD_URL}#grok-4.5`,
     ]);
     assert.ok(optionHas(model, `${second.url}#second-small`));
 

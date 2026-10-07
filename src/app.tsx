@@ -5,9 +5,7 @@
  * terminal interface earns its keep by getting out of the way — showing the
  * work, the receipts, and the refusals, and nothing else.
  */
-import { CLAUDE_CODE_URL, claudeCodeHealth } from "./claude-code.js";
 import { ACP_AGENTS, acpHealth } from "./acp.js";
-import { AGY_URL, agyHealth } from "./agy.js";
 import { Integrity } from "./integrity.js";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Box, Static, Text, render, useApp, useInput, useStdout } from "ink";
@@ -318,16 +316,13 @@ const LOCAL_ROW = "local or self-hosted…";
  * somewhere else. Someone with a Max plan looking for where to plug it in
  * looks here.
  */
-const CLAUDE_CODE_ROW = "claude code (your Pro/Max plan)…";
-/** Google AI Pro via Antigravity CLI — same door as desktop Settings. */
-const AGY_ROW = "google plan (Antigravity)…";
 /** xAI subscription via Grok Build ACP agent. */
 const GROK_ROW = "grok build (your xAI plan)…";
 
 const FIRST_RUN_OPTIONS = [
   "Login with a provider key",
   "Local or self-hosted endpoint",
-  "Claude plan (Pro/Max)",
+  "Grok plan (Grok Build)",
   "Quit",
 ] as const;
 
@@ -707,7 +702,6 @@ export function App({
           model: engine.model,
           cwd: engine.cwd,
           fetchFn: engine.cfg.fetchFn,
-          claudeCodeSdk: engine.cfg.claudeCodeSdk,
         });
         if (seq !== interviewSeq.current) return;
         if (r.kind === "error") {
@@ -1281,8 +1275,6 @@ export function App({
         // and `/endpoint` was a command nobody would think to type.
         providers: [
           ...keyedProviders().map((name) => ({ name, hasKey: Boolean(stored[name]) })),
-          { name: CLAUDE_CODE_ROW, hasKey: false },
-          { name: AGY_ROW, hasKey: false },
           { name: GROK_ROW, hasKey: false },
           // LOCAL_ROW stays last so ↑ from the top still lands on it in tests.
           { name: LOCAL_ROW, hasKey: false },
@@ -2303,16 +2295,21 @@ export function App({
           setMode({ kind: "login-url" });
           return;
         }
-        if (pick.startsWith("Claude")) {
+        if (pick.startsWith("Grok")) {
+          const spec = ACP_AGENTS.find((a) => a.name === "grok-build");
+          if (!spec) {
+            add("error", "Grok Build is not one of the backends this build knows.");
+            return;
+          }
           void connectPlan(
-            "Claude Code",
+            "Grok Build",
             async () => {
-              const h = await claudeCodeHealth();
-              return { ...h, url: CLAUDE_CODE_URL };
+              const h = await acpHealth(spec);
+              return { ...h, url: spec.url };
             },
-            CLAUDE_CODE_URL,
-            "claude-code",
-            "choose a model with /model (opus, sonnet, haiku)",
+            spec.url,
+            "grok-build",
+            "choose a model with /model (grok-4.6, …)",
           );
           return;
         }
@@ -2385,34 +2382,6 @@ export function App({
         }
         if (key.return) {
           const provider = mode.providers[mode.index]!.name;
-          if (provider === CLAUDE_CODE_ROW) {
-            setMode({ kind: "chat" });
-            void connectPlan(
-              "Claude Code",
-              async () => {
-                const h = await claudeCodeHealth();
-                return { ...h, url: CLAUDE_CODE_URL };
-              },
-              CLAUDE_CODE_URL,
-              "claude-code",
-              "choose a model with /model (opus, sonnet, haiku)",
-            );
-            return;
-          }
-          if (provider === AGY_ROW) {
-            setMode({ kind: "chat" });
-            void connectPlan(
-              "Antigravity",
-              async () => {
-                const h = await agyHealth();
-                return { ...h, url: AGY_URL };
-              },
-              AGY_URL,
-              "antigravity",
-              "choose a model with /model (gemini-3.1-pro-high, …)",
-            );
-            return;
-          }
           if (provider === GROK_ROW) {
             setMode({ kind: "chat" });
             const spec = ACP_AGENTS.find((a) => a.name === "grok-build");

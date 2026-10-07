@@ -125,7 +125,7 @@ describe("a receipt shows the lines the turn wrote", () => {
 /**
  * A test that matches source text can pass while the thing it names is broken.
  *
- * Receipt 0062 wired the `claude-code` shorthand into the window and pinned it
+ * Receipt 0062 wired an endpoint shorthand into the window and pinned it
  * with assertions like
  *
  *     /return typed \? endpointProblem\(endpointFieldValue\(\)\) : null;/
@@ -143,13 +143,14 @@ describe("a receipt shows the lines the turn wrote", () => {
 describe("the endpoint guard is run, not matched", () => {
   it("answers for every shape the box can hold", async () => {
     const { typedEndpointProblem } = await import("../src/endpoint.js");
-    assert.equal(typedEndpointProblem("claude-code"), null, "the shorthand is an endpoint");
-    assert.equal(typedEndpointProblem("  claude-code  "), null, "however it is spaced");
+    assert.equal(typedEndpointProblem("grok-build"), null, "the shorthand is an endpoint");
+    assert.equal(typedEndpointProblem("  grok  "), null, "however it is spaced");
     assert.equal(typedEndpointProblem("https://api.openai.com/v1"), null);
     assert.equal(typedEndpointProblem("http://localhost:11434/v1"), null);
     assert.equal(typedEndpointProblem(""), null, "an empty box is not a problem yet");
     assert.equal(typedEndpointProblem("   "), null, "nor is a box of spaces");
-    assert.match(typedEndpointProblem("claude-cod") ?? "", /is not an endpoint/);
+    assert.match(typedEndpointProblem("claude-code") ?? "", /removed|no longer supported/i);
+    assert.match(typedEndpointProblem("not-a-url") ?? "", /is not an endpoint/);
     assert.match(typedEndpointProblem("ftp://x/v1") ?? "", /ftp/);
   });
 
@@ -160,8 +161,8 @@ describe("the endpoint guard is run, not matched", () => {
    */
   it("fails if the expansion is ever dropped", async () => {
     const { endpointProblem, expandEndpointShorthand } = await import("../src/endpoint.js");
-    const withExpansion = endpointProblem(expandEndpointShorthand("claude-code"));
-    const without = endpointProblem("claude-code");
+    const withExpansion = endpointProblem(expandEndpointShorthand("grok-build"));
+    const without = endpointProblem("not-a-url");
     assert.equal(withExpansion, null);
     assert.ok(without, "the two paths must not agree, or the test proves nothing");
   });

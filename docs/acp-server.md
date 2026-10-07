@@ -33,7 +33,7 @@ Build it once with `npm run build`, then add this to Zed's `settings.json`
       "env": {},
       "default_config_options": {
         "autonomy": "low",
-        "model": "claude-code://subscription#sonnet"
+        "model": "grok-build://subscription#grok-4.6"
       }
     }
   }
@@ -86,11 +86,10 @@ names as section headers, and lets you star favourites.
 The model picker lists everything molt can run on this machine, in three
 groups:
 
-- **Subscriptions** — the CLIs molt drives on your own plan: Claude Code
-  (`claude-code://subscription#opus|sonnet|haiku`), Grok Build
-  (`grok-build://subscription#grok-4.7`, …), Gemini CLI, Antigravity. Listed
-  only when molt's own health check passes: installed, signed in, and (for
-  Grok) not set to approve everything. The check spawns each CLI once, in the
+- **Subscriptions** — the CLI molt drives on your own plan: Grok Build
+  (`grok-build://subscription#grok-4.7`, …). Listed
+  only when molt's own health check passes: installed, signed in, and
+  not set to approve everything. The check spawns the CLI once, in the
   background, when the editor connects.
 - **API keys** — each provider `/login` stored a key for, with the models its
   `/models` returns, plus any non-local endpoint molt has been pointed at.
@@ -101,7 +100,7 @@ groups:
 The model in use is always listed, whether or not its endpoint answered. A
 value is the endpoint URL and the model id joined by the first `#`, so it
 reads as what it is in `default_config_options`: `https://api.x.ai/v1#grok-4.6`,
-`http://127.0.0.1:8080/v1#qwen3-coder-30b-a3b`, `gemini-cli://subscription#gemini-3-pro`.
+`http://127.0.0.1:8080/v1#qwen3-coder-30b-a3b`, `grok-build://subscription#grok-4.6`.
 
 What a choice does is what `/model` does in the terminal: the next turn runs
 on that model, `config.json` remembers it (so a bare `molt` starts there too),
@@ -116,10 +115,10 @@ one second (`MOLT_ACP_DISCOVERY_WAIT_MS` changes that; `0` never waits).
 Sources that answer later are added to the open picker. To skip the
 subscription health checks — say, on a machine where you know the answer —
 set `MOLT_ACP_SUBSCRIPTIONS` in `env` to the ones to list:
-`"claude-code,grok-build"`, or `""` for none.
+`"grok-build"`, or `""` for none.
 
 Subscriptions report plan usage, not dollars: their `usage_update` carries
-tokens and `_meta.molt.plan` (e.g. `Claude`), and no `cost`.
+tokens and `_meta.molt.plan` (e.g. `Grok Build`), and no `cost`.
 
 ### The bar's commands and PATH
 
@@ -229,7 +228,7 @@ timeout and output cap, and are killed on cancel.
 - Task criteria. The window drafts them from the first prompt for a person to
   approve before work starts; ACP has no step for that approval, so an editor
   session is judged against the project's `.molt/done.yml` only.
-- The subscription backends (`--url claude-code`, `grok-build`, `gemini-cli`,
-  `antigravity`) are selected the same way as any endpoint, but have not been
-  exercised behind an editor session yet; the tests drive an OpenAI-shaped
-  provider.
+- The Grok Build subscription backend (`--url grok-build`) is selected the
+  same way as any endpoint, but has not been exercised behind an editor
+  session yet; the tests drive an OpenAI-shaped provider. (Claude Code,
+  Gemini CLI, and Antigravity subscription backends were removed.)

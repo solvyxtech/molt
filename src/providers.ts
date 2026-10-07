@@ -12,8 +12,6 @@
  * into one.
  */
 import { ACP_AGENTS, acpAgentFor, isAcp } from "./acp.js";
-import { AGY_URL, isAgy } from "./agy.js";
-import { CLAUDE_CODE_URL, isClaudeCode } from "./claude-code.js";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { windowAround } from "./commands.js";
@@ -40,33 +38,12 @@ export const PROVIDERS: Record<string, Provider> = {
   },
   openai: { url: "https://api.openai.com/v1", needsKey: true },
   xai: { url: "https://api.x.ai/v1", needsKey: true },
-  /**
-   * Not an endpoint. molt runs the Claude Code you already logged in, and the
-   * CLI authenticates itself — so there is no key to hold, and `needsKey` is
-   * false for a provider that is anything but free. See claude-code.ts.
-   */
-  "claude-code": {
-    url: CLAUDE_CODE_URL,
-    needsKey: false,
-    hint: "runs your own logged-in Claude Code — a Pro/Max plan pays for it, not a key",
-  },
   groq: { url: "https://api.groq.com/openai/v1", needsKey: true },
   /**
-   * The other two subscriptions molt can drive, on the same terms as
-   * `claude-code`: molt spawns the CLI you logged in and speaks ACP to it, so
-   * there is no key to hold and `needsKey` is false for something that is
-   * anything but free. See acp.ts.
+   * Subscription CLI(s) molt drives over ACP (currently Grok Build).
+   * molt spawns the CLI you logged in; there is no key to hold.
+   * See acp.ts.
    */
-  /**
-   * Antigravity speaks its own stream rather than ACP, so it is a row here
-   * rather than one in `ACP_AGENTS`. Same bargain: molt runs the CLI you
-   * signed in, and the plan pays.
-   */
-  antigravity: {
-    url: AGY_URL,
-    needsKey: false,
-    hint: "runs your own logged-in Antigravity CLI — a Google AI plan pays for it, not a key",
-  },
   ...Object.fromEntries(
     ACP_AGENTS.map((a) => [
       a.name,
@@ -324,8 +301,6 @@ export function anthropicPricing(model: string): Pricing | null {
  * rate, and advice to invent one, for a run that costs no money at all.
  */
 export function planFor(baseUrl: string): string | undefined {
-  if (isClaudeCode(baseUrl)) return "Claude";
-  if (isAgy(baseUrl)) return "Google AI";
   return acpAgentFor(baseUrl)?.label;
 }
 
@@ -484,7 +459,7 @@ export function isSelfHosted(baseUrl: string): boolean {
    * wrong for a frontier model: with the map it won 3 of 3 paired runs and
    * cost 23% less. Said first, before the address is parsed at all.
    */
-  if (isClaudeCode(baseUrl) || isAcp(baseUrl) || isAgy(baseUrl)) return false;
+  if (isAcp(baseUrl)) return false;
   let host = "";
   try {
     host = new URL(baseUrl).hostname.toLowerCase();

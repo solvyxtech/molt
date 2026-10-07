@@ -35,8 +35,6 @@ type MoltBridge = {
     apiKey?: string;
   }): Promise<{ ok: boolean; error?: string; state?: AppState }>;
   saveKey(provider: string, key: string): Promise<boolean>;
-  claudeCodeHealth(): Promise<PlanHealth>;
-  agyHealth(): Promise<PlanHealth>;
   acpHealth(): Promise<PlanHealth[]>;
   saveEndpoint(baseUrl: string, model: string): Promise<boolean>;
   storedEndpoint(): Promise<{ baseUrl?: string; model?: string }>;
@@ -2332,7 +2330,7 @@ type PlanHealth = {
  * the endpoint and a model, which is the same thing choosing one from the
  * picker does — this is just the door people actually look for.
  *
- * One function for all three, because the difference between them is a name
+ * One function for the subscription plan button, because the difference is a name
  * and a preferred model. Three copies of this drifted apart once already on
  * every other pair of surfaces in this repo.
  */
@@ -2388,17 +2386,6 @@ async function usePlan(
   status.textContent = `${h.detail} — open the workspace to use it`;
   $("set-status").textContent = `${name} selected. No API key needed.`;
 }
-
-$("set-claude-code").addEventListener("click", () => {
-  void usePlan("Claude Code", () => molt.claudeCodeHealth(), ["sonnet", "opus"]);
-});
-
-$("set-agy").addEventListener("click", () => {
-  void usePlan("Antigravity", () => molt.agyHealth(), [
-    "gemini-3.1-pro-high",
-    "gemini-3.1-pro-low",
-  ]);
-});
 
 $("set-grok").addEventListener("click", () => {
   void usePlan(

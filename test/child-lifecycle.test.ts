@@ -2,8 +2,8 @@
  * A subscription CLI is a child process, and two ways it outlived or outran molt.
  *
  *  - A cancel during start-up reached `close` while the session was still
- *    awaiting its tool server (or Antigravity's setup, which can run `agy mcp
- *    add`). There was no child yet, so nothing was killed — and start-up then
+ *    awaiting its tool server. There was no child yet, so nothing was killed —
+ *    and start-up then
  *    carried on and spawned one that nothing would ever stop.
  *  - Writing to a child that has died raises EPIPE as an 'error' event on its
  *    stdin. Nobody listened, and an unheard 'error' event is thrown: in the
@@ -15,7 +15,6 @@ import { PassThrough } from "node:stream";
 import type { spawn } from "node:child_process";
 import { describe, it } from "node:test";
 import { ACP_AGENTS, AcpConnection, AcpSession } from "../src/acp.js";
-import { AgySession } from "../src/agy.js";
 
 const GROK = ACP_AGENTS.find((a) => a.name === "grok-build")!;
 
@@ -40,29 +39,6 @@ function fakeSpawn() {
 }
 
 describe("a cancel during start-up does not leave a CLI running", () => {
-  it("Antigravity: closed during setup, never spawned", async () => {
-    const { fn, spawned } = fakeSpawn();
-    let release!: () => void;
-    const setupDone = new Promise<void>((r) => (release = r));
-    const session = new AgySession<unknown>({
-      model: "m",
-      cwd: process.cwd(),
-      systemPrompt: "s",
-      tools: [],
-      runTool: async () => "",
-      setup: () => setupDone,
-      spawnFn: fn,
-    });
-    const turn = (async () => {
-      for await (const _ of session.send(["hi"])) void _;
-    })();
-    await new Promise((r) => setTimeout(r, 20));
-    await session.close();
-    release();
-    await turn;
-    assert.equal(spawned.length, 0, "an agy started after close would run with nobody to stop it");
-  });
-
   it("ACP: closed while the tool server starts, never spawned", async () => {
     const { fn, spawned } = fakeSpawn();
     const session = new AcpSession<unknown>({
@@ -93,66 +69,5 @@ describe("a dead child's stdin does not throw", () => {
     await assert.rejects(pending, /EPIPE/);
   });
 
-  it("Antigravity: EPIPE ends the turn with the error", async () => {
-    const { fn, spawned } = fakeSpawn();
-    const session = new AgySession<unknown>({
-      model: "m",
-      cwd: process.cwd(),
-      systemPrompt: "s",
-      tools: [],
-      runTool: async () => "",
-      setup: async () => {},
-      spawnFn: fn,
-    });
-    const events: { kind: string; error?: string }[] = [];
-    const turn = (async () => {
-      for await (const e of session.send(["hi"])) events.push(e as { kind: string; error?: string });
-    })();
-    await new Promise((r) => setTimeout(r, 20));
-    spawned[0]!.stdin.emit("error", Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
-    await turn;
-    await session.close();
-    assert.match(events.find((e) => e.kind === "done")?.error ?? "", /EPIPE/);
-  });
 });
 
-describe("what a subscription step would have cost", () => {
-  it("journals each step's own share, not the session's running total again", async () => {
-    const { Engine } = await import("../src/engine.js");
-    const { Journal } = await import("../src/journal.js");
-    const { Archive } = await import("../src/archive.js");
-    const { Receipts } = await import("../src/receipts.js");
-    const { parseBar } = await import("../src/bar.js");
-    const { CLAUDE_CODE_URL } = await import("../src/claude-code.js");
-    const { allowAll, drain, scriptedClaudeCode, workspace } = await import("./helpers.js");
-    const w = workspace();
-    try {
-      const journal = new Journal(w.dir);
-      // The SDK reports 0.01 after step one and 0.02 after step two: a running
-      // total. Each step cost 0.01.
-      const cc = scriptedClaudeCode([
-        { calls: [{ name: "write_file", args: { path: "a.txt", content: "a\n" } }], text: "Done." },
-        { calls: [{ name: "write_file", args: { path: "b.txt", content: "b\n" } }], text: "Done now." },
-      ]);
-      const engine = new Engine({
-        baseUrl: CLAUDE_CODE_URL,
-        model: "sonnet",
-        provider: "claude-code",
-        cwd: w.dir,
-        journal,
-        claudeCodeSdk: cc.sdk,
-        bar: parseBar("version: 1\nchecks:\n  - name: b\n    run: test -f b.txt\n"),
-        archive: new Archive(w.dir),
-        receipts: new Receipts(w.dir),
-      });
-      await drain(engine.run("write a.txt and b.txt", allowAll));
-      const notes = Journal.read(journal.path)
-        .filter((e) => e.kind === "note" && (e.data as { subscription?: boolean }).subscription)
-        .map((e) => (e.data as { costEstimateUsd: number }).costEstimateUsd);
-      assert.equal(notes.length, 2);
-      assert.deepEqual(notes.map((n) => n.toFixed(2)), ["0.01", "0.01"]);
-    } finally {
-      w.cleanup();
-    }
-  });
-});

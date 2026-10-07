@@ -96,7 +96,6 @@ import {
 import { Integrity } from "./integrity.js";
 import {
   authHeaders,
-  endpointProblem,
   isSelfHosted,
 } from "./providers.js";
 import { Receipts } from "./receipts.js";
@@ -104,16 +103,8 @@ import { readStream, type StreamAccumulator, type Usage } from "./stream.js";
 import { Fragments, SafeStream } from "./live.js";
 import { Transcript, toolDetail } from "./transcript.js";
 import { acpAgentFor, acpHealth, acpModels, AcpSession, isAcp } from "./acp.js";
-import { AGY_MODELS, AgySession, agyHealth, agyModels, isAgy } from "./agy.js";
-import {
-  type BackendSession,
-  CLAUDE_CODE_MODELS,
-  ClaudeCodeSession,
-  claudeCodeHealth,
-  type ToolRunner,
-  isClaudeCode,
-  type Sdk,
-} from "./claude-code.js";
+import { type BackendSession, type ToolRunner } from "./backend.js";
+import { endpointProblem, removedSubscriptionProblem } from "./endpoint.js";
 import {
   estTokens,
   type Bar,
@@ -1124,29 +1115,13 @@ export type EngineConfig = {
    */
   nativeApi?: boolean;
   /**
-   * The Agent SDK, injected.
-   *
-   * Only tests pass one. Left out, the Claude Code backend loads the real SDK
-   * at runtime — which is also the only way a test could spend a real
-   * subscription's quota, so every test that drives the backend supplies this.
-   */
-  claudeCodeSdk?: Sdk;
-  /**
    * How an ACP agent's process is started, injected.
    *
-   * Only tests pass one, for the same reason `claudeCodeSdk` exists: left out,
-   * `AcpSession` spawns the real `grok` or `gemini`, which is the only way a
-   * test could spend a real subscription's quota. Every test that drives the
-   * backend supplies a scripted agent here instead.
+   * Only tests pass one. Left out, `AcpSession` spawns the real `grok`, which
+   * is the only way a test could spend a real subscription's quota. Every
+   * test that drives the backend supplies a scripted agent here instead.
    */
   acpSpawn?: typeof import("node:child_process").spawn;
-  /**
-   * How the Antigravity config home is prepared, injected.
-   *
-   * Tests supply one so no real settings file is edited and no `agy mcp add`
-   * runs against the machine running the suite.
-   */
-  agySetup?: (endpoint: { url: string; headers: { name: string; value: string }[] }) => Promise<void>;
   /**
    * Response ceiling for protocols that demand one. Anthropic's Messages API
    * requires `max_tokens`; the OpenAI shape treats it as optional.
@@ -1810,7 +1785,7 @@ export class Engine {
    * Read off the endpoint, so it survives `/endpoint` switching mid-session
    * and cannot disagree with what the receipt records.
    *
-   * One predicate for three backends, because everything downstream of it
+   * One predicate for ACP backends, because everything downstream of it
    * asks the same question: there is no request body to put `tool_choice` in,
    * no `/models` to fetch, no token price to apply, and the context belongs to
    * the subprocess rather than to molt's transcript. Which CLI it is only
@@ -1818,8 +1793,7 @@ export class Engine {
    */
   /** The CLI's name, for a message a person reads. */
   private get backendLabel(): string {
-    if (isAgy(this.cfg.baseUrl)) return "Antigravity";
-    return acpAgentFor(this.cfg.baseUrl)?.label ?? "Claude Code";
+    return acpAgentFor(this.cfg.baseUrl)?.label ?? "subscription CLI";
   }
 
   /** The tools this session offers the model. */
@@ -1828,7 +1802,7 @@ export class Engine {
   }
 
   private get subprocess(): boolean {
-    return isClaudeCode(this.cfg.baseUrl) || isAcp(this.cfg.baseUrl) || isAgy(this.cfg.baseUrl);
+    return isAcp(this.cfg.baseUrl);
   }
 
   /** Where a completion request goes, which differs between the two APIs. */
@@ -3930,7 +3904,6 @@ export class Engine {
           cwd: this.cwd,
           reasoningEffort: this.cfg.review.reasoningEffort ?? this.cfg.reasoningEffort,
           fetchFn: this.cfg.fetchFn,
-          claudeCodeSdk: this.cfg.claudeCodeSdk,
           acpSpawn: this.cfg.acpSpawn,
         },
       }).catch(() => null);
@@ -3993,7 +3966,7 @@ export class Engine {
   }
 
   /**
-   * The live Claude Code session, started when it is first needed.
+   * The live ACP (Grok Build) session, started when it is first needed.
    *
    * Rebuilt whenever molt's system prompt changes — `/map`, `/read` and a
    * repo-map refresh all rewrite it — because a session carrying the old one
@@ -4013,10 +3986,8 @@ export class Engine {
       /**
        * The one tool path, whichever CLI is on the other end.
        *
-       * Claude Code reaches it through the Agent SDK's in-process MCP server
-       * and the ACP agents reach it over a loopback HTTP one, and neither
-       * difference is visible here: the same autonomy gate, the same ledger
-       * entry, the same journal lines, the same events on screen.
+       * ACP agents reach it over a loopback HTTP MCP server. The same
+       * autonomy gate, ledger entry, journal lines, and events on screen.
        */
       const runTool: ToolRunner<EngineEvent> = async (name, args, callId, emit) => {
         const ctx = this.ccCtx;
@@ -4032,46 +4003,28 @@ export class Engine {
         }
       };
       const spec = acpAgentFor(this.cfg.baseUrl);
-      this.cc = isAgy(this.cfg.baseUrl)
-        ? new AgySession<EngineEvent>({
-            model: this.cfg.model,
-            cwd: this.cwd,
-            systemPrompt: system,
-            tools: TOOLS,
-            runTool,
-            ...(this.cfg.acpSpawn ? { spawnFn: this.cfg.acpSpawn } : {}),
-            ...(this.cfg.agySetup ? { setup: this.cfg.agySetup } : {}),
-          })
-        : spec
-        ? new AcpSession<EngineEvent>({
-            spec,
-            model: this.cfg.model,
-            cwd: this.cwd,
-            systemPrompt: system,
-            tools: TOOLS,
-            runTool,
-            ...(this.cfg.acpSpawn ? { spawnFn: this.cfg.acpSpawn } : {}),
-          })
-        : /**
-           * Claude Code has no tools of its own, so `runTool` is the only way
-           * anything reaches the disk — which is what lets `tree-accounted`
-           * mean something on this backend. `acp.ts` buys the same guarantee
-           * a harder way; see its header.
-           */
-          new ClaudeCodeSession<EngineEvent>({
-            model: this.cfg.model,
-            cwd: this.cwd,
-            systemPrompt: system,
-            tools: TOOLS,
-            sdk: this.cfg.claudeCodeSdk,
-            runTool,
-          });
+      if (!spec) {
+        const removed = removedSubscriptionProblem(this.cfg.baseUrl);
+        throw new Error(
+          removed ??
+            `no ACP agent for endpoint '${this.cfg.baseUrl}' — use grok-build or an HTTP API`,
+        );
+      }
+      this.cc = new AcpSession<EngineEvent>({
+        spec,
+        model: this.cfg.model,
+        cwd: this.cwd,
+        systemPrompt: system,
+        tools: TOOLS,
+        runTool,
+        ...(this.cfg.acpSpawn ? { spawnFn: this.cfg.acpSpawn } : {}),
+      });
     }
     return this.cc;
   }
 
   /**
-   * One step of a turn, done by Claude Code instead of by an HTTP request.
+   * One step of a turn, done by an ACP agent instead of by an HTTP request.
    *
    * A "step" here is everything up to the model falling silent: it may have
    * called twenty tools on the way, and each was gated, run and recorded by
@@ -6190,8 +6143,7 @@ export class Engine {
               cwd: this.cwd,
               reasoningEffort: this.cfg.review?.reasoningEffort ?? this.cfg.reasoningEffort,
               fetchFn: this.cfg.fetchFn,
-              claudeCodeSdk: this.cfg.claudeCodeSdk,
-              acpSpawn: this.cfg.acpSpawn,
+                  acpSpawn: this.cfg.acpSpawn,
             },
           }).catch(() => null);
           log?.append("dispute", {
@@ -6448,8 +6400,7 @@ export class Engine {
             cwd: this.cwd,
             reasoningEffort: this.cfg.review.reasoningEffort ?? this.cfg.reasoningEffort,
             fetchFn: this.cfg.fetchFn,
-            claudeCodeSdk: this.cfg.claudeCodeSdk,
-            acpSpawn: this.cfg.acpSpawn,
+              acpSpawn: this.cfg.acpSpawn,
           },
         }).catch(() => null);
         if (review && !review.confirmed && review.violations.length) {
@@ -6619,26 +6570,25 @@ export class Engine {
      * Nothing to reach, so nothing is asked.
      *
      * The two questions doctor answers — can molt get there, and is the model
-     * there — become one: is Claude Code installed and logged in. Fetching
-     * `claude-code://subscription/models` would fail in a way that reads as a
-     * network problem and sends someone to check their wifi.
+     * there — become one: is the subscription CLI installed and logged in.
+     * Fetching `grok-build://subscription/models` would fail in a way that
+     * reads as a network problem and sends someone to check their wifi.
      */
     if (this.subprocess) {
       const spec = acpAgentFor(this.cfg.baseUrl);
-      const agy = isAgy(this.cfg.baseUrl);
-      const health = agy ? await agyHealth() : spec ? await acpHealth(spec) : await claudeCodeHealth();
-      const ids: string[] = agy
-        ? await agyModels()
-        : spec
-          ? acpModels(this.cfg.baseUrl)
-          : [...CLAUDE_CODE_MODELS];
+      if (!spec) {
+        const removed = removedSubscriptionProblem(this.cfg.baseUrl);
+        return {
+          ok: false,
+          reachable: false,
+          detail: removed ?? `no ACP agent for '${this.cfg.baseUrl}'`,
+        };
+      }
+      const health = await acpHealth(spec);
+      const ids = acpModels(this.cfg.baseUrl);
       // An alias the CLI resolves itself is not in the list and is still
       // valid; refusing it would be molt overruling the only party that knows.
-      const has = agy
-        ? ids.length === 0 || ids.includes(this.cfg.model)
-        : spec
-          ? ids.includes(this.cfg.model) || this.cfg.model.startsWith(spec.bin)
-          : ids.includes(this.cfg.model) || this.cfg.model.startsWith("claude-");
+      const has = ids.includes(this.cfg.model) || this.cfg.model.startsWith(spec.bin);
       return {
         ok: health.ok && has,
         reachable: health.installed,
@@ -6728,14 +6678,9 @@ export class Engine {
   ): Promise<{ ok: true; ids: string[] } | { ok: false; error: string }> {
     const fetchFn = this.cfg.fetchFn ?? fetch;
     const base = baseUrl.replace(/\/$/, "");
-    // The CLI resolves these aliases itself against whatever the account can
-    // reach; a list fetched from an endpoint molt never contacts would be made
-    // up. See CLAUDE_CODE_MODELS.
-    if (isClaudeCode(baseUrl)) return { ok: true, ids: [...CLAUDE_CODE_MODELS] };
     if (isAcp(baseUrl)) return { ok: true, ids: acpModels(baseUrl) };
-    // The constant, not the live list: `/model` asks every provider it knows,
-    // and a picker keystroke must not spawn a CLI. See AGY_MODELS.
-    if (isAgy(baseUrl)) return { ok: true, ids: [...AGY_MODELS] };
+    const removed = removedSubscriptionProblem(baseUrl);
+    if (removed) return { ok: false, error: removed };
     const probeMs = this.cfg.probeTimeoutMs;
     try {
       const res = await fetchFn(`${base}/models`, {

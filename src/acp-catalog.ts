@@ -21,9 +21,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ACP_AGENTS, acpAgentFor, isAcp } from "./acp.js";
-import { AGY_MODELS, isAgy } from "./agy.js";
-import { CLAUDE_CODE_MODELS } from "./claude-code.js";
-import { AGY_URL, CLAUDE_CODE_URL, isClaudeCode } from "./endpoint.js";
 import { PROVIDERS, isSelfHosted, providerName } from "./providers.js";
 
 export type ModelGroup = "subscriptions" | "api-keys" | "local";
@@ -40,7 +37,7 @@ const GROUP_ORDER: ModelGroup[] = ["subscriptions", "api-keys", "local"];
 export type ModelSource = {
   group: ModelGroup;
   url: string;
-  /** How the source is named in the picker: "Claude Code", "xai", "localhost:11434". */
+  /** How the source is named in the picker: "Grok Build", "xai", "localhost:11434". */
   label: string;
   models: string[];
 };
@@ -82,7 +79,7 @@ export function decodeModelValue(value: string): { url: string; model: string } 
 }
 
 export function isSubscription(url: string): boolean {
-  return isClaudeCode(url) || isAcp(url) || isAgy(url);
+  return isAcp(url);
 }
 
 export function groupOf(url: string): ModelGroup {
@@ -91,8 +88,6 @@ export function groupOf(url: string): ModelGroup {
 }
 
 export function labelOf(url: string): string {
-  if (isClaudeCode(url)) return "Claude Code";
-  if (isAgy(url)) return "Antigravity";
   const acp = acpAgentFor(url);
   if (acp) return acp.label;
   return providerName(url);
@@ -100,11 +95,7 @@ export function labelOf(url: string): string {
 
 /** The subscription backends molt implements, with the models it knows for each. */
 export function subscriptionBackends(): { url: string; models: string[] }[] {
-  return [
-    { url: CLAUDE_CODE_URL, models: [...CLAUDE_CODE_MODELS] },
-    ...ACP_AGENTS.map((a) => ({ url: a.url, models: [...a.models] })),
-    { url: AGY_URL, models: [...AGY_MODELS] },
-  ];
+  return ACP_AGENTS.map((a) => ({ url: a.url, models: [...a.models] }));
 }
 
 function within<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {

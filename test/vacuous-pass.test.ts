@@ -27,7 +27,7 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { BUILTINS, mutationVerdict, parseBar, runBar, type BarContext } from "../src/bar.js";
 import type { LedgerEntry } from "../src/types.js";
-import { CLAUDE_CODE_URL } from "../src/claude-code.js";
+import { GROK_BUILD_URL, removedSubscriptionProblem } from "../src/endpoint.js";
 import { endpointProblem } from "../src/providers.js";
 import { workspace } from "./helpers.js";
 
@@ -329,21 +329,30 @@ describe("build-current: what you ship, against what you changed", () => {
 /**
  * An endpoint that is not an address is not a network outage.
  *
- * Reported live: `molt run --url claude-code` typed at a build without the
- * shorthand became `claude-code/chat/completions`, which `fetch` rejects as an
+ * Reported live: `molt run --url not-a-url` typed at a build became
+ * `not-a-url/chat/completions`, which `fetch` rejects as an
  * invalid URL. molt retried it four times over seven and a half seconds and
  * reported "network: TypeError". Nothing was down, and the second attempt was
  * never going to differ from the first.
  */
 describe("an endpoint molt cannot use is refused, not retried", () => {
   it("names what is wrong with a string that is not a URL", () => {
-    const why = endpointProblem("claude-code");
+    const why = endpointProblem("not-a-url");
     assert.ok(why, "a bare word is not an endpoint");
     assert.match(why, /not an endpoint/);
-    // The message has to carry the two spellings that do work, or it is a
+    // The message has to carry spellings that do work, or it is a
     // refusal with nowhere to go.
     assert.match(why, /https:\/\//);
-    assert.match(why, /claude-code/);
+    assert.match(why, /grok-build/);
+  });
+
+  it("refuses removed subscription backends clearly", () => {
+    for (const raw of ["claude-code", "claude-code://subscription", "agy", "antigravity://subscription", "gemini-cli", "gemini-cli://subscription"]) {
+      const why = endpointProblem(raw);
+      assert.ok(why, raw);
+      assert.match(why, /removed|no longer supported/i, raw);
+    }
+    assert.ok(removedSubscriptionProblem("agy://subscription"));
   });
 
   it("refuses a scheme molt does not speak", () => {
@@ -359,7 +368,7 @@ describe("an endpoint molt cannot use is refused, not retried", () => {
   it("accepts the shapes that actually work", () => {
     assert.equal(endpointProblem("https://api.openai.com/v1"), null);
     assert.equal(endpointProblem("http://localhost:11434/v1"), null);
-    assert.equal(endpointProblem(CLAUDE_CODE_URL), null);
+    assert.equal(endpointProblem(GROK_BUILD_URL), null);
   });
 });
 

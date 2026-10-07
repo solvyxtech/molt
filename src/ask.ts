@@ -4,8 +4,8 @@
  *
  * Three things in molt need this — drafting criteria, the interview, and
  * planning a mission — and each had grown its own copy of the same four
- * branches: HTTP endpoint, Claude Code, an ACP agent, Antigravity. Four
- * copies of a transport is four places for the next backend to be missed,
+ * branches: HTTP endpoint or an ACP agent (Grok Build). Two
+ * copies of a transport is two places for the next backend to be missed,
  * which is the both-surfaces bug in a different coat. This is the one place.
  *
  * Deliberately not a turn. No tools, a small token ceiling, temperature
@@ -13,8 +13,7 @@
  * person or a gate will read, never work.
  */
 import { acpAgentFor, acpAsk } from "./acp.js";
-import { agyAsk, isAgy } from "./agy.js";
-import { claudeCodeAsk, isClaudeCode, type Sdk } from "./claude-code.js";
+import { removedSubscriptionProblem } from "./endpoint.js";
 import { errorText } from "./format.js";
 import { authHeaders } from "./providers.js";
 import { askError, askTimeoutMs, probeSignal } from "./watchdog.js";
@@ -34,9 +33,7 @@ export type AskOptions = {
   /** What is being asked, for the error message: "drafting criteria". */
   what?: string;
   fetchFn?: typeof fetch;
-  claudeCodeSdk?: Sdk;
   acpSpawn?: typeof import("node:child_process").spawn;
-  agyRun?: (cmd: string, args: string[], opts: object) => Promise<{ stdout: string }>;
   timeoutMs?: number;
 };
 
@@ -82,15 +79,8 @@ export async function askModel(opts: AskOptions): Promise<Asked> {
 async function askOnce(opts: AskOptions, maxTokens: number): Promise<Asked> {
   const limitMs = askTimeoutMs(maxTokens, opts.timeoutMs);
 
-  if (isAgy(opts.baseUrl)) {
-    const asked = await agyAsk({
-      model: opts.model,
-      systemPrompt: opts.system,
-      prompt: opts.prompt,
-      ...(opts.agyRun ? { run: opts.agyRun } : {}),
-    });
-    return asked.ok ? { ok: true, text: asked.text, cutOff: false } : asked;
-  }
+  const removed = removedSubscriptionProblem(opts.baseUrl);
+  if (removed) return { ok: false, error: removed };
 
   const acp = acpAgentFor(opts.baseUrl);
   if (acp) {
@@ -102,18 +92,6 @@ async function askOnce(opts: AskOptions, maxTokens: number): Promise<Asked> {
       prompt: opts.prompt,
       cwd: opts.cwd,
       ...(opts.acpSpawn ? { spawnFn: opts.acpSpawn } : {}),
-    });
-    return asked.ok ? { ok: true, text: asked.text, cutOff: false } : asked;
-  }
-
-  if (isClaudeCode(opts.baseUrl)) {
-    const asked = await claudeCodeAsk({
-      timeoutMs: limitMs,
-      model: opts.model,
-      systemPrompt: opts.system,
-      prompt: opts.prompt,
-      cwd: opts.cwd,
-      sdk: opts.claudeCodeSdk,
     });
     return asked.ok ? { ok: true, text: asked.text, cutOff: false } : asked;
   }
