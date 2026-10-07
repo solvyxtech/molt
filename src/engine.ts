@@ -112,7 +112,7 @@ import { parseLenient } from "./lenient-json.js";
 import { LONG_RATE_LIMIT_MS, longQuotaText, rateLimitResetAt, untilText, providerErrorText, normalizeMessage, readStream, transientProviderError, type ProviderError, type StreamAccumulator, type Usage } from "./stream.js";
 import { Fragments, SafeStream } from "./live.js";
 import { Transcript, toolDetail } from "./transcript.js";
-import { acpAgentFor, acpHealth, acpModels, AcpSession, isAcp } from "./acp.js";
+import { acpAgentFor, acpHealth, acpModels, AcpSession, backendStallMs, isAcp } from "./acp.js";
 import { type BackendSession, type ToolRunner } from "./backend.js";
 import { endpointProblem, removedSubscriptionProblem } from "./endpoint.js";
 import {
@@ -1152,6 +1152,15 @@ export function changesSomething(name: string, rawArgs: string): boolean {
 }
 
 /**
+ * The grace a closing summary gets past the deadline: a tenth of the budget,
+ * between 1 s and 30 s. The summary is a courtesy; a run given 540 s must not
+ * spend another five minutes on it (or an hour, on a backend that hangs).
+ */
+export function deadlineGraceMs(budgetMs: number): number {
+  return Math.min(30_000, Math.max(1_000, Math.round(budgetMs / 10)));
+}
+
+/**
  * How long a turn with a time budget waits for its drafted checks before
  * sealing what is ready: a tenth of the budget, between 45 s and 2 min. No
  * budget, no bound — a person at the keyboard can wait.
@@ -1431,6 +1440,13 @@ export type EngineConfig = {
    * REQUEST_IDLE_MS (src/watchdog.ts); 0 turns it off.
    */
   requestIdleMs?: number;
+  /**
+   * Silence from a subprocess (ACP) backend, in ms, after which its provider
+   * is taken to have stalled and the turn ends as a provider issue. Unset
+   * means `MAAT_BACKEND_STALL_MS`, then BACKEND_STALL_MS (src/acp.ts); 0
+   * turns it off.
+   */
+  backendStallMs?: number;
   /**
    * The allowance before a request's first byte, overriding the one scaled
    * from the prompt and output sizes (see firstByteMs in src/watchdog.ts).
@@ -2178,6 +2194,8 @@ export class Engine {
    * ran; two of them had passing work on disk.
    */
   private turnEndedBy: "deadline" | "provider" | undefined;
+  /** A subprocess backend went silent past the stall allowance this turn (a provider issue). */
+  private turnProviderStall = false;
   /** `--revert` put this turn's work back, so a person cannot accept it as it stands. */
   private turnRestored = false;
   /** The pre-turn working tree, as a commit object nothing else can see. */
@@ -2529,6 +2547,24 @@ export class Engine {
   private deadlineAt(): number | undefined {
     const ms = this.turnDeadlineMs;
     return ms > 0 && this.turnStartedAt > 0 ? this.turnStartedAt + ms : undefined;
+  }
+
+  /**
+   * How long a closing summary may wait, as an epoch ms, under a time budget.
+   *
+   * The salvage runs after the clock has stopped the model, so the turn's own
+   * deadline is already behind it; it gets a short grace (deadlineGraceMs)
+   * past whichever is later, the deadline or now. Without a budget, undefined:
+   * the idle and stall watchdogs still bound it.
+   */
+  private salvageDeadlineAt(): number | undefined {
+    const at = this.deadlineAt();
+    return at === undefined ? undefined : Math.max(at, Date.now()) + deadlineGraceMs(this.turnDeadlineMs);
+  }
+
+  /** The stall allowance for a subprocess backend (EngineConfig.backendStallMs). */
+  private stallMs(): number {
+    return this.cfg.backendStallMs ?? backendStallMs();
   }
 
   /**
@@ -3564,6 +3600,9 @@ export class Engine {
           stream: false,
         }, isSelfHosted(this.cfg.baseUrl) ? localSpeed() : undefined),
       idleMs: idle,
+      // Under a time budget, bounded by it plus a short grace: a salvage
+      // waits on the same provider that may just have hung.
+      deadlineAt: this.salvageDeadlineAt(),
     });
     try {
       // The salvage is a request like any other, so it speaks whichever
@@ -3700,13 +3739,13 @@ export class Engine {
     if (!texts.length) return;
 
     let done:
-      | { text: string; promptTokens: number; completionTokens: number; error?: string }
+      | { text: string; promptTokens: number; completionTokens: number; error?: string; stopped?: "deadline" | "stall" }
       | undefined;
     /** The last answer that called nothing, in case `done` carries no text. */
     let last = "";
     this.ccNoTools = true;
     try {
-      for await (const ev of cc.send([texts.join("\n\n")])) {
+      for await (const ev of cc.send([texts.join("\n\n")], { deadlineAt: this.salvageDeadlineAt(), stallMs: this.stallMs() })) {
         if (ev.kind === "done") done = ev;
         else if (ev.kind === "assistant" && !ev.toolCalls.length && ev.text) last = ev.text;
       }
@@ -3725,6 +3764,14 @@ export class Engine {
       this.ccNoTools = false;
     }
 
+    if (done?.stopped) {
+      // Cut by the clock or a stall: the agent was cancelled and killed, and
+      // the next turn starts a fresh session.
+      await this.dropAcpSession();
+      log?.append("note", { text: `salvage not written: ${done.error ?? done.stopped}`, ...(done.stopped === "stall" ? { providerIssue: true, providerStall: true } : {}) });
+      yield { kind: "info", text: "could not write a closing summary — the work above is all there is" };
+      return;
+    }
     if (!done || done.error) {
       // A session that vanished mid-salvage was cancelled, not broken:
       // `cancel()` ends it, because ending it is the only way to stop the
@@ -4070,6 +4117,7 @@ export class Engine {
     this.turnAllRetired = false;
     this.turnRevealed = [];
     this.turnEndedBy = undefined;
+    this.turnProviderStall = false;
     this.turnRestored = false;
     this.refusedThisTurn = false;
     this.turnReview = undefined;
@@ -4217,6 +4265,8 @@ export class Engine {
           acpSpawn: this.cfg.acpSpawn,
           // Never longer than the turn has left: a review that outlives the clock ends it without a verdict.
           ...(this.timeLeftMs() !== undefined ? { timeoutMs: Math.max(1_000, this.timeLeftMs()!) } : {}),
+          // And every retry and pause inside it, not just one ask.
+          deadlineAt: this.deadlineAt(),
         },
       }).catch(() => null);
       this.cfg.journal?.append("review", review ? { confirmed: review.confirmed, votes: review.votes, violations: review.violations.length } : { ran: false });
@@ -4298,6 +4348,7 @@ export class Engine {
       ...(this.reviewSkipped ? { unreviewed: true } : {}),
       ...(this.turnEndedBy ? { endedBy: this.turnEndedBy, ...(this.turnEndedBy === "deadline" ? { deadline: true } : {}) } : {}),
       ...(passedAtEnd ? { passedAtEnd: true } : {}),
+      ...(this.turnProviderStall ? { providerStall: true } : {}),
       ...(checksDisagree ? { checksDisagree: failing.map((r) => r.name) } : {}),
       ...(outcome === "verified" && this.turnRevealed.length ? { revealed: [...this.turnRevealed] } : {}),
       ...(review ? { review: { confirmed: review.confirmed, votes: review.votes, violations: review.violations } } : {}),
@@ -4456,6 +4507,9 @@ export class Engine {
         systemPrompt: system,
         tools: TOOLS,
         runTool,
+        // The per-call controller invokeTool sets: a deadline or a stall that
+        // ends the agent's turn ends the command it was waiting on too.
+        abortTools: () => this.running?.abort(),
         ...(this.cfg.acpSpawn ? { spawnFn: this.cfg.acpSpawn } : {}),
       });
     }
@@ -4478,7 +4532,7 @@ export class Engine {
     ctx: ToolContext,
   ): AsyncGenerator<
     EngineEvent,
-    { msg: Msg; usage: Usage; finishReason?: string; streamed: boolean } | "cancelled" | null
+    { msg: Msg; usage: Usage; finishReason?: string; streamed: boolean } | "cancelled" | "deadline" | "stall" | null
   > {
     this.ccCtx = ctx;
     this.ccCancelled = false;
@@ -4555,10 +4609,15 @@ export class Engine {
           cachedTokens: number;
           cumulativeCostUsd: number;
           error?: string;
+          stopped?: "deadline" | "stall";
+          silentMs?: number;
         }
       | undefined;
 
-    for await (const ev of cc.send(said)) {
+    // Every wait on the agent is bounded: by the turn's deadline, and by a
+    // stall allowance on its silence. Neither existed, and one Grok Build
+    // prompt turn held a 540 s bench job for an hour.
+    for await (const ev of cc.send(said, { deadlineAt: this.deadlineAt(), stallMs: this.stallMs() })) {
       if (ev.kind === "host") {
         yield ev.event;
       } else if (ev.kind === "delta") {
@@ -4602,6 +4661,32 @@ export class Engine {
       yield { kind: "error", text: `the ${this.backendLabel} session ended without answering` };
       await this.dropAcpSession();
       return null;
+    }
+    if (done.stopped === "deadline") {
+      // The clock, not the provider: the step loop closes the turn the way it
+      // closes any that ran out of time, judging what is on disk.
+      if (deferred !== null) this.transcript.push({ role: "assistant", content: deferred });
+      ctx.log?.append("note", {
+        text: `time budget reached during step ${step}'s ${this.backendLabel} turn — session/cancel sent, agent process tree ended`,
+      });
+      await this.dropAcpSession();
+      return "deadline";
+    }
+    if (done.stopped === "stall") {
+      // The provider went quiet, which is not the task failing. Journalled the
+      // way a provider's quota wall is — a provider issue — so a benchmark
+      // does not count it against the work.
+      const silent = waited(done.silentMs ?? this.stallMs());
+      const text = `provider stall: ${this.backendLabel} sent nothing for ${silent} — its turn was cancelled and the agent process tree ended`;
+      ctx.log?.append("error", { text, providerIssue: true, providerStall: true, silentMs: done.silentMs ?? null });
+      if (deferred !== null) this.transcript.push({ role: "assistant", content: deferred });
+      this.turnProviderStall = true;
+      yield {
+        kind: "error",
+        text: `${text}. This is the provider, not the task. Nothing was verified; the work above still happened.`,
+      };
+      await this.dropAcpSession();
+      return "stall";
     }
     if (done.error) {
       const wall = longQuotaText(done.error);
@@ -5815,6 +5900,17 @@ export class Engine {
           yield { kind: "cancelled", filesWritten: wrote };
           return;
         }
+        if (got === "deadline") {
+          deadlineInterrupted = true;
+          continue;
+        }
+        if (got === "stall") {
+          // Work that happened is judged, as after any provider failure; no
+          // closing summary is asked of a provider that has just gone silent.
+          const judged = this.turnWrites.length > 0 ? yield* judgeOnDisk("provider", "") : false;
+          if (!judged) this.turnEndedBy = "provider";
+          return;
+        }
         if (!got) return;
         msg = got.msg;
         usage = got.usage;
@@ -7022,7 +7118,8 @@ export class Engine {
               cwd: this.cwd,
               reasoningEffort: this.cfg.review?.reasoningEffort ?? this.cfg.reasoningEffort,
               fetchFn: this.cfg.fetchFn,
-                  acpSpawn: this.cfg.acpSpawn,
+              acpSpawn: this.cfg.acpSpawn,
+              deadlineAt: this.deadlineAt(),
             },
           }).catch(() => null);
           log?.append("dispute", {
@@ -7355,6 +7452,7 @@ export class Engine {
             fetchFn: this.cfg.fetchFn,
             acpSpawn: this.cfg.acpSpawn,
             ...(this.timeLeftMs() !== undefined ? { timeoutMs: Math.max(1_000, this.timeLeftMs()!) } : {}),
+            deadlineAt: this.deadlineAt(),
           },
         }).catch(() => null);
         if (review && !review.confirmed && review.violations.length && this.cfg.reviewAdvisory !== true) {

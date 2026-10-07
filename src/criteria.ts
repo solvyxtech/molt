@@ -594,6 +594,7 @@ async function edgeProbes(opts: Parameters<typeof draftCriteria>[0], view: strin
     acpSpawn: opts.acpSpawn,
     cliRun: opts.cliRun,
     timeoutMs: opts.timeoutMs,
+    deadlineAt: opts.deadlineAt,
     reasoningEffort: opts.reasoningEffort,
     latency: opts.latency,
   }).catch(() => null);
@@ -634,6 +635,8 @@ export async function draftCriteria(opts: {
   cliRun?: (cmd: string, args: string[], opts: object) => Promise<{ stdout: string }>;
   /** How long the HTTP question may wait for its answer; see askTimeoutMs. Tests only. */
   timeoutMs?: number;
+  /** The run's time budget, as an epoch ms (AskOptions.deadlineAt). */
+  deadlineAt?: number;
   /** Pause before re-asking after empty replies (EMPTY_DRAFT_DELAY_MS). Tests only. */
   emptyRetryDelayMs?: number;
   reasoningEffort?: string;
@@ -702,6 +705,7 @@ export async function draftCriteria(opts: {
     acpSpawn: opts.acpSpawn,
     cliRun: opts.cliRun,
     timeoutMs: opts.timeoutMs,
+    deadlineAt: opts.deadlineAt,
     reasoningEffort: opts.reasoningEffort,
     latency: opts.latency,
   });
@@ -722,6 +726,7 @@ export async function draftCriteria(opts: {
     acpSpawn: opts.acpSpawn,
     cliRun: opts.cliRun,
     timeoutMs: opts.timeoutMs,
+    deadlineAt: opts.deadlineAt,
     reasoningEffort: opts.reasoningEffort,
     latency: opts.latency,
   });
@@ -746,6 +751,7 @@ export async function draftCriteria(opts: {
         acpSpawn: opts.acpSpawn,
         cliRun: opts.cliRun,
         timeoutMs: opts.timeoutMs,
+        deadlineAt: opts.deadlineAt,
       reasoningEffort: opts.reasoningEffort,
       latency: opts.latency,
     });
@@ -1003,6 +1009,7 @@ async function critiqued(
         acpSpawn: opts.acpSpawn,
         cliRun: opts.cliRun,
         timeoutMs: opts.timeoutMs,
+        deadlineAt: opts.deadlineAt,
       reasoningEffort: opts.reasoningEffort,
       latency: opts.latency,
     });

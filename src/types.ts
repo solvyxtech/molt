@@ -646,6 +646,12 @@ export type EngineEvent =
        */
       passedAtEnd?: boolean;
       /**
+       * A subprocess backend sent nothing for the stall allowance
+       * (MAAT_BACKEND_STALL_MS) and its turn was cancelled: a provider issue,
+       * not a verdict on the work.
+       */
+      providerStall?: boolean;
+      /**
        * What a passing turn earned (src/tiers.ts): "verified" only when a
        * check ran the deliverable and asserted a value (or a person wrote the
        * check) and no reviewer contradicted it. "passed-checks" is the outcome

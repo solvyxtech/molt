@@ -141,7 +141,7 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
             review = ev.get("review")
             disagree = ev.get("checksDisagree") or []
             # Only what job_end carried; absent keys stay absent (older builds).
-            extra = {k: ev[k] for k in ("revealed", "deadline", "endedBy", "retired", "build", "tier", "tierReason") if k in ev}
+            extra = {k: ev[k] for k in ("revealed", "deadline", "endedBy", "retired", "build", "tier", "tierReason", "providerStall") if k in ev}
     # The provider's daily cap, not the work: every later task would fail the
     # same way (2026-10-05: eleven tasks per arm "failed" in 140 s, 0 turns).
     capped = provider_capped(out, steps)

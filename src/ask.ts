@@ -48,6 +48,11 @@ export type AskOptions = {
   /** The CLI runner for the opencode ask path. Tests only. */
   cliRun?: (cmd: string, args: string[], opts: object) => Promise<{ stdout: string }>;
   timeoutMs?: number;
+  /**
+   * The run's time budget, as an epoch ms. No ask, retry or pause waits past
+   * it: each ask's allowance is cut to what is left, and none starts after.
+   */
+  deadlineAt?: number;
   /** Pauses between asks after an overloaded provider (ASK_OVERLOAD_BACKOFF_MS). Tests only. */
   overloadBackoffMs?: number[];
   /**
@@ -77,10 +82,25 @@ export const ASK_MAX_TOKENS = 2_000;
 /** How much larger the retry is when a reply came back empty at the ceiling. */
 export const ASK_RETRY_FACTOR = 4;
 
+/** Milliseconds left before `deadlineAt`, or undefined when there is none. */
+function leftMs(deadlineAt: number | undefined): number | undefined {
+  return deadlineAt === undefined ? undefined : deadlineAt - Date.now();
+}
+
+/** The answer when the time budget is spent before an ask could be made. */
+function outOfTime(opts: AskOptions): Asked {
+  return { ok: false, error: `the time budget ran out${opts.what ? ` before ${opts.what}` : ""}` };
+}
+
 export async function askModel(opts: AskOptions): Promise<Asked> {
   const pauses = opts.overloadBackoffMs ?? ASK_OVERLOAD_BACKOFF_MS;
+  if ((leftMs(opts.deadlineAt) ?? 1) <= 0) return outOfTime(opts);
   let asked = await askSized(opts);
   for (let i = 0; i < pauses.length && !asked.ok && asked.transient; i++) {
+    // A pause that would end past the budget is not taken: the ask after it
+    // could not be waited for anyway.
+    const left = leftMs(opts.deadlineAt);
+    if (left !== undefined && left <= (pauses[i] ?? 0)) break;
     await new Promise((r) => setTimeout(r, pauses[i]));
     asked = await askSized(opts);
   }
@@ -93,7 +113,7 @@ async function askSized(opts: AskOptions): Promise<Asked> {
   // never started the answer. Once, with room: a model that empties a four
   // times larger ceiling the same way is not going to answer, and the second
   // failure says exactly that instead of "the reply was empty".
-  if (first.ok && first.cutOff && first.text.trim() === "") {
+  if (first.ok && first.cutOff && first.text.trim() === "" && (leftMs(opts.deadlineAt) ?? 1) > 0) {
     const bigger = (opts.maxTokens ?? ASK_MAX_TOKENS) * ASK_RETRY_FACTOR;
     const second = await askOnce(opts, bigger);
     if (second.ok && second.cutOff && second.text.trim() === "") {
@@ -114,10 +134,16 @@ async function askOnce(opts: AskOptions, maxTokens: number): Promise<Asked> {
   // Sized from this question's own prompt, and at local-hardware rates for a
   // self-hosted server (watchdog.ts localSpeed): the NUC's drafter timed out
   // on a fixed 2,000-token guess and a laptop's rates, and sealed nothing.
-  const limitMs = askTimeoutMs(maxTokens, opts.timeoutMs, {
+  const sized = askTimeoutMs(maxTokens, opts.timeoutMs, {
     promptTokens: Math.ceil((opts.system.length + opts.prompt.length) / 4),
     ...(isSelfHosted(opts.baseUrl) ? { speed: localSpeed() } : {}),
   });
+  // Never past the run's time budget, whichever transport answers. A limit
+  // of 0 means "none" to every transport below, so a spent budget is refused
+  // here rather than passed on as 0.
+  const left = leftMs(opts.deadlineAt);
+  if (left !== undefined && left <= 0) return outOfTime(opts);
+  const limitMs = left === undefined ? sized : sized > 0 ? Math.min(sized, left) : left;
 
   const removed = removedSubscriptionProblem(opts.baseUrl);
   if (removed) return { ok: false, error: removed };
@@ -125,6 +151,7 @@ async function askOnce(opts: AskOptions, maxTokens: number): Promise<Asked> {
   if (isOpencode(opts.baseUrl)) {
     const asked = await opencodeAsk({
       timeoutMs: limitMs,
+      deadlineAt: opts.deadlineAt,
       model: opts.model,
       systemPrompt: opts.system,
       prompt: opts.prompt,
