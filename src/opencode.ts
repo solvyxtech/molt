@@ -42,6 +42,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { errorText } from "./format.js";
 import { isOpencodeUrl, opencodeModelProblem } from "./endpoint.js";
+import { groupSpawn, killTree, trackGroup } from "./proctree.js";
 
 export { OPENCODE_URL, opencodeModelProblem } from "./endpoint.js";
 
@@ -179,6 +180,8 @@ export type OpencodeAskOptions = {
   systemPrompt: string;
   prompt: string;
   timeoutMs?: number;
+  /** The run's time budget, as an epoch ms: no attempt waits past it. */
+  deadlineAt?: number;
   /** Injected in tests. Real callers spawn the CLI. */
   run?: (cmd: string, args: string[], opts: object) => Promise<{ stdout: string }>;
 };
@@ -192,12 +195,19 @@ const NO_TOOLS =
 function runCli(cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv; timeoutMs: number }): Promise<{ stdout: string }> {
   return new Promise((resolve, reject) => {
     // stdin must be ignored: `opencode run` waits on an open pipe forever.
-    const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env, stdio: ["ignore", "pipe", "pipe"] });
+    // Its own process group, so a timeout ends what it started too (src/proctree.ts).
+    const child = spawn(cmd, args, { cwd: opts.cwd, env: opts.env, stdio: ["ignore", "pipe", "pipe"], ...groupSpawn() });
+    trackGroup(child);
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d: Buffer) => (stdout += d));
     child.stderr.on("data", (d: Buffer) => (stderr += d));
-    const timer = setTimeout(() => child.kill("SIGKILL"), opts.timeoutMs);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      // `close` reports a signal only for the leader; say it was the clock.
+      timedOut = true;
+      killTree(child);
+    }, opts.timeoutMs);
     child.on("error", (e) => {
       clearTimeout(timer);
       reject(e);
@@ -205,7 +215,7 @@ function runCli(cmd: string, args: string[], opts: { cwd: string; env: NodeJS.Pr
     child.on("close", (code, signal) => {
       clearTimeout(timer);
       // A non-zero exit still carries the error event on stdout; the caller reads it.
-      if (signal) reject(new Error(`opencode did not answer within ${Math.round(opts.timeoutMs / 1000)}s`));
+      if (signal || timedOut) reject(new Error(`opencode did not answer within ${Math.round(opts.timeoutMs / 1000)}s`));
       else resolve({ stdout: stdout || (code ? stderr : "") });
     });
   });
@@ -230,11 +240,14 @@ export async function opencodeAsk(opts: OpencodeAskOptions): Promise<OpencodeRep
   try {
     let last: OpencodeReply = { ok: false, error: "OpenCode returned nothing" };
     for (let attempt = 0; attempt < 2; attempt++) {
+      const left = opts.deadlineAt === undefined ? undefined : opts.deadlineAt - Date.now();
+      if (left !== undefined && left <= 0) return attempt ? last : { ok: false, error: "the time budget ran out before OpenCode was asked" };
+      const thisMs = left === undefined ? timeoutMs : Math.min(timeoutMs, left);
       let stdout: string;
       try {
         ({ stdout } = injected
           ? await injected("opencode", opencodeArgs(opts.model, message, dir), { cwd: dir, env: opencodeEnv(dir) })
-          : await runCli("opencode", opencodeArgs(opts.model, message, dir), { cwd: dir, env: opencodeEnv(dir), timeoutMs }));
+          : await runCli("opencode", opencodeArgs(opts.model, message, dir), { cwd: dir, env: opencodeEnv(dir), timeoutMs: thisMs }));
       } catch (e) {
         const em = errorText(e);
         if (/ENOENT/u.test(em)) return { ok: false, error: "the opencode CLI is not installed (npm i -g opencode-ai, or brew install sst/tap/opencode)" };

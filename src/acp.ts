@@ -81,11 +81,14 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 import { errorText } from "./format.js";
+import { env as readEnv } from "./env.js";
+import { PROBE_TIMEOUT_MS } from "./watchdog.js";
 import { RpcPeer, type RpcMessage } from "./jsonrpc.js";
-import type { BackendEvent, MoltTool, ToolRunner } from "./backend.js";
+import type { BackendEvent, MoltTool, SendLimits, ToolRunner } from "./backend.js";
 import { GROK_BUILD_URL, OPENCODE_URL } from "./endpoint.js";
 import { OPENCODE_CONFIG, OPENCODE_DEFAULT_MODEL, opencodeChildEnv, opencodeModel, opencodeModelProblem } from "./opencode.js";
 import { estTokens } from "./types.js";
+import { groupSpawn, killTree, trackGroup } from "./proctree.js";
 
 const exec = promisify(execFile);
 
@@ -422,18 +425,30 @@ export async function acpHealth(
  */
 async function probeAuth(spec: AcpAgentSpec): Promise<{ authenticated: boolean; detail?: string }> {
   const conn = new AcpConnection(spec);
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await conn.start();
-    await conn.request("initialize", {
-      protocolVersion: 1,
-      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+    // Bounded like every other probe: an agent that takes the handshake and
+    // never answers must not hold `doctor` or the picker for ever.
+    const expired = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${spec.label} did not answer within ${PROBE_TIMEOUT_MS / 1000}s`)), PROBE_TIMEOUT_MS);
+      timer.unref?.();
     });
-    await conn.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+    const handshake = (async () => {
+      await conn.start();
+      await conn.request("initialize", {
+        protocolVersion: 1,
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+      });
+      await conn.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+    })();
+    handshake.catch(() => {});
+    await Promise.race([handshake, expired]);
     return { authenticated: true };
   } catch (e) {
     const text = errorText(e);
     return { authenticated: false, detail: /auth/iu.test(text) ? "not signed in" : text };
   } finally {
+    if (timer) clearTimeout(timer);
     await conn.close();
   }
 }
@@ -444,6 +459,22 @@ async function probeAuth(spec: AcpAgentSpec): Promise<{ authenticated: boolean; 
 
 /** A method the agent calls on molt, and what molt answers. */
 export type ClientHandler = (method: string, params: unknown) => Promise<unknown>;
+
+/** How long an agent told `session/cancel` gets to end its turn before it is killed. */
+export const CANCEL_GRACE_MS = 500;
+
+/**
+ * Silence from an ACP agent, in ms, after which its provider is taken to have
+ * stalled: `MAAT_BACKEND_STALL_MS`, default five minutes, 0 for never. Maat's
+ * own tool calls do not count as the agent's silence.
+ */
+export const BACKEND_STALL_MS = 5 * 60_000;
+
+export function backendStallMs(raw: string | undefined = readEnv("BACKEND_STALL_MS")): number {
+  if (raw === undefined || raw.trim() === "") return BACKEND_STALL_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : BACKEND_STALL_MS;
+}
 
 /**
  * Newline-delimited JSON-RPC over a child process's stdio.
@@ -466,6 +497,8 @@ export class AcpConnection {
       spawnFn?: typeof spawn;
       onNotify?: (method: string, params: unknown) => void;
       onRequest?: ClientHandler;
+      /** Anything at all arrived from the agent: the stall watchdog's clock. */
+      onActivity?: () => void;
     } = {},
   ) {
     const onRequest = opts.onRequest;
@@ -501,8 +534,11 @@ export class AcpConnection {
         ...this.spec.env,
         ...(this.spec.env ? { PWD: this.opts.cwd ?? process.cwd() } : {}),
       },
+      // Its own process group, so ending it ends what it started (src/proctree.ts).
+      ...groupSpawn(),
     });
     this.child = child;
+    trackGroup(child);
     // A write to a child that has died raises EPIPE as an 'error' event on its
     // stdin, and an 'error' event nobody listens for is thrown — in the window,
     // from Electron's main process. It is the same fact as the exit below.
@@ -532,6 +568,7 @@ export class AcpConnection {
   }
 
   private feed(chunk: string): void {
+    this.opts.onActivity?.();
     this.peer.feed(chunk);
   }
 
@@ -547,7 +584,9 @@ export class AcpConnection {
   async close(): Promise<void> {
     this.fail(new Error("session closed"));
     this.child?.stdin?.end();
-    this.child?.kill();
+    // The agent and everything it started: a helper left running holds the
+    // job's directory and the machine's cores after the job has ended.
+    killTree(this.child);
   }
 }
 
@@ -711,6 +750,9 @@ export class McpToolServer<H> {
     await new Promise<void>((resolve) => {
       if (!this.server) return resolve();
       this.server.close(() => resolve());
+      // An agent killed mid-call leaves its connection open; waiting for it
+      // to drain is waiting on a process that no longer exists.
+      this.server.closeAllConnections?.();
     });
   }
 }
@@ -869,11 +911,22 @@ export class AcpSession<H> {
   }
 
   private async start(): Promise<void> {
-    const { spec, cwd, systemPrompt, tools, runTool } = this.opts;
+    const { spec, cwd, systemPrompt, tools } = this.opts;
     // A model this agent may not run is refused before anything is spawned.
     const pick = acpModelFor(spec, this.opts.model);
     if (pick.problem) throw new Error(pick.problem);
     this.want = pick.model;
+    // A tool Maat is running is Maat's time, not the agent's silence: a test
+    // suite that takes ten minutes is not a stalled provider.
+    const runTool: ToolRunner<H> = async (...a) => {
+      this.busy += 1;
+      try {
+        return await this.opts.runTool(...a);
+      } finally {
+        this.busy -= 1;
+        this.touch();
+      }
+    };
     const mcp = new McpToolServer<H>(tools, runTool, (event) =>
       this.events.push({ kind: "host", event }),
     );
@@ -888,6 +941,7 @@ export class AcpSession<H> {
       ...(this.opts.spawnFn ? { spawnFn: this.opts.spawnFn } : {}),
       onNotify: (method, params) => this.onNotify(method, params),
       onRequest: (method, params) => this.onRequest(method, params),
+      onActivity: () => this.touch(),
     });
     this.conn = conn;
     await conn.start();
@@ -1129,12 +1183,113 @@ export class AcpSession<H> {
    * loop uses: the model has stopped calling tools and produced an answer, so
    * the bar can run.
    */
-  async *send(messages: readonly string[]): AsyncGenerator<BackendEvent<H>> {
-    if (!this.started) {
+  /** When the agent last said anything, or Maat last finished a tool for it. */
+  private lastActivity = Date.now();
+  /** Maat tool calls running for the agent right now. */
+  private busy = 0;
+
+  private touch(): void {
+    this.lastActivity = Date.now();
+  }
+
+  /**
+   * Wait for `p`, but never past the deadline, and never through a stall.
+   *
+   * An ACP prompt turn has no clock of its own: a bench run given 540 s sat in
+   * one `session/prompt` for an hour, because nothing bounded the wait for
+   * its reply. Whatever the agent does, Maat keeps its own deadline here.
+   */
+  private async bounded<T>(
+    p: Promise<T>,
+    limits: SendLimits,
+  ): Promise<{ ok: true; value: T } | { ok: false; stop: "deadline" | "stall"; silentMs: number }> {
+    const settled = p.then((value) => ({ ok: true as const, value }));
+    // Abandoned on a stop; a late rejection is nobody's to handle.
+    settled.catch(() => {});
+    const stallMs = limits.stallMs && limits.stallMs > 0 ? limits.stallMs : 0;
+    if (limits.deadlineAt === undefined && !stallMs) return settled;
+    for (;;) {
+      const now = Date.now();
+      if (limits.deadlineAt !== undefined && now >= limits.deadlineAt) {
+        return { ok: false, stop: "deadline", silentMs: now - this.lastActivity };
+      }
+      const stallAt = stallMs ? (this.busy > 0 ? now + stallMs : this.lastActivity + stallMs) : Infinity;
+      if (now >= stallAt) return { ok: false, stop: "stall", silentMs: now - this.lastActivity };
+      const wake = Math.min(limits.deadlineAt ?? Infinity, stallAt) - now;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const woke = await Promise.race([
+        settled,
+        new Promise<null>((r) => {
+          timer = setTimeout(() => r(null), Math.max(1, wake));
+        }),
+      ]);
+      clearTimeout(timer);
+      if (woke) return woke;
+    }
+  }
+
+  /**
+   * Stop the agent: `session/cancel` (the protocol's own way to end a prompt
+   * turn), a moment for it to answer, then the whole process tree.
+   *
+   * The kill is not optional. An agent that ignores the cancel — or is hung
+   * past hearing it — is exactly the one that must not outlive the job.
+   */
+  private async interrupt(answered?: Promise<unknown>): Promise<void> {
+    if (this.conn && this.sessionId) {
       try {
-        await this.start();
+        this.conn.notify("session/cancel", { sessionId: this.sessionId });
+      } catch {
+        // A dead pipe; the kill below is what counts.
+      }
+      if (answered) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          answered.catch(() => {}),
+          new Promise<void>((r) => {
+            timer = setTimeout(r, CANCEL_GRACE_MS);
+          }),
+        ]);
+        clearTimeout(timer);
+      }
+    }
+    await this.close();
+  }
+
+  /** The `done` for a wait Maat cut short. The session is closed by then. */
+  private stoppedEvent(stop: "deadline" | "stall", silentMs: number): BackendEvent<H> {
+    const label = this.opts.spec.label;
+    const error =
+      stop === "deadline"
+        ? `the time budget ran out while ${label} was still working — its turn was cancelled`
+        : `${label} sent nothing for ${Math.round(silentMs / 1000)}s — provider stall, its turn was cancelled`;
+    return { ...this.finish(error), stopped: stop, ...(stop === "stall" ? { silentMs } : {}) };
+  }
+
+  /**
+   * Send messages and read back everything until the model stops.
+   *
+   * Returns at `session/prompt`'s reply, which is the same boundary molt's own
+   * loop uses: the model has stopped calling tools and produced an answer, so
+   * the bar can run. With `limits`, it also returns — with a `done` that says
+   * `stopped` — when the deadline passes or the agent stalls; by then the agent
+   * has been cancelled and its process tree ended.
+   */
+  async *send(messages: readonly string[], limits: SendLimits = {}): AsyncGenerator<BackendEvent<H>> {
+    this.touch();
+    if (!this.started) {
+      const starting = this.start();
+      starting.catch(() => {});
+      let got;
+      try {
+        got = await this.bounded(starting, limits);
       } catch (e) {
         yield doneEvent("", errorText(e));
+        return;
+      }
+      if (!got.ok) {
+        await this.interrupt();
+        yield { ...doneEvent<H>("", `${this.opts.spec.label} did not start before the ${got.stop === "deadline" ? "time budget ran out" : "stall allowance ran out"}`), stopped: got.stop };
         return;
       }
     }
@@ -1165,7 +1320,14 @@ export class AcpSession<H> {
 
     this.reader ??= this.events.drain();
     for (;;) {
-      const next = await this.reader.next();
+      const got = await this.bounded(this.reader.next(), limits);
+      if (!got.ok) {
+        const ev = this.stoppedEvent(got.stop, got.silentMs);
+        await this.interrupt(answered);
+        yield ev;
+        return;
+      }
+      const next = got.value;
       if (next.done) break;
       yield next.value;
       if (next.value.kind === "done") break;
@@ -1174,7 +1336,7 @@ export class AcpSession<H> {
   }
 
   /** The step's `done`, with molt's own count of what went over the wire. */
-  private finish(error?: string): BackendEvent<H> {
+  private finish(error?: string): Extract<BackendEvent<H>, { kind: "done" }> {
     const prompt = estTokens(this.conversation);
     this.conversation += this.reply;
     return {
@@ -1214,7 +1376,7 @@ export class AcpSession<H> {
  * Zero tokens is the truth here and only here: nothing was sent, so there is
  * nothing to have counted. Once a session exists, `finish` estimates instead.
  */
-function doneEvent<H>(text: string, error?: string): BackendEvent<H> {
+function doneEvent<H>(text: string, error?: string): Extract<BackendEvent<H>, { kind: "done" }> {
   return {
     kind: "done",
     text,

@@ -1220,6 +1220,8 @@ async function autoDraft(
   // stage of each draft read this and never the folder the work is changing.
   const snapshot = inputs?.snapshot ?? drafterSnapshotFor(args);
   const none: ReturnType<typeof taskChecksFrom> = { taskChecks: [], taskNotes: [] };
+  // Under --for, no draft, critique or retry waits past the run's budget.
+  const deadlineAt = args.forMs ? Date.now() + args.forMs : undefined;
   // Drafted, then read cold by a critic against the task text: a check that
   // invents or guesses is dropped (with a task quote), and a draft where
   // nothing runs the deliverable is asked for once more. See criteria.ts.
@@ -1236,6 +1238,7 @@ async function autoDraft(
       cwd: args.cwd,
       reasoningEffort: judgeEffort(args.reasoningChecks ?? args.reasoning),
       latency: engine.askLatency,
+      deadlineAt,
       // What is ready when a time budget stops the wait (RunOptions.criteriaSoFar).
       onProgress: (d) => {
         if (soFar) soFar.draft = d;
@@ -1300,6 +1303,7 @@ function startReference(args: Args): Promise<{ check: Check; note: Record<string
     model: args.model,
     cwd: args.cwd,
     reasoningEffort: args.reasoningChecks ?? args.reasoning,
+    ...(args.forMs ? { deadlineAt: Date.now() + args.forMs } : {}),
   }).then((r) => {
     if (!r.ok) {
       process.stderr.write(`maat: no reference check — ${r.why}\n`);
