@@ -22,7 +22,7 @@ import { Receipts } from "../src/receipts.js";
 import { Integrity } from "../src/integrity.js";
 import { runCommand } from "../src/run.js";
 import { stateDir } from "../src/statedir.js";
-import { disablePrivSep, enablePrivSep, privSep, safeRel, type PrivSep } from "../src/privsep.js";
+import { disablePrivSep, enablePrivSep, gitSync, privSep, safeRel, type PrivSep } from "../src/privsep.js";
 import { listBackground, resetBackgroundRegistry, startBackground, type BackgroundProcess } from "../src/background.js";
 import { ACP_AGENTS } from "../src/acp.js";
 import type { Check, EngineEvent } from "../src/types.js";
@@ -406,6 +406,28 @@ describe("privilege separation (Linux, root)", { skip: linuxRoot ? false : "need
       rmSync(ps2.stateRoot, { recursive: true, force: true });
       rmSync(v, { recursive: true, force: true });
       rmSync(secret, { force: true });
+    }
+  });
+
+  it("runs Maat's git as the worker: repository config never runs as root", () => {
+    active();
+    const repo = join(dir, "gitrepo");
+    const mark = join(dir, "git-marker");
+    const r = asWorker(
+      `mkdir -p '${repo}' && cd '${repo}' && git init -q && git config core.fsmonitor 'touch ${mark}; false' && echo ok`,
+    );
+    assert.equal(r.status, 0, r.out);
+    try {
+      assert.ok(!Object.values(process.env).includes("safe.directory"), "safe.directory is still set for Maat");
+      gitSync(["status", "--porcelain"], repo);
+      if (existsSync(mark)) assert.equal(statSync(mark).uid, uid, "the repository's configured command ran as root");
+      // And Maat's own (root) git, without safe.directory, refuses the worker's repository.
+      const own = spawnSync("git", ["status"], { cwd: repo, encoding: "utf8" });
+      assert.notEqual(own.status, 0, "root git accepted a repository the worker owns");
+      assert.ok(!existsSync(mark) || statSync(mark).uid === uid);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(mark, { force: true });
     }
   });
 

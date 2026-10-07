@@ -25,7 +25,6 @@ import { judgeEffort, judgeTarget } from "./judge.js";
 import { tierOf } from "./tiers.js";
 import { arbitrate, parseDisputes, type Ruling } from "./dispute.js";
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { excludeMoltFromGit, listProject, removeNew, unnamedNewFiles, type ProjectListing } from "./leftovers.js";
 import { inspectDir, inspectFile, namedInputs, profileLine } from "./inspect.js";
@@ -132,7 +131,7 @@ import {
   type Spend,
 } from "./types.js";
 import { stateDir, stateDirName, stateRedirect } from "./statedir.js";
-import { privSep, type WorkerFs } from "./privsep.js";
+import { gitSync, privSep, type WorkerFs } from "./privsep.js";
 import { env } from "./env.js";
 import { Judgments, caseReason, reasonText } from "./judgment.js";
 
@@ -4490,7 +4489,7 @@ export class Engine {
     let tracked: Set<string>;
     try {
       tracked = new Set(
-        execFileSync("git", ["ls-files"], { cwd: this.cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+        gitSync(["ls-files"], this.cwd)
           .split("\n")
           .filter(Boolean),
       );

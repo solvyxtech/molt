@@ -35,7 +35,7 @@
  *
  * Off (the default) nothing here runs and nothing changes.
  */
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, spawnSync, type ChildProcess, type SpawnSyncReturns } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   chmodSync,
@@ -263,12 +263,10 @@ export class PrivSep {
     // Maat's own temp files (reference tries, check copies, drafts, judge
     // scratch) land in the state dir; the worker's get /tmp (workerEnv).
     this.setEnv("TMPDIR", join(this.stateRoot, "tmp"));
-    // Maat reads the worker's repository as another user; git refuses a
-    // repository owned by someone else unless told it is safe.
-    const n = Number(process.env.GIT_CONFIG_COUNT ?? 0) || 0;
-    this.setEnv(`GIT_CONFIG_KEY_${n}`, "safe.directory");
-    this.setEnv(`GIT_CONFIG_VALUE_${n}`, "*");
-    this.setEnv("GIT_CONFIG_COUNT", String(n + 1));
+    // No `safe.directory=*`: git's refusal of a repository someone else owns
+    // is what stops a worker-written .git/config (core.fsmonitor, hooks,
+    // filters, diff drivers) from running as Maat. Maat's own git runs as
+    // the worker instead (`gitSync`, src/git.ts), so it never needs it.
 
     this.seed();
     redirectState(this.project, this.stateRoot);
@@ -309,9 +307,9 @@ export class PrivSep {
    * The project's `.maat/` is the worker's: it is read, and the contract
    * removed, by the file helper running as the worker (`fs-helper.js pack`),
    * never by Maat walking it. Only regular files and folders come back, by
-   * name, and Maat writes them into its own state dir: a symlink in the
-   * project (`.maat/receipts -> /root/...`) is skipped by the helper and could
-   * not be created here anyway, so Maat never writes through one later.
+   * name, and Maat writes them into its own state dir. Symlinks in the
+   * project's `.maat/` are skipped by the helper, so the state dir holds no
+   * links.
    */
   private seed(): void {
     const src = join(this.project, stateDirName(this.project));
@@ -521,6 +519,24 @@ export class PrivSep {
     return this.nsInit !== undefined && existsSync(`/proc/${this.nsInit}`);
   }
 
+  /**
+   * Run a program as the worker and wait for it (in its PID namespace when
+   * there is one). For Maat's own short git calls and small writes in the
+   * worker's tree, which must not run as Maat.
+   */
+  workerSync(file: string, args: readonly string[], cwd: string, opts: { timeout?: number; maxBuffer?: number; input?: string } = {}): SpawnSyncReturns<string> {
+    const spec = this.execSpec(file, args, cwd);
+    return spawnSync(spec.file, spec.args, {
+      cwd,
+      env: spec.env,
+      encoding: "utf8",
+      timeout: opts.timeout ?? 30_000,
+      maxBuffer: opts.maxBuffer ?? 8 * 1024 * 1024,
+      ...(opts.input !== undefined ? { input: opts.input } : {}),
+      ...(spec.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
+    });
+  }
+
   /** The file tools, performed as the worker. Started on first use. */
   fs(): WorkerFs {
     if (!this.helper) this.helper = new FsHelper(this);
@@ -648,9 +664,8 @@ export class PrivSep {
    *
    * Maat reads its own state dir (regular files and folders only) and the
    * file helper, running as the worker, writes them into the project, so the
-   * copies are the worker's and Maat writes nothing in the worker's tree: a
-   * symlink planted at `.maat/receipts` sends the worker's write where the
-   * worker could write anyway.
+   * copies are the worker's and Maat writes nothing in the worker's tree:
+   * every write there happens with the worker's own permissions.
    */
   publish(): string {
     const dest = join(this.project, stateDirName(this.project));
@@ -861,6 +876,30 @@ export function enablePrivSep(opts: PrivSepOptions): PrivSep {
 export function disablePrivSep(): void {
   active?.close();
   active = undefined;
+}
+
+/**
+ * git, synchronously, in the project. Under privilege separation it runs as
+ * the worker: the repository and its config are the worker's, and git reads
+ * that config (core.fsmonitor, hooks, filters) and may run what it names.
+ * Otherwise as Maat, as before. Returns stdout; throws on a non-zero exit,
+ * like execFileSync.
+ */
+export function gitSync(args: readonly string[], cwd: string, opts: { timeout?: number; maxBuffer?: number } = {}): string {
+  const ps = active;
+  if (!ps) {
+    return execFileSync("git", [...args], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      ...(opts.timeout ? { timeout: opts.timeout } : {}),
+      maxBuffer: opts.maxBuffer ?? 8 * 1024 * 1024,
+    });
+  }
+  const r = ps.workerSync("git", args, cwd, opts);
+  if (r.error) throw r.error;
+  if (r.status !== 0) throw new Error(`git ${args[0] ?? ""} exited ${r.status}: ${(r.stderr ?? "").trim().slice(0, 300)}`);
+  return r.stdout;
 }
 
 /** The worker user asked for, from the flag or MAAT_WORKER_USER. */

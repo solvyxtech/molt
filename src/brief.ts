@@ -103,7 +103,9 @@ export type Probe = (command: string, timeoutMs: number) => Promise<string | nul
  */
 export async function shellProbe(command: string, timeoutMs: number, cwd?: string): Promise<string | null> {
   try {
-    const r = await runCommand(command, { cwd: cwd ?? process.cwd(), timeoutMs, maxBuffer: 16 * 1024 });
+    // The worker's environment, as the worker sees it (src/privsep.ts): and
+    // git here reads the worker's repository config, which must not run as Maat.
+    const r = await runCommand(command, { cwd: cwd ?? process.cwd(), timeoutMs, maxBuffer: 16 * 1024, asWorker: true });
     if (r.timedOut) return null;
     if (r.code !== 0) return null;
     const line = `${r.stdout}\n${r.stderr}`

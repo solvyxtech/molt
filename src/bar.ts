@@ -17,11 +17,10 @@ import { planMutations, applyMutation, negateComparison, type Mutation } from ".
 import { proposeBar, type Detected } from "./detect.js";
 import { assertionsIn, fingerprint, isTestPath, treeChanges, type TreeSnapshot } from "./files.js";
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { copyTreeOrWhy, runsInCopy } from "./scratch.js";
 import { maskText } from "./withhold.js";
-import { privSep } from "./privsep.js";
+import { gitSync, privSep } from "./privsep.js";
 import { dirname, join, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { ArchiveLike } from "./archive.js";
@@ -1647,11 +1646,8 @@ function importsTracked(ctx: BarContext): {
 } {
   let tracked: Set<string>;
   try {
-    const out = execFileSync("git", ["ls-files", "-z"], {
-      cwd: ctx.cwd,
-      encoding: "utf8",
-      maxBuffer: 8 * 1024 * 1024,
-    });
+    // As the worker under privilege separation: never Maat's git on the worker's repository.
+    const out = gitSync(["ls-files", "-z"], ctx.cwd);
     tracked = new Set(out.split("\0").filter(Boolean));
   } catch {
     return {

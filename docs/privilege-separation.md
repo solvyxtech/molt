@@ -80,9 +80,8 @@ dir can point back into the worker's reach or out to a file of root's.
 These stay in the project: `.maat/done.yml`, because a person wrote it, and
 `.maat/bg/`, which holds the worker's own background-job logs. The worker
 makes those itself: a background job starts as the worker with a shell that
-creates the folder and opens its log, so Maat never opens a path in the
-worker's tree (a planted `.maat/bg/<id>.log` symlink only redirects the
-worker's own write).
+creates the folder and opens its log, so the log is opened with the
+worker's permissions and Maat never opens a path in the worker's tree.
 `.maat/mission/library/` also stays, because the worker writes it. A spilled
 output (`.maat/out/<call>.txt`) is still readable through `read_file`: Maat
 serves its own masked copy of the worker's output. The worker cannot `cat`
@@ -94,8 +93,8 @@ it from bash.
 checks them there. Maat reads its own state dir and the file helper, as the
 worker, writes the copies (`fs-helper.js unpack`), so they are owned by the
 worker and Maat writes nothing into the worker's tree. If a copy cannot be
-written (the worker planted a link to somewhere it cannot write), Maat says
-so and the records stay in the state dir, which is always kept.
+written with the worker's permissions, Maat says so and the records stay in
+the state dir, which is always kept.
 
 **The judge and the checks stay Maat's.** Judge and ask subprocesses
 (OpenCode, a Grok judge, an HTTP judge) run as Maat with Maat's HOME. If that
@@ -111,9 +110,11 @@ changed with `fchown` on the open descriptor, and the project itself must be
 the folder (device and inode) the job started in. A folder swapped for a
 symlink mid-walk fails to open and is skipped; files with more than one hard
 link, symlinks, special files and other file systems are left alone. Hand-back
-is Linux-only; elsewhere root-made files stay Maat's. Git, running as Maat on a repository the worker owns,
-is told `safe.directory=*` through `GIT_CONFIG_*`. The worker's environment
-does not get that setting.
+is Linux-only; elsewhere root-made files stay Maat's. Maat's own git calls in the project (snapshots, commits,
+`ls-files`, the local exclude file, the brief's probes) run as the worker,
+because the repository and its config belong to the worker. Maat does not set
+`safe.directory`, so its own git keeps refusing a repository another user
+owns.
 
 ## The process list
 

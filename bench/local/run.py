@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -65,16 +66,99 @@ AGENT_USER = os.environ.get("BENCH_AGENT_USER")  # set in the containers: the ag
 # whole of Maat as the agent user, as before 2026-10-07.
 PRIVSEP = bool(AGENT_USER) and os.environ.get("BENCH_PRIVSEP", "1") != "0" and os.geteuid() == 0
 
-if AGENT_USER and os.geteuid() == 0:
-    # The graders (root) run git in task repositories the agent user owns. On the container's
-    # own filesystem ownership is real, and git refuses a repository owned by someone else
-    # ("dubious ownership"): fix-git graded every correct merge as a failure. On the old /work
-    # bind mount chown was ignored, so this never showed. Maat passes the same setting to its
-    # own checks and strips it from the worker's environment.
-    _n = int(os.environ.get("GIT_CONFIG_COUNT") or 0)
-    os.environ[f"GIT_CONFIG_KEY_{_n}"] = "safe.directory"
-    os.environ[f"GIT_CONFIG_VALUE_{_n}"] = "*"
-    os.environ["GIT_CONFIG_COUNT"] = str(_n + 1)
+# The graders run as root. They never run git in the agent's own repository: the agent owns its
+# .git/config, and core.fsmonitor, hooks, filters and diff drivers there would run as root. Until
+# 2026-10-07 run.py set safe.directory=* so git would grade an agent-owned repository at all; that
+# setting is gone. The graders get a root-owned copy of the task folder instead, with the git
+# config cut down to the repository format and the hooks removed (grading_copy), and git runs
+# with no system or global config and hooks pointed at /dev/null (GRADER_GIT_ENV).
+GRADER_GIT_ENV = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_COUNT": "3",
+    "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": "/dev/null",
+    "GIT_CONFIG_KEY_1": "core.fsmonitor", "GIT_CONFIG_VALUE_1": "false",
+    "GIT_CONFIG_KEY_2": "core.pager", "GIT_CONFIG_VALUE_2": "cat",
+    "GIT_TERMINAL_PROMPT": "0",
+}
+
+
+def sanitize_git(git_dir: Path) -> None:
+    """Replace a copied repository's config with the format lines alone, and drop its hooks
+    and attributes: nothing in it can name a program for git to run."""
+    cfg = git_dir / "config"
+    version, objfmt = "0", None
+    try:
+        section = ""
+        for line in cfg.read_text(errors="replace").splitlines():
+            t = line.strip()
+            if t.startswith("["):
+                section = t.strip("[]").strip().lower()
+                continue
+            k, _, v = t.partition("=")
+            k, v = k.strip().lower(), v.strip()
+            if section == "core" and k == "repositoryformatversion" and v.isdigit():
+                version = v
+            elif section == "extensions" and k == "objectformat" and v in ("sha1", "sha256"):
+                objfmt = v
+    except OSError:
+        pass
+    text = f"[core]\n\trepositoryformatversion = {version}\n\tfilemode = true\n\tbare = false\n"
+    if objfmt:
+        text += f"[extensions]\n\tobjectformat = {objfmt}\n"
+    if cfg.is_symlink() or cfg.exists():
+        cfg.unlink()
+    cfg.write_text(text)
+    for p in (git_dir / "hooks", git_dir / "info" / "attributes", git_dir / "config.worktree"):
+        if p.is_symlink() or p.is_file():
+            p.unlink()
+        elif p.is_dir():
+            shutil.rmtree(p)
+
+
+def grading_copy(d: Path) -> Path:
+    """A root-owned copy of a finished task folder, for the graders. Regular files, folders and
+    symlinks (as links) only: a FIFO or device the agent left is skipped, not opened. Every
+    repository in it (.git folders) is sanitized. Call with the agent's processes stopped."""
+    import tempfile
+
+    def copy_regular(src, dst, *, follow_symlinks=True):
+        st = os.lstat(src)
+        if not stat.S_ISREG(st.st_mode):
+            return dst
+        fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as fsrc:
+            if not stat.S_ISREG(os.fstat(fsrc.fileno()).st_mode):
+                return dst
+            with open(dst, "wb") as fdst:
+                shutil.copyfileobj(fsrc, fdst)
+        shutil.copystat(src, dst, follow_symlinks=False)
+        return dst
+
+    dst = Path(tempfile.mkdtemp(prefix="maat-grade-")) / d.name
+    shutil.copytree(d, dst, symlinks=True, copy_function=copy_regular)
+    for root, dirs, _files in os.walk(dst):
+        if ".git" in dirs and not os.path.islink(os.path.join(root, ".git")):
+            sanitize_git(Path(root) / ".git")
+    return dst
+
+
+def grade_safely(T, d: Path):
+    """T.grade on a sanitized root-owned copy (grading_copy), with GRADER_GIT_ENV set."""
+    if AGENT_USER and shutil.which("pkill"):
+        subprocess.run(["pkill", "-KILL", "-u", AGENT_USER], check=False)
+    copy = grading_copy(d)
+    saved = {k: os.environ.get(k) for k in GRADER_GIT_ENV}
+    os.environ.update(GRADER_GIT_ENV)
+    try:
+        return T.grade(copy)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(copy.parent, ignore_errors=True)
 
 
 def as_agent(cmd: list, env: dict | None = None) -> tuple[list, dict | None]:
@@ -297,7 +381,7 @@ def run_all(which: str, repeats: int, task_filter: str | None) -> None:
                         # Not recorded, so a resume runs this task again.
                         print(f"STOPPED: the provider's daily limit / quota is reached ({tag} not recorded)", flush=True)
                         return
-                    ok, why = T.grade(d)
+                    ok, why = grade_safely(T, d)
                     lock(d)
                     final = ""
                     r.update(task=T.name, agent=a, rep=rep, passed=ok, why=why, final=final[:300])

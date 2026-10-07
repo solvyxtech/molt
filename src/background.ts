@@ -103,10 +103,9 @@ export function startBackground(
   let child;
   if (ps) {
     // Under privilege separation the job is the worker's, and so is its log:
-    // the worker's own shell makes the folder and opens the file. Maat (root)
-    // never creates or opens a path in the worker's tree, where a planted
-    // `.maat/bg/<id>.log -> /etc/...` would have made root truncate the
-    // target and the worker's command write into it.
+    // the worker's own shell makes the folder and opens the file, so the
+    // log is created with the worker's permissions. Maat (root) never creates
+    // or opens a path in the worker's tree.
     const spec = ps.execSpec(
       "/bin/sh",
       ["-c", 'mkdir -p -- "$1" && exec >"$2" 2>&1 </dev/null && exec /bin/sh -c "$3"', "maat-bg", dir, join(opts.cwd, log), command],
