@@ -180,6 +180,12 @@ by SpaceXAI — you remain responsible for xAI's terms and acceptable use; do no
 pool or resell access. A plan is not a bill, so the meter shows tokens and no
 money.
 
+Other providers (OpenAI, Anthropic, OpenRouter, Groq, Mistral, local Ollama /
+llama.cpp / vLLM, and the rest) are the same idea: BYOK or your own local
+runtime, your account, their terms. See
+[docs/provider-terms.md](docs/provider-terms.md) — not legal advice, just how
+Maat connects and what it does not claim.
+
 Headless, for CI or a script:
 
 ```sh
@@ -401,6 +407,7 @@ held to them.
 
 ## Docs
 
+- [provider-terms.md](docs/provider-terms.md) — BYOK, unaffiliation, provider ToS pointers (not legal advice)
 - [why.md](docs/why.md) — the failure this exists for
 - [done-yml.md](docs/done-yml.md) — the bar, every builtin, `watch`, advisory checks
 - [commandments.md](docs/commandments.md) — rules, each traced to the run that produced it, sorted by how they are enforced

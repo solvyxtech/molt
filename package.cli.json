@@ -1,7 +1,7 @@
 {
   "name": "@solvyx/molt",
   "version": "0.2.1",
-  "description": "Maat Agent \u2014 a coding agent that can't say done without proving it. Built on the molt engine. Terminal CLI and TUI.",
+  "description": "Maat Agent \u2014 a coding agent that can't say done without proving it. Built on the molt engine. Terminal CLI and TUI. OpenAI-compatible and Anthropic APIs; uses Grok Build via ACP.",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -12,15 +12,15 @@
     "url": "https://github.com/solvyxtech/molt/issues"
   },
   "keywords": [
+    "maat",
+    "maat-agent",
     "coding-agent",
     "verification",
     "cli",
     "tui",
     "openai-compatible",
-    "anthropic",
-    "receipts",
-    "maat-agent",
-    "maat"
+    "byok",
+    "receipts"
   ],
   "author": "Tyler Skelton",
   "type": "module",
