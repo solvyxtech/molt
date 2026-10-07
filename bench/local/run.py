@@ -65,6 +65,9 @@ AGENT_USER = os.environ.get("BENCH_AGENT_USER")  # set in the containers: the ag
 # the reference program, the judge's HOME or its process list either. BENCH_PRIVSEP=0 runs the
 # whole of Maat as the agent user, as before 2026-10-07.
 PRIVSEP = bool(AGENT_USER) and os.environ.get("BENCH_PRIVSEP", "1") != "0" and os.geteuid() == 0
+# With privilege separation, task checks (hidden, drafted, mission) run as a third account
+# (--check-user): they can read the reference check, and the worker cannot. The image makes it.
+CHECK_USER = os.environ.get("BENCH_CHECK_USER") or "checker"
 
 # The graders run as root. They never run git in the agent's own repository: the agent owns its
 # .git/config, and core.fsmonitor, hooks, filters and diff drivers there would run as root. Until
@@ -116,31 +119,40 @@ def sanitize_git(git_dir: Path) -> None:
             shutil.rmtree(p)
 
 
+def _copy_regular(src, dst, *, follow_symlinks=True):
+    """copytree's copy function: regular files only, opened without following a link and
+    without blocking on a FIFO; anything else is skipped."""
+    st = os.lstat(src)
+    if not stat.S_ISREG(st.st_mode):
+        return dst
+    fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as fsrc:
+        if not stat.S_ISREG(os.fstat(fsrc.fileno()).st_mode):
+            return dst
+        with open(dst, "wb") as fdst:
+            shutil.copyfileobj(fsrc, fdst)
+    shutil.copystat(src, dst, follow_symlinks=False)
+    return dst
+
+
+def sanitized_copy(src: Path, dst: Path) -> Path:
+    """Copy an agent-written tree to `dst` (which must not exist), owned by whoever runs this:
+    regular files, folders and symlinks (as links) only, and every repository in it (.git
+    folders) sanitized (sanitize_git)."""
+    shutil.copytree(src, dst, symlinks=True, copy_function=_copy_regular)
+    for root, dirs, _files in os.walk(dst):
+        if ".git" in dirs and not os.path.islink(os.path.join(root, ".git")):
+            sanitize_git(Path(root) / ".git")
+    return dst
+
+
 def grading_copy(d: Path) -> Path:
     """A root-owned copy of a finished task folder, for the graders. Regular files, folders and
     symlinks (as links) only: a FIFO or device the agent left is skipped, not opened. Every
     repository in it (.git folders) is sanitized. Call with the agent's processes stopped."""
     import tempfile
 
-    def copy_regular(src, dst, *, follow_symlinks=True):
-        st = os.lstat(src)
-        if not stat.S_ISREG(st.st_mode):
-            return dst
-        fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
-        with os.fdopen(fd, "rb") as fsrc:
-            if not stat.S_ISREG(os.fstat(fsrc.fileno()).st_mode):
-                return dst
-            with open(dst, "wb") as fdst:
-                shutil.copyfileobj(fsrc, fdst)
-        shutil.copystat(src, dst, follow_symlinks=False)
-        return dst
-
-    dst = Path(tempfile.mkdtemp(prefix="maat-grade-")) / d.name
-    shutil.copytree(d, dst, symlinks=True, copy_function=copy_regular)
-    for root, dirs, _files in os.walk(dst):
-        if ".git" in dirs and not os.path.islink(os.path.join(root, ".git")):
-            sanitize_git(Path(root) / ".git")
-    return dst
+    return sanitized_copy(d, Path(tempfile.mkdtemp(prefix="maat-grade-")) / d.name)
 
 
 def grade_safely(T, d: Path):
@@ -164,11 +176,12 @@ def grade_safely(T, d: Path):
 def as_agent(cmd: list, env: dict | None = None) -> tuple[list, dict | None]:
     """With BENCH_AGENT_USER set, run the agent as that user: it cannot read the graders
     or the reference solutions, which stay root-only. Unset (Mac host lanes): unchanged.
-    With privilege separation Maat stays root and is told which user the worker is."""
+    With privilege separation Maat stays root and is told which user the worker is, and which
+    account runs the task checks."""
     if not AGENT_USER:
         return cmd, env
     if PRIVSEP:
-        return [*cmd[:3], "--worker-user", AGENT_USER, *cmd[3:]], env
+        return [*cmd[:3], "--worker-user", AGENT_USER, "--check-user", CHECK_USER, *cmd[3:]], env
     import pwd
     home = pwd.getpwnam(AGENT_USER).pw_dir
     return ["runuser", "-u", AGENT_USER, "--", "env", f"HOME={home}", *cmd], env

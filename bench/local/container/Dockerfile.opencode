@@ -3,7 +3,7 @@
 # (run-in-container.sh passes BASE), so OPENCODE=1 combines with SUBSCRIPTION=grok. Pinned to the
 # version the owner's Mac runs. No credentials are baked in: run-in-container.sh copies
 # auth.json in at start.
-ARG BASE=maat-bench:agentu
+ARG BASE=maat-bench:agentcu
 FROM ${BASE}
 ARG OPENCODE_VERSION=1.18.33
 RUN npm install -g --no-fund --no-audit opencode-ai@${OPENCODE_VERSION} && opencode --version

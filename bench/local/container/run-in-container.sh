@@ -22,7 +22,8 @@
 #   ARMS="oc:MAAT_JUDGE_MODEL=opencode/big-pickle,MAAT_JUDGE_URL=opencode://zen"
 # The key is never printed.
 # Privilege separation (default; BENCH_PRIVSEP=0 turns it off): Maat runs as root and only the
-# worker's tools run as `agent` (--worker-user agent). Maat's records sit in /var/lib/maat (700,
+# worker's tools run as `agent` (--worker-user agent); task checks run as `checker`
+# (--check-user checker), which can read the reference check and `agent` cannot. Maat's records sit in /var/lib/maat (700,
 # root) until each job ends; the judge's logins are in /root (700); finished task folders and
 # logs in /work are locked to root. BENCH_PIDNS=1 (default) also gives the container
 # CAP_SYS_ADMIN so Maat can put the worker's commands in their own PID namespace with a private
@@ -31,11 +32,12 @@
 set -e
 name=$1; tgz=${2:A}; shift 2; [ "$1" = "--" ] && shift
 here=${0:A:h}; local_dir=${here:h}
-# Image tags carry ":agentu": images with the unprivileged `agent` user (older ones lack it).
-sha=$(shasum -a 256 "$tgz" | cut -c1-8); base=maat-bench:agentu; img=maat-bench:$sha-u
+# Image tags carry ":agentcu": images with the unprivileged `agent` (worker) and `checker` (task
+# checks, --check-user) users. Older ":agentu" images lack `checker`.
+sha=$(shasum -a 256 "$tgz" | cut -c1-8); base=maat-bench:agentcu; img=maat-bench:$sha-cu
 docker image inspect $base >/dev/null 2>&1 || docker build -q -t $base "$here" >/dev/null
 if [ "$SUBSCRIPTION" = grok ]; then
-  base=maat-bench-grok:agentu; img=maat-bench-grok:$sha-u
+  base=maat-bench-grok:agentcu; img=maat-bench-grok:$sha-cu
   docker image inspect $base >/dev/null 2>&1 || docker build -q -t $base -f "$here/Dockerfile.grok" "$here" >/dev/null
   [ -f ~/.grok/auth.json ] || { echo "no ~/.grok/auth.json: run 'grok login' on the Mac first" >&2; exit 1; }
   # The token is short-lived (~6 h) and a refresh inside the container may rotate the refresh
@@ -45,7 +47,7 @@ if [ "$SUBSCRIPTION" = grok ]; then
 fi
 if [ "$OPENCODE" = 1 ]; then
   [ -f ~/.local/share/opencode/auth.json ] || { echo "no ~/.local/share/opencode/auth.json: run 'opencode auth login' on the Mac first" >&2; exit 1; }
-  ocbase=${base%:*}-oc:agentu
+  ocbase=${base%:*}-oc:agentcu
   docker image inspect $ocbase >/dev/null 2>&1 || docker build -q -t $ocbase -f "$here/Dockerfile.opencode" --build-arg BASE=$base "$here" >/dev/null
   base=$ocbase; img=${img%:*}-oc:${img##*:}
 fi
