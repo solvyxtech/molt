@@ -66,6 +66,18 @@ def as_agent(cmd: list, env: dict | None = None) -> tuple[list, dict | None]:
     return ["runuser", "-u", AGENT_USER, "--", "env", f"HOME={home}", *cmd], env
 
 
+def kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the agent's whole process group, and in a container every process of the
+    unprivileged agent user (a backend CLI may start its own session)."""
+    import signal
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    if AGENT_USER and shutil.which("pkill"):
+        subprocess.run(["pkill", "-KILL", "-u", AGENT_USER], check=False)
+
+
 def hand_over(d: Path) -> None:
     if AGENT_USER:
         subprocess.run(["chown", "-R", AGENT_USER, str(d)], check=True)
@@ -93,13 +105,20 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
     ]
     t0 = time.time()
     cmd, env = as_agent(cmd, env)
+    # Own session, so the backstop kills the whole tree. subprocess.run's timeout killed only
+    # the top process (runuser in the containers) and then waited on the pipe Maat and its
+    # backend still held: one hung Grok turn ran 3570 s against a 600 s limit (2026-10-07).
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                            start_new_session=True)
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=LIMIT, env=env)
-        out, err = proc.stdout, proc.stderr
+        out, err = proc.communicate(timeout=LIMIT)
         timed_out = False
-    except subprocess.TimeoutExpired as e:
-        out = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-        err = (e.stderr or b"").decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
         timed_out = True
     secs = time.time() - t0
     log.write_text(out)
