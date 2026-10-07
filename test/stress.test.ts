@@ -1219,8 +1219,10 @@ describe("fingerprint stress", () => {
     try {
       writeFileSync(join(dir, "a.ts"), "hello");
       const fp1 = fingerprint(dir);
-      // Wait a bit to ensure mtime changes
-      writeFileSync(join(dir, "a.ts"), "HELLO");
+      // Fingerprint keys on path:bytes:mtimeMs. Same-length rewrites on a
+      // coarse clock (Linux tmpfs in the same millisecond) keep mtimeMs and
+      // size identical, so change the length too — that is still a modification.
+      writeFileSync(join(dir, "a.ts"), "HELLO!");
       const fp2 = fingerprint(dir);
       assert.notEqual(fp1, fp2);
     } finally {
