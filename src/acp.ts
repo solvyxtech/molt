@@ -110,17 +110,16 @@ export type AcpAgentSpec = {
   /** Where the CLI keeps the credential, so health can say "logged out". */
   readonly credentialPath: string;
   /**
-   * How this agent can be handed molt's tool server.
+   * How this agent can be handed Maat's tool server.
    *
    * Grok says `mcpCapabilities: { http: true }` at `initialize` and takes a
-   * URL. The `"stdio"` variant existed for Gemini CLI (via mcp-bridge); with
-   * that backend removed, only `"http"` is used.
+   * URL. Only HTTP is supported.
    */
-  readonly mcpTransport: "http" | "stdio";
+  readonly mcpTransport: "http";
   /**
-   * Per-agent `session/new` `_meta`, which is where both of these vendors put
-   * the things ACP itself has no field for. Returns {} for an agent with no
-   * extensions rather than being optional, so the call site has no branch.
+   * Per-agent `session/new` `_meta`, which is where vendors put the things
+   * ACP itself has no field for. Returns {} for an agent with no extensions
+   * rather than being optional, so the call site has no branch.
    */
   readonly sessionMeta: (o: { systemPrompt: string }) => Record<string, unknown>;
 };
@@ -220,13 +219,13 @@ export type AcpHealth = {
 /**
  * Can this machine run the agent, and as whom.
  *
- * Both halves separately, for the reason `claudeCodeHealth` already learned:
- * "not installed" and "installed but logged out" have different fixes, and
- * folding them into one boolean sends people to the wrong one.
+ * Both halves separately: "not installed" and "installed but logged out" have
+ * different fixes, and folding them into one boolean sends people to the wrong
+ * one.
  *
  * Authentication is probed by asking the agent to open a session and watching
  * it refuse. That is a real answer rather than a guess about a credential file
- * format that is not molt's to parse — and unlike reading the file, it stays
+ * format that is not Maat's to parse — and unlike reading the file, it stays
  * true when the token is present but expired, which is exactly the state a
  * lapsed subscription leaves behind.
  */
@@ -246,10 +245,9 @@ export async function acpHealth(
     /**
      * The first thing that looks like a version, not the first word.
      *
-     * `claude --version` prints "2.1.263 (Claude Code)" and taking field zero
-     * works; `grok --version` prints "grok 1.0.13 (5e9a58…) [stable]" and the
-     * same rule reported the version as "grok", which reached the endpoint
-     * picker as "grok grok · signed in".
+     * `grok --version` prints "grok 1.0.13 (5e9a58…) [stable]" — taking field
+     * zero reported the version as "grok", which reached the endpoint picker
+     * as "grok grok · signed in". A digit-looking token is the real answer.
      */
     version =
       /\b(\d+\.\d+(?:\.\d+)?)\b/u.exec(stdout)?.[1] ?? stdout.trim().split(/\s+/u)[0];
@@ -644,10 +642,9 @@ export class Channel<T> {
 }
 
 /**
- * Hand molt's tool server to an ACP agent.
+ * Hand Maat's tool server to an ACP agent.
  *
- * Grok Build takes HTTP MCP. The former stdio bridge (`mcp-bridge`) existed
- * for Gemini CLI and is gone with that backend.
+ * Grok Build takes HTTP MCP; that is the only transport Maat uses.
  */
 export function mcpEntry(
   _spec: AcpAgentSpec,
@@ -887,9 +884,9 @@ export class AcpSession<H> {
       const called = String((u as { toolName?: string }).toolName ?? name);
       this.toolCallNames.set(id, called);
       if (McpToolServer.isMoltTool(called)) {
-        // The transcript records the call molt is about to run, exactly as the
-        // Claude Code path does — the handler itself reports from inside
-        // `runTool` a moment later, over the MCP connection.
+        // The transcript records the call Maat is about to run — the handler
+        // itself reports from inside `runTool` a moment later, over the MCP
+        // connection.
         this.events.push({
           kind: "assistant",
           text: "",
@@ -1102,11 +1099,10 @@ export type AcpAskOptions = {
 /**
  * The pre-turn calls — `interviewTurn` and `draftCriteria` — on this backend.
  *
- * Both were written against `/chat/completions` and both are dead ends here,
- * for the same reason they were on Claude Code: `grok-build://subscription` is
- * a name for "the subscription is doing the work" and not a URL. There is
- * still no endpoint; there is a subprocess, and that is enough to ask a
- * question.
+ * Both were written against `/chat/completions` and both are dead ends here:
+ * `grok-build://subscription` is a name for "the subscription is doing the
+ * work" and not a URL. There is still no endpoint; there is a subprocess, and
+ * that is enough to ask a question.
  *
  * Deliberately not `AcpSession`: no MCP server at all, so the model answering
  * cannot read a file, cannot write one, and cannot touch the ledger the bar

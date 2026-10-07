@@ -509,10 +509,9 @@ describe("health", () => {
  * `grok-build://subscription` is a name for "the subscription is doing the
  * work", not a URL, and `fetch` refuses the scheme with the six words
  * "TypeError: fetch failed" — a sentence that names neither the cause nor the
- * layer, and that a reader cannot tell from a dead local server. Claude Code
- * shipped that bug three times over before `claude-code-http-leak.test.ts`
- * pinned it; this is the same invariant for the same reason, written at the
- * same time as the backend rather than after the third report.
+ * layer, and that a reader cannot tell from a dead local server. This
+ * invariant is written at the same time as the backend rather than after the
+ * third report.
  */
 describe("nothing on an ACP endpoint reaches for HTTP", () => {
   /** A fetch that fails the test rather than the request. */

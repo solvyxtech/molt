@@ -78,7 +78,7 @@ async function start() {
     installHint: "",
     loginHint: "",
     credentialPath: "",
-    mcpTransport: "stdio",
+    mcpTransport: "http",
     sessionMeta: () => ({}),
   } as AcpAgentSpec;
 

@@ -303,10 +303,10 @@ export function anthropicPricing(model: string): Pricing | null {
  * endpoint that bills per token.
  *
  * One answer for both surfaces. The window asked this before looking up a
- * price and said "your Claude plan is paying for this"; the terminal did
- * not, and on `/model opus` told a Max subscriber that "subscription
- * publishes no price for opus — /price <in> <out> to set one": a missing
- * rate, and advice to invent one, for a run that costs no money at all.
+ * price and said the plan is paying for this; the terminal did not, and on
+ * `/model` for a subscription run told the user that "subscription publishes
+ * no price — /price <in> <out> to set one": a missing rate, and advice to
+ * invent one, for a run that costs no money at all.
  */
 export function planFor(baseUrl: string): string | undefined {
   return acpAgentFor(baseUrl)?.label;

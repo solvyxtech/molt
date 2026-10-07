@@ -3247,7 +3247,7 @@ export class Engine {
      * This backend has no endpoint to post to.
      *
      * `salvage` was the last path still speaking HTTP on it. The base URL is
-     * `claude-code://subscription`, which `fetch` refuses outright, so every
+     * `grok-build://subscription`, which `fetch` refuses outright, so every
      * ceiling in this loop — the deadline, the budget, the spending ceiling,
      * the step limit, a provider that gave up — ended with the safety net
      * throwing into the journal and nothing at all reaching the reader. The
@@ -5531,12 +5531,12 @@ export class Engine {
             /**
              * An endpoint that is not an address is not a network problem.
              *
-             * `fetch` reports both as a TypeError, so molt retried
-             * `--url claude-code` — the shorthand, typed at a build too old to
-             * expand it — four times over seven seconds and then called it a
-             * network failure. Nothing was down. Asked before the generic case,
-             * because this policy's own rule is that what cannot improve on a
-             * second attempt is not retried.
+             * `fetch` reports both as a TypeError, so Maat retried
+             * `--url grok` — the shorthand, typed at a build too old to expand
+             * it — four times over seven seconds and then called it a network
+             * failure. Nothing was down. Asked before the generic case, because
+             * this policy's own rule is that what cannot improve on a second
+             * attempt is not retried.
              */
             const badEndpoint = endpointProblem(this.cfg.baseUrl);
             failure = badEndpoint

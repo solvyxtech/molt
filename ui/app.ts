@@ -2010,10 +2010,10 @@ $("set-savekey").addEventListener("click", async () => {
 /**
  * What the endpoint box means, as an address rather than as typed text.
  *
- * `--url claude-code` has worked at the flag since the shorthand was written;
+ * `--url grok-build` has worked at the flag since the shorthand was written;
  * the window never got it, because the flag parser was the only place that
- * translated the word into `claude-code://subscription` — everywhere else
- * that read a base URL treated `'claude-code'` as a literal address and sent
+ * translated the word into `grok-build://subscription` — everywhere else
+ * that read a base URL treated `'grok-build'` as a literal address and sent
  * it to `fetch`, which is the same "not a network problem" mistake
  * `endpointProblem` exists to catch, just upstream of where it could catch it.
  * `expandEndpointShorthand` now lives beside `endpointProblem` in
@@ -2352,12 +2352,9 @@ async function usePlan(
      *
      * `usePlan` used to report the failure and return, leaving `set-url`
      * exactly as it was — and what it was is often a different vendor. Press
-     * "Use my Google plan", have it fail, press "Open workspace", and molt
-     * opens whatever was in the field: reported as "in settings when using
-     * use my google plan it links to google cli", which is precisely what the
-     * screen said, because the box still held `gemini-cli://subscription`
-     * from before and nothing had told the person the button had not changed
-     * it.
+     * a plan button, have it fail, press "Open workspace", and Maat opens
+     * whatever was already in the field — so the screen implied a switch that
+     * did not happen.
      *
      * So the failure says which endpoint is actually selected. It does not
      * clear the field — silently emptying a box someone filled is its own

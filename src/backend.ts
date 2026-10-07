@@ -1,10 +1,8 @@
 /**
  * Shared shapes for subprocess backends (ACP agents such as Grok Build).
  *
- * These used to live in `claude-code.ts` because Claude Code was the first
- * non-HTTP backend. That backend is gone; the types stay here so ACP sessions
- * and the engine can share one event/session contract without importing a
- * deleted subscription path.
+ * Extracted so ACP sessions and the engine can share one event/session
+ * contract without each defining its own.
  */
 
 /** An OpenAI-shaped tool definition, which is what molt holds internally. */
