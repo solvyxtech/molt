@@ -60,6 +60,13 @@ url=${url//127.0.0.1/host.docker.internal}; url=${url//localhost/host.docker.int
 # run ends: on the command line (-e KEY=...) it showed in every `ps` listing.
 envf=$(mktemp); chmod 600 "$envf"; trap 'rm -f "$envf"' EXIT
 printf 'OPENROUTER_API_KEY=%s\n' "$key" > "$envf"
+# Anthropic API lanes (BENCH_URL=https://api.anthropic.com/v1): the key comes from the
+# Keychain item maat-bench-anthropic (paste it with container/set-anthropic-key.sh),
+# never from the command line.
+if [[ "$url" == *api.anthropic.com* ]]; then
+  akey=$(security find-generic-password -s maat-bench-anthropic -w 2>/dev/null) || { echo "no Keychain item maat-bench-anthropic: run bench/local/container/set-anthropic-key.sh" >&2; exit 1; }
+  printf 'ANTHROPIC_API_KEY=%s\n' "$akey" >> "$envf"
+fi
 # The graders and reference solutions are mounted where only root can reach (/root is 700),
 # copied to a root-only /opt/bench, and run.py runs from there as root; it runs the agent
 # as the unprivileged `agent` user (BENCH_AGENT_USER) and grades as root afterwards.

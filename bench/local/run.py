@@ -173,7 +173,9 @@ def claim_of(ev: dict) -> str | None:
 
 
 def run_molt(d: Path, prompt: str, log: Path) -> dict:
-    key = openrouter_key() if "openrouter.ai" in URL else "local"
+    key = (openrouter_key() if "openrouter.ai" in URL
+           else os.environ.get("ANTHROPIC_API_KEY", "") if "api.anthropic.com" in URL
+           else "local")
     env = os.environ | {"MOLT_API_KEY": key, "MOLT_JUDGMENT": "0"}  # nobody rules on a benchmark run
     cmd = [
         "node", str(MOLT), "run", "--url", URL, "--model", os.environ.get("BENCH_MODEL") or MODEL,
