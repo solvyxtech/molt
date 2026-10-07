@@ -1668,7 +1668,7 @@ export class Engine {
   private tokenScale = 1;
 
   /**
-   * The live Claude Code session, when that is the backend.
+   * The live ACP session (Grok Build), when that is the backend.
    *
    * One per molt session rather than per turn: the second message into a
    * streaming session read 2,200 tokens out of cache where the first wrote
@@ -1689,7 +1689,7 @@ export class Engine {
   /** The system prompt the live session was started with. */
   private ccSystem = "";
   /**
-   * User messages Claude Code has already been given.
+   * User messages the ACP agent has already been given.
    *
    * By identity, not by index. A cancelled turn rolls the transcript back and
    * a shed renumbers it; an object either was forwarded or was not.
@@ -2115,17 +2115,17 @@ export class Engine {
     this.inFlight?.abort();
     this.running?.abort();
     /**
-     * The Claude Code subprocess has to be told too.
+     * The ACP agent subprocess has to be told too.
      *
      * Nothing else reaches it: `inFlight` guards a fetch this backend never
-     * makes, and stopping molt's reader would leave a `claude` process
-     * working through the rest of the turn on the plan's quota with nobody
-     * watching. Ending the session is the only way to unask the question, so
-     * the next turn starts a new one.
+     * makes, and stopping molt's reader would leave the agent process
+     * working through the rest of the turn with nobody watching. Ending the
+     * session is the only way to unask the question, so the next turn starts
+     * a new one.
      */
     if (this.cc) {
       this.ccCancelled = true;
-      void this.dropClaudeCode();
+      void this.dropAcpSession();
     }
   }
 
@@ -3402,10 +3402,10 @@ export class Engine {
     }
 
     /**
-     * Everything molt has said that Claude Code has not been told yet.
+     * Everything molt has said that the ACP agent has not been told yet.
      *
      * The salvage prompt, and whatever a ceiling pushed just before it. Same
-     * rule `claudeCodeStep` uses, so the two conversations do not drift apart
+     * rule the ACP step uses, so the two conversations do not drift apart
      * on the last message of the turn.
      */
     const pending = this.transcript
@@ -4054,7 +4054,7 @@ export class Engine {
     }
 
     /**
-     * Everything molt has said that Claude Code has not been told yet.
+     * Everything molt has said that the ACP agent has not been told yet.
      *
      * The ask, the sealed criteria, an empty-turn nudge, a refused bar — molt
      * writes all of them to the transcript as user messages, so forwarding
@@ -4161,7 +4161,7 @@ export class Engine {
     }
     if (!done) {
       yield { kind: "error", text: `the ${this.backendLabel} session ended without answering` };
-      await this.dropClaudeCode();
+      await this.dropAcpSession();
       return null;
     }
     if (done.error) {
@@ -4174,7 +4174,7 @@ export class Engine {
       };
       // The session cannot be trusted to continue after it has failed, and a
       // new one costs a cached prefix rather than the turn.
-      await this.dropClaudeCode();
+      await this.dropAcpSession();
       return null;
     }
 
@@ -4188,8 +4188,8 @@ export class Engine {
     /**
      * Only when the backend actually reported one.
      *
-     * Claude Code's SDK reports what the same turn would have cost on the API,
-     * which is worth recording. ACP reports nothing, and a note reading
+     * Some subscription SDKs report what the same turn would have cost on the
+     * API, which is worth recording. ACP reports nothing, and a note reading
      * "0.0000 USD would have been billed" is not a cheap turn — it is a
      * missing number wearing a measurement's clothes.
      */
@@ -4226,8 +4226,8 @@ export class Engine {
     };
   }
 
-  /** End the Claude Code session, so the next turn starts a fresh one. */
-  private async dropClaudeCode(): Promise<void> {
+  /** End the ACP session, so the next turn starts a fresh one. */
+  private async dropAcpSession(): Promise<void> {
     const cc = this.cc;
     this.cc = undefined;
     this.subscriptionCostSeen = 0;
@@ -4238,12 +4238,12 @@ export class Engine {
   /**
    * One tool call, from the decision to allow it through to the record of it.
    *
-   * Lifted out of the step loop when a second backend arrived. Claude Code
-   * runs molt's tools through an MCP server rather than through the loop, so
-   * without this the gate, the ledger, the read-coverage map, the repeat
-   * pointer and three journal entries would exist twice — and this repo has
-   * shipped the same bug on two surfaces six times over. There is one copy,
-   * and both backends call it.
+   * Lifted out of the step loop when a second backend arrived. The ACP
+   * agent runs molt's tools through an MCP server rather than through the
+   * loop, so without this the gate, the ledger, the read-coverage map, the
+   * repeat pointer and three journal entries would exist twice — and this
+   * repo has shipped the same bug on two surfaces six times over. There is
+   * one copy, and both backends call it.
    *
    * A generator because everything in here reports: the caller drains the
    * events to its own consumer and reads the outcome off the return.
@@ -4288,7 +4288,7 @@ export class Engine {
     // Past the turn's wall clock, nothing more runs. The step loop reads the
     // clock between steps, which on the HTTP path is between tool batches —
     // but a subscription backend runs a whole agentic step, every call in it,
-    // inside one of molt's steps, so `--for 5m` on Claude Code bounded
+    // inside one of molt's steps, so `--for 5m` on an ACP agent bounded
     // nothing: the step could go on calling tools for as long as it liked.
     // Every call comes through here, whichever backend made it, so this is
     // where the clock is honoured; the model is told, and the step loop
@@ -4899,7 +4899,7 @@ export class Engine {
          * Advice in the unit that is actually binding.
          *
          * It said `/budget $5` unconditionally. Where no price is known —
-         * every Claude Code run, since a subscription turn has no dollar
+         * every subscription ACP run, since a subscription turn has no dollar
          * figure at all — the money ceiling is not what stopped anything, so
          * that command would change a number nothing reads and the turn would
          * hit the same wall. A bare number sets the token ceiling; `$` sets
@@ -4966,7 +4966,7 @@ export class Engine {
       /**
        * Context management, for the backend that has any.
        *
-       * Claude Code holds its own conversation and compacts it its own way;
+       * An ACP agent holds its own conversation and compacts it its own way;
        * molt's transcript is a record of what was said, not the thing being
        * sent. Eliding and shedding it there would buy nothing, and shedding
        * would archive into exuviae a context that was never in flight —
@@ -5028,7 +5028,7 @@ export class Engine {
       let streamedContent = false;
 
       if (this.subprocess) {
-        // Claude Code runs the model, the tool calls and its own context. What
+        // The ACP agent runs the model, the tool calls and its own context. What
         // comes back is the same three things the HTTP path produces — a final
         // message, what it cost in tokens, and why it stopped — so everything
         // below this branch is shared.
