@@ -11,8 +11,8 @@
  * skip elsewhere. The default-unchanged tests run everywhere.
  */
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
@@ -22,7 +22,9 @@ import { Receipts } from "../src/receipts.js";
 import { Integrity } from "../src/integrity.js";
 import { runCommand } from "../src/run.js";
 import { stateDir } from "../src/statedir.js";
-import { disablePrivSep, enablePrivSep, privSep, type PrivSep } from "../src/privsep.js";
+import { disablePrivSep, enablePrivSep, privSep, safeRel, type PrivSep } from "../src/privsep.js";
+import { listBackground, resetBackgroundRegistry, startBackground, type BackgroundProcess } from "../src/background.js";
+import { ACP_AGENTS } from "../src/acp.js";
 import type { Check, EngineEvent } from "../src/types.js";
 import { fileURLToPath } from "node:url";
 import { allowAll, scriptedProvider, workspace } from "./helpers.js";
@@ -57,6 +59,46 @@ function project(uid: number): string {
   return dir;
 }
 
+/** A root-owned folder of root-owned files, outside every project: what an attack aims at. */
+function victim(files = 20): string {
+  mkdirSync("/var/tmp", { recursive: true });
+  const v = mkdtempSync("/var/tmp/maat-victim-");
+  chmodSync(v, 0o755);
+  for (let i = 0; i < files; i++) writeFileSync(join(v, `f${i}`), "precious\n", { mode: 0o644 });
+  return v;
+}
+
+/** Every entry under `dir` (and `dir` itself) still root's, with the original content. */
+function assertUntouched(v: string): void {
+  assert.equal(statSync(v).uid, 0, `${v} was chowned`);
+  for (const n of readdirSync(v)) {
+    const st = lstatSync(join(v, n));
+    assert.equal(st.uid, 0, `${join(v, n)} was chowned to ${st.uid}`);
+    if (st.isFile()) assert.equal(readFileSync(join(v, n), "utf8"), "precious\n", `${join(v, n)} was written`);
+  }
+}
+
+/** Every path under `root` that is a symlink. */
+function symlinksUnder(root: string): string[] {
+  const out: string[] = [];
+  const walk = (d: string): void => {
+    for (const n of readdirSync(d)) {
+      const p = join(d, n);
+      const st = lstatSync(p);
+      if (st.isSymbolicLink()) out.push(p);
+      else if (st.isDirectory()) walk(p);
+    }
+  };
+  walk(root);
+  return out;
+}
+
+async function waitExit(p: BackgroundProcess, ms = 10_000): Promise<void> {
+  const t0 = Date.now();
+  while (!p.exit && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 50));
+  assert.ok(p.exit, `job ${p.id} did not exit`);
+}
+
 function toolResults(provider: ReturnType<typeof scriptedProvider>): string[] {
   const last = provider.requests().at(-1) as { messages: { role: string; content: string | null }[] } | undefined;
   return (last?.messages ?? []).filter((m) => m.role === "tool").map((m) => String(m.content ?? ""));
@@ -67,6 +109,15 @@ describe("privilege separation (Linux, root)", { skip: linuxRoot ? false : "need
   let dir = "";
   let ps: PrivSep;
   const savedState = process.env.MAAT_STATE_DIR;
+  const roots: string[] = [];
+  /** Privilege separation on for the main project (a test before may have turned it off). */
+  const active = (): PrivSep => {
+    if (privSep() !== ps || !privSep()) {
+      ps = enablePrivSep({ user: WORKER, project: dir, helper: HELPER });
+      roots.push(ps.stateRoot);
+    }
+    return ps;
+  };
 
   before(() => {
     uid = ensureWorker();
@@ -82,7 +133,7 @@ describe("privilege separation (Linux, root)", { skip: linuxRoot ? false : "need
 
   after(() => {
     disablePrivSep();
-    rmSync(ps.stateRoot, { recursive: true, force: true });
+    for (const r of [ps.stateRoot, ...roots]) rmSync(r, { recursive: true, force: true });
     rmSync(join(homedir(), ".grok", "judge-session.json"), { force: true });
     if (savedState !== undefined) process.env.MAAT_STATE_DIR = savedState;
     rmSync(dir, { recursive: true, force: true });
@@ -193,6 +244,182 @@ describe("privilege separation (Linux, root)", { skip: linuxRoot ? false : "need
       rmSync(ps2.stateRoot, { recursive: true, force: true });
     }
   });
+
+  it("a symlinked .maat/bg/<id>.log does not make root write the target", async () => {
+    const v = victim(1);
+    const target = join(v, "f0");
+    const v2 = victim(0);
+    active();
+    resetBackgroundRegistry();
+    try {
+      // The worker plants the next job's log as a link to a root-owned file.
+      const bg = join(dir, ".maat", "bg");
+      const r = asWorker(`mkdir -p '${bg}' && ln -sf '${target}' '${bg}/1.log' && echo ok`);
+      assert.equal(r.status, 0, r.out);
+      const j1 = startBackground("echo pwned", { cwd: dir, asWorker: true });
+      await waitExit(j1);
+      assert.equal(readFileSync(target, "utf8"), "precious\n", "root truncated or wrote the link's target");
+      assert.equal(statSync(target).uid, 0);
+      assert.notEqual(j1.exit?.code, 0, "the worker's own shell should have been refused the root-owned target");
+
+      // A normal job: its log is made by the worker and holds the output.
+      const j2 = startBackground("echo hello-bg", { cwd: dir, asWorker: true });
+      await waitExit(j2);
+      assert.equal(readFileSync(join(dir, j2.log), "utf8"), "hello-bg\n");
+      assert.equal(statSync(join(dir, j2.log)).uid, uid, "the log is not the worker's");
+
+      // The whole bg folder swapped for a link into a root-owned folder.
+      rmSync(bg, { recursive: true, force: true });
+      assert.equal(asWorker(`ln -s '${v2}' '${bg}' && echo ok`).status, 0);
+      const j3 = startBackground("echo pwned", { cwd: dir, asWorker: true });
+      await waitExit(j3);
+      assert.deepEqual(readdirSync(v2), [], "a log was created inside the root-owned folder");
+      assert.ok(listBackground().length >= 3);
+    } finally {
+      resetBackgroundRegistry();
+      rmSync(join(dir, ".maat", "bg"), { recursive: true, force: true });
+      rmSync(v, { recursive: true, force: true });
+      rmSync(v2, { recursive: true, force: true });
+    }
+  });
+
+  it("handBack: a folder swapped for a symlink mid-walk never gets root to chown outside", async () => {
+    const v = victim(40);
+    active();
+    const swap = join(dir, "swap");
+    mkdirSync(swap);
+    for (let i = 0; i < 40; i++) writeFileSync(join(swap, `g${i}`), "x\n");
+    chownSync(swap, uid, uid);
+    // Root-made files inside, so the walk has something to hand back each time.
+    const refill = () => {
+      for (let i = 0; i < 40; i++) {
+        try {
+          chownSync(join(swap, `g${i}`), 0, 0);
+        } catch {
+          /* swapped out right now */
+        }
+      }
+    };
+    // The worker flips `swap` between its real folder and a link to the victim, as fast as it can.
+    assert.equal(asWorker(`ln -s '${v}' '${join(dir, "lnk")}' && echo ok`).status, 0);
+    const stop = join("/tmp", `maat-flip-stop-${process.pid}`);
+    rmSync(stop, { force: true });
+    const flipper = spawn(
+      "runuser",
+      [
+        "-u",
+        WORKER,
+        "--",
+        process.execPath,
+        "-e",
+        `const fs=require("fs");process.chdir(${JSON.stringify(dir)});const end=Date.now()+15000;let i=0;` +
+          `while(Date.now()<end&&!(++i%64===0&&fs.existsSync(${JSON.stringify(stop)}))){try{fs.renameSync("swap","real");fs.renameSync("lnk","swap");fs.renameSync("swap","lnk");fs.renameSync("real","swap");}catch{}}`,
+      ],
+      { stdio: "ignore" },
+    );
+    const flipped = new Promise((r) => flipper.once("exit", r));
+    const stopFlipper = async () => {
+      writeFileSync(stop, "");
+      await flipped;
+    };
+    try {
+      // A static link as well, the case without any race.
+      assert.equal(asWorker(`ln -sfn '${v}' '${join(dir, "static-link")}' && echo ok`).status, 0);
+      const t0 = Date.now();
+      let runs = 0;
+      while (Date.now() - t0 < 4_000) {
+        refill();
+        ps.handBack(dir);
+        runs += 1;
+        await new Promise((r) => setImmediate(r));
+      }
+      assert.ok(runs > 10, `only ${runs} hand-backs ran`);
+      assertUntouched(v);
+      // The state dir is Maat's and stays so.
+      assert.equal(statSync(ps.stateRoot).uid, 0);
+      // And hand-back still does its job on the real tree.
+      await stopFlipper();
+      const real = existsSync(join(dir, "real")) ? join(dir, "real") : swap;
+      writeFileSync(join(real, "made-by-root.txt"), "x\n");
+      ps.handBack(dir);
+      assert.equal(statSync(join(real, "made-by-root.txt")).uid, uid, "hand-back did not give back a root-made file");
+    } finally {
+      await stopFlipper();
+      rmSync(stop, { force: true });
+      for (const n of ["swap", "real", "lnk", "static-link"]) rmSync(join(dir, n), { recursive: true, force: true });
+      rmSync(v, { recursive: true, force: true });
+    }
+  });
+
+  it("handBack leaves a hard link to a root-owned file alone", () => {
+    // Root-made, with a second link elsewhere in the tree: nlink 2 is refused.
+    active();
+    const a = join(dir, "hl-a.txt");
+    writeFileSync(a, "x\n");
+    execFileSync("ln", [a, join(dir, "hl-b.txt")]);
+    try {
+      ps.handBack(dir);
+      assert.equal(statSync(a).uid, 0, "a multiply-linked root file was chowned");
+    } finally {
+      rmSync(a, { force: true });
+      rmSync(join(dir, "hl-b.txt"), { force: true });
+    }
+  });
+
+  it("seed refuses symlinks: nothing from the project becomes a link in the state dir", () => {
+    const ws = project(uid);
+    const v = victim(1);
+    const secret = "/root/maat-seed-secret.txt";
+    writeFileSync(secret, "root-only-secret-81\n", { mode: 0o600 });
+    // The worker leaves links where Maat's records go, and one real record.
+    const r = asWorker(
+      `mkdir -p '${ws}/.maat/integrity' '${ws}/.maat/mission' && echo kept > '${ws}/.maat/integrity/chain' && ` +
+        `ln -s '${v}' '${ws}/.maat/receipts' && ln -s '${secret}' '${ws}/.maat/secret.txt' && ` +
+        `ln -s '${v}' '${ws}/.maat/integrity/sub' && ln -s '${secret}' '${ws}/.maat/mission/contract.yml' && echo ok`,
+    );
+    assert.equal(r.status, 0, r.out);
+    disablePrivSep();
+    const ps2 = enablePrivSep({ user: WORKER, project: ws, helper: HELPER });
+    try {
+      assert.deepEqual(symlinksUnder(ps2.stateRoot), [], "a symlink was carried into the state dir");
+      assert.equal(readFileSync(join(ps2.stateRoot, "integrity", "chain"), "utf8"), "kept\n", "a real record was not seeded");
+      assert.ok(!existsSync(join(ps2.stateRoot, "secret.txt")), "a link to a root file was read into the state dir");
+      for (const s of ["receipts", "secret.txt", "integrity/sub", "mission/contract.yml"]) {
+        assert.ok(ps2.skippedOnSeed.includes(s), `${s} was not reported as skipped: ${ps2.skippedOnSeed.join(", ")}`);
+      }
+      // Maat now writes its receipts into its own folder, not through the link.
+      mkdirSync(stateDir(ws, "receipts"), { recursive: true });
+      writeFileSync(stateDir(ws, "receipts", "0001.md"), "receipt\n");
+      assert.ok(stateDir(ws, "receipts").startsWith(ps2.stateRoot));
+      assertUntouched(v);
+
+      // Publishing goes back as the worker: the link at .maat/receipts gets the
+      // worker's write, which the root-owned target refuses. Nothing of root's is
+      // written, and the secret never reaches the project.
+      assert.throws(() => ps2.publish(), /could not be written/);
+      assertUntouched(v);
+      assert.equal(readFileSync(secret, "utf8"), "root-only-secret-81\n");
+      assert.notEqual(asWorker(`grep -r root-only-secret-81 '${ws}'`).status, 0, "the root-only secret reached the project");
+    } finally {
+      disablePrivSep();
+      rmSync(ws, { recursive: true, force: true });
+      rmSync(ps2.stateRoot, { recursive: true, force: true });
+      rmSync(v, { recursive: true, force: true });
+      rmSync(secret, { force: true });
+    }
+  });
+
+  it("passes the worker agent's own credential through, and only that", () => {
+    const base = { OPENCODE_API_KEY: "zen-key", OPENAI_API_KEY: "other", GITHUB_TOKEN: "gh", PATH: "/usr/bin" };
+    active();
+    const oc = ACP_AGENTS.find((a) => a.name === "opencode")!;
+    const spec = ps.execSpec("opencode", ["acp"], dir, base, oc.workerCredentialEnv);
+    assert.equal(spec.env.OPENCODE_API_KEY, "zen-key");
+    assert.equal(spec.env.OPENAI_API_KEY, undefined);
+    assert.equal(spec.env.GITHUB_TOKEN, undefined);
+    // A plain worker command never gets it.
+    assert.equal(ps.commandSpec("env", true, dir, base).env.OPENCODE_API_KEY, undefined);
+  });
 });
 
 describe("privilege separation off (the default)", () => {
@@ -221,6 +448,17 @@ describe("privilege separation off (the default)", () => {
     } finally {
       ws.cleanup();
     }
+  });
+
+  it("accepts only plain relative paths back from the file helper", () => {
+    assert.equal(safeRel("receipts/0001.md"), join("receipts", "0001.md"));
+    for (const bad of ["", "/etc/passwd", "../x", "a/../../x", "a//b", "./a", "a/\0b"]) assert.equal(safeRel(bad), null, bad);
+  });
+
+  it("names the OpenCode worker's own credential, and no agent names another's", () => {
+    const oc = ACP_AGENTS.find((a) => a.name === "opencode");
+    assert.deepEqual(oc?.workerCredentialEnv, ["OPENCODE_API_KEY"]);
+    for (const a of ACP_AGENTS) for (const k of a.workerCredentialEnv ?? []) assert.match(k, new RegExp(`^${a.name}_`, "i"));
   });
 
   it("refuses a worker user that cannot be switched to", () => {

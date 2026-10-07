@@ -3,7 +3,8 @@ name: check
 on:
   push:
     branches: [main]
-  # Stacked work is reviewed as PRs into claude/* branches, not only main.
+  # Stacked PRs target claude/* branches, not main; both get the checks
+  # (privsep-linux included).
   pull_request:
     branches: [main, "claude/**"]
 

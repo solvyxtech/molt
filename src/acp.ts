@@ -131,6 +131,15 @@ export type AcpAgentSpec = {
   /** Where the CLI keeps the credential, so health can say "logged out". */
   readonly credentialPath: string;
   /**
+   * Environment variables that carry this agent's own login. Under privilege
+   * separation (src/privsep.ts) the worker's environment loses every
+   * credential-looking name; these, and only for this agent's process when it
+   * is the worker, pass through. Anything else (another provider's key, a
+   * token the worker's shell commands would see) stays out. An agent without
+   * one must find its login in the worker user's HOME.
+   */
+  readonly workerCredentialEnv?: readonly string[];
+  /**
    * How this agent can be handed Maat's tool server.
    *
    * Grok says `mcpCapabilities: { http: true }` at `initialize` and takes a
@@ -253,6 +262,8 @@ export const ACP_AGENTS: readonly AcpAgentSpec[] = [
     installHint: "npm install -g opencode-ai",
     loginHint: "opencode auth login",
     credentialPath: ".local/share/opencode/auth.json",
+    // The Zen account's key, when it arrives through the environment rather than auth.json.
+    workerCredentialEnv: ["OPENCODE_API_KEY"],
     mcpTransport: "http",
     sessionMeta: () => ({}),
   },
@@ -539,7 +550,7 @@ export class AcpConnection {
     // its own reads (Grok auto-approves read_file, grep, list_dir) never
     // reach Maat, so only the uid can bound them.
     const ps = this.opts.asWorker ? privSep() : undefined;
-    const spec = ps?.execSpec(this.spec.bin, this.spec.args, cwd, env);
+    const spec = ps?.execSpec(this.spec.bin, this.spec.args, cwd, env, this.spec.workerCredentialEnv);
     const child = spawnFn(spec?.file ?? this.spec.bin, spec?.args ?? [...this.spec.args], {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],

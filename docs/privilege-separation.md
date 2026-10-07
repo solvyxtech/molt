@@ -42,7 +42,12 @@ bound those. As root, Maat spawns them with the worker's uid and gid and no
 supplementary groups. With sudo, it uses `sudo -n -u <name> env -i ...`. The
 environment is scrubbed: every variable whose name looks like a credential is
 removed, along with Maat's own `MAAT_*` and `MOLT_*` settings. HOME, USER and
-LOGNAME are set to the worker's, and TMPDIR is `/tmp`.
+LOGNAME are set to the worker's, and TMPDIR is `/tmp`. The one exception is
+the worker agent's own login: an ACP spec names it (`workerCredentialEnv`;
+for OpenCode, `OPENCODE_API_KEY`), and that name, and no other, passes the
+scrub for that agent's process only, never for the worker's shell commands.
+Grok has none: its login must be in the worker user's HOME
+(`~/.grok/auth.json`), as the bench sets it up.
 
 **The file tools run as the worker.** `read_file`, `write_file`, `edit_file`,
 `list_dir`, `grep` and `inspect` are carried out by a small helper process
@@ -66,10 +71,18 @@ scratch dirs, the copy-on-run trees for hidden checks (`maat-check-*`) and
 the judge's own temp files are private too. When the job starts, records
 from earlier jobs are copied out of the project's `.maat/` so the hash chains
 continue, and a mission's contract, features and state are moved out of the
-task folder.
+task folder. That copy is read, and the contract removed, by the file helper
+running as the worker (`fs-helper.js pack`); Maat gets back regular files and
+folders by name and writes them into its own state dir. Symlinks and other
+special files in the project's `.maat/` are skipped, so nothing in the state
+dir can point back into the worker's reach or out to a file of root's.
 
 These stay in the project: `.maat/done.yml`, because a person wrote it, and
-`.maat/bg/`, which holds the worker's own background-job logs.
+`.maat/bg/`, which holds the worker's own background-job logs. The worker
+makes those itself: a background job starts as the worker with a shell that
+creates the folder and opens its log, so Maat never opens a path in the
+worker's tree (a planted `.maat/bg/<id>.log` symlink only redirects the
+worker's own write).
 `.maat/mission/library/` also stays, because the worker writes it. A spilled
 output (`.maat/out/<call>.txt`) is still readable through `read_file`: Maat
 serves its own masked copy of the worker's output. The worker cannot `cat`
@@ -77,9 +90,12 @@ it from bash.
 
 **When the job ends, the records come back.** `maat run`, `maat ask` and
 `maat mission run` copy the state dir (except `tmp/`) into the project's
-`.maat/`. The copies are owned by the project's owner, so receipts are where
-people always found them and `maat verify` checks them there. The state dir
-itself is kept.
+`.maat/`, so receipts are where people always found them and `maat verify`
+checks them there. Maat reads its own state dir and the file helper, as the
+worker, writes the copies (`fs-helper.js unpack`), so they are owned by the
+worker and Maat writes nothing into the worker's tree. If a copy cannot be
+written (the worker planted a link to somewhere it cannot write), Maat says
+so and the records stay in the state dir, which is always kept.
 
 **The judge and the checks stay Maat's.** Judge and ask subprocesses
 (OpenCode, a Grok judge, an HTTP judge) run as Maat with Maat's HOME. If that
@@ -88,7 +104,14 @@ refuses to start otherwise. Hidden checks run as Maat in the copy-on-run
 tree, never as the worker. A check that ran in place (a project check, or a
 tree too large to copy) can leave files owned by Maat in the project. After
 every bar run, those are handed back to the worker, so the worker can keep
-editing its own tree. Git, running as Maat on a repository the worker owns,
+editing its own tree. The worker may be changing the tree while that runs,
+so it is never walked by path: each folder is opened relative to its parent
+with `O_NOFOLLOW|O_DIRECTORY` (`/proc/self/fd/<fd>/<name>`), ownership is
+changed with `fchown` on the open descriptor, and the project itself must be
+the folder (device and inode) the job started in. A folder swapped for a
+symlink mid-walk fails to open and is skipped; files with more than one hard
+link, symlinks, special files and other file systems are left alone. Hand-back
+is Linux-only; elsewhere root-made files stay Maat's. Git, running as Maat on a repository the worker owns,
 is told `safe.directory=*` through `GIT_CONFIG_*`. The worker's environment
 does not get that setting.
 

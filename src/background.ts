@@ -98,33 +98,40 @@ export function startBackground(
   const id = nextId++;
   const bgRel = `${stateDirName(opts.cwd)}/bg`;
   const dir = join(opts.cwd, bgRel);
-  mkdirSync(dir, { recursive: true });
   const log = `${bgRel}/${id}.log`;
-  const fd = openSync(join(opts.cwd, log), "w");
-  // Under privilege separation the job, and its log, are the worker's.
   const ps = opts.asWorker ? privSep() : undefined;
+  let child;
   if (ps) {
-    ps.giveToWorker(join(opts.cwd, stateDirName(opts.cwd)));
-    ps.giveToWorker(dir);
-    ps.giveToWorker(join(opts.cwd, log));
+    // Under privilege separation the job is the worker's, and so is its log:
+    // the worker's own shell makes the folder and opens the file. Maat (root)
+    // never creates or opens a path in the worker's tree, where a planted
+    // `.maat/bg/<id>.log -> /etc/...` would have made root truncate the
+    // target and the worker's command write into it.
+    const spec = ps.execSpec(
+      "/bin/sh",
+      ["-c", 'mkdir -p -- "$1" && exec >"$2" 2>&1 </dev/null && exec /bin/sh -c "$3"', "maat-bg", dir, join(opts.cwd, log), command],
+      opts.cwd,
+      opts.env,
+    );
+    child = spawn(spec.file, spec.args, {
+      cwd: opts.cwd,
+      env: spec.env,
+      detached: true,
+      stdio: "ignore",
+      ...(spec.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
+    });
+  } else {
+    mkdirSync(dir, { recursive: true });
+    const fd = openSync(join(opts.cwd, log), "w");
+    child = spawn(command, {
+      cwd: opts.cwd,
+      shell: true,
+      env: opts.env,
+      detached: true,
+      stdio: ["ignore", fd, fd],
+    });
+    closeSync(fd);
   }
-  const spec = ps?.commandSpec(command, true, opts.cwd, opts.env);
-  const child = spec
-    ? spawn(spec.file, spec.args, {
-        cwd: opts.cwd,
-        env: spec.env,
-        detached: true,
-        stdio: ["ignore", fd, fd],
-        ...(spec.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
-      })
-    : spawn(command, {
-        cwd: opts.cwd,
-        shell: true,
-        env: opts.env,
-        detached: true,
-        stdio: ["ignore", fd, fd],
-      });
-  closeSync(fd);
   const entry: BackgroundProcess = {
     id,
     pid: child.pid ?? -1,

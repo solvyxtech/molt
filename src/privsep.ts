@@ -39,19 +39,23 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import {
   chmodSync,
-  cpSync,
+  closeSync,
+  constants,
   existsSync,
-  lchownSync,
+  fchownSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
   realpathSync,
-  rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { GrepResult, WalkOptions, WalkResult } from "./files.js";
 import { redirectState, stateDirName } from "./statedir.js";
 
@@ -83,7 +87,23 @@ export type WorkerFs = {
 
 export class PrivSepError extends Error {}
 
-/** Environment names that hold a credential, whatever the vendor. */
+/** One entry `fs-helper.js pack` reads or `unpack` writes (src/fs-helper.ts). */
+export type PackEntry = { rel: string; kind: "dir" | "file"; mode: number; data?: string };
+
+/** A relative path from the file helper, or null if it could leave its root. */
+export function safeRel(rel: string): string | null {
+  if (typeof rel !== "string" || !rel || rel.includes("\0") || isAbsolute(rel)) return null;
+  const parts = rel.split("/");
+  if (parts.some((p) => p === "" || p === "." || p === ".." || p.includes(sep))) return null;
+  return parts.join(sep);
+}
+
+/**
+ * Environment names that hold a credential, whatever the vendor. Broad on
+ * purpose: it also drops harmless names such as AUTHOR_NAME, which costs the
+ * worker nothing it needs. A worker agent's own credential gets through only
+ * by name, from the agent's allowlist (`execSpec`'s `keep`).
+ */
 const SECRETISH = /(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|AUTH)/i;
 
 /** Look a user up by name: NSS first (getent), then /etc/passwd. */
@@ -189,6 +209,9 @@ export class PrivSep {
   readonly mode: "root" | "sudo";
   readonly pidns: boolean;
   readonly helperScript: string;
+  /** The project as it was when the job started, so a swapped folder is never walked. */
+  private readonly projectReal: string;
+  private readonly projectId: { dev: number; ino: number };
   private nsLeader?: ChildProcess;
   private nsInit?: number;
   private helper?: FsHelper;
@@ -207,6 +230,9 @@ export class PrivSep {
     }
     if (this.worker.uid === 0) throw new PrivSepError("--worker-user must not be root");
     this.project = resolve(opts.project);
+    this.projectReal = realpathSync(this.project);
+    const pst = statSync(this.projectReal);
+    this.projectId = { dev: pst.dev, ino: pst.ino };
     this.helperScript = opts.helper ?? join(dirname(realpathSync(process.argv[1] ?? ".")), "fs-helper.js");
     if (!existsSync(this.helperScript)) throw new PrivSepError(`the file helper is missing: ${this.helperScript}`);
     if (uid === 0) this.mode = "root";
@@ -279,25 +305,90 @@ export class PrivSep {
    * continue; a mission contract leaves the project entirely until the job is
    * over. The checks file, the worker's background logs and the mission
    * library (which the worker writes) stay.
+   *
+   * The project's `.maat/` is the worker's: it is read, and the contract
+   * removed, by the file helper running as the worker (`fs-helper.js pack`),
+   * never by Maat walking it. Only regular files and folders come back, by
+   * name, and Maat writes them into its own state dir: a symlink in the
+   * project (`.maat/receipts -> /root/...`) is skipped by the helper and could
+   * not be created here anyway, so Maat never writes through one later.
    */
   private seed(): void {
     const src = join(this.project, stateDirName(this.project));
-    if (!existsSync(src)) return;
-    for (const name of readdirSync(src)) {
-      if (name === "done.yml" || name === "bg") continue;
-      const from = join(src, name);
-      cpSync(from, join(this.stateRoot, name), {
-        recursive: true,
-        force: true,
-        filter: (p) => relative(src, p) !== join("mission", "library") && !relative(src, p).startsWith(join("mission", "library") + sep),
-      });
-    }
-    const mission = join(src, "mission");
-    if (existsSync(mission)) {
-      for (const name of readdirSync(mission)) {
-        if (name !== "library") rmSync(join(mission, name), { recursive: true, force: true });
+    const out = this.runHelper<{ entries: PackEntry[]; skipped: string[] }>("pack", {
+      src,
+      skip: ["done.yml", "bg", "mission/library"],
+      clear: { dir: "mission", keep: ["library"] },
+    });
+    for (const e of out.entries) {
+      const rel = safeRel(e.rel);
+      if (!rel) continue;
+      const to = join(this.stateRoot, rel);
+      if (!this.privateParent(to)) continue;
+      try {
+        if (e.kind === "dir") mkdirSync(to, { mode: 0o700 });
+        else writeFileSync(to, Buffer.from(e.data ?? "", "base64"), { mode: 0o600, flag: "w" });
+      } catch {
+        /* an entry that clashes with the state dir's own is not copied */
       }
     }
+    this.skippedOnSeed = out.skipped;
+  }
+
+  /** What `seed` refused to carry over (symlinks and other non-files), project-relative to `.maat/`. */
+  skippedOnSeed: readonly string[] = [];
+
+  /**
+   * True when every folder from the state root down to `p`'s parent exists
+   * and is a real folder (not a symlink). The state dir is Maat's and mode
+   * 700, so this holds unless something went badly wrong; it is checked
+   * anyway, because a write here is a write as Maat.
+   */
+  private privateParent(p: string): boolean {
+    const rel = relative(this.stateRoot, dirname(p));
+    if (rel.startsWith("..") || isAbsolute(rel)) return false;
+    let cur = this.stateRoot;
+    for (const part of rel ? rel.split(sep) : []) {
+      cur = join(cur, part);
+      try {
+        const st = lstatSync(cur);
+        if (!st.isDirectory() || st.uid !== this.maatUid) return false;
+      } catch {
+        return false;
+      }
+    }
+    try {
+      const st = lstatSync(p);
+      if (st.isSymbolicLink()) return false;
+    } catch {
+      /* not there yet: fine */
+    }
+    return true;
+  }
+
+  /**
+   * Run the file helper once, as the worker, with `input` on stdin and JSON
+   * on stdout (`pack`, `unpack`; see src/fs-helper.ts).
+   */
+  private runHelper<T>(mode: "pack" | "unpack", input: unknown): T {
+    const env = { ...this.workerEnv(), ELECTRON_RUN_AS_NODE: "1" };
+    const spec: SpawnSpec =
+      this.mode === "root"
+        ? { file: process.execPath, args: [this.helperScript, mode], env, uid: this.worker.uid, gid: this.worker.gid }
+        : this.execSpec(process.execPath, [this.helperScript, mode], "/", env);
+    const r = spawnSync(spec.file, spec.args, {
+      cwd: "/",
+      env: { ...spec.env, ELECTRON_RUN_AS_NODE: "1" },
+      input: JSON.stringify(input),
+      encoding: "utf8",
+      maxBuffer: 1 << 30,
+      timeout: 120_000,
+      ...(spec.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
+    });
+    if (r.status !== 0) {
+      throw new PrivSepError(`the worker file helper (${mode}) failed: ${(r.error?.message ?? r.stderr ?? "").toString().trim() || `exit ${r.status}`}`);
+    }
+    return JSON.parse(r.stdout) as T;
   }
 
   /**
@@ -355,11 +446,11 @@ export class PrivSep {
   }
 
   /** The environment a worker process gets: no credentials, no Maat internals, its own HOME and /tmp. */
-  workerEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  workerEnv(base: NodeJS.ProcessEnv = process.env, keep: readonly string[] = []): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = {};
     for (const [k, v] of Object.entries(base)) {
       if (v === undefined) continue;
-      if (SECRETISH.test(k)) continue;
+      if (SECRETISH.test(k) && !keep.includes(k)) continue;
       if (/^(MAAT|MOLT)_/.test(k) || /^GIT_CONFIG_/.test(k)) continue;
       if (k === "ELECTRON_RUN_AS_NODE" || k === "TMP" || k === "TEMP" || k === "XDG_STATE_HOME" || k === "XDG_CONFIG_HOME" || k === "XDG_DATA_HOME" || k === "XDG_CACHE_HOME" || k === "XDG_RUNTIME_DIR") continue;
       if (k === "SUDO_USER" || k === "SUDO_UID" || k === "SUDO_GID" || k === "SUDO_COMMAND" || k === "MAIL") continue;
@@ -377,9 +468,14 @@ export class PrivSep {
     return this.execSpec(shell === true ? "/bin/sh" : shell, ["-c", command], cwd, env);
   }
 
-  /** A program, run as the worker (in its PID namespace when there is one). */
-  execSpec(file: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv): SpawnSpec {
-    const wenv = this.workerEnv(env ?? process.env);
+  /**
+   * A program, run as the worker (in its PID namespace when there is one).
+   * `keep` names credential variables that pass the scrub: only the worker
+   * agent's own login (an ACP spec's `workerCredentialEnv`), never anything
+   * the worker's shell commands get.
+   */
+  execSpec(file: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv, keep: readonly string[] = []): SpawnSpec {
+    const wenv = this.workerEnv(env ?? process.env, keep);
     const { uid, gid, name } = this.worker;
     if (this.mode === "sudo") {
       const pairs = Object.entries(wenv).map(([k, v]) => `${k}=${v}`);
@@ -435,88 +531,150 @@ export class PrivSep {
    * After Maat ran something in the project as itself (a project check in
    * place, a git commit), hand what it created back to the worker, so the
    * worker can go on editing its own tree. Only entries Maat's user owns.
+   *
+   * The tree is the worker's and the worker may be changing it while this
+   * runs, so it is never walked by path. Each folder is opened relative to
+   * the one before (`/proc/self/fd/<fd>/<name>`, the openat(2) of Linux) with
+   * O_NOFOLLOW|O_DIRECTORY, files with O_NOFOLLOW, and ownership is changed
+   * on the open descriptor (fchown). A folder swapped for a symlink fails to
+   * open and is skipped; one moved out of the project is noticed (its path
+   * no longer starts with the project's) and skipped. The project itself
+   * must be the folder, by device and inode, that the job started in. Files
+   * with more than one link are left alone (a hard link to a file outside),
+   * as are symlinks and anything on another file system. Linux only: elsewhere
+   * nothing is handed back.
    */
   handBack(dir: string = this.project, limit = 100_000): void {
-    if (this.mode !== "root") return;
+    if (this.mode !== "root" || process.platform !== "linux" || !existsSync("/proc/self/fd")) return;
     const r = relative(this.project, resolve(dir));
-    if (r.startsWith("..") || resolve(dir) !== join(this.project, r)) return;
-    let seen = 0;
+    if (r.startsWith("..") || isAbsolute(r)) return;
     const { uid, gid } = this.worker;
-    const walk = (d: string): void => {
+    const DIR = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+    const FILE = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | constants.O_NOCTTY;
+    const at = (fd: number, name: string) => `/proc/self/fd/${fd}/${name}`;
+    const inside = (fd: number): boolean => {
+      try {
+        const p = readlinkSync(`/proc/self/fd/${fd}`);
+        return p === this.projectReal || p.startsWith(this.projectReal + sep);
+      } catch {
+        return false;
+      }
+    };
+    let fd: number;
+    try {
+      fd = openSync(this.projectReal, DIR);
+    } catch {
+      return;
+    }
+    try {
+      const st = fstatSync(fd);
+      if (st.dev !== this.projectId.dev || st.ino !== this.projectId.ino || !inside(fd)) return;
+      for (const part of r ? r.split(sep) : []) {
+        const next = openSync(at(fd, part), DIR);
+        closeSync(fd);
+        fd = next;
+      }
+    } catch {
+      closeSync(fd);
+      return;
+    }
+    let seen = 0;
+    const walk = (dfd: number, depth: number): void => {
+      if (!inside(dfd)) return;
+      const st = fstatSync(dfd);
+      if (st.dev !== this.projectId.dev) return;
+      if (st.uid === this.maatUid) fchownSync(dfd, uid, gid);
+      if (depth > 256) return;
       let names: string[];
       try {
-        names = readdirSync(d);
+        names = readdirSync(`/proc/self/fd/${dfd}`);
       } catch {
         return;
       }
       for (const n of names) {
         if (++seen > limit) return;
-        const p = join(d, n);
-        let st;
+        let lst;
         try {
-          st = lstatSync(p);
+          lst = lstatSync(at(dfd, n));
         } catch {
           continue;
         }
-        if (st.uid === this.maatUid) {
+        if (lst.isDirectory()) {
+          let sub: number;
           try {
-            lchownSync(p, uid, gid);
+            sub = openSync(at(dfd, n), DIR);
+          } catch {
+            continue;
+          }
+          try {
+            walk(sub, depth + 1);
+          } catch {
+            /* best effort */
+          } finally {
+            closeSync(sub);
+          }
+        } else if (lst.isFile() && lst.uid === this.maatUid) {
+          let f: number;
+          try {
+            f = openSync(at(dfd, n), FILE);
+          } catch {
+            continue;
+          }
+          try {
+            const fst = fstatSync(f);
+            if (fst.isFile() && fst.uid === this.maatUid && fst.nlink === 1 && fst.dev === this.projectId.dev) fchownSync(f, uid, gid);
           } catch {
             /* not ours to change */
+          } finally {
+            closeSync(f);
           }
         }
-        if (st.isDirectory() && !st.isSymbolicLink()) walk(p);
+        // Symlinks, FIFOs, sockets and devices are left as they are.
       }
     };
     try {
-      if (lstatSync(dir).uid === this.maatUid) lchownSync(dir, uid, gid);
-    } catch {
-      return;
-    }
-    walk(dir);
-  }
-
-  /** Make a path Maat created for the worker (a background log) the worker's. */
-  giveToWorker(path: string): void {
-    if (this.mode !== "root") return;
-    try {
-      lchownSync(path, this.worker.uid, this.worker.gid);
+      walk(fd, 0);
     } catch {
       /* best effort */
+    } finally {
+      closeSync(fd);
     }
   }
 
   /**
    * The job is over: copy Maat's records into the project's `.maat/`, where
-   * people have always found them, owned by whoever owns the project. The
-   * temp dir is not copied. Returns the folder they went to.
+   * people have always found them. The temp dir is not copied. Returns the
+   * folder they went to.
+   *
+   * Maat reads its own state dir (regular files and folders only) and the
+   * file helper, running as the worker, writes them into the project, so the
+   * copies are the worker's and Maat writes nothing in the worker's tree: a
+   * symlink planted at `.maat/receipts` sends the worker's write where the
+   * worker could write anyway.
    */
   publish(): string {
     const dest = join(this.project, stateDirName(this.project));
-    mkdirSync(dest, { recursive: true });
-    for (const name of readdirSync(this.stateRoot)) {
-      if (name === "tmp") continue;
-      cpSync(join(this.stateRoot, name), join(dest, name), { recursive: true, force: true });
-    }
-    if (this.mode === "root") {
-      let owner = { uid: this.worker.uid, gid: this.worker.gid };
-      try {
-        const st = statSync(this.project);
-        owner = { uid: st.uid, gid: st.gid };
-      } catch {
-        /* the worker's, then */
-      }
-      const chown = (p: string): void => {
-        try {
-          lchownSync(p, owner.uid, owner.gid);
-          if (lstatSync(p).isDirectory()) for (const n of readdirSync(p)) chown(join(p, n));
-        } catch {
-          /* best effort */
+    const entries: PackEntry[] = [];
+    const walk = (rel: string): void => {
+      for (const name of readdirSync(rel ? join(this.stateRoot, rel) : this.stateRoot)) {
+        if (!rel && name === "tmp") continue;
+        const r = rel ? `${rel}/${name}` : name;
+        const p = join(this.stateRoot, r);
+        const st = lstatSync(p);
+        if (st.isDirectory()) {
+          entries.push({ rel: r, kind: "dir", mode: 0o755 });
+          walk(r);
+        } else if (st.isFile()) {
+          entries.push({ rel: r, kind: "file", mode: 0o644, data: readFileSync(p).toString("base64") });
         }
-      };
-      chown(dest);
-      this.handBack(this.project);
+      }
+    };
+    walk("");
+    const out = this.runHelper<{ written: number; failed: string[] }>("unpack", { dest, entries });
+    if (out.failed.length) {
+      throw new PrivSepError(`${out.failed.length} record(s) could not be written into ${dest} (${out.failed.slice(0, 3).join(", ")}); they are still in ${this.stateRoot}`);
     }
+    this.handBack(this.project);
     return dest;
   }
 
