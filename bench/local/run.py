@@ -28,6 +28,16 @@ HERE = Path(__file__).resolve().parent
 # Outside every git repository: a task folder inside this one let agents'
 # `git commit` walk up and commit task files into molt-desktop's main.
 WORK = Path(os.environ.get("BENCH_WORK", Path.home() / ".cache/maat-bench/work"))
+# BENCH_EXPORT: where each finished task's folder and logs are copied, right after it is graded.
+# Unset: WORK itself. The task RUNS somewhere else (private_dir below), never in the export.
+#
+# 2026-10-07 (ml4b lanes): a worker spent 90-125 tool calls per task reading the other tasks'
+# folders and logs in the shared /work instead of working. /work is a host bind mount, and on
+# OrbStack and Docker Desktop a bind mount ignores chown and does not enforce modes for other
+# users, so nothing there can be locked away from the agent user. The containers therefore mount
+# the export (and the results) under /root (700, container-local, enforced), run each task in a
+# private folder under BENCH_WORK, and copy it out once it is finished and the agent is gone.
+EXPORT = Path(os.environ.get("BENCH_EXPORT") or WORK)
 # MOLT_DIST_ABS: an absolute path to the built Maat (the container mounts it at /maat).
 MOLT = (Path(os.environ["MOLT_DIST_ABS"]) if os.environ.get("MOLT_DIST_ABS") else Path.home() / os.environ.get("MOLT_DIST", "Documents/molt-desktop/dist-compare")) / "cli.js"
 LIMIT = int(os.environ.get("BENCH_LIMIT", "600"))  # seconds per task
@@ -81,6 +91,56 @@ def kill_tree(proc: subprocess.Popen) -> None:
 def hand_over(d: Path) -> None:
     if AGENT_USER:
         subprocess.run(["chown", "-R", AGENT_USER, str(d)], check=True)
+
+
+def private_dir(tag: str) -> Path:
+    """
+    A fresh folder for one task: BENCH_WORK/<random>/<tag>.
+
+    BENCH_WORK is 711 (made so here when we own it): the agent can reach its own task by the
+    exact path it is given, but cannot list BENCH_WORK, and the random parent cannot be guessed,
+    so no task can find another's folder. Finished tasks are removed (finish_task), so there is
+    nothing left to find anyway. On a Mac host lane (no agent user) the layout is the same; the
+    agent then runs as the owner, so only the names and the removal keep tasks apart.
+    """
+    import secrets
+    WORK.mkdir(parents=True, exist_ok=True)
+    if AGENT_USER:
+        os.chmod(WORK, 0o711)
+    box = WORK / secrets.token_hex(8)
+    box.mkdir(mode=0o711)
+    os.chmod(box, 0o711)  # mkdir's mode is masked by the umask
+    d = box / tag
+    d.mkdir()
+    return d
+
+
+def log_dir() -> Path:
+    """Where Maat's stdout/stderr are written while a run is live: root-only (700), never in a task folder."""
+    logs = WORK / ".logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    os.chmod(logs, 0o700)
+    return logs
+
+
+def finish_task(d: Path, logs: list[Path]) -> None:
+    """
+    The task is graded and its agent is gone: copy the folder and its logs to EXPORT, then remove
+    the private copies. In a container, every process of the agent user is killed first: a server
+    a worker left running would otherwise still be there, as that user, during the next task.
+    """
+    if AGENT_USER and shutil.which("pkill"):
+        subprocess.run(["pkill", "-KILL", "-u", AGENT_USER], check=False)
+    EXPORT.mkdir(parents=True, exist_ok=True)
+    dst = EXPORT / d.name
+    if dst.resolve() != d.resolve():
+        shutil.rmtree(dst, ignore_errors=True)
+        shutil.copytree(d, dst, symlinks=True)
+    for f in logs:
+        if f.exists() and (EXPORT / f.name).resolve() != f.resolve():
+            shutil.copy2(f, EXPORT / f.name)
+            f.unlink()
+    shutil.rmtree(d.parent, ignore_errors=True)
 
 
 def provider_capped(out: str, steps: int) -> bool:
@@ -230,6 +290,7 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
         tasks = [T for T in tasks if T.name in want]
     arms = parse_arms(os.environ.get("ARMS"))
     out = Path(os.environ.get("RESULTS_DIR", HERE)) / os.environ.get("RESULTS", f"results-{which}-x{repeats}.jsonl")
+    out.parent.mkdir(parents=True, exist_ok=True)
     done = set()
     if out.exists():  # resume: skip runs already recorded
         for line in out.read_text().splitlines():
@@ -242,15 +303,17 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
                     if (T.name, a, rep, arm) in done:
                         continue
                     tag = f"{T.name}-{a}-{rep}" + (f"-{arm}" if arm else "")
-                    d = WORK / tag
-                    shutil.rmtree(d, ignore_errors=True)
-                    d.mkdir(parents=True)
+                    d = private_dir(tag)
+                    log = log_dir() / f"{tag}.log"
                     T.setup(d)
                     hand_over(d)
                     saved = {k: os.environ.get(k) for k in arm_env}
                     os.environ.update(arm_env)
                     try:
-                        r = agents[a](d, T.PROMPT, WORK / f"{tag}.log")
+                        r = agents[a](d, T.PROMPT, log)
+                    except BaseException:
+                        finish_task(d, [log, log.with_suffix(".err")])
+                        raise
                     finally:
                         for k, v in saved.items():
                             if v is None:
@@ -258,10 +321,14 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
                             else:
                                 os.environ[k] = v
                     if r.get("provider_capped"):
+                        finish_task(d, [log, log.with_suffix(".err")])
                         # Not recorded, so a resume runs this task again.
                         print(f"STOPPED: the provider's daily limit / quota is reached ({tag} not recorded)", flush=True)
                         return
-                    ok, why = T.grade(d)
+                    try:
+                        ok, why = T.grade(d)
+                    finally:
+                        finish_task(d, [log, log.with_suffix(".err")])
                     final = ""
                     r.update(task=T.name, agent=a, rep=rep, passed=ok, why=why, final=final[:300])
                     if arm:

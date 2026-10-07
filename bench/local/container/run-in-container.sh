@@ -5,8 +5,9 @@
 # The image is maat-bench:<sha8 of the tarball>, built once and reused, so every run
 # records exactly which Maat it tested. Env passed through: REFERENCE BENCH_MODEL
 # BENCH_URL BENCH_LIMIT RESULTS (file name). Results land in
-# ~/.cache/maat-bench/container-results/; each task's folder and Maat's log are kept
-# in ~/.cache/maat-bench/container-work/<name>/ (the only host path it can write).
+# ~/.cache/maat-bench/container-results/; each task's folder and Maat's log are copied,
+# once the task is graded, to ~/.cache/maat-bench/container-work/<name>/ (the only host
+# path it can write; the agent never sees it, see "Task isolation" below).
 # SUBSCRIPTION=grok: use the owner's Grok Build login (BENCH_URL=grok-build://subscription
 # BENCH_MODEL=grok-4.7). Image is maat-bench-grok:<sha> (Dockerfile.grok: official grok
 # installer, linux, pinned). ~/.grok/auth.json is mounted read-only OUTSIDE the container's
@@ -62,7 +63,17 @@ printf 'OPENROUTER_API_KEY=%s\n' "$key" > "$envf"
 # The graders and reference solutions are mounted where only root can reach (/root is 700),
 # copied to a root-only /opt/bench, and run.py runs from there as root; it runs the agent
 # as the unprivileged `agent` user (BENCH_AGENT_USER) and grades as root afterwards.
-credmount=; startcmd='export MOLT_DIST_ABS=$(npm root -g)/@solvyx/molt/dist; mkdir -p /work && chmod 755 /work && rm -rf /opt/bench && cp -a /root/bench-src /opt/bench && chmod -R go-rwx /opt/bench && cd /opt/bench && python3 run.py "$@"'
+#
+# Task isolation, in every mode (plain, SUBSCRIPTION=grok, OPENCODE=1). A host bind mount
+# ignores chown and does not enforce modes for other users (OrbStack, Docker Desktop), so the
+# agent can read anything mounted where it can reach it: on 2026-10-07 a worker spent its whole
+# budget reading the other tasks' folders and logs in a shared /work. So nothing from the host
+# is mounted where the agent can reach it. The work folder and the results are mounted under
+# /root (700, container-local, enforced). Each task runs in a private folder under the
+# container-local /var/lib/bench-work (711, random per-task parent, removed after the task);
+# Maat's logs are written to a root-only folder there; folder and logs are copied to the export
+# only once the task is graded and every process of the agent user is gone (run.py finish_task).
+credmount=; startcmd='export MOLT_DIST_ABS=$(npm root -g)/@solvyx/molt/dist BENCH_WORK=/var/lib/bench-work BENCH_EXPORT=/root/bench-export RESULTS_DIR=/root/bench-results; chmod 700 /root && mkdir -p $BENCH_WORK && chmod 711 $BENCH_WORK && rm -rf /opt/bench && cp -a /root/bench-src /opt/bench && chmod -R go-rwx /opt/bench && cd /opt/bench && python3 run.py "$@"'
 if [ "$SUBSCRIPTION" = grok ]; then
   credmount="-v $HOME/.grok/auth.json:/root/grok-cred/auth.json:ro"
   # grok runs as `agent`, so the credential copy lives in ITS home, owned by it, mode 600.
@@ -82,7 +93,7 @@ if [ "$OPENCODE" = 1 ]; then
 fi
 echo "maat $img → $out/${RESULTS:-results.jsonl}"
 docker run --rm --name "maat-bench-$name" \
-  -v "$local_dir":/root/bench-src:ro -v "$out":/results -v "$work":/work ${=credmount} \
+  -v "$local_dir":/root/bench-src:ro -v "$out":/root/bench-results -v "$work":/root/bench-export ${=credmount} \
   --env-file "$envf" -e REFERENCE="${REFERENCE:-0}" -e BENCH_MODEL="${BENCH_MODEL:-}" \
   -e ARMS="${ARMS:-}" -e BENCH_TASKS="${BENCH_TASKS:-}" -e BENCH_URL="$url" -e BENCH_LIMIT="${BENCH_LIMIT:-600}" -e BENCH_REASONING="${BENCH_REASONING:-}" -e BENCH_GATE="${BENCH_GATE:-}" -e RESULTS="${RESULTS:-results.jsonl}" \
   -e MAAT_BUILD="$sha" -e PYTHONDONTWRITEBYTECODE=1 \

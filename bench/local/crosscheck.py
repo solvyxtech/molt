@@ -83,7 +83,8 @@ def inside() -> None:
         d = fresh()
         # a check names the folder of the run that drafted it (/work/<task>-molt-<n>); in another
         # run's tree that path must mean "this tree", or every foreign tree fails it spuriously
-        run_cmd = re.sub(r"/work/[\w.-]+-molt-\d+", str(dst), cmd)
+        # (runs since 2026-10-07 have a private folder: /var/lib/bench-work/<random>/<task>-molt-<n>)
+        run_cmd = re.sub(r"(?:/var/lib/bench-work/[0-9a-f]+|/work)/[\w.-]+-molt-\d+", str(dst), cmd)
         p = subprocess.Popen(run_cmd, shell=True, cwd=d, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              stdin=subprocess.DEVNULL, start_new_session=True)
         try:
@@ -212,7 +213,7 @@ def exec_tree(run: dict, cmds: list[str]) -> str:
             if set(cmds) <= set(old["checks"]):
                 return "cached"
         else:  # results from before the /work/<folder> rewrite: redo only commands that name such a path
-            cmds = [c for c in cmds if "/work/" in c]
+            cmds = [c for c in cmds if "/work/" in c or "/var/lib/bench-work/" in c]
             if not cmds:
                 old["pathfix"] = True
                 out.write_text(json.dumps(old))
@@ -263,7 +264,7 @@ def execute(jobs: int) -> None:
 
 # ------------------------------------------------------------------ analysis
 def sig(rc: int, out: str, run_name: str) -> str:
-    o = re.sub(r"/work/[\w.-]+", "/work/T", out)
+    o = re.sub(r"(?:/var/lib/bench-work/[0-9a-f]+|/work)/[\w.-]+", "/work/T", out)
     o = re.sub(r"0x[0-9a-f]+|\b[0-9a-f]{7,40}\b", "H", o)
     o = re.sub(r"\d{4,}", "N", o)
     o = re.sub(r"\s+", " ", o).strip()[:300]
