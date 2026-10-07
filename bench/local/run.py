@@ -65,6 +65,17 @@ AGENT_USER = os.environ.get("BENCH_AGENT_USER")  # set in the containers: the ag
 # whole of Maat as the agent user, as before 2026-10-07.
 PRIVSEP = bool(AGENT_USER) and os.environ.get("BENCH_PRIVSEP", "1") != "0" and os.geteuid() == 0
 
+if AGENT_USER and os.geteuid() == 0:
+    # The graders (root) run git in task repositories the agent user owns. On the container's
+    # own filesystem ownership is real, and git refuses a repository owned by someone else
+    # ("dubious ownership"): fix-git graded every correct merge as a failure. On the old /work
+    # bind mount chown was ignored, so this never showed. Maat passes the same setting to its
+    # own checks and strips it from the worker's environment.
+    _n = int(os.environ.get("GIT_CONFIG_COUNT") or 0)
+    os.environ[f"GIT_CONFIG_KEY_{_n}"] = "safe.directory"
+    os.environ[f"GIT_CONFIG_VALUE_{_n}"] = "*"
+    os.environ["GIT_CONFIG_COUNT"] = str(_n + 1)
+
 
 def as_agent(cmd: list, env: dict | None = None) -> tuple[list, dict | None]:
     """With BENCH_AGENT_USER set, run the agent as that user: it cannot read the graders
