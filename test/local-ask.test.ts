@@ -78,17 +78,31 @@ describe("an ask to a self-hosted server", () => {
 
   it("ends at the timeout while the stream is still open, closing the request", async () => {
     let aborted = false;
+    let socket: ReturnType<typeof setInterval> | undefined;
     const fetchFn = (async (_u: string, init: { signal?: AbortSignal }) => {
       init.signal?.addEventListener("abort", () => (aborted = true));
+      // An open connection is a socket, and a socket keeps the event loop
+      // alive. This in-memory stream is not one, and the ask's deadline is
+      // AbortSignal.timeout, whose timer is unref'd: with nothing else
+      // holding the loop it drains before the deadline fires. Node 26's test
+      // runner happens to hold the loop open while a test is pending; Node
+      // 22's (CI) does not, so this test and every one after it in the file
+      // was cancelled with "Promise resolution is still pending but the
+      // event loop has already resolved". Stand in for the socket until the
+      // request is closed.
+      socket = setInterval(() => {}, 1_000);
       const body = new ReadableStream<Uint8Array>({
         start(c) {
           c.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(delta({ reasoning_content: "x" }))}\n\n`));
-          init.signal?.addEventListener("abort", () => c.error(init.signal!.reason));
+          init.signal?.addEventListener("abort", () => {
+            clearInterval(socket);
+            c.error(init.signal!.reason);
+          });
         },
       });
       return new Response(body, { headers: { "content-type": "text/event-stream" } });
     }) as unknown as typeof fetch;
-    const r = await askModel({ baseUrl: LOCAL, model: "m", system: "s", prompt: "p", fetchFn, timeoutMs: 30 });
+    const r = await askModel({ baseUrl: LOCAL, model: "m", system: "s", prompt: "p", fetchFn, timeoutMs: 30 }).finally(() => clearInterval(socket));
     assert.equal(aborted, true);
     assert.match(!r.ok ? r.error : "", /did not answer within/);
   });
