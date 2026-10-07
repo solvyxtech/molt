@@ -9,8 +9,8 @@
  * is a provider stall — not a failure of the task.
  */
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { ACP_AGENTS, backendStallMs, BACKEND_STALL_MS } from "../src/acp.js";
@@ -73,7 +73,13 @@ process.stdin.on("data", (d) => {
 function alive(pid: number): boolean {
   try {
     process.kill(pid, 0);
-    return true;
+  } catch {
+    return false;
+  }
+  // kill(pid, 0) succeeds on a zombie, which is dead but not yet reaped (a
+  // container with no init to reap the orphaned `sleep`).
+  try {
+    return !execFileSync("ps", ["-o", "stat=", "-p", String(pid)]).toString().trim().startsWith("Z");
   } catch {
     return false;
   }
@@ -224,6 +230,24 @@ describe("the deadline inside the engine, on a subprocess backend", () => {
   });
 });
 
+describe("a Maat tool call running when the deadline ends the agent's turn", { skip: process.platform === "win32" }, () => {
+  it("is stopped before the tree is judged", async () => {
+    const dir = ws();
+    const agent = scriptedAcpAgent([{ calls: [{ name: "bash", args: { command: "sleep 2 && echo late > late.txt" } }], text: "Done." }]);
+    const engine = new Engine({
+      baseUrl: GROK.url, model: "grok-4.6", provider: "grok-build", cwd: dir, bar: null,
+      acpSpawn: agent.spawnFn, autonomy: "high", turnDeadlineMs: 500,
+    });
+    const t0 = Date.now();
+    const events = await drain(engine.run("write late.txt", allowAll));
+    assert.ok(Date.now() - t0 < 2_000, `the turn waited out the command: ${Date.now() - t0}ms`);
+    assert.equal(jobEnd(events).endedBy, "deadline");
+    // Long enough for the command to have finished, had it not been stopped.
+    await new Promise((r) => setTimeout(r, 2_500));
+    assert.equal(existsSync(join(dir, "late.txt")), false, "the command went on writing after the deadline");
+  });
+});
+
 describe("a backend that goes silent", () => {
   it("is a provider stall: cancelled, journalled as a provider issue, not a task failure", async () => {
     const dir = ws();
@@ -259,6 +283,19 @@ describe("a backend that goes silent", () => {
     const e = jobEnd(events);
     assert.ok(!e.providerStall, "a tool that ran longer than the stall allowance was called a stall");
     assert.ok(events.some((x) => x.kind === "assistant_text" && /Slept/.test(x.text)));
+  });
+
+  it("does not count the agent's own running tool as silence either", async () => {
+    const dir = ws();
+    const agent = scriptedAcpAgent([{ ownToolMs: 900, text: "Tests ran." }]);
+    const engine = new Engine({
+      baseUrl: GROK.url, model: "grok-4.6", provider: "grok-build", cwd: dir, bar: null,
+      acpSpawn: agent.spawnFn, autonomy: "high", backendStallMs: 300,
+    });
+    const events = await drain(engine.run("run the tests", allowAll));
+    const e = jobEnd(events);
+    assert.ok(!e.providerStall, "the agent's own tool running past the stall allowance was called a stall");
+    assert.ok(events.some((x) => x.kind === "assistant_text" && /Tests ran/.test(x.text)));
   });
 
   it("reads MAAT_BACKEND_STALL_MS, five minutes by default, 0 for never", () => {

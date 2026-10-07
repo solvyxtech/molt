@@ -4507,6 +4507,9 @@ export class Engine {
         systemPrompt: system,
         tools: TOOLS,
         runTool,
+        // The per-call controller invokeTool sets: a deadline or a stall that
+        // ends the agent's turn ends the command it was waiting on too.
+        abortTools: () => this.running?.abort(),
         ...(this.cfg.acpSpawn ? { spawnFn: this.cfg.acpSpawn } : {}),
       });
     }

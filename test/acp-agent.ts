@@ -50,6 +50,11 @@ export type ScriptedAcpTurn = {
   authError?: boolean;
   /** Accept the prompt and never answer it. */
   hang?: boolean;
+  /**
+   * Run one of its own builtins for this long first: announced, silent while
+   * it runs (as GROK_OWN_TOOLS runs a test suite), then completed.
+   */
+  ownToolMs?: number;
 };
 
 export type ScriptedAgent = {
@@ -236,6 +241,14 @@ export function scriptedAcpAgent(turns: ScriptedAcpTurn[], models: AgentModels =
           turn += 1;
           if (script.hang) return;
 
+          if (script.ownToolMs) {
+            const upd = (update: Record<string, unknown>) =>
+              write({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "s1", update } });
+            upd({ sessionUpdate: "tool_call", toolCallId: "own_1", title: "run_terminal_cmd", toolName: "run_terminal_cmd" });
+            await new Promise((r) => setTimeout(r, script.ownToolMs));
+            upd({ sessionUpdate: "tool_call_update", toolCallId: "own_1", status: "completed" });
+          }
+
           for (const b of script.autoTools ?? []) {
             // Announced, then completed, with no permission request in
             // between. molt cannot stop this one; it can only say so.
@@ -353,7 +366,8 @@ export function scriptedAcpAgent(turns: ScriptedAcpTurn[], models: AgentModels =
             });
             if ((await ask(wire)) !== "yes") continue;
             if (endpoint) {
-              await mcpCall(endpoint, "tools/call", { name: script.wirePrefix ? c.name : wire, arguments: c.args }, mcpId++);
+              // An agent whose tool server went away (an interrupted turn) gets an error back, not a crash.
+              await mcpCall(endpoint, "tools/call", { name: script.wirePrefix ? c.name : wire, arguments: c.args }, mcpId++).catch(() => ({}));
             }
           }
 

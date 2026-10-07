@@ -827,9 +827,18 @@ export type AcpOptions<H> = {
   systemPrompt: string;
   tools: readonly MoltTool[];
   runTool: ToolRunner<H>;
+  /**
+   * Stop whatever Maat tool call is running for the agent. Called when a
+   * deadline or a stall ends the agent's turn: the agent is gone, and a
+   * `bash` it asked for must not go on changing the tree being judged.
+   */
+  abortTools?: () => void;
   /** Injected in tests, which drive a scripted agent rather than a real one. */
   spawnFn?: typeof spawn;
 };
+
+/** How long an interrupted turn waits for its aborted tool calls to end. */
+export const TOOL_ABORT_WAIT_MS = 5_000;
 
 /**
  * An ACP session, alive for as long as molt's is.
@@ -919,10 +928,16 @@ export class AcpSession<H> {
     // A tool Maat is running is Maat's time, not the agent's silence: a test
     // suite that takes ten minutes is not a stalled provider.
     const runTool: ToolRunner<H> = async (...a) => {
+      // The agent was interrupted; nothing it asks for now may run.
+      if (this.interrupted) return "[molt: the turn was stopped. No more tools.]";
       this.busy += 1;
+      const run = this.opts.runTool(...a);
+      const settled = run.then(() => {}, () => {});
+      this.running.add(settled);
       try {
-        return await this.opts.runTool(...a);
+        return await run;
       } finally {
+        this.running.delete(settled);
         this.busy -= 1;
         this.touch();
       }
@@ -1180,6 +1195,10 @@ export class AcpSession<H> {
   private lastActivity = Date.now();
   /** Maat tool calls running for the agent right now. */
   private busy = 0;
+  /** Those calls, settled or not, so an interrupt can wait for them to end. */
+  private running = new Set<Promise<void>>();
+  /** Set by an interrupt: no tool call starts after it. */
+  private interrupted = false;
 
   private touch(): void {
     this.lastActivity = Date.now();
@@ -1206,7 +1225,12 @@ export class AcpSession<H> {
       if (limits.deadlineAt !== undefined && now >= limits.deadlineAt) {
         return { ok: false, stop: "deadline", silentMs: now - this.lastActivity };
       }
-      const stallAt = stallMs ? (this.busy > 0 ? now + stallMs : this.lastActivity + stallMs) : Infinity;
+      // Silence while a tool runs is not a stall: Maat's own tools (busy), or
+      // the agent's own builtins it announced and has not finished (inFlight;
+      // GROK_OWN_TOOLS runs a test suite that way with no ACP traffic). The
+      // deadline still bounds both.
+      const working = this.busy > 0 || this.inFlight.size > 0;
+      const stallAt = stallMs ? (working ? now + stallMs : this.lastActivity + stallMs) : Infinity;
       if (now >= stallAt) return { ok: false, stop: "stall", silentMs: now - this.lastActivity };
       const wake = Math.min(limits.deadlineAt ?? Infinity, stallAt) - now;
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1229,6 +1253,7 @@ export class AcpSession<H> {
    * past hearing it — is exactly the one that must not outlive the job.
    */
   private async interrupt(answered?: Promise<unknown>): Promise<void> {
+    this.interrupted = true;
     if (this.conn && this.sessionId) {
       try {
         this.conn.notify("session/cancel", { sessionId: this.sessionId });
@@ -1247,6 +1272,20 @@ export class AcpSession<H> {
       }
     }
     await this.close();
+    // The agent is gone, but a Maat tool call it started (a build, a script
+    // that rewrites files) would go on changing the tree the judge is about
+    // to read. Stop it, and wait for it to end, within reason.
+    if (this.running.size) {
+      this.opts.abortTools?.();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.allSettled([...this.running]),
+        new Promise<void>((r) => {
+          timer = setTimeout(r, TOOL_ABORT_WAIT_MS);
+        }),
+      ]);
+      clearTimeout(timer);
+    }
   }
 
   /** The `done` for a wait Maat cut short. The session is closed by then. */
