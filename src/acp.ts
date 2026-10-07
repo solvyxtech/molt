@@ -1176,13 +1176,6 @@ export class AcpSession<H> {
       : { outcome: { outcome: "cancelled" } };
   }
 
-  /**
-   * Send messages and read back everything until the model stops.
-   *
-   * Returns at `session/prompt`'s reply, which is the same boundary molt's own
-   * loop uses: the model has stopped calling tools and produced an answer, so
-   * the bar can run.
-   */
   /** When the agent last said anything, or Maat last finished a tool for it. */
   private lastActivity = Date.now();
   /** Maat tool calls running for the agent right now. */

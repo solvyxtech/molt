@@ -1152,11 +1152,6 @@ export function changesSomething(name: string, rawArgs: string): boolean {
 }
 
 /**
- * How long a turn with a time budget waits for its drafted checks before
- * sealing what is ready: a tenth of the budget, between 45 s and 2 min. No
- * budget, no bound — a person at the keyboard can wait.
- */
-/**
  * The grace a closing summary gets past the deadline: a tenth of the budget,
  * between 1 s and 30 s. The summary is a courtesy; a run given 540 s must not
  * spend another five minutes on it (or an hour, on a backend that hangs).
@@ -1165,6 +1160,11 @@ export function deadlineGraceMs(budgetMs: number): number {
   return Math.min(30_000, Math.max(1_000, Math.round(budgetMs / 10)));
 }
 
+/**
+ * How long a turn with a time budget waits for its drafted checks before
+ * sealing what is ready: a tenth of the budget, between 45 s and 2 min. No
+ * budget, no bound — a person at the keyboard can wait.
+ */
 export function criteriaWaitMs(budgetMs: number): number | undefined {
   if (!budgetMs) return undefined;
   return Math.min(120_000, Math.max(45_000, Math.round(budgetMs / 10)));

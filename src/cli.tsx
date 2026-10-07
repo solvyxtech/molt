@@ -1215,13 +1215,14 @@ async function autoDraft(
   args: Args,
   soFar?: { draft?: Draft; sealed?: boolean; late?: boolean },
   inputs?: { snapshot: DrafterInputs; used: string[] },
+  deadlineAt?: number,
 ): Promise<ReturnType<typeof taskChecksFrom>> {
   // Taken once, now, before the first step: the second try below and every
   // stage of each draft read this and never the folder the work is changing.
   const snapshot = inputs?.snapshot ?? drafterSnapshotFor(args);
   const none: ReturnType<typeof taskChecksFrom> = { taskChecks: [], taskNotes: [] };
-  // Under --for, no draft, critique or retry waits past the run's budget.
-  const deadlineAt = args.forMs ? Date.now() + args.forMs : undefined;
+  // Under --for, no draft, critique or retry waits past the run's budget
+  // (the job's own deadline, taken once by the caller: runDeadlineAt).
   // Drafted, then read cold by a critic against the task text: a check that
   // invents or guesses is dropped (with a task quote), and a draft where
   // nothing runs the deliverable is asked for once more. See criteria.ts.
@@ -1284,7 +1285,7 @@ async function autoDraft(
  * there is no python3, the project is too large to copy, or no reference
  * applies.
  */
-function startReference(args: Args): Promise<{ check: Check; note: Record<string, unknown> } | null> | undefined {
+function startReference(args: Args, deadlineAt?: number): Promise<{ check: Check; note: Record<string, unknown> } | null> | undefined {
   const here = commandsHere(args.cwd);
   if (!here.present.includes("python3")) {
     process.stderr.write("maat: no reference check — python3 is not installed here\n");
@@ -1303,7 +1304,7 @@ function startReference(args: Args): Promise<{ check: Check; note: Record<string
     model: args.model,
     cwd: args.cwd,
     reasoningEffort: args.reasoningChecks ?? args.reasoning,
-    ...(args.forMs ? { deadlineAt: Date.now() + args.forMs } : {}),
+    ...(deadlineAt !== undefined ? { deadlineAt } : {}),
   }).then((r) => {
     if (!r.ok) {
       process.stderr.write(`maat: no reference check — ${r.why}\n`);
@@ -1540,7 +1541,11 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   // The drafter's inputs, frozen here; the engine journals their hash at turn
   // start and compares it with what each drafter stage actually used.
   const drafterInputs = args.autoCriteria && !ask ? { snapshot: drafterSnapshotFor(args), used: [] as string[] } : undefined;
-  const pendingCriteria = drafterInputs ? autoDraft(engine, args, soFar, drafterInputs) : undefined;
+  // One deadline for everything this job starts before its turn, taken once:
+  // the drafter and the reference each used to take their own Date.now(), a
+  // little later than the job's, and could wait that much past --for.
+  const runDeadlineAt = args.forMs ? Date.now() + args.forMs : undefined;
+  const pendingCriteria = drafterInputs ? autoDraft(engine, args, soFar, drafterInputs, runDeadlineAt) : undefined;
   const draftInputs = drafterInputs
     ? { sha: drafterInputsHash(drafterInputs.snapshot), used: () => [...drafterInputs.used] }
     : undefined;
@@ -1553,7 +1558,7 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         return soFar.draft?.checks.length ? sealDraft(soFar.draft, args) : Promise.resolve({ taskChecks: [], taskNotes: [] });
       }
     : undefined;
-  const referenceCheck = args.reference && !ask ? startReference(args) : undefined;
+  const referenceCheck = args.reference && !ask ? startReference(args, runDeadlineAt) : undefined;
   let undetermined = false;
   /** The turn's own verdict, from job_end. */
   let outcome: string | undefined;

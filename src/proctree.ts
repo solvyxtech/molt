@@ -13,14 +13,66 @@
  * when Maat itself exits is killed on the way out, so a `process.exit` at the
  * end of a headless run never leaves an agent behind. Windows has no process
  * groups; there the leader is killed as before.
+ *
+ * A detached group is out of the terminal's foreground group, so Ctrl-C and a
+ * hangup no longer reach the agent with Maat — and Node runs no `exit`
+ * handlers when it dies of a signal it has no listener for. So the first
+ * tracked group also installs SIGINT/SIGTERM/SIGHUP listeners (only where
+ * nobody else listens, as src/background.ts does): they end every group and
+ * exit with the conventional 128 + signal number, which runs the `exit`
+ * handlers of everything else on the way out.
  */
 import type { ChildProcess } from "node:child_process";
 
 /** How long a group gets between SIGTERM and SIGKILL. */
 export const KILL_GRACE_MS = 1_500;
 
-const groups = new Set<number>();
+/** Tracked group leaders, and the pending SIGKILL of a group being ended. */
+const groups = new Map<number, ReturnType<typeof setTimeout> | null>();
 let hooked = false;
+
+const SIGNAL_EXIT: Record<"SIGINT" | "SIGTERM" | "SIGHUP", number> = { SIGHUP: 129, SIGINT: 130, SIGTERM: 143 };
+
+function killAllNow(): void {
+  for (const [g, t] of groups) {
+    if (t) clearTimeout(t);
+    signalGroup(g, "SIGKILL");
+  }
+  groups.clear();
+}
+
+function hookExit(): void {
+  if (hooked) return;
+  hooked = true;
+  process.on("exit", killAllNow);
+  for (const sig of Object.keys(SIGNAL_EXIT) as (keyof typeof SIGNAL_EXIT)[]) {
+    if (process.listenerCount(sig) === 0) {
+      process.once(sig, () => {
+        // A moment's SIGTERM would be kinder, but the process is going now and
+        // nothing would be left to send the SIGKILL after it.
+        for (const g of groups.keys()) signalGroup(g, "SIGTERM");
+        killAllNow();
+        process.exit(SIGNAL_EXIT[sig]);
+      });
+    }
+  }
+}
+
+/**
+ * End a group: SIGTERM now, SIGKILL after KILL_GRACE_MS for whatever did not
+ * listen. A group already being ended keeps the SIGKILL it has.
+ */
+function endGroup(pid: number, termSent = false): void {
+  if (groups.get(pid)) return;
+  if (!termSent) signalGroup(pid, "SIGTERM");
+  const t = setTimeout(() => {
+    if (!groups.has(pid)) return;
+    signalGroup(pid, "SIGKILL");
+    groups.delete(pid);
+  }, KILL_GRACE_MS);
+  t.unref?.();
+  groups.set(pid, t);
+}
 
 /** Spawn options that make the child lead its own process group, where that exists. */
 export function groupSpawn(): { detached: boolean } {
@@ -44,19 +96,13 @@ function signalGroup(pid: number, signal: NodeJS.Signals): boolean {
 export function trackGroup(child: ChildProcess): void {
   const pid = child.pid;
   if (pid === undefined || process.platform === "win32") return;
-  groups.add(pid);
-  if (!hooked) {
-    hooked = true;
-    process.on("exit", () => {
-      for (const g of groups) signalGroup(g, "SIGKILL");
-      groups.clear();
-    });
-  }
+  groups.set(pid, null);
+  hookExit();
   child.once("exit", () => {
     // The leader is gone; anything still in its group was its, and stays only
-    // because nobody ended it.
-    signalGroup(pid, "SIGKILL");
-    groups.delete(pid);
+    // because nobody ended it. It gets the same SIGTERM-then-SIGKILL as
+    // killTree (and keeps killTree's timer if that is what ended the leader).
+    if (groups.has(pid)) endGroup(pid);
   });
 }
 
@@ -72,6 +118,7 @@ export function killTree(child: ChildProcess | undefined): void {
     }
     return;
   }
+  if (groups.get(pid)) return;
   if (!signalGroup(pid, "SIGTERM")) {
     try {
       child.kill();
@@ -79,10 +126,5 @@ export function killTree(child: ChildProcess | undefined): void {
       // Already gone.
     }
   }
-  const t = setTimeout(() => {
-    if (!groups.has(pid)) return;
-    signalGroup(pid, "SIGKILL");
-    groups.delete(pid);
-  }, KILL_GRACE_MS);
-  t.unref?.();
+  endGroup(pid, true);
 }

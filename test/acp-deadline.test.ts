@@ -152,6 +152,55 @@ describe("an ACP agent that never answers, under --for 5s", { skip: process.plat
   });
 });
 
+describe("Maat killed by a signal while an ACP agent hangs", { skip: process.platform === "win32" }, () => {
+  // The agent leads its own process group (src/proctree.ts), so a Ctrl-C or a
+  // harness's SIGTERM to Maat no longer reaches it — and Node runs no `exit`
+  // handlers on a signal nobody listens for. Maat has to end the group itself.
+  for (const [sig, code] of [["SIGTERM", 143], ["SIGINT", 130], ["SIGHUP", 129]] as const) {
+    it(`${sig}: Maat ends the agent's whole group and exits ${code}`, async () => {
+      const root = ws();
+      const bin = join(root, "bin");
+      const dir = join(root, "project");
+      mkdirSync(bin);
+      mkdirSync(dir);
+      writeFileSync(join(bin, "grok"), HUNG_AGENT);
+      chmodSync(join(bin, "grok"), 0o755);
+      const agentLog = join(root, "agent.log");
+      const child = spawn(
+        process.execPath,
+        [CLI, "run", "write a.txt", "--url", "grok-build", "--model", "grok-4.6", "--json", "--yes", "--cwd", dir],
+        {
+          stdio: ["ignore", "ignore", "ignore"],
+          env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}`, FAKE_ACP_LOG: agentLog, MOLT_CONFIG_DIR: join(root, "cfg") },
+        },
+      );
+      const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) =>
+        child.on("exit", (c, s) => r({ code: c, signal: s })),
+      );
+      // Wait until the agent is holding the prompt, with its own child running.
+      const until = Date.now() + 20_000;
+      let said = "";
+      while (Date.now() < until) {
+        try {
+          said = readFileSync(agentLog, "utf8");
+        } catch {
+          said = "";
+        }
+        if (/^prompt$/m.test(said)) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.match(said, /^prompt$/m, "the agent never got the prompt");
+      const pids = [...said.matchAll(/^pid (\d+)$/gm)].map((m) => Number(m[1]));
+      assert.ok(pids.length >= 2, said);
+
+      child.kill(sig);
+      const end = await exited;
+      assert.deepEqual(end, { code, signal: null });
+      assert.deepEqual(await allGone(pids, 3_000), [], `agent processes outlived Maat's ${sig}`);
+    });
+  }
+});
+
 describe("the deadline inside the engine, on a subprocess backend", () => {
   it("cuts a hung prompt turn at the budget and judges the turn as a deadline", async () => {
     const dir = ws();
