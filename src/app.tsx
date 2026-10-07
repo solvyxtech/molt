@@ -311,10 +311,10 @@ const LOCAL_ROW = "local or self-hosted…";
  * The row for a backend that takes no key at all.
  *
  * `/login` lists providers you hold a key for, which is exactly why Ollama
- * needed a row of its own — and Claude Code needs one for the same reason
+ * needed a row of its own — and Grok Build needs one for the same reason
  * twice over: it takes no key, and the thing it asks for is a command you run
- * somewhere else. Someone with a Max plan looking for where to plug it in
- * looks here.
+ * somewhere else (`grok login`). Someone with an xAI plan looking for where
+ * to plug it in looks here.
  */
 /** xAI subscription via Grok Build ACP agent. */
 const GROK_ROW = "grok build (your xAI plan)…";

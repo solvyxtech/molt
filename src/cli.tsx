@@ -397,10 +397,10 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
       case "--url": {
         const given = next();
         /**
-         * `--url claude-code` is what people type.
+         * `--url grok-build` (or `grok`) is what people type.
          *
          * The backend's endpoint is a sentinel, not an address, and asking
-         * someone to spell `claude-code://subscription` exactly is asking them
+         * someone to spell `grok-build://subscription` exactly is asking them
          * to get it wrong. The full form still works and is what gets stored.
          *
          * The translation itself lives in `src/endpoint.ts`, beside
@@ -411,10 +411,10 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         /**
          * Refused here, not four retries later.
          *
-         * `--url claude-code` typed at a build without the shorthand became
-         * `claude-code/chat/completions`, which `fetch` rejects as an invalid
-         * URL and molt read as the network being down. The flag is the first
-         * place that knows, so it is the place that says so.
+         * `--url grok` typed at a build without the shorthand became
+         * `grok/chat/completions`, which `fetch` rejects as an invalid URL and
+         * Maat read as the network being down. The flag is the first place
+         * that knows, so it is the place that says so.
          */
         const wrong = endpointProblem(out.url);
         if (wrong) {

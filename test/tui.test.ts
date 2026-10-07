@@ -2144,10 +2144,10 @@ describe("/verify and /receipts in session", () => {
 
 describe("pricing on a plan", () => {
   it("says the plan is paying, not that a price is missing, when the model changes", async () => {
-    // The window has always said this. The terminal told a Max subscriber
-    // "publishes no price for sonnet — /price <in> <out> to set one": a gap
-    // in molt's knowledge, and advice to invent a rate, for a run that costs
-    // no money at all.
+    // The window has always said this. The terminal used to tell a
+    // subscription user "publishes no price — /price <in> <out> to set one":
+    // a gap in Maat's knowledge, and advice to invent a rate, for a run that
+    // costs no money at all.
     const agent = scriptedAcpAgent([]);
     const t = await mount({
       baseUrl: GROK_BUILD_URL,

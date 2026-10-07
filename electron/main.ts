@@ -1157,14 +1157,13 @@ ipcMain.handle(
     const refuse = sessionOpenReject(opts, running !== null);
     if (refuse) return { ok: false, error: refuse };
     /**
-     * A backend molt already knows is dead is refused at the door.
+     * A backend Maat already knows is dead is refused at the door.
      *
-     * molt has a health check for every CLI backend and did not consult it
-     * before opening. So a workspace could be opened on `gemini-cli` — where
-     * `acpHealth` reports, in molt's own words, "This client is no longer
-     * supported for Gemini Code Assist for individuals" — and the person
-     * found out one turn later, having written a prompt and waited, from an
-     * error that reads like the model's rather than the address's.
+     * Maat has a health check for every CLI backend and did not consult it
+     * before opening. So a workspace could be opened on a CLI that is not
+     * installed or not logged in — and the person found out one turn later,
+     * having written a prompt and waited, from an error that reads like the
+     * model's rather than the address's.
      *
      * Only for the CLI backends, and only when the answer is already known:
      * an HTTP endpoint is not probed here, because reachability is a network

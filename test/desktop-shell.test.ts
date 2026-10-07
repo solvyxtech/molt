@@ -1603,7 +1603,7 @@ describe("a bad endpoint is refused where it is typed", () => {
   });
 
   /**
-   * `--url claude-code` expanded to the sentinel at the flag since the
+   * `--url grok-build` expanded to the sentinel at the flag since the
    * shorthand was written. Nowhere else that took a base URL knew the word,
    * so typing it into Settings was refused as "not an endpoint" — the exact
    * complaint this test would have caught before it shipped.
@@ -1751,11 +1751,10 @@ describe("a backend molt knows is dead is refused at the door", () => {
    * that had not happened and "Open workspace" then used whatever was in the
    * box.
    *
-   * And the door never asked. molt has a health check for every CLI backend
-   * and did not consult it before opening, so a workspace could open on
-   * `gemini-cli`, where molt's own health reports Google's withdrawal of the
-   * product, and the person found out a turn later from an error that reads
-   * like the model's rather than the address's.
+   * And the door never asked. Maat has a health check for every CLI backend
+   * and did not consult it before opening, so a workspace could open on a CLI
+   * that is not installed or not logged in, and the person found out a turn
+   * later from an error that reads like the model's rather than the address's.
    */
   it("says which endpoint is still selected when a plan is refused", () => {
     const ui = readFileSync(path.join(repoRoot(), "ui", "app.ts"), "utf8");

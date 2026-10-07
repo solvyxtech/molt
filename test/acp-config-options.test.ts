@@ -405,7 +405,7 @@ describe("molt acp over stdio: choosing a second endpoint", { timeout: 60_000 },
     const spec = {
       name: "molt", label: "molt", url: "molt://acp", bin: process.execPath,
       args: [join(process.cwd(), "dist", "cli.js"), "acp", "--url", first.url, "--model", "first-model", "--yes"],
-      models: [], installHint: "", loginHint: "", credentialPath: "", mcpTransport: "stdio", sessionMeta: () => ({}),
+      models: [], installHint: "", loginHint: "", credentialPath: "", mcpTransport: "http", sessionMeta: () => ({}),
     } as AcpAgentSpec;
     let stdout = "";
     const updates: Record<string, unknown>[] = [];
