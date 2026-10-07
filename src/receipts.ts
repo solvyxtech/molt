@@ -14,6 +14,7 @@ import { MIN_SECRET_CHARS, redact } from "./redact.js";
 import type { BarResult } from "./types.js";
 import { stateDir } from "./statedir.js";
 import { WITHHELD, maskDeep, maskText } from "./withhold.js";
+import type { Objection } from "./review.js";
 
 /** Where a receipt's full text goes when hidden commands were masked in it (src/withhold.ts). */
 export const FULL_DIR = "full";
@@ -89,6 +90,12 @@ export type ReceiptRecord = {
   tierReason?: string;
   /** The strongest evidence class among the passing checks. */
   evidence?: string;
+  /**
+   * `--review-executable`: each reviewer objection, the command that came with
+   * it and what running it showed (src/review.ts). Added after the receipt is
+   * written (`amendReview`), like the tier.
+   */
+  objections?: Objection[];
 };
 
 /** What `repair()` changed, and what it left alone. */
@@ -732,6 +739,36 @@ export class Receipts {
             hit = true;
             const { tierReason: _drop, ...rest } = r;
             return JSON.stringify({ ...rest, tier: tier.tier, ...(tier.reason ? { tierReason: redact(tier.reason, this.secrets) } : {}) });
+          } catch {
+            return l;
+          }
+        });
+      if (hit) writeFileSync(this.indexPath, out.join("\n"), "utf8");
+      return hit;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Record the independent review's objections on a receipt's index row: each
+   * with its command and result (`--review-executable`). Masked like every
+   * other write while hidden commands are withheld. The receipt file itself,
+   * hash-bound when it was written, is never rewritten.
+   */
+  amendReview(file: string, objections: readonly Objection[]): boolean {
+    try {
+      if (!existsSync(this.indexPath)) return false;
+      let hit = false;
+      const out = readFileSync(this.indexPath, "utf8")
+        .split("\n")
+        .map((l) => {
+          if (!l.trim()) return l;
+          try {
+            const r = JSON.parse(l) as ReceiptRecord;
+            if (r.file !== file) return l;
+            hit = true;
+            return redact(JSON.stringify({ ...r, objections: maskDeep([...objections], this.withheld) }), this.secrets);
           } catch {
             return l;
           }

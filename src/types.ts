@@ -633,7 +633,13 @@ export type EngineEvent =
        * confirmed means "passed its checks, unconfirmed": a majority of
        * reviews found a violation quoted from the task text.
        */
-      review?: { confirmed: boolean; votes: string; violations: { quote: string; evidence: string }[] };
+      review?: {
+        confirmed: boolean;
+        votes: string;
+        violations: { quote: string; evidence: string }[];
+        /** `--review-executable`: every objection, its command and what running it showed. */
+        objections?: import("./review.js").Objection[];
+      };
       /** The judgment case this job opened: the scale did not settle it, a person will (judgment.ts). */
       case?: number;
       /**

@@ -18,9 +18,11 @@
  *  - Shedding is two-phase: archive first, mutate second.
  *  - Nothing is summarized by a model, ever.
  */
-import { runCommand } from "./run.js";
+import { bashPath, runCommand } from "./run.js";
+import { copyTreeOrWhy } from "./scratch.js";
 import { describeStart, listBackground, startBackground, stopBackground } from "./background.js";
-import { reviewClaim, type Review } from "./review.js";
+import { objectionLine, readsTheWork, reviewClaim, type ExecutableReview, type ObjectionRun, type Review } from "./review.js";
+import { credentialFreeEnv } from "./credenv.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
 import { tierOf } from "./tiers.js";
 import { arbitrate, parseDisputes, type Ruling } from "./dispute.js";
@@ -1347,6 +1349,15 @@ export type EngineConfig = {
    * failed before the work (tiers.ts `reviewAdvisory`). Off by default.
    */
   reviewAdvisory?: boolean;
+  /**
+   * Experimental (`--review-executable`, MAAT_REVIEW_EXECUTABLE=1): each
+   * objection the independent review raises must carry a read-only shell
+   * command that demonstrates it. Maat runs it on a throwaway copy of the tree;
+   * an objection counts only when its command ran and showed the failure.
+   * The rest are recorded as unsubstantiated notes and veto nothing
+   * (src/review.ts). Off by default.
+   */
+  reviewExecutable?: boolean;
   /**
    * Requirement sign-out (src/signout.ts): one round per unattended turn that
    * lists each stated requirement beside the commands run for it. Off unless
@@ -3586,6 +3597,61 @@ export class Engine {
     return this.markGuards(await runBar(bar, this.barContext(claim)));
   }
 
+  /** The review's executable-objection runner, when `reviewExecutable` is on; else nothing. */
+  private executableReview(): { executable?: ExecutableReview } {
+    if (this.cfg.reviewExecutable !== true) return {};
+    return { executable: { run: (command) => this.runObjection(command) } };
+  }
+
+  /**
+   * Run one reviewer's objection command as a task check runs: in a throwaway
+   * copy of the tree (src/scratch.ts), under bash, never past the turn's clock.
+   * The command has already passed lint L15 (it does not change the work).
+   *
+   * Never on the work itself. A reviewer's command is written by a model that
+   * read the task text, which may be anyone's, and it exists to probe the
+   * work, not to protect it; the lint is a reading of the command, not a
+   * guarantee. With no copy (a worktree's .git pointer, a tree over the copy
+   * limits, MAAT_CHECK_COPY=0) the objection is not run and does not count:
+   * "could not be run safely".
+   */
+  private async runObjection(command: string): Promise<ObjectionRun> {
+    const tried = process.env.MAAT_CHECK_COPY === "0" ? { why: "MAAT_CHECK_COPY=0 turns throwaway copies off" } : await copyTreeOrWhy(this.cwd);
+    if ("why" in tried) {
+      return { code: null, stdout: "", stderr: "", notRun: `could not be run safely: no throwaway copy of the tree (${tried.why})` };
+    }
+    const copy = tried;
+    try {
+      const left = this.timeLeftMs();
+      if (left !== undefined && left <= 0) {
+        return { code: null, stdout: "", stderr: "", notRun: "the time budget is spent" };
+      }
+      const r = await runCommand(command, {
+        cwd: copy.dir,
+        shell: bashPath() ?? true,
+        timeoutMs: left !== undefined ? Math.max(1, Math.min(30_000, left)) : 30_000,
+        maxBuffer: 1024 * 1024,
+        // The reviewer's command never sees Maat's credentials (credentialFreeEnv).
+        env: credentialFreeEnv(process.env),
+        signal: this.running?.signal,
+      });
+      const fix = (t: string) => copy.unmap(t);
+      return { code: r.code, stdout: fix(r.stdout), stderr: fix(r.stderr), timedOut: r.timedOut, readsWork: readsTheWork(command, copy.dir) };
+    } finally {
+      await copy.cleanup();
+    }
+  }
+
+
+  /** Executable mode: every objection that did not count, as an info line each. */
+  private *unsubstantiated(review: Review | null): Generator<EngineEvent> {
+    for (const o of review?.objections ?? []) {
+      if (o.result === "demonstrated") continue;
+      // The reviewer's command and its output can quote a hidden check.
+      yield { kind: "info", text: this.maskWithheld(`objection not counted (reviewer ${o.vote}): ${objectionLine(o)}`) };
+    }
+  }
+
   /** tierOf's advisory-review arguments: empty unless `reviewAdvisory`. */
   private advisoryTier(): { reviewAdvisory?: true; guards?: ReadonlySet<string> } {
     return this.cfg.reviewAdvisory === true ? { reviewAdvisory: true, guards: this.passedBeforeWork } : {};
@@ -4327,7 +4393,7 @@ export class Engine {
     if (outcome === "verified" && this.cfg.review && inTurn !== undefined) {
       // Reviewed inside the turn, and nothing changed after.
       review = inTurn;
-      this.cfg.journal?.append("review", review ? { confirmed: review.confirmed, votes: review.votes, violations: review.violations.length } : { ran: false });
+      this.cfg.journal?.append("review", review ? { confirmed: review.confirmed, votes: review.votes, violations: review.violations.length, ...(review.objections ? { objections: review.objections } : {}) } : { ran: false });
       if (review && !review.confirmed) {
         yield { kind: "info", text: `passed its checks, unconfirmed: the reviewer (${review.votes}) found ` + review.violations.map((v) => `"${v.quote}" — ${v.evidence}`).join("; ") };
       }
@@ -4352,8 +4418,11 @@ export class Engine {
           // And every retry and pause inside it, not just one ask.
           deadlineAt: this.deadlineAt(),
         },
+        ...this.executableReview(),
       }).catch(() => null);
-      this.cfg.journal?.append("review", review ? { confirmed: review.confirmed, votes: review.votes, violations: review.violations.length } : { ran: false });
+      this.cfg.journal?.append("review", review ? { confirmed: review.confirmed, votes: review.votes, violations: review.violations.length, ...(review.objections ? { objections: review.objections } : {}) } : { ran: false });
+      if (review?.objections && receiptPath) this.cfg.receipts?.amendReview(basename(receiptPath), review.objections);
+      yield* this.unsubstantiated(review);
       if (!review) {
         yield { kind: "info", text: "the independent review could not be run; the claim stands as checked" };
       } else if (!review.confirmed) {
@@ -4435,7 +4504,7 @@ export class Engine {
       ...(this.turnProviderStall ? { providerStall: true } : {}),
       ...(checksDisagree ? { checksDisagree: failing.map((r) => r.name) } : {}),
       ...(outcome === "verified" && this.turnRevealed.length ? { revealed: [...this.turnRevealed] } : {}),
-      ...(review ? { review: { confirmed: review.confirmed, votes: review.votes, violations: review.violations } } : {}),
+      ...(review ? { review: { confirmed: review.confirmed, votes: review.votes, violations: review.violations, ...(review.objections ? { objections: review.objections } : {}) } } : {}),
       ...(opened !== undefined ? { case: opened } : {}),
     };
   }
@@ -7550,11 +7619,16 @@ export class Engine {
             ...(this.timeLeftMs() !== undefined ? { timeoutMs: Math.max(1_000, this.timeLeftMs()!) } : {}),
             deadlineAt: this.deadlineAt(),
           },
+          ...this.executableReview(),
         }).catch(() => null);
+        if (review?.objections) {
+          if (lastReceipt) this.cfg.receipts?.amendReview(lastReceipt, review.objections);
+          yield* this.unsubstantiated(review);
+        }
         if (review && !review.confirmed && review.violations.length && this.cfg.reviewAdvisory !== true) {
           reviewNudged = true;
           this.turnReview = undefined;
-          log?.append("review", { confirmed: false, votes: review.votes, violations: review.violations.length, nudged: true });
+          log?.append("review", { confirmed: false, votes: review.votes, violations: review.violations.length, nudged: true, ...(review.objections ? { objections: review.objections } : {}) });
           yield {
             kind: "info",
             text:
@@ -7566,7 +7640,10 @@ export class Engine {
             content:
               `[molt] Your checks passed, but independent reviewers who read only the task and your ` +
               `receipt found the work contradicts the task:\n` +
-              review.violations.map((v) => `- the task says "${v.quote}" — ${v.evidence}`).join("\n") +
+              (review.objections
+                ? // Executable mode: an objection's command output may quote a hidden check.
+                  this.maskWithheld(review.violations.map((v) => `- the task says "${v.quote}" — ${v.evidence}`).join("\n"))
+                : review.violations.map((v) => `- the task says "${v.quote}" — ${v.evidence}`).join("\n")) +
               `\nIf they are right, fix it and say done again. If they are wrong, say in one line why, ` +
               `and say done again without changing anything.`,
           });
