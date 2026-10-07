@@ -28,10 +28,12 @@ import { parse as parseYaml, stringify as toYaml } from "yaml";
 import { askModel, jsonIn, notJson, type AskOptions } from "./ask.js";
 import type { Engine } from "./engine.js";
 import { runCommand } from "./run.js";
+import { privSep } from "./privsep.js";
+import { copyTree } from "./scratch.js";
 import { diagnoseFailure } from "./bar.js";
 import type { Check, Confirm, EngineEvent, JobOutcome, Spend } from "./types.js";
 import { estTokens } from "./types.js";
-import { stateDir, stateDirName } from "./statedir.js";
+import { projectStateDir, stateDir, stateDirName } from "./statedir.js";
 
 /** How the folder is named in messages; the real one is `missionRel(cwd)`. */
 export const MISSION_DIR = ".maat/mission";
@@ -363,7 +365,8 @@ export function assertionNotes(contract: Contract, ids: readonly string[]): stri
 
 /** Every `.md` under the library, as the worker is shown it, within a budget. */
 export function readLibrary(cwd: string, budgetTokens = LIBRARY_TOKENS): string {
-  const dir = join(missionDir(cwd), LIBRARY_DIR);
+  // In the project even under privilege separation: the worker writes it.
+  const dir = projectStateDir(cwd, "mission", LIBRARY_DIR);
   if (!existsSync(dir)) return "";
   const files = readdirSync(dir).filter((f) => f.endsWith(".md")).sort();
   const parts: string[] = [];
@@ -450,23 +453,32 @@ export async function runAssertions(
     const a = byId.get(id);
     if (!a?.run) continue;
     const t0 = Date.now();
+    // With a check account (--check-user) an assertion is a task check like
+    // any other: it runs as that account in a copy of the tree, or as the
+    // worker in the tree itself when no copy can be taken. Without one it
+    // runs in place as Maat, as it always has.
+    const copy = privSep()?.check && process.env.MAAT_CHECK_COPY !== "0" ? await copyTree(cwd) : null;
     try {
       const r = await runCommand(a.run, {
-        cwd,
+        cwd: copy?.dir ?? cwd,
         timeoutMs: a.timeoutMs ?? DEFAULT_ASSERTION_TIMEOUT_MS,
         maxBuffer: 256 * 1024,
         signal,
+        asCheck: copy ? "copy" : "in-place",
       });
       const d = diagnoseFailure(r.code ?? 0, r.stdout, r.stderr);
+      const text = `${r.stdout}${r.stderr}`;
       out.push({
         id,
         ok: !r.timedOut && r.code === 0,
-        output: (r.timedOut ? "timed out\n" : "") + `${r.stdout}${r.stderr}`.slice(-4000),
+        output: (r.timedOut ? "timed out\n" : "") + (copy ? copy.unmap(text) : text).slice(-4000),
         didNotRun: d.didNotRun,
         ms: Date.now() - t0,
       });
     } catch (e) {
       out.push({ id, ok: false, output: String(e), didNotRun: true, ms: Date.now() - t0 });
+    } finally {
+      await copy?.cleanup();
     }
   }
   return out;
@@ -874,7 +886,7 @@ export function writePlan(cwd: string, plan: MissionPlan, opts: { force?: boolea
   if (hasMission(cwd) && !opts.force) {
     throw new MissionError(`a mission already exists in ${MISSION_DIR}; pass --force to replace it`);
   }
-  mkdirSync(join(dir, LIBRARY_DIR), { recursive: true });
+  mkdirSync(projectStateDir(cwd, "mission", LIBRARY_DIR), { recursive: true });
   const written: string[] = [];
   const put = (name: string, text: string) => {
     writeFileSync(join(dir, name), text);

@@ -17,10 +17,10 @@ import { planMutations, applyMutation, negateComparison, type Mutation } from ".
 import { proposeBar, type Detected } from "./detect.js";
 import { assertionsIn, fingerprint, isTestPath, treeChanges, type TreeSnapshot } from "./files.js";
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { copyTreeOrWhy, runsInCopy } from "./scratch.js";
 import { maskText } from "./withhold.js";
+import { gitSync, privSep } from "./privsep.js";
 import { dirname, join, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { ArchiveLike } from "./archive.js";
@@ -1006,7 +1006,8 @@ async function mutationCheck(
     };
   }
   if (!prior) {
-    const baseline = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal });
+    // Mutation runs are in the worker's own tree: with a check account they run as the worker.
+    const baseline = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal, asCheck: "in-place" });
     if (baseline.code !== 0) {
       return {
         ok: false,
@@ -1039,6 +1040,7 @@ async function mutationCheck(
         cwd: ctx.cwd,
         timeoutMs,
         signal: ctx.signal,
+        asCheck: "in-place",
       });
       // A mutation the command still passes is a line nothing checks — unless
       // it was a boundary nudge and negating the same condition is caught.
@@ -1052,7 +1054,7 @@ async function mutationCheck(
         let negKilled = false;
         if (neg && negText !== null && negText !== file.text) {
           writeFileSync(file.abs, negText, "utf8");
-          const rn = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal });
+          const rn = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal, asCheck: "in-place" });
           negKilled = rn.code !== 0;
         }
         if (negKilled) boundaryOnly.push(`${m.path}:${m.line} (${m.operator}) — ${m.before.trim()}`);
@@ -1646,11 +1648,8 @@ function importsTracked(ctx: BarContext): {
 } {
   let tracked: Set<string>;
   try {
-    const out = execFileSync("git", ["ls-files", "-z"], {
-      cwd: ctx.cwd,
-      encoding: "utf8",
-      maxBuffer: 8 * 1024 * 1024,
-    });
+    // As the worker under privilege separation: never Maat's git on the worker's repository.
+    const out = gitSync(["ls-files", "-z"], ctx.cwd);
     tracked = new Set(out.split("\0").filter(Boolean));
   } catch {
     return {
@@ -2196,6 +2195,10 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
       timeoutMs: check.timeoutMs,
       maxBuffer: 8 * 1024 * 1024,
       signal: ctx.signal,
+      // With a check account (--check-user): a check in its copy runs as that
+      // account; one in the project itself (a project check, or a task check
+      // whose tree was too large to copy) runs as the worker, whose tree it is.
+      asCheck: copy ? "copy" : "in-place",
     });
     output = copy ? copy.unmap(`${r.stdout}${r.stderr}`) : `${r.stdout}${r.stderr}`;
     exitCode = r.code ?? 1;
@@ -2308,6 +2311,19 @@ export class CheckCache {
 }
 
 export async function runBar(bar: Bar, ctx: BarContext): Promise<BarResult> {
+  try {
+    return await runBarAs(bar, ctx);
+  } finally {
+    // Without a check account, checks run as Maat. Under privilege
+    // separation, whatever one left in the project (a build in place, a
+    // cache) goes back to the worker, so the worker can still edit its own
+    // tree (src/privsep.ts). With one, checks in the project run as the
+    // worker and this finds nothing of Maat's to hand back.
+    privSep()?.handBack(ctx.cwd);
+  }
+}
+
+async function runBarAs(bar: Bar, ctx: BarContext): Promise<BarResult> {
   const t0 = Date.now();
   // In order, one at a time. Checks share a working directory and routinely
   // build into it; running them concurrently would have them tripping over

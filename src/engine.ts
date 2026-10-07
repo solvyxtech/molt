@@ -25,7 +25,6 @@ import { judgeEffort, judgeTarget } from "./judge.js";
 import { tierOf } from "./tiers.js";
 import { arbitrate, parseDisputes, type Ruling } from "./dispute.js";
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { excludeMoltFromGit, listProject, removeNew, unnamedNewFiles, type ProjectListing } from "./leftovers.js";
 import { inspectDir, inspectFile, namedInputs, profileLine } from "./inspect.js";
@@ -131,7 +130,11 @@ import {
   type Msg,
   type Spend,
 } from "./types.js";
-import { stateDir, stateDirName } from "./statedir.js";
+import { stateDir, stateDirName, stateRedirect } from "./statedir.js";
+import { gitSync, isolationLine, privSep, type WorkerFs } from "./privsep.js";
+
+/** Journals that already carry the isolation line (one per journal, however many engines share it). */
+const isolationNoted = new WeakSet<object>();
 import { env } from "./env.js";
 import { Judgments, caseReason, reasonText } from "./judgment.js";
 
@@ -2228,6 +2231,14 @@ export class Engine {
         journalRoot: cfg.journal.chainRoot(),
       });
     }
+    // Under --worker-user, one line in the journal saying what isolation was
+    // actually in effect (src/privsep.ts), e.g.
+    // "isolation: worker uid 1001, check uid 1002, pid namespace on".
+    const isolation = isolationLine();
+    if (isolation && cfg.journal && !isolationNoted.has(cfg.journal)) {
+      isolationNoted.add(cfg.journal);
+      cfg.journal.append("note", { kind: "isolation", text: isolation });
+    }
   }
 
   get model(): string {
@@ -2842,9 +2853,11 @@ export class Engine {
    */
   private spill(text: string, callId: string): string | null {
     try {
-      const rel = `${stateDirName(this.cwd)}/out/${callId.replace(/[^\w-]/g, "_")}.txt`;
+      const name = `${callId.replace(/[^\w-]/g, "_")}.txt`;
+      const rel = `${stateDirName(this.cwd)}/out/${name}`;
       mkdirSync(stateDir(this.cwd, "out"), { recursive: true });
-      writeFileSync(join(this.cwd, rel), this.maskWithheld(redact(text, this.secrets())), "utf8");
+      // In the state dir under privilege separation; read_file serves it back (spilledOutput).
+      writeFileSync(stateDir(this.cwd, "out", name), this.maskWithheld(redact(text, this.secrets())), "utf8");
       return rel;
     } catch {
       return null;
@@ -3125,6 +3138,9 @@ export class Engine {
    * editor is where the freshest copy lives, not the only copy there is.
    */
   private async readText(abs: string): Promise<string> {
+    // Under privilege separation the worker's helper reads it, as the worker.
+    const wfs = this.workerFs;
+    if (wfs) return wfs.read(abs);
     const read = this.cfg.files?.read;
     if (read) {
       try {
@@ -3147,6 +3163,11 @@ export class Engine {
    * so the two agree and the ledger names a file that exists.
    */
   private async writeText(abs: string, content: string): Promise<string> {
+    const wfs = this.workerFs;
+    if (wfs) {
+      await wfs.write(abs, content);
+      return content;
+    }
     mkdirSync(dirname(abs), { recursive: true });
     const write = this.cfg.files?.write;
     if (write) {
@@ -3165,6 +3186,39 @@ export class Engine {
     }
     writeFileSync(abs, content, "utf8");
     return content;
+  }
+
+  /**
+   * The file tools' hands under privilege separation (src/privsep.ts): a
+   * helper running as the worker user. Undefined when it is off, and the
+   * tools touch the disk as Maat, as they always did.
+   */
+  private get workerFs(): WorkerFs | undefined {
+    return privSep()?.fs();
+  }
+
+  private async fileExists(abs: string): Promise<boolean> {
+    const wfs = this.workerFs;
+    return wfs ? wfs.exists(abs) : existsSync(abs);
+  }
+
+  private async fileSha(abs: string): Promise<string | null> {
+    const wfs = this.workerFs;
+    return wfs ? wfs.sha256(abs) : sha256Of(abs);
+  }
+
+  /**
+   * A spilled output (`.maat/out/<call>.txt`) while Maat's records are out of
+   * the project: the worker cannot read the state dir, so Maat serves its own
+   * masked copy of the worker's own output. Undefined for any other path.
+   */
+  private spilledOutput(rel: string): string | undefined {
+    const to = stateRedirect(this.cwd);
+    if (!to) return undefined;
+    const m = /^(?:\.\/)?\.(?:maat|molt)\/out\/([\w-]+\.txt)$/.exec(rel);
+    if (!m) return undefined;
+    const p = join(to, "out", m[1]!);
+    return existsSync(p) ? readFileSync(p, "utf8") : undefined;
   }
 
   private overBudget(): boolean {
@@ -3186,11 +3240,14 @@ export class Engine {
       case "inspect": {
         const rel = String(args.path ?? ".");
         const abs = resolve(this.cwd, rel);
-        if (!existsSync(abs)) return `${rel} does not exist`;
+        const wfs = this.workerFs;
+        if (!(await this.fileExists(abs))) return `${rel} does not exist`;
         try {
+          const part = { offset: num(args.offset, 0), length: num(args.length, 0) || undefined };
+          if (wfs) return (await wfs.isDir(abs)) ? await wfs.inspectDir(abs, rel) : await wfs.inspectFile(abs, rel, part);
           return statSync(abs).isDirectory()
             ? inspectDir(abs, rel)
-            : inspectFile(abs, rel, { offset: num(args.offset, 0), length: num(args.length, 0) || undefined });
+            : inspectFile(abs, rel, part);
         } catch (e) {
           return `could not inspect ${rel}: ${e instanceof Error ? e.message : String(e)}`;
         }
@@ -3199,7 +3256,7 @@ export class Engine {
       case "read_file":
         this.readPaths.add(String(args.path ?? ""));
         return readPart(
-          await this.readText(resolve(this.cwd, String(args.path ?? ""))),
+          this.spilledOutput(String(args.path ?? "")) ?? (await this.readText(resolve(this.cwd, String(args.path ?? "")))),
           String(args.path ?? ""),
           num(args.offset, 0),
           num(args.limit, Number.MAX_SAFE_INTEGER),
@@ -3213,11 +3270,11 @@ export class Engine {
         // promise to the person who made it, and a promise that holds only
         // when the model cooperates is not one.
         if (this.isReadOnly(rel, abs)) return readOnlyRefusal(rel);
-        const before = sha256Of(abs);
+        const before = await this.fileSha(abs);
         // The text as well as the hash: a hash proves the file changed, and
         // only the text can say whether the change was a comment.
         let priorText = "";
-        const existed = existsSync(abs);
+        const existed = await this.fileExists(abs);
         if (existed) {
           try {
             priorText = await this.readText(abs);
@@ -3266,14 +3323,9 @@ export class Engine {
         this.mustBeInside(abs, rel);
         // Bounded and off the main thread: a listing the model asks for can be
         // pointed at anything, including a home directory.
-        return formatListing(
-          rel,
-          await walkAsync(abs, {
-            depth: num(args.depth, 1),
-            glob: str(args.glob),
-            deadline: Date.now() + WALK_DEADLINE_MS,
-          }),
-        );
+        const walkOpts = { depth: num(args.depth, 1), glob: str(args.glob), deadline: Date.now() + WALK_DEADLINE_MS };
+        const wfs = this.workerFs;
+        return formatListing(rel, wfs ? await wfs.walk(abs, walkOpts) : await walkAsync(abs, walkOpts));
       }
 
       case "grep": {
@@ -3281,13 +3333,9 @@ export class Engine {
         const abs = resolve(this.cwd, rel);
         this.mustBeInside(abs, rel);
         const pattern = String(args.pattern ?? "");
-        return formatMatches(
-          pattern,
-          await grepFiles(abs, pattern, {
-            glob: str(args.glob),
-            ignoreCase: args.ignore_case === true,
-          }),
-        );
+        const grepOpts = { glob: str(args.glob), ignoreCase: args.ignore_case === true };
+        const wfs = this.workerFs;
+        return formatMatches(pattern, wfs ? await wfs.grep(abs, pattern, grepOpts) : await grepFiles(abs, pattern, grepOpts));
       }
 
       case "edit_file": {
@@ -3295,8 +3343,8 @@ export class Engine {
         const abs = resolve(this.cwd, rel);
         this.mustBeInside(abs, rel);
         if (this.isReadOnly(rel, abs)) return readOnlyRefusal(rel);
-        if (!existsSync(abs)) return `no such file: ${rel} — write_file creates a new one`;
-        const before = sha256Of(abs);
+        if (!(await this.fileExists(abs))) return `no such file: ${rel} — write_file creates a new one`;
+        const before = await this.fileSha(abs);
         const current = await this.readText(abs);
         const edit = applyEdit(
           current,
@@ -3353,7 +3401,7 @@ export class Engine {
           return `stopping job ${id} (pid ${p.pid}, "${p.command}"); its log is ${p.log}`;
         }
         if (args.background === true) {
-          const p = startBackground(command, { cwd: this.cwd, env: scrubbedEnv() });
+          const p = startBackground(command, { cwd: this.cwd, env: scrubbedEnv(), asWorker: true });
           // A process that died before the result was even composed is the
           // common failure — a typo in the command, a port already bound. Give
           // it a moment so that case is reported as what it is, not as a
@@ -3382,6 +3430,8 @@ export class Engine {
           timeoutMs,
           maxBuffer: 1024 * 1024,
           env: scrubbedEnv(),
+          // As the worker user when privilege separation is on (src/privsep.ts).
+          asWorker: true,
           // A cancelled turn kills the command it is waiting on. Leaving a
           // build running after the turn that asked for it was called off is
           // the machine doing work nobody is going to read.
@@ -4450,7 +4500,7 @@ export class Engine {
     let tracked: Set<string>;
     try {
       tracked = new Set(
-        execFileSync("git", ["ls-files"], { cwd: this.cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+        gitSync(["ls-files"], this.cwd)
           .split("\n")
           .filter(Boolean),
       );
@@ -4594,6 +4644,7 @@ export class Engine {
         // The per-call controller invokeTool sets: a deadline or a stall that
         // ends the agent's turn ends the command it was waiting on too.
         abortTools: () => this.running?.abort(),
+        asWorker: true,
         ...(this.cfg.acpSpawn ? { spawnFn: this.cfg.acpSpawn } : {}),
       });
     }

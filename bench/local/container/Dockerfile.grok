@@ -2,7 +2,7 @@
 # Installed with the official script (https://x.ai/cli/install.sh), pinned to the version the
 # owner's Mac runs so ACP behaviour matches. No credentials are baked in: run-in-container.sh
 # copies them in at start (SUBSCRIPTION=grok).
-FROM maat-bench:agentu
+FROM maat-bench:agentcu
 ARG GROK_VERSION=1.0.46
 RUN curl -fsSL https://x.ai/cli/install.sh | HOME=/opt/grok-install GROK_BIN_DIR=/opt/grok-install/.grok/bin bash -s ${GROK_VERSION} \
     && cp -L "$(readlink -f /opt/grok-install/.grok/bin/grok)" /tmp/grok.bin && rm -f /usr/local/bin/grok /usr/local/bin/agent && mv /tmp/grok.bin /usr/local/bin/grok && rm -rf /opt/grok-install \

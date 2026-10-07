@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -28,6 +29,11 @@ HERE = Path(__file__).resolve().parent
 # Outside every git repository: a task folder inside this one let agents'
 # `git commit` walk up and commit task files into molt-desktop's main.
 WORK = Path(os.environ.get("BENCH_WORK", Path.home() / ".cache/maat-bench/work"))
+# BENCH_EXPORT: where the task folders and logs are copied when the whole run ends. The
+# container works in a container-local BENCH_WORK because a host bind mount (OrbStack, Docker
+# Desktop) ignores chown and does not enforce modes for other users: on /work a later task's
+# worker could read every earlier task's log and released checks however they were locked.
+EXPORT = os.environ.get("BENCH_EXPORT")
 # MOLT_DIST_ABS: an absolute path to the built Maat (the container mounts it at /maat).
 MOLT = (Path(os.environ["MOLT_DIST_ABS"]) if os.environ.get("MOLT_DIST_ABS") else Path.home() / os.environ.get("MOLT_DIST", "Documents/molt-desktop/dist-compare")) / "cli.js"
 LIMIT = int(os.environ.get("BENCH_LIMIT", "600"))  # seconds per task
@@ -54,13 +60,128 @@ def openrouter_key() -> str:
 # denied calls per 60 runs: writing the deliverable through a heredoc, removing
 # the model's own scratch files. BENCH_GATE=yes reproduces the old runs.
 AGENT_USER = os.environ.get("BENCH_AGENT_USER")  # set in the containers: the agent runs unprivileged
+# Privilege separation (default in the containers): Maat runs as root and only the worker's
+# tools run as BENCH_AGENT_USER (--worker-user), so the worker cannot read Maat's state dir,
+# the reference program, the judge's HOME or its process list either. BENCH_PRIVSEP=0 runs the
+# whole of Maat as the agent user, as before 2026-10-07.
+PRIVSEP = bool(AGENT_USER) and os.environ.get("BENCH_PRIVSEP", "1") != "0" and os.geteuid() == 0
+# With privilege separation, task checks (hidden, drafted, mission) run as a third account
+# (--check-user): they can read the reference check, and the worker cannot. The image makes it.
+CHECK_USER = os.environ.get("BENCH_CHECK_USER") or "checker"
+
+# The graders run as root. They never run git in the agent's own repository: the agent owns its
+# .git/config, and core.fsmonitor, hooks, filters and diff drivers there would run as root. Until
+# 2026-10-07 run.py set safe.directory=* so git would grade an agent-owned repository at all; that
+# setting is gone. The graders get a root-owned copy of the task folder instead, with the git
+# config cut down to the repository format and the hooks removed (grading_copy), and git runs
+# with no system or global config and hooks pointed at /dev/null (GRADER_GIT_ENV).
+GRADER_GIT_ENV = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_CONFIG_COUNT": "3",
+    "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": "/dev/null",
+    "GIT_CONFIG_KEY_1": "core.fsmonitor", "GIT_CONFIG_VALUE_1": "false",
+    "GIT_CONFIG_KEY_2": "core.pager", "GIT_CONFIG_VALUE_2": "cat",
+    "GIT_TERMINAL_PROMPT": "0",
+}
+
+
+def sanitize_git(git_dir: Path) -> None:
+    """Replace a copied repository's config with the format lines alone, and drop its hooks
+    and attributes: nothing in it can name a program for git to run."""
+    cfg = git_dir / "config"
+    version, objfmt = "0", None
+    try:
+        section = ""
+        for line in cfg.read_text(errors="replace").splitlines():
+            t = line.strip()
+            if t.startswith("["):
+                section = t.strip("[]").strip().lower()
+                continue
+            k, _, v = t.partition("=")
+            k, v = k.strip().lower(), v.strip()
+            if section == "core" and k == "repositoryformatversion" and v.isdigit():
+                version = v
+            elif section == "extensions" and k == "objectformat" and v in ("sha1", "sha256"):
+                objfmt = v
+    except OSError:
+        pass
+    text = f"[core]\n\trepositoryformatversion = {version}\n\tfilemode = true\n\tbare = false\n"
+    if objfmt:
+        text += f"[extensions]\n\tobjectformat = {objfmt}\n"
+    if cfg.is_symlink() or cfg.exists():
+        cfg.unlink()
+    cfg.write_text(text)
+    for p in (git_dir / "hooks", git_dir / "info" / "attributes", git_dir / "config.worktree"):
+        if p.is_symlink() or p.is_file():
+            p.unlink()
+        elif p.is_dir():
+            shutil.rmtree(p)
+
+
+def _copy_regular(src, dst, *, follow_symlinks=True):
+    """copytree's copy function: regular files only, opened without following a link and
+    without blocking on a FIFO; anything else is skipped."""
+    st = os.lstat(src)
+    if not stat.S_ISREG(st.st_mode):
+        return dst
+    fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as fsrc:
+        if not stat.S_ISREG(os.fstat(fsrc.fileno()).st_mode):
+            return dst
+        with open(dst, "wb") as fdst:
+            shutil.copyfileobj(fsrc, fdst)
+    shutil.copystat(src, dst, follow_symlinks=False)
+    return dst
+
+
+def sanitized_copy(src: Path, dst: Path) -> Path:
+    """Copy an agent-written tree to `dst` (which must not exist), owned by whoever runs this:
+    regular files, folders and symlinks (as links) only, and every repository in it (.git
+    folders) sanitized (sanitize_git)."""
+    shutil.copytree(src, dst, symlinks=True, copy_function=_copy_regular)
+    for root, dirs, _files in os.walk(dst):
+        if ".git" in dirs and not os.path.islink(os.path.join(root, ".git")):
+            sanitize_git(Path(root) / ".git")
+    return dst
+
+
+def grading_copy(d: Path) -> Path:
+    """A root-owned copy of a finished task folder, for the graders. Regular files, folders and
+    symlinks (as links) only: a FIFO or device the agent left is skipped, not opened. Every
+    repository in it (.git folders) is sanitized. Call with the agent's processes stopped."""
+    import tempfile
+
+    return sanitized_copy(d, Path(tempfile.mkdtemp(prefix="maat-grade-")) / d.name)
+
+
+def grade_safely(T, d: Path):
+    """T.grade on a sanitized root-owned copy (grading_copy), with GRADER_GIT_ENV set."""
+    if AGENT_USER and shutil.which("pkill"):
+        subprocess.run(["pkill", "-KILL", "-u", AGENT_USER], check=False)
+    copy = grading_copy(d)
+    saved = {k: os.environ.get(k) for k in GRADER_GIT_ENV}
+    os.environ.update(GRADER_GIT_ENV)
+    try:
+        return T.grade(copy)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(copy.parent, ignore_errors=True)
 
 
 def as_agent(cmd: list, env: dict | None = None) -> tuple[list, dict | None]:
     """With BENCH_AGENT_USER set, run the agent as that user: it cannot read the graders
-    or the reference solutions, which stay root-only. Unset (Mac host lanes): unchanged."""
+    or the reference solutions, which stay root-only. Unset (Mac host lanes): unchanged.
+    With privilege separation Maat stays root and is told which user the worker is, and which
+    account runs the task checks."""
     if not AGENT_USER:
         return cmd, env
+    if PRIVSEP:
+        return [*cmd[:3], "--worker-user", AGENT_USER, "--check-user", CHECK_USER, *cmd[3:]], env
     import pwd
     home = pwd.getpwnam(AGENT_USER).pw_dir
     return ["runuser", "-u", AGENT_USER, "--", "env", f"HOME={home}", *cmd], env
@@ -81,6 +202,26 @@ def kill_tree(proc: subprocess.Popen) -> None:
 def hand_over(d: Path) -> None:
     if AGENT_USER:
         subprocess.run(["chown", "-R", AGENT_USER, str(d)], check=True)
+
+
+def lock(p: Path) -> None:
+    """A finished task's folder and logs: root-only, so a later task's worker cannot read an
+    earlier run's released checks, receipts or Maat's log (/work is shared by every task)."""
+    if not AGENT_USER or not p.exists():
+        return
+    try:
+        os.chown(p, 0, 0, follow_symlinks=False)
+        os.chmod(p, 0o700 if p.is_dir() else 0o600)
+    except (PermissionError, FileNotFoundError):
+        pass
+
+
+def write_private(p: Path, text: str) -> None:
+    """Written mode 600 from the start: the logs carry every hidden check once a job ends."""
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    lock(p)
 
 
 def provider_capped(out: str, steps: int) -> bool:
@@ -121,9 +262,9 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
             out, err = "", ""
         timed_out = True
     secs = time.time() - t0
-    log.write_text(out)
+    write_private(log, out)
     # Maat's own notices (criteria not drafted, dropped checks, refusals) go to stderr.
-    log.with_suffix(".err").write_text(err or "")
+    write_private(log.with_suffix(".err"), err or "")
     steps = 0; per = []; outcome = None; spend = {}; review = None; disagree = []; extra = {}
     for line in out.splitlines():
         if not line.startswith("{"):
@@ -197,6 +338,14 @@ def parse_arms(spec: str | None) -> list[tuple[str | None, dict]]:
 
 
 def main(which: str, repeats: int, task_filter: str | None) -> None:
+    try:
+        run_all(which, repeats, task_filter)
+    finally:
+        if EXPORT and Path(EXPORT).resolve() != WORK.resolve() and WORK.exists():
+            shutil.copytree(WORK, EXPORT, symlinks=True, dirs_exist_ok=True)
+
+
+def run_all(which: str, repeats: int, task_filter: str | None) -> None:
     from tasks2 import TASKS2  # noqa: PLC0415
     from tasks3 import TASKS3  # noqa: PLC0415
     agents = {"molt": run_molt}
@@ -210,6 +359,10 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
         tasks = [T for T in tasks if T.name in want]
     arms = parse_arms(os.environ.get("ARMS"))
     out = Path(os.environ.get("RESULTS_DIR", HERE)) / os.environ.get("RESULTS", f"results-{which}-x{repeats}.jsonl")
+    # Earlier runs' folders and logs (a resumed run, an earlier lane): out of the worker's reach.
+    if AGENT_USER and WORK.exists():
+        for p in WORK.iterdir():
+            lock(p)
     done = set()
     if out.exists():  # resume: skip runs already recorded
         for line in out.read_text().splitlines():
@@ -241,7 +394,8 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
                         # Not recorded, so a resume runs this task again.
                         print(f"STOPPED: the provider's daily limit / quota is reached ({tag} not recorded)", flush=True)
                         return
-                    ok, why = T.grade(d)
+                    ok, why = grade_safely(T, d)
+                    lock(d)
                     final = ""
                     r.update(task=T.name, agent=a, rep=rep, passed=ok, why=why, final=final[:300])
                     if arm:
