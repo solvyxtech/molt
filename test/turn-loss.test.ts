@@ -832,6 +832,17 @@ describe("an endpoint too small for the conversation", () => {
     // would destroy a working conversation to fix something else.
     assert.equal(contextOverflow(`{"error":"invalid api key"}`), null);
     assert.equal(contextOverflow(`{"error":"unsupported tool_choice value"}`), null);
+    // Mentioning context is not refusing for size: a pinned provider's 400 after a
+    // rate-limit retry ended a 2,476-token run as "too large" (2026-10-07).
+    assert.equal(
+      contextOverflow(`{"error":{"message":"No endpoints available for the requested provider and context","code":400}}`),
+      null,
+    );
+    assert.equal(contextOverflow(`{"error":"invalid message: context field missing"}`), null);
+    // Real overflow wordings still count.
+    assert.notEqual(contextOverflow(`{"error":"Prompt exceeds the maximum context of 131072 tokens"}`), null);
+    assert.notEqual(contextOverflow(`{"error":{"message":"prompt is too long: 210000 tokens > 200000 maximum"}}`), null);
+    assert.notEqual(contextOverflow(`{"error":"context_length_exceeded"}`), null);
   });
 
   it("measures how wrong its own token estimate is", () => {

@@ -339,7 +339,15 @@ export type Overflow = {
 };
 
 export function contextOverflow(body: string): Overflow | null {
-  if (!/context|n_ctx|too many tokens|maximum context length/i.test(body)) return null;
+  // Overflow wording, not the bare word "context": a pinned OpenRouter provider
+  // answered a rate-limit retry with a 400 that merely mentioned context, and a
+  // 2,476-token request was shed to nothing and the run ended (2026-10-07).
+  if (
+    !/n_ctx|too many tokens|maximum context length|context (length|window|size)|exceeds? (the )?(available |maximum )?context|context.{0,40}(exceed|too (long|large))|prompt is too long|request too large/i.test(
+      body,
+    )
+  )
+    return null;
   // Every field the common servers use, most specific first.
   const win =
     /"n_ctx"\s*:\s*(\d+)/.exec(body) ??
@@ -6250,6 +6258,7 @@ export class Engine {
                 if (target > 0) this.cfg.autoShedAtTokens = target;
 
                 log?.append("note", {
+                  body: body.slice(0, 600),
                   text:
                     `context window ${over.window || "unknown"}; server counted ${over.sent} where ` +
                     `maat estimated ${bom.requestTotalEst} (x${this.tokenScale.toFixed(2)}) — ` +
