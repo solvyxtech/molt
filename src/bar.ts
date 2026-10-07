@@ -2181,7 +2181,7 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
   let timedOut = false;
   // A task check runs in a throwaway copy of the tree, so a check that writes,
   // commits or deletes cannot change the work it judges (src/scratch.ts).
-  const tried = runsInCopy(check) ? copyTreeOrWhy(ctx.cwd) : null;
+  const tried = runsInCopy(check) ? await copyTreeOrWhy(ctx.cwd) : null;
   const copy = tried && !("why" in tried) ? tried : null;
   // Said on the result (and so in the receipt and the journal's bar_run), not
   // left silent: this check ran on the work itself.
@@ -2210,7 +2210,7 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
     exitCode = 1;
     output = String(e);
   } finally {
-    copy?.cleanup();
+    await copy?.cleanup();
   }
   let passed = exitCode === check.expectExit;
   if (!passed && diagnosis.hint) {

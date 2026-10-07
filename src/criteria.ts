@@ -312,7 +312,7 @@ export async function preflightCriteria(
     // In a copy, like the bar (src/scratch.ts): tried before the work, a check
     // that checks out a branch or deletes a file would change the folder the
     // work starts from.
-    const copy = process.env.MAAT_CHECK_COPY === "0" ? null : copyTree(opts.cwd);
+    const copy = process.env.MAAT_CHECK_COPY === "0" ? null : await copyTree(opts.cwd);
     try {
       const r = await runCommand(c.run, {
         cwd: copy?.dir ?? opts.cwd,
@@ -340,7 +340,7 @@ export async function preflightCriteria(
       // Failing to spawn it here is molt's problem, not the criterion's.
       // Reporting it as broken would block work for the wrong reason.
     } finally {
-      copy?.cleanup();
+      await copy?.cleanup();
     }
   }
   return broken;

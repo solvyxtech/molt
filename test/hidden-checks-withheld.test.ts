@@ -364,25 +364,49 @@ describe("checks cannot change the work", () => {
     }
   });
 
-  it("the copy links dependency folders, shares a large object store, and leaves Maat's records out", () => {
+  it("the copy copies a small dependency folder, links a large one, and leaves Maat's records out", async () => {
     const ws = repo();
     try {
       mkdirSync(join(ws.dir, "node_modules", "dep"), { recursive: true });
       writeFileSync(join(ws.dir, "node_modules", "dep", "index.js"), "module.exports = 1;\n");
+      mkdirSync(join(ws.dir, "target"), { recursive: true });
+      for (let i = 0; i < 5; i++) writeFileSync(join(ws.dir, "target", `o${i}`), "x");
       mkdirSync(join(ws.dir, ".maat", "receipts"), { recursive: true });
       writeFileSync(join(ws.dir, ".maat", "receipts", "0000-refused.md"), "x");
-      const c = copyTree(ws.dir);
+      const c = await copyTree(ws.dir, { linkOverFiles: 3 });
       assert.ok(c);
       try {
-        assert.ok(lstatSync(join(c.dir, "node_modules")).isSymbolicLink());
+        // Small: a copy, so a write into it stays in the copy.
+        assert.ok(!lstatSync(join(c.dir, "node_modules")).isSymbolicLink());
+        writeFileSync(join(c.dir, "node_modules", "dep", "index.js"), "changed\n");
+        assert.equal(readFileSync(join(ws.dir, "node_modules", "dep", "index.js"), "utf8"), "module.exports = 1;\n");
+        // Large: linked, and the copy says so.
+        assert.ok(lstatSync(join(c.dir, "target")).isSymbolicLink());
+        assert.deepEqual(c.linked, ["target"]);
         assert.ok(!existsSync(join(c.dir, ".maat")));
         assert.equal(readFileSync(join(c.dir, "about.md"), "utf8"), "# About\nI am a student.\n");
         assert.equal(execFileSync("git", ["log", "--oneline", "--all"], { cwd: c.dir }).toString().split("\n").filter(Boolean).length, 2);
       } finally {
-        c.cleanup();
+        await c.cleanup();
       }
       assert.ok(!existsSync(c.dir), "cleaned up");
-      assert.equal(copyTree(ws.dir, { maxFiles: 2 }), null, "over the limit runs in place");
+      assert.equal(await copyTree(ws.dir, { maxFiles: 2 }), null, "over the limit runs in place");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("the copy does not block the event loop", async () => {
+    const ws = repo();
+    try {
+      for (let i = 0; i < 300; i++) writeFileSync(join(ws.dir, `f${i}.txt`), "x\n");
+      let ticks = 0;
+      const t = setInterval(() => ticks++, 0);
+      const c = await copyTree(ws.dir);
+      clearInterval(t);
+      assert.ok(c);
+      await c.cleanup();
+      assert.ok(ticks > 0, "no timer ran while the tree was copied");
     } finally {
       ws.cleanup();
     }

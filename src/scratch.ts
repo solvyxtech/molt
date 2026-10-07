@@ -8,39 +8,35 @@
  * (src/checkwrites.ts) catches the commands it can read; this is the half
  * that does not depend on reading them. Each task check runs in a fresh copy
  * of the tree, `.git` included, and the copy is deleted afterwards, so what
- * a check writes, moves or commits in the project's own files and history
- * never reaches the work it is judging. Linked dependency folders (below)
- * are the exception: they are the real folders, so a check that installs
- * into `node_modules` or builds into `target` still writes there.
+ * a check writes, moves or commits in the project's files and history never
+ * reaches the work it is judging.
+ *
+ * What the copy does NOT cover: a large dependency folder (below) is linked,
+ * not copied, so it is the real folder, and a check that installs into
+ * `node_modules`, builds into `target` or writes a `.cache` still writes
+ * there. A symlink already in the tree is copied as a link and writes
+ * through to wherever it points. A check can change those; it cannot change
+ * the rest of the tree.
  *
  * Cost is kept down three ways:
  *  - files are cloned where the filesystem can (APFS, btrfs, XFS reflinks),
  *    which makes a copy close to free;
- *  - dependency folders (`node_modules`, virtualenvs, build caches) are
- *    linked, not copied: a check needs to import from them, and they are
- *    not the work;
+ *  - dependency folders (`node_modules`, virtualenvs, build caches) over
+ *    LINK_OVER_FILES files or LINK_OVER_BYTES are linked, not copied; a
+ *    small one is copied like the rest (and so is a source folder that only
+ *    happens to be called `target`);
  *  - a large `.git/objects` is shared through git's own alternates file
  *    instead of copied: new objects land in the copy, existing ones are
  *    read from the original, and git never deletes from an alternate.
+ * The copy is asynchronous, so the event loop (timers, Ctrl-C, the deadline)
+ * keeps running while it is taken on a filesystem that cannot clone.
  * A tree too big to copy within the limits below (or a `.git` that is a
- * pointer file, as in a worktree, which a copy cannot detach from) runs in
- * place, as every check did before this existed; `copyTree` returns null,
- * `whyNoCopy` says why, and the caller records it on the result.
+ * pointer file, as in a worktree, which a copy cannot detach from) gets no
+ * copy: `copyTreeOrWhy` says why, and the caller records it (a task check
+ * then runs in place and says so; a reviewer's objection is not run).
  */
-import {
-  constants,
-  copyFileSync,
-  lstatSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readlinkSync,
-  realpathSync,
-  rmSync,
-  symlinkSync,
-  utimesSync,
-  writeFileSync,
-} from "node:fs";
+import { constants } from "node:fs";
+import { copyFile, lstat, mkdir, mkdtemp, readdir, readlink, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { STATE_DIRS } from "./statedir.js";
@@ -71,6 +67,9 @@ export const COPY_MAX_FILES = 20_000;
 export const COPY_MAX_BYTES = 512 * 1024 * 1024;
 /** A `.git/objects` larger than this is shared through alternates instead of copied. */
 export const OBJECTS_COPY_MAX_BYTES = 64 * 1024 * 1024;
+/** A dependency folder over either of these is linked; under both, copied. */
+export const LINK_OVER_FILES = 2_000;
+export const LINK_OVER_BYTES = 32 * 1024 * 1024;
 
 export type TreeCopy = {
   /** The copy of the project root. Same base name as the original. */
@@ -78,49 +77,53 @@ export type TreeCopy = {
   files: number;
   bytes: number;
   ms: number;
+  /** Folders linked to the real ones rather than copied, relative to the root. */
+  linked: string[];
   /** Remove the copy. Safe to call twice. */
-  cleanup: () => void;
+  cleanup: () => Promise<void>;
   /** Rewrite the copy's path back to the project's in text a check printed. */
   unmap: (text: string) => string;
 };
 
 class TooBig extends Error {}
 
-/** Bytes under a directory, stopping once past `cap`. */
-function sizeUpTo(dir: string, cap: number): number {
-  let total = 0;
-  const walk = (d: string): void => {
-    if (total > cap) return;
-    let names: string[];
+/** Files and bytes under a directory, stopping once past either cap. */
+async function sizeUpTo(dir: string, capFiles: number, capBytes: number): Promise<{ files: number; bytes: number }> {
+  const total = { files: 0, bytes: 0 };
+  const over = () => total.files > capFiles || total.bytes > capBytes;
+  const walk = async (d: string): Promise<void> => {
+    if (over()) return;
+    let ents;
     try {
-      names = readdirSync(d);
+      ents = await readdir(d, { withFileTypes: true });
     } catch {
       return;
     }
-    for (const n of names) {
-      if (total > cap) return;
-      const p = join(d, n);
-      let st;
-      try {
-        st = lstatSync(p);
-      } catch {
-        continue;
+    for (const e of ents) {
+      if (over()) return;
+      const p = join(d, e.name);
+      if (e.isDirectory()) await walk(p);
+      else if (e.isFile()) {
+        total.files += 1;
+        try {
+          total.bytes += (await lstat(p)).size;
+        } catch {
+          /* gone */
+        }
       }
-      if (st.isDirectory()) walk(p);
-      else total += st.size;
     }
   };
-  walk(dir);
+  await walk(dir);
   return total;
 }
 
-/** Files under `root` the copy would take, stopping once past `cap`. */
-function countUpTo(root: string, cap: number): number {
+/** Files under `root` the copy would take, stopping once past `cap`. Dependency folders are counted when copied. */
+async function countUpTo(root: string, cap: number): Promise<number> {
   let n = 0;
-  const walk = (d: string, top: boolean): void => {
+  const walk = async (d: string, top: boolean): Promise<void> => {
     let ents;
     try {
-      ents = readdirSync(d, { withFileTypes: true });
+      ents = await readdir(d, { withFileTypes: true });
     } catch {
       return;
     }
@@ -129,11 +132,11 @@ function countUpTo(root: string, cap: number): number {
       if (top && (STATE_DIRS as readonly string[]).includes(e.name)) continue;
       if (e.isDirectory()) {
         if (LINKED_DIRS.has(e.name)) continue;
-        walk(join(d, e.name), false);
+        await walk(join(d, e.name), false);
       } else if (e.isFile()) n += 1;
     }
   };
-  walk(root, true);
+  await walk(root, true);
   return n;
 }
 
@@ -141,107 +144,111 @@ function countUpTo(root: string, cap: number): number {
  * Copy `root` to a fresh temporary directory. Null when the tree is over
  * the limits or cannot be copied; the caller then runs in place.
  */
-export function copyTree(root: string, limits: { maxFiles?: number; maxBytes?: number } = {}): TreeCopy | null {
-  const r = copyTreeOrWhy(root, limits);
+export type CopyLimits = { maxFiles?: number; maxBytes?: number; linkOverFiles?: number };
+
+export async function copyTree(root: string, limits: CopyLimits = {}): Promise<TreeCopy | null> {
+  const r = await copyTreeOrWhy(root, limits);
   return "why" in r ? null : r;
 }
 
-/** Why the last tree had no copy, for a caller that got null. */
-export function copyTreeOrWhy(
+/** A copy of the tree, or why there is none. */
+export async function copyTreeOrWhy(
   root: string,
-  limits: { maxFiles?: number; maxBytes?: number } = {},
-): TreeCopy | { why: string } {
+  limits: CopyLimits = {},
+): Promise<TreeCopy | { why: string }> {
   const t0 = Date.now();
+  const linkOverFiles = limits.linkOverFiles ?? LINK_OVER_FILES;
   const maxFiles = limits.maxFiles ?? COPY_MAX_FILES;
   const maxBytes = limits.maxBytes ?? COPY_MAX_BYTES;
   let gitLink = false;
   try {
-    gitLink = lstatSync(join(root, ".git")).isFile();
+    gitLink = (await lstat(join(root, ".git"))).isFile();
   } catch {
     /* no .git */
   }
   if (gitLink) return { why: "its .git is a pointer file (a worktree or submodule), which a copy cannot detach from" };
   // Counted first, names only: a tree over the limit is found out in a
   // fraction of what copying up to the limit and throwing it away costs.
-  if (countUpTo(root, maxFiles) > maxFiles) return { why: `the tree has over ${maxFiles} files` };
+  if ((await countUpTo(root, maxFiles)) > maxFiles) return { why: `the tree has over ${maxFiles} files` };
   let tmp: string;
   try {
-    tmp = mkdtempSync(join(tmpdir(), "maat-check-"));
+    tmp = await mkdtemp(join(tmpdir(), "maat-check-"));
   } catch (e) {
     return { why: `no temporary directory (${e instanceof Error ? e.message : String(e)})` };
   }
   const dest = join(tmp, basename(root) || "work");
   let files = 0;
   let bytes = 0;
-  const copyDir = (src: string, dst: string, top: boolean, inGit: boolean): void => {
-    mkdirSync(dst, { recursive: true });
-    for (const ent of readdirSync(src, { withFileTypes: true })) {
+  const linked: string[] = [];
+  const copyOne = async (s: string, d: string): Promise<void> => {
+    const st = await lstat(s);
+    files += 1;
+    bytes += st.size;
+    if (files > maxFiles || bytes > maxBytes) throw new TooBig();
+    await copyFile(s, d, constants.COPYFILE_FICLONE);
+    // Same mtimes: `make`, git's index and a check that compares ages all read them.
+    await utimes(d, st.atime, st.mtime);
+  };
+  const copyDir = async (src: string, dst: string, top: boolean, inGit: boolean): Promise<void> => {
+    await mkdir(dst, { recursive: true });
+    for (const ent of await readdir(src, { withFileTypes: true })) {
       const name = ent.name;
       if (top && (STATE_DIRS as readonly string[]).includes(name)) continue;
       const s = join(src, name);
       const d = join(dst, name);
       if (ent.isSymbolicLink()) {
-        symlinkSync(readlinkSync(s), d);
+        await symlink(await readlink(s), d);
         continue;
       }
       if (ent.isDirectory()) {
         if (!inGit && LINKED_DIRS.has(name)) {
-          symlinkSync(s, d);
-          continue;
+          const size = await sizeUpTo(s, linkOverFiles, LINK_OVER_BYTES);
+          if (size.files > linkOverFiles || size.bytes > LINK_OVER_BYTES) {
+            await symlink(s, d);
+            linked.push(s.slice(root.length + 1));
+            continue;
+          }
         }
         if (name === ".git" && !inGit) {
-          copyGit(s, d);
+          await copyGit(s, d);
           continue;
         }
-        copyDir(s, d, false, inGit);
+        await copyDir(s, d, false, inGit);
         continue;
       }
       if (!ent.isFile()) continue;
-      const st = lstatSync(s);
-      files += 1;
-      bytes += st.size;
-      if (files > maxFiles || bytes > maxBytes) throw new TooBig();
-      copyFileSync(s, d, constants.COPYFILE_FICLONE);
-      // Same mtimes: `make`, git's index and a check that compares ages all read them.
-      utimesSync(d, st.atime, st.mtime);
+      await copyOne(s, d);
     }
   };
-  const copyGit = (src: string, dst: string): void => {
-    mkdirSync(dst, { recursive: true });
-    for (const ent of readdirSync(src, { withFileTypes: true })) {
+  const copyGit = async (src: string, dst: string): Promise<void> => {
+    await mkdir(dst, { recursive: true });
+    for (const ent of await readdir(src, { withFileTypes: true })) {
       const s = join(src, ent.name);
       const d = join(dst, ent.name);
-      if (ent.name === "objects" && ent.isDirectory() && sizeUpTo(s, OBJECTS_COPY_MAX_BYTES) > OBJECTS_COPY_MAX_BYTES) {
+      if (ent.name === "objects" && ent.isDirectory() && (await sizeUpTo(s, Infinity, OBJECTS_COPY_MAX_BYTES)).bytes > OBJECTS_COPY_MAX_BYTES) {
         // Shared, read-only from the copy's side: git writes new objects to
         // the copy's own store and never prunes an alternate.
-        mkdirSync(join(d, "info"), { recursive: true });
-        mkdirSync(join(d, "pack"), { recursive: true });
-        writeFileSync(join(d, "info", "alternates"), `${realpathSync(s)}\n`);
+        await mkdir(join(d, "info"), { recursive: true });
+        await mkdir(join(d, "pack"), { recursive: true });
+        await writeFile(join(d, "info", "alternates"), `${await realpath(s)}\n`);
         continue;
       }
-      if (ent.isSymbolicLink()) symlinkSync(readlinkSync(s), d);
-      else if (ent.isDirectory()) copyDir(s, d, false, true);
-      else if (ent.isFile()) {
-        const st = lstatSync(s);
-        files += 1;
-        bytes += st.size;
-        if (files > maxFiles || bytes > maxBytes) throw new TooBig();
-        copyFileSync(s, d, constants.COPYFILE_FICLONE);
-        utimesSync(d, st.atime, st.mtime);
-      }
+      if (ent.isSymbolicLink()) await symlink(await readlink(s), d);
+      else if (ent.isDirectory()) await copyDir(s, d, false, true);
+      else if (ent.isFile()) await copyOne(s, d);
     }
   };
-  const cleanup = () => {
+  const cleanup = async () => {
     try {
-      rmSync(tmp, { recursive: true, force: true });
+      await rm(tmp, { recursive: true, force: true });
     } catch {
       /* a temp dir left behind is the OS's to clear */
     }
   };
   try {
-    copyDir(root, dest, true, false);
+    await copyDir(root, dest, true, false);
   } catch (e) {
-    cleanup();
+    await cleanup();
     return {
       why: e instanceof TooBig
         ? `the tree is over ${maxFiles} files or ${Math.round(maxBytes / 1024 / 1024)} MB`
@@ -251,8 +258,8 @@ export function copyTreeOrWhy(
   let realDest = dest;
   let realRoot = root;
   try {
-    realDest = realpathSync(dest);
-    realRoot = realpathSync(root);
+    realDest = await realpath(dest);
+    realRoot = await realpath(root);
   } catch {
     /* compare as given */
   }
@@ -264,6 +271,7 @@ export function copyTreeOrWhy(
     dir: dest,
     files,
     bytes,
+    linked,
     ms: Date.now() - t0,
     cleanup,
     unmap: (text) => {
