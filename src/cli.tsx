@@ -181,6 +181,13 @@ options
                      on the tree before the work and passes now; otherwise
                      "passed checks that did not test this work", exit 3
                      (also MAAT_REQUIRE_DISCRIMINATING=1; off by default)
+  --post-work-audit  when the checks sealed before the work did not verify a
+                     claim, the --judge model drafts checks from the task and
+                     the work's interface (never its transcript or outputs);
+                     one that quotes the task, passes on the work, fails
+                     before it and fails on a mutant of the changed code earns
+                     "verified (post-work audit: <judge>)". Needs --judge
+                     (also MAAT_POST_WORK_AUDIT=1; off by default)
   --signout          before an unattended claim is judged, put each stated
                      requirement to the model once beside the commands it ran
                      (off by default: 60 rounds rescued no task)
@@ -320,6 +327,8 @@ type Args = {
   reviewExecutable?: boolean;
   /** `--require-discriminating`: see EngineConfig.requireDiscriminating. */
   requireDiscriminating?: boolean;
+  /** `--post-work-audit`: see EngineConfig.postWorkAudit. */
+  postWorkAudit?: boolean;
   /** `--signout`: see EngineConfig.signOut. */
   signout?: boolean;
   /** `--arbiter-model` / `--dispute-votes`: see EngineConfig.dispute. */
@@ -567,6 +576,9 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         break;
       case "--require-discriminating":
         out.requireDiscriminating = true;
+        break;
+      case "--post-work-audit":
+        out.postWorkAudit = true;
         break;
       case "--signout":
         out.signout = true;
@@ -886,6 +898,7 @@ function engineFor(args: Args, session = false, extra: { files?: FileAccess } = 
     ...(args.reviewAdvisory || env("REVIEW_ADVISORY") === "1" ? { reviewAdvisory: true } : {}),
     ...(args.reviewExecutable || env("REVIEW_EXECUTABLE") === "1" ? { reviewExecutable: true } : {}),
     ...(args.requireDiscriminating || env("REQUIRE_DISCRIMINATING") === "1" ? { requireDiscriminating: true } : {}),
+    ...(args.postWorkAudit || env("POST_WORK_AUDIT") === "1" ? { postWorkAudit: true } : {}),
     ...(args.signout ? { signOut: true } : {}),
     ...(args.arbiterModel || args.disputeVotes ? { dispute: { model: args.arbiterModel, votes: args.disputeVotes } } : {}),
     ...(args.review ? { review: { votes: args.review, reasoningEffort: args.reasoningChecks ?? args.reasoning } } : {}),

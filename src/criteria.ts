@@ -325,6 +325,8 @@ export async function preflightCriteria(
      * run. The task text is where a path the person stated is allowed from.
      */
     stray?: { task: string };
+    /** Kill what each check left running when it exits (run.ts killGroupOnExit). */
+    killGroupOnExit?: boolean;
   },
 ): Promise<BrokenCriterion[]> {
   const broken: BrokenCriterion[] = [];
@@ -357,6 +359,7 @@ export async function preflightCriteria(
         signal: opts.signal,
         // As the check account in its copy, or as the worker in the project (--check-user).
         asCheck: copy ? "copy" : "in-place",
+        ...(opts.killGroupOnExit ? { killGroupOnExit: true } : {}),
       });
       // One decision point, shared with the bar. A command that outlived the
       // timeout plainly ran, and a timeout's exit code is never one of the
@@ -993,6 +996,47 @@ export const PASSES_BEFORE_WORK =
 export const PRINTS_FAIL_EXITS_0 =
   "it printed a failure (FAIL or False) and still exited 0 before any work, so its exit code does not carry its verdict; make a failure exit non-zero (assert, sys.exit(1), jq -e, or compare in the shell)";
 
+/**
+ * The pre-work screen: each check is tried on a copy of the project taken
+ * before the work. One that already passes there cannot show the task was
+ * done (P1); one that exits 0 while printing FAIL cannot fail at all (L16).
+ * The rest are kept, including one that could not run before the work (its
+ * deliverable did not exist yet). Used at seal time and by the post-work
+ * audit (src/post-audit.ts). Null when the screen could not run, or the copy
+ * changed under it (`intact`): then it decided nothing.
+ */
+export async function preWorkScreen(
+  checks: readonly DraftedCheck[],
+  preWorkDir: string,
+  redraft = false,
+  opts: { killGroupOnExit?: boolean; timeoutMs?: number; intact?: () => Promise<boolean> } = {},
+): Promise<{ ok: DraftedCheck[]; bad: LintDrop[] } | null> {
+  const passed: string[] = [];
+  const printedFail: string[] = [];
+  const { intact, ...run } = opts;
+  // A copy the worker changed (the draft can outlive the start of the work)
+  // is not the tree before the work: nothing tried on it decides anything.
+  if (intact && !(await intact())) return null;
+  try {
+    await preflightCriteria(
+      // As they will be sealed: hidden task checks, so under the bar's shell.
+      checks.map((c) => ({ name: c.name, kind: "command", run: c.run, hidden: true, tags: ["task"] })),
+      { cwd: preWorkDir, passed, printedFail, ...run },
+    );
+  } catch {
+    return null;
+  }
+  if (intact && !(await intact())) return null;
+  const ok: DraftedCheck[] = [];
+  const bad: LintDrop[] = [];
+  for (const c of checks) {
+    if (printedFail.includes(c.name)) bad.push({ name: c.name, run: c.run, rule: "L16-printed-fail", why: PRINTS_FAIL_EXITS_0, redraft });
+    else if (passed.includes(c.name)) bad.push({ name: c.name, run: c.run, rule: "P1-passes-before-work", why: PASSES_BEFORE_WORK, redraft });
+    else ok.push(c);
+  }
+  return { ok, bad };
+}
+
 /** A drafted check the seal-time lint retired (src/checklint.ts), for the journal. */
 export type LintDrop = { name: string; run: string; rule: string; why: string; redraft: boolean };
 type Sink = { requirements: string[]; lint: LintDrop[] };
@@ -1059,29 +1103,8 @@ async function critiqued(
   const screen = async (checks: DraftedCheck[], redraft: boolean): Promise<{ ok: DraftedCheck[]; bad: LintDrop[] }> => {
     const l = lintSplit(checks, redraft);
     if (!opts.preWorkDir || !l.ok.length) return l;
-    const passed: string[] = [];
-    const printedFail: string[] = [];
-    // A copy the worker changed (the draft can outlive the start of the work)
-    // is not the tree before the work: nothing tried on it decides anything.
-    if (opts.preWorkIntact && !(await opts.preWorkIntact())) return l;
-    try {
-      await preflightCriteria(
-        // As they will be sealed: hidden task checks, so under the bar's shell.
-        l.ok.map((c) => ({ name: c.name, kind: "command", run: c.run, hidden: true, tags: ["task"] })),
-        { cwd: opts.preWorkDir, passed, printedFail },
-      );
-    } catch {
-      return l;
-    }
-    if (opts.preWorkIntact && !(await opts.preWorkIntact())) return l;
-    const ok: DraftedCheck[] = [];
-    const bad = [...l.bad];
-    for (const c of l.ok) {
-      if (printedFail.includes(c.name)) bad.push({ name: c.name, run: c.run, rule: "L16-printed-fail", why: PRINTS_FAIL_EXITS_0, redraft });
-      else if (passed.includes(c.name)) bad.push({ name: c.name, run: c.run, rule: "P1-passes-before-work", why: PASSES_BEFORE_WORK, redraft });
-      else ok.push(c);
-    }
-    return { ok, bad };
+    const s = await preWorkScreen(l.ok, opts.preWorkDir, redraft, { intact: opts.preWorkIntact });
+    return s ? { ok: s.ok, bad: [...l.bad, ...s.bad] } : l;
   };
   const drafted1 = await draftCriteria(opts);
   let first = drafted1.ok ? { ...drafted1, draft: fix(drafted1.draft) } : drafted1;

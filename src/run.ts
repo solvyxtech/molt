@@ -56,6 +56,13 @@ export type RunOptions = {
    * runs it (`/proc/$PPID/cmdline`).
    */
   hideCommand?: boolean;
+  /**
+   * When the shell exits, kill whatever it left running in its process group
+   * (a server started with `&`). Used where runs follow one another on the
+   * same ports (src/post-audit.ts): a server left by the run on the work would
+   * otherwise answer for the pre-work copy and for every mutant.
+   */
+  killGroupOnExit?: boolean;
 };
 
 /**
@@ -284,6 +291,7 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
     // "close" is bounded.
     child.on("close", (code, signal) => finish(code, signal));
     child.on("exit", (code, signal) => {
+      if (opts.killGroupOnExit) signalAll("SIGKILL");
       drainTimer ??= setTimeout(() => finish(code, signal, true), DRAIN_GRACE_MS);
     });
     child.on("error", (e) => {

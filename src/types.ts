@@ -694,7 +694,7 @@ export type EngineEvent =
        * check) and no reviewer contradicted it. "passed-checks" is the outcome
        * "unverified" with `tierReason` saying why the word was not earned.
        */
-      tier?: "verified" | "passed-checks" | "passed-own-checks" | "passed-untested";
+      tier?: "verified" | "passed-checks" | "passed-own-checks" | "passed-untested" | "verified-audit";
       tierReason?: string;
       /**
        * The claim in words, the same on every surface and in the bench's
@@ -705,6 +705,13 @@ export type EngineEvent =
       claim?: string;
       /** Who wrote each sealed check, by name: "worker <model>", "judge <model>", "person", "reference <model>". */
       checkAuthors?: Record<string, string>;
+      /**
+       * The post-work audit (`--post-work-audit`, src/post-audit.ts), when it
+       * ran: the judge, how many checks it drafted, how many quoted the task,
+       * and which cleared every gate. Absent when the flag is off or the run
+       * was already verified.
+       */
+      audit?: { judge: string; drafted: number; grounded: number; accepted: string[]; error?: string };
     }
   | {
       kind: "step_summary";

@@ -180,6 +180,7 @@ describe("a check's command text", { skip: !posix }, () => {
       ["src/criteria.ts", /runCommand\(/g],
       ["src/mission.ts", /runCommand\(/g],
       ["src/reference.ts", /runCommand\(check\.run/g],
+      ["src/post-audit.ts", /runCommand\(run,/g],
     ];
     for (const [file, re] of sites) {
       const src = readFileSync(join(process.cwd(), file), "utf8");

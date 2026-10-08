@@ -60,7 +60,7 @@ def no_verdict(row: dict) -> bool:
     return (not c) or c.startswith(("error", "stopped")) or bool(row.get("timed_out"))
 
 
-TIERS = ("verified", "passed-checks", "passed-own-checks", "passed-untested")
+TIERS = ("verified", "passed-checks", "passed-own-checks", "passed-untested", "verified-audit")
 
 
 def claim_basis(claim) -> str | None:
@@ -71,6 +71,9 @@ def claim_basis(claim) -> str | None:
       "verified (your checks)"                      -> "person"
       "passed own checks (m), not verified"         -> "own"
       "passed checks that did not test this work, not verified" -> "untested"
+      "verified (post-work audit: m)"               -> "audit"  (--post-work-audit:
+                                  checks drafted after the work, gated on the
+                                  pre-work tree and on mutants)
       "verified (self-checked)"  (builds before 2026-10-07: the checks were
                                   drafted, by the worker or a judge; the
                                   text cannot say which)  -> "self-checked"
@@ -82,6 +85,8 @@ def claim_basis(claim) -> str | None:
         return None
     if claim.startswith("verified (independent checks"):
         return "independent"
+    if claim.startswith("verified (post-work audit"):
+        return "audit"
     if claim.startswith("verified (your checks)"):
         return "person"
     if claim.startswith("passed own checks"):
@@ -96,10 +101,15 @@ def claim_basis(claim) -> str | None:
 
 
 def claim_judge(claim) -> list[str]:
-    """The judge model(s) named by "verified (independent checks: a, b)"; [] otherwise."""
-    if not isinstance(claim, str) or not claim.startswith("verified (independent checks:"):
+    """The judge model(s) named by "verified (independent checks: a, b)" or "verified (post-work audit: j)"; [] otherwise."""
+    if not isinstance(claim, str):
         return []
-    inner = claim[len("verified (independent checks:"):].rsplit(")", 1)[0]
+    for head in ("verified (independent checks:", "verified (post-work audit:"):
+        if claim.startswith(head):
+            break
+    else:
+        return []
+    inner = claim[len(head):].rsplit(")", 1)[0]
     return [m.strip() for m in inner.split(",") if m.strip()]
 
 
