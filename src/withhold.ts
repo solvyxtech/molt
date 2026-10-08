@@ -42,6 +42,16 @@ function ordered(list: readonly string[]): string[] {
   return [...new Set(list)].filter((s) => s.length >= WITHHELD_MIN_CHARS).sort((a, b) => b.length - a.length);
 }
 
+/**
+ * Masking is by exact substring (plus a trimmed and a markdown-`\|`-escaped
+ * form). It catches a command written back verbatim — the common case, since
+ * Maat echoes the command it ran. It does NOT catch a command a tool has
+ * reformatted: re-quoted, re-indented, line-rewrapped, or split so no run of
+ * it appears intact. Masking is a convenience for Maat's own records, not a
+ * confidentiality boundary; the boundary is keeping the command off disk while
+ * the job runs (this module), out of argv (`hideCommand`, src/run.ts) and,
+ * under `--worker-user`, behind a uid the worker cannot cross.
+ */
 export function maskText(text: string, list: readonly string[]): string {
   if (!text || list.length === 0) return text;
   let out = text;
