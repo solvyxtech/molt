@@ -26,6 +26,8 @@ export const STALE_FAILURE_PREFIX = "[molt: superseded]";
 export const ELIDED_PREFIX = "[molt: superseded tool result —";
 /** How the engine sends a repeated call whose result has not changed (see engine.ts). */
 const SAME_CALL_PREFIX = "[molt: this is the same ";
+/** How the engine sends a read of lines the model has already been shown. */
+const SHOWN_PREFIX = "[molt: you have already been shown";
 
 /**
  * A bash command that only prints one file: `cat f`, `head -n 40 f`,
@@ -617,6 +619,11 @@ export class Transcript {
         if (!path) return;
 
         if (call.function.name === "read_file") {
+          // A repeat the engine answered with a pointer ("already shown",
+          // "the same call") points at the earlier copy: that copy must stay,
+          // and stays the one a later write invalidates.
+          const got = at >= 0 ? (this.working[at].content ?? "") : "";
+          if (got.startsWith(SAME_CALL_PREFIX) || got.startsWith(SHOWN_PREFIX)) return;
           // Identical arguments return identical bytes; anything else is a
           // different part of the file and stands on its own.
           const window = `${path}@${Number(args.offset ?? 0)}+${String(args.limit ?? "all")}`;

@@ -264,6 +264,18 @@ describe("per-call elision (default)", () => {
     assert.ok(!JSON.stringify(t.wire()).includes("DUR_OLD"));
   });
 
+  it("a read_file answered with a pointer keeps the copy it points at, and a write still finds it", () => {
+    const t = new Transcript("S");
+    step(t, [["read_file", { path: "dur.py" }, "a", body("DUR_OLD")]]);
+    step(t, [["read_file", { path: "dur.py" }, "b", "[molt: you have already been shown lines 1-40 of dur.py. Scroll up.]"]]);
+    step(t, [["read_file", { path: "dur.py" }, "c", "[molt: this is the same read_file call you made at step 1, and nothing has changed since.]"]]);
+    assert.equal(t.elideSupersededReads().elided, 0, "the original was elided under its own pointer");
+    assert.ok(JSON.stringify(t.wire()).includes("DUR_OLD"));
+    step(t, [["write_file", { path: "dur.py", content: "new" }, "w", "wrote"]]);
+    assert.equal(t.elideSupersededReads().elided, 1);
+    assert.ok(!JSON.stringify(t.wire()).includes("DUR_OLD"));
+  });
+
   it("the rerun key does not depend on argument order", () => {
     const t = new Transcript("S");
     t.push({ role: "assistant", content: null, tool_calls: [{ id: "a", type: "function", function: { name: "bash", arguments: '{"timeout_s":600,"command":"make"}' } }] });
