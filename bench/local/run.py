@@ -98,7 +98,9 @@ def claim_of(ev: dict) -> str | None:
 
     Builds from 2026-10-07 on carry job_end's own `claim`, which says who stood
     behind the word: "verified (independent checks: <judge>)", "verified (your
-    checks)", or "passed own checks (<worker>), not verified" (never counted as
+    checks)", "verified (post-work audit: <judge>)" (--post-work-audit, tier
+    verified-audit: checks drafted after the work, gated on the pre-work tree
+    and on mutants), or "passed own checks (<worker>), not verified" (never counted as
     verified: it does not start with "verified"). Older builds, and outcomes
     that are not a tier, carry the outcome as before, with " (self-checked)"
     when every check was drafted (whoever drafted it).
@@ -161,7 +163,7 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
             review = ev.get("review")
             disagree = ev.get("checksDisagree") or []
             # Only what job_end carried; absent keys stay absent (older builds).
-            extra = {k: ev[k] for k in ("revealed", "deadline", "endedBy", "retired", "build", "tier", "tierReason", "providerStall", "checkAuthors") if k in ev}
+            extra = {k: ev[k] for k in ("revealed", "deadline", "endedBy", "retired", "build", "tier", "tierReason", "providerStall", "checkAuthors", "audit") if k in ev}
     # The provider's daily cap, not the work: every later task would fail the
     # same way (2026-10-05: eleven tasks per arm "failed" in 140 s, 0 turns).
     capped = provider_capped(out, steps)

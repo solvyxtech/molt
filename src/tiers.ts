@@ -146,7 +146,7 @@ export function evidenceTags(run: string, surface: boolean | undefined): string[
  * ... || echo fail` passed before server.py existed and earned a wrong
  * "verified" (the grader got a non-JSON 404).
  */
-export type Tier = "verified" | "passed-checks" | "passed-own-checks" | "passed-untested";
+export type Tier = "verified" | "passed-checks" | "passed-own-checks" | "passed-untested" | "verified-audit";
 export type TierVerdict = {
   tier: Tier;
   reason?: string;
@@ -279,6 +279,19 @@ export function claimLabel(outcome: string, tier: Pick<TierVerdict, "tier" | "ba
   }
   return outcome;
 }
+
+/**
+ * "verified-audit": the run was not verified by the checks sealed before the
+ * work, and an independent judge's post-work audit check (src/post-audit.ts,
+ * `--post-work-audit`) passed on the work, failed before it, failed on a
+ * mutant of the changed code that still ran, and cleared the lints. A
+ * separate tier and label, so its precision is read off apart from the
+ * pre-work "verified".
+ */
+export function auditClaim(judge: string): string {
+  return `${AUDIT_CLAIM_PREFIX}${judge || "another model"})`;
+}
+export const AUDIT_CLAIM_PREFIX = "verified (post-work audit: ";
 
 /** The claim for the "passed-untested" tier, on every surface. */
 export const UNTESTED_CLAIM = "passed checks that did not test this work, not verified";
