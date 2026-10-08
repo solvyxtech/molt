@@ -118,7 +118,7 @@ import { takeTurn } from "./localgate.js";
 import { parseLenient } from "./lenient-json.js";
 import { LONG_RATE_LIMIT_MS, longQuotaText, rateLimitResetAt, untilText, providerErrorText, normalizeMessage, readStream, transientProviderError, type ProviderError, type StreamAccumulator, type Usage } from "./stream.js";
 import { Fragments, SafeStream } from "./live.js";
-import { Transcript, toolDetail } from "./transcript.js";
+import { Transcript, excerpt, toolDetail } from "./transcript.js";
 import { acpAgentFor, acpHealth, acpModels, AcpSession, backendStallMs, isAcp } from "./acp.js";
 import { type BackendSession, type ToolRunner } from "./backend.js";
 import { endpointProblem, removedSubscriptionProblem } from "./endpoint.js";
@@ -313,6 +313,10 @@ const CEILING_WARNINGS = [0.5, 0.8];
  * original is preserved in `.maat/exuviae/`, `record-intact` fails if it is
  * not, and `/regrow` pulls it back by pattern.
  */
+/** Malformed tool calls in a row before the model is told firmly, and before the turn ends. */
+export const MALFORMED_WARN = 3;
+export const MALFORMED_STOP = 6;
+
 export const DEFAULT_AUTO_SHED_TOKENS = 60_000;
 
 /**
@@ -2418,6 +2422,13 @@ export class Engine {
    * ran; two of them had passing work on disk.
    */
   private turnEndedBy: "deadline" | "provider" | "no-progress" | undefined;
+  /**
+   * Malformed tool calls in a row this turn. One is a slip; a run that kept
+   * sending broken `act` calls made 17 in a row and paid for every one
+   * (2026-10-07). After MALFORMED_WARN the model is told firmly; after
+   * MALFORMED_STOP the turn ends and the work on disk is judged.
+   */
+  private malformedStreak = 0;
   /** A subprocess backend went silent past the stall allowance this turn (a provider issue). */
   private turnProviderStall = false;
   /** `--revert` put this turn's work back, so a person cannot accept it as it stands. */
@@ -4829,6 +4840,7 @@ export class Engine {
     this.turnAllRetired = false;
     this.turnRevealed = [];
     this.turnEndedBy = undefined;
+    this.malformedStreak = 0;
     this.turnProviderStall = false;
     this.turnRestored = false;
     this.refusedThisTurn = false;
@@ -5589,6 +5601,10 @@ export class Engine {
       // sent. Say what actually happened instead.
       malformed = true;
     }
+    // An act reaches a tool call as itself only when its actions could not be
+    // read (expandAct), so it counts as malformed here too.
+    const refused = malformed || name === "act";
+    this.malformedStreak = refused ? this.malformedStreak + 1 : 0;
     const detail = toolDetail(name, args);
     this.turnCalls.add(callId);
     // What the current autonomy level says about this exact call. The
@@ -5662,8 +5678,13 @@ export class Engine {
           ? `[molt: the arguments for ${name} do not fit its schema, so nothing ran: ` +
             `${violations.join("; ")}. Send the call again with them fixed.]`
           : `[molt: the arguments for ${name} were not valid JSON, so nothing ran. ` +
-            `Send them again as a JSON object. What arrived was: ${raw}]`;
-      this.transcript.push({ role: "tool", tool_call_id: callId, content: complaint });
+            `Send them again as a JSON object. What arrived began: ${excerpt(raw)}]`;
+      const firm =
+        this.malformedStreak >= MALFORMED_WARN
+          ? ` [molt: that is ${this.malformedStreak} malformed calls in a row. Send ONE call whose arguments are a single JSON object matching the ${name} schema, or finish; after ${MALFORMED_STOP} the turn ends.]`
+          : "";
+      this.transcript.push({ role: "tool", tool_call_id: callId, content: complaint + firm });
+      this.transcript.markMalformedCall(callId);
       return { name, result: complaint, auto: true, repeated: false };
     }
     // Timed around execution only. Waiting on a human to approve a gated
@@ -5837,6 +5858,7 @@ export class Engine {
       auto: !decision.ask,
     };
     this.transcript.push({ role: "tool", tool_call_id: callId, content: result });
+    if (refused) this.transcript.markMalformedCall(callId);
     return { name, result, auto: !decision.ask, repeated: repeatedHere };
   }
 
@@ -6538,6 +6560,17 @@ export class Engine {
         };
         const judged = yield* judgeOnDisk("no-progress", "");
         if (!judged) yield* this.salvage("No file in the project has changed for a long time; the turn is over.", fetchFn, log);
+        return;
+      }
+      if (this.malformedStreak >= MALFORMED_STOP) {
+        log?.append("note", { text: `ended: malformed tool calls (${this.malformedStreak} in a row)`, malformedStop: true });
+        yield {
+          kind: "info",
+          text: `ended: ${this.malformedStreak} malformed tool calls in a row — no more tool calls this turn. The work on disk is judged as it stands.`,
+        };
+        this.turnEndedBy = "provider";
+        const judged = this.turnWrites.length > 0 ? yield* judgeOnDisk("provider", "") : false;
+        if (!judged) yield* this.salvage("You sent several malformed tool calls in a row, so this turn has ended.", fetchFn, log);
         return;
       }
       if (deadlineInterrupted || this.pastDeadline()) {
