@@ -13,7 +13,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
-import { ACP_AGENTS, backendStallMs, BACKEND_STALL_MS } from "../src/acp.js";
+import { ACP_AGENTS, backendStallMs, BACKEND_STALL_MS, CANCEL_GRACE_MS } from "../src/acp.js";
 import { askModel } from "../src/ask.js";
 import { deadlineGraceMs, Engine } from "../src/engine.js";
 import { Journal } from "../src/journal.js";
@@ -105,8 +105,26 @@ describe("an ACP agent that never answers, under --for 5s", { skip: process.plat
     chmodSync(join(bin, "grok"), 0o755);
     const agentLog = join(root, "agent.log");
 
-    const t0 = Date.now();
-    const { code, stdout } = await new Promise<{ code: number; stdout: string }>((resolve) => {
+    // The clock is started when the agent has the prompt, not when the CLI is
+    // spawned. `--for` is a ceiling on the turn (the turn's own clock is
+    // job_end's durationMs, checked below); the node start-up and set-up
+    // before the turn are outside it, and on a loaded machine they are not
+    // small. Measured 2026-10-08 with 150 CPU burners on a 10-core Mac:
+    // durationMs 7007 on every run, but 11.6–12.5 s from spawn to exit — about
+    // 3 s of module loading before the journal opened and 1.7 s of set-up
+    // before the turn began. That is the 11.06 s CI failure on #54 and the
+    // 11.3 s on #51/#52: a wall clock that included start-up, not a deadline
+    // missed. From the prompt on, every wait is a timer.
+    let promptAt = 0;
+    const watch = setInterval(() => {
+      if (promptAt) return;
+      try {
+        if (/^prompt$/m.test(readFileSync(agentLog, "utf8"))) promptAt = Date.now();
+      } catch {
+        // Not written yet.
+      }
+    }, 20);
+    const { code, stdout, exitAt } = await new Promise<{ code: number; stdout: string; exitAt: number }>((resolve) => {
       const child = spawn(
         process.execPath,
         [CLI, "run", "write a.txt", "--url", "grok-build", "--model", "grok-4.6", "--for", "5s", "--json", "--yes", "--cwd", dir],
@@ -117,13 +135,9 @@ describe("an ACP agent that never answers, under --for 5s", { skip: process.plat
       );
       let out = "";
       child.stdout.on("data", (d: Buffer) => (out += d.toString()));
-      child.on("exit", (c) => resolve({ code: c ?? -1, stdout: out }));
+      child.on("exit", (c) => resolve({ code: c ?? -1, stdout: out, exitAt: Date.now() }));
     });
-    const took = Date.now() - t0;
-
-    // 5 s of budget, the cancel grace, and a closing summary bounded by its
-    // 1 s grace — not the hour the hung prompt would have held it.
-    assert.ok(took < 11_000, `the job took ${took}ms on a 5s budget`);
+    clearInterval(watch);
     const end = stdout
       .split("\n")
       .filter((l) => l.startsWith("{"))
@@ -133,7 +147,18 @@ describe("an ACP agent that never answers, under --for 5s", { skip: process.plat
     assert.equal(end.deadline, true);
     assert.equal(end.endedBy, "deadline");
     assert.notEqual(end.outcome, "verified");
-    assert.ok((end.durationMs ?? Infinity) < 9_000, `job_end durationMs ${end.durationMs}`);
+    // 5 s of budget, the cancel grace, a closing summary bounded by its grace,
+    // and the cancel grace again when that is cut — not the hour the hung
+    // prompt would have held it. 7 s by the constants; the rest is slack for
+    // timers firing late on a busy machine.
+    const tail = 2 * CANCEL_GRACE_MS + deadlineGraceMs(5_000);
+    assert.ok((end.durationMs ?? Infinity) < 5_000 + tail + 2_000, `job_end durationMs ${end.durationMs} on a 5s budget`);
+    // And nothing holds the process open past the turn: from the prompt to the
+    // exit is within the same bound. A kill that waited on the hung agent, or
+    // a cancel awaited without a cap, would show here.
+    assert.ok(promptAt > 0, "never saw the agent take the prompt");
+    const sincePrompt = exitAt - promptAt;
+    assert.ok(sincePrompt < 5_000 + tail + 2_000, `the job ran ${sincePrompt}ms past the prompt on a 5s budget (durationMs ${end.durationMs})`);
     assert.notEqual(code, 0);
 
     // The agent was asked to cancel, and then it and its child were ended —

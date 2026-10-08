@@ -7,10 +7,10 @@ import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { Engine } from "../src/engine.js";
+import { Engine, type RunOptions } from "../src/engine.js";
 import { Receipts } from "../src/receipts.js";
 import { LatencyLearner } from "../src/watchdog.js";
-import type { Check } from "../src/types.js";
+import type { Check, EngineEvent } from "../src/types.js";
 import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
 const greet = (hidden = true): Check => ({
@@ -31,6 +31,26 @@ const slowWrite = (content: string) => [
   { text: "never asked for" },
 ];
 
+/**
+ * Run the turn with its 400 ms budget armed once out.txt is being written.
+ *
+ * Armed at the start, the budget raced the engine's start-up: under 150 CPU
+ * burners (2026-10-08) it ran out before the scripted reply was read ("time
+ * budget reached (414ms of 400ms) — no more tool calls"), nothing was
+ * written, and the bar rightly failed the empty tree; `passedAtEnd` failed
+ * 14 runs in 20. The budget is read live (`deadlineAt`), so arming it at the
+ * write makes the clock stop the turn after the work, under any load: during
+ * the 0.7 s command if the write came early, at once if it came late.
+ */
+async function stoppedAfterWrite(engine: Engine, opts?: RunOptions) {
+  const events: EngineEvent[] = [];
+  for await (const e of engine.run("write out.txt", allowAll, opts)) {
+    events.push(e);
+    if (e.kind === "tool" && e.name === "write_file") engine.setTurnDeadline(400);
+  }
+  return events;
+}
+
 describe("a turn stopped by the clock", () => {
   // Mercury 2.5: three half-finished trees passed weak drafted checks at the
   // deadline and were "verified"; the grader failed all three.
@@ -40,9 +60,9 @@ describe("a turn stopped by the clock", () => {
       const p = scriptedProvider(slowWrite("hello\n"));
       const engine = new Engine({
         baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: p.fetchFn, bar: null, stream: false,
-        autonomy: "high", turnDeadlineMs: 400, receipts: new Receipts(ws.dir),
+        autonomy: "high", receipts: new Receipts(ws.dir),
       });
-      const events = await drain(engine.run("write out.txt", allowAll, { taskChecks: [greet()] }));
+      const events = await stoppedAfterWrite(engine, { taskChecks: [greet()] });
       const e = end(events);
       assert.equal(e.outcome, "unverified");
       assert.equal(e.passedAtEnd, true);
@@ -65,10 +85,10 @@ describe("a turn stopped by the clock", () => {
       const p = scriptedProvider(slowWrite("goodbye\n"));
       const engine = new Engine({
         baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: p.fetchFn, bar: null, stream: false,
-        autonomy: "high", turnDeadlineMs: 400,
+        autonomy: "high",
       });
       // A person's check, so the refusal is not softened to "unverified".
-      const events = await drain(engine.run("write out.txt", allowAll, { taskChecks: [greet(false)] }));
+      const events = await stoppedAfterWrite(engine, { taskChecks: [greet(false)] });
       const e = end(events);
       assert.equal(e.outcome, "not proven");
       assert.equal(e.deadline, true);
@@ -83,9 +103,9 @@ describe("a turn stopped by the clock", () => {
       const p = scriptedProvider([...slowWrite("hello\n"), { text: "Wrote out.txt; ran out of time." }]);
       const engine = new Engine({
         baseUrl: "http://provider.test/v1", model: "m", cwd: ws.dir, fetchFn: p.fetchFn, bar: null, stream: false,
-        autonomy: "high", turnDeadlineMs: 400,
+        autonomy: "high",
       });
-      const e = end(await drain(engine.run("write out.txt", allowAll)));
+      const e = end(await stoppedAfterWrite(engine));
       assert.equal(e.outcome, "unverified");
       assert.equal(e.deadline, true);
     } finally {

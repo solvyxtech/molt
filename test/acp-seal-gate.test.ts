@@ -14,9 +14,9 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { ACP_AGENTS } from "../src/acp.js";
 import { Engine } from "../src/engine.js";
-import type { Check } from "../src/types.js";
+import type { Check, EngineEvent } from "../src/types.js";
 import { scriptedAcpAgent } from "./acp-agent.js";
-import { allowAll, drain, workspace } from "./helpers.js";
+import { allowAll, workspace } from "./helpers.js";
 
 const GROK = ACP_AGENTS.find((a) => a.name === "grok-build")!;
 
@@ -36,19 +36,32 @@ describe("seal gate on a subprocess backend", () => {
         },
       ]);
       const engine = new Engine({ baseUrl: GROK.url, model: "grok-4.6", provider: "grok-build", cwd: ws.dir, bar: null, acpSpawn: agent.spawnFn, autonomy: "high" });
+      // The drafter finishes when the gate is holding the write, not at a fixed
+      // 600 ms. On a loaded machine (150 CPU burners, 2026-10-08) the scripted
+      // agent's first call came 700–1000 ms in, after a 600 ms drafter had
+      // already finished: nothing was left to gate, the product rightly did
+      // not wait, and "the wait was announced" failed 15 runs in 20. The
+      // fallback only bounds a gate that never holds; that still fails below.
       let fileWhenSealed: boolean | undefined;
-      const pending = new Promise<{ taskChecks: Check[]; taskNotes: string[] }>((resolve) =>
-        setTimeout(() => {
-          fileWhenSealed = existsSync(join(ws.dir, "out.txt"));
-          resolve({ taskChecks: [mk("greeting", "grep -qx hello out.txt")], taskNotes: [] });
-        }, 600),
-      );
-      const ev = await drain(
-        engine.run("write hello to out.txt", allowAll, {
-          pendingCriteria: pending,
-          criteriaSoFar: async () => ({ taskChecks: [], taskNotes: [] }),
-        }),
-      );
+      let gateHeld!: () => void;
+      let fallback: ReturnType<typeof setTimeout> | undefined;
+      const held = new Promise<void>((r) => {
+        gateHeld = r;
+        fallback = setTimeout(r, 10_000);
+      });
+      const pending = held.then(() => {
+        clearTimeout(fallback);
+        fileWhenSealed = existsSync(join(ws.dir, "out.txt"));
+        return { taskChecks: [mk("greeting", "grep -qx hello out.txt")], taskNotes: [] as string[] };
+      });
+      const ev: EngineEvent[] = [];
+      for await (const e of engine.run("write hello to out.txt", allowAll, {
+        pendingCriteria: pending,
+        criteriaSoFar: async () => ({ taskChecks: [], taskNotes: [] }),
+      })) {
+        ev.push(e);
+        if (e.kind === "info" && /waiting for this task's checks to be sealed/.test(e.text)) gateHeld();
+      }
       assert.equal(fileWhenSealed, false, "the drafter finished before the file was written");
       const wait = ev.findIndex((e) => e.kind === "info" && /waiting for this task's checks to be sealed/.test(e.text));
       const write = ev.findIndex((e) => e.kind === "tool" && e.name === "write_file");
