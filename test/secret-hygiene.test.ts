@@ -315,7 +315,8 @@ async function workerSees(how: "fd" | "file" | "env", key: string): Promise<{ se
   const url = await leakProvider(auth);
   const cfg = join(ws(), "cfg");
   mkdirSync(cfg, { recursive: true });
-  const base: NodeJS.ProcessEnv = { ...scrubEnv(process.env), MOLT_CONFIG_DIR: cfg };
+  // A worker of Maat's own user is the subject: as root on Linux the default would separate it.
+  const base: NodeJS.ProcessEnv = { ...scrubEnv(process.env), MOLT_CONFIG_DIR: cfg, MAAT_WORKER_USER: "none" };
   const payload = `MAAT_API_KEY=${key}\nOPENROUTER_API_KEY=${key}-or\nMAAT_JUDGE_KEY=${key}-judge\n`;
   let childEnv: NodeJS.ProcessEnv;
   if (how === "file") {

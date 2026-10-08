@@ -2334,10 +2334,12 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   // run as root on Linux separates by default (privsep.ts defaultWorkerUser);
   // anywhere else nothing changes, and the notice says which account it is.
   let worker = named === "none" ? undefined : named;
+  let defaulted = false;
   if (!named && separates && !checker && !args.workerStrict) {
     const d = defaultWorkerUser();
     process.stderr.write(`maat: ${d.notice}\n`);
     worker = d.user;
+    defaulted = worker !== undefined;
   }
   if (!worker && separates && (checker || args.workerStrict)) {
     process.stderr.write(`maat: ${args.workerStrict ? "--worker-strict" : "--check-user"} needs --worker-user (MAAT_WORKER_USER)\n`);
@@ -2364,6 +2366,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       process.stderr.write(`maat: ${(e as Error).message}; carrying on WITHOUT privilege separation (--worker-strict refuses instead)\n`);
       setIsolationLine(`isolation: none (worker tools and checks run as Maat, uid ${process.getuid?.() ?? "?"}: ${(e as Error).message})`);
     }
+    // Separated by default: the project is the run's own (a container's,
+    // a CI checkout's), so what root owns in it is handed to the worker,
+    // which could not edit it otherwise. Named with --worker-user, the
+    // person has set the ownership up.
+    if (ps && defaulted) ps.handBack();
     if (ps) {
       process.stderr.write(
         `maat: worker tools run as ${ps.worker.name} (uid ${ps.worker.uid})` +

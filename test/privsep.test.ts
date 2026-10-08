@@ -14,6 +14,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmodSync, chownSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+import { createServer } from "node:http";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { Engine } from "../src/engine.js";
@@ -245,7 +246,7 @@ describe("privilege separation (Linux, root)", { skip: linuxRoot ? false : "need
       const receipts = new Receipts(ws);
       const integrity = new Integrity(ws);
       const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high", journal, receipts, integrity });
-      const check: Check = { name: "task:out", kind: "command", run: "grep -q hello out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true };
+      const check: Check = { name: "task:out", kind: "command", run: "grep -q hello out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: { kind: "judge", model: "judge-j" } };
       const events: EngineEvent[] = [];
       for await (const ev of engine.run("write out.txt saying hello", allowAll, { taskChecks: [check] })) events.push(ev);
       const end = events.find((e) => e.kind === "job_end");
@@ -598,7 +599,7 @@ describe("check account: --check-user and --worker-strict (Linux, root)", { skip
       const journal = new Journal(ws);
       const receipts = new Receipts(ws);
       const engine = new Engine({ baseUrl: "http://provider.test/v1", model: "m", cwd: ws, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high", journal, receipts });
-      const check: Check = { name: "task:out", kind: "command", run: `grep -q hello out.txt && test "$(id -u)" = ${cuid}`, timeoutMs: 10_000, expectExit: 0, tags: ["task", "value"], hidden: true };
+      const check: Check = { name: "task:out", kind: "command", run: `grep -q hello out.txt && test "$(id -u)" = ${cuid}`, timeoutMs: 10_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: { kind: "judge", model: "judge-j" } };
       const events: EngineEvent[] = [];
       for await (const ev of engine.run("write out.txt saying hello", allowAll, { taskChecks: [check] })) events.push(ev);
       const end = events.find((e) => e.kind === "job_end");
@@ -755,6 +756,48 @@ describe("the default worker user for unattended runs", () => {
       const d = defaultWorkerUser({ platform, euid, exists: () => assert.fail("not looked up"), create: () => assert.fail("not made") });
       assert.equal(d.user, undefined, `${platform} ${euid}`);
       assert.match(d.notice, /the same account as Maat/);
+    }
+  });
+});
+
+describe("the default worker user, end to end (Linux, root)", { skip: linuxRoot ? false : "needs Linux and root (CI's Linux job)" }, () => {
+  it("an unattended `maat run` as root runs the worker's tools as maat-worker, in a project handed to it", async () => {
+    let n = 0;
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        const first = n++ % 2 === 0;
+        const message = first
+          ? { role: "assistant", content: null, tool_calls: [{ id: `call_${n}`, type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "id -u > who.txt" }) } }] }
+          : { role: "assistant", content: "Done." };
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ choices: [{ message, finish_reason: first ? "tool_calls" : "stop" }], usage: { prompt_tokens: 10, completion_tokens: 5 } }));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const addr = server.address();
+    const url = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}/v1`;
+    const dir = mkdtempSync(join(tmpdir(), "maat-default-worker-"));
+    chmodSync(dir, 0o755);
+    const cfg = mkdtempSync(join(tmpdir(), "maat-default-cfg-"));
+    try {
+      const cli = join(process.cwd(), "dist-test", "src", "cli.js");
+      const env: NodeJS.ProcessEnv = { ...process.env, MOLT_CONFIG_DIR: cfg, MAAT_API_KEY: "k" };
+      delete env.MAAT_WORKER_USER;
+      const child = spawn(process.execPath, [cli, "run", "say who you are", "--url", url, "--model", "m", "--cwd", dir, "--no-stream", "--sandbox"], { env, stdio: ["ignore", "ignore", "pipe"] });
+      let err = "";
+      child.stderr?.on("data", (d) => (err += d));
+      await new Promise<void>((r) => child.on("exit", () => r()));
+      assert.match(err, /maat-worker/, err);
+      const who = execFileSync("id", ["-u", "maat-worker"], { encoding: "utf8" }).trim();
+      assert.ok(existsSync(join(dir, "who.txt")), `the worker could not write the project:\n${err}`);
+      assert.equal(readFileSync(join(dir, "who.txt"), "utf8").trim(), who);
+      assert.ok(existsSync(join(dir, ".maat", "log")), `the records were not copied into the project:\n${err}`);
+      assert.doesNotMatch(err, /could not copy the records/);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(cfg, { recursive: true, force: true });
     }
   });
 });
