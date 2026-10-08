@@ -366,10 +366,4 @@ export const GAP = {
   otherRuns: `#33: runs outside the bench container can read other runs' released receipts — ${PR}/33#pullrequestreview-5449896957`,
   leftovers: `#33: processes the worker leaves behind are not ended before the checks run (bench grades before it kills) — ${PR}/33#pullrequestreview-5449896957`,
   symlinks: `#29: Maat writes through symlinks the worker planted under .maat/ (as root under --worker-user) — ${PR}/29#pullrequestreview-5447096315`,
-  specRewrite: "new (no PR yet): spec-intact counts deleted assertions only; rewriting one into a tautology, or skipping the test, passes it",
-  shadowRunner: "new (no PR yet): a project-local module, conftest.py or node_modules/.bin shim replaces the test runner the person's bar calls",
-  visibleInputOnly: "new (no PR yet): a hidden check that only uses inputs the worker can read is met by hardcoding them; nothing asks for a held-out input",
-  workerWritesExpected: "new (no PR yet): `diff out expected.txt` counts as asserting a value (src/tiers.ts:77-81) even when the worker wrote expected.txt",
-  reviewTruncated: "new (no PR yet): receiptEvidence cuts at the first '## Output' (src/review.ts:62), and the claim is quoted above it, so the worker can blank the reviewer's evidence",
-  referenceExit: "new (no PR yet): the reference driver treats exit 0 as a match; a deliverable that calls os._exit(0) on import passes without being compared",
 } as const;

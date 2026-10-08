@@ -56,9 +56,30 @@ export function groundedViolations(reply: string, task: string): Violation[] {
     .filter((v) => norm(v.quote).length >= 4 && t.includes(norm(v.quote)));
 }
 
-/** The receipt as evidence: everything above its raw output section, capped. */
+/**
+ * The receipt as evidence: everything above its raw output section, capped.
+ *
+ * The worker writes part of the receipt — its claim is quoted near the top,
+ * and the lines it wrote are shown — so neither the cut nor the cap may be
+ * steerable by that text. The cut is at the receipt's own `## Output`
+ * heading: a whole line, found only after the check table's heading (a claim
+ * is quoted with "> ", so a "## Output" inside it is never a whole-line
+ * heading, and nothing before the check table can end the evidence early).
+ * The cap trims from the worker-influenced part above the check table, never
+ * the check table itself: a long claim must not push the check results out of
+ * what the reviewer reads.
+ */
 export function receiptEvidence(receipt: string, cap = 14_000): string {
-  return receipt.split("## Output")[0]!.slice(0, cap);
+  const checkedAt = receipt.search(/^## What was checked/m);
+  const from = checkedAt >= 0 ? checkedAt : 0;
+  const outAt = receipt.slice(from).search(/^## Output[ \t]*$/m);
+  const end = outAt >= 0 ? from + outAt : receipt.length;
+  const head = receipt.slice(0, from);
+  const checks = receipt.slice(from, end).slice(0, cap);
+  if (head.length + checks.length <= cap) return head + checks;
+  const room = cap - checks.length;
+  const marker = "\n… (receipt shortened here to fit; the check results follow)\n\n";
+  return (room > marker.length ? head.slice(0, room - marker.length) + marker : "") + checks;
 }
 
 /**

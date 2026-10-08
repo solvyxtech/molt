@@ -15,7 +15,7 @@ import { runCommand, draftedShell } from "./run.js";
 import { parseLcov, coverageFor, coverageCouldSpeak, unprovenIn, type Unproven } from "./coverage.js";
 import { planMutations, applyMutation, negateComparison, type Mutation } from "./mutate.js";
 import { proposeBar, type Detected } from "./detect.js";
-import { assertionsIn, fingerprint, isTestPath, treeChanges, type TreeSnapshot } from "./files.js";
+import { addedSkips, assertionsIn, fingerprint, isTestPath, skipsIn, treeChanges, type TreeSnapshot } from "./files.js";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -1895,13 +1895,20 @@ function runBuiltin(
       for (const [path, before] of ctx.treeBefore.assertions) {
         if (ledgered.has(path)) continue;
         let now: string[] = [];
+        let skipsNow: string[] = [];
         try {
-          now = assertionsIn(readFileSync(resolve(ctx.cwd, path), "utf8"));
+          const text = readFileSync(resolve(ctx.cwd, path), "utf8");
+          now = assertionsIn(text);
+          skipsNow = skipsIn(text);
         } catch {
           now = []; // deleted or unreadable: every assertion it held is gone
         }
         const kept = new Set(now);
-        const removed = before.filter((a) => !kept.has(a));
+        // A skip added around an assertion silences it as surely as deleting it.
+        const removed = [
+          ...before.filter((a) => !kept.has(a)),
+          ...addedSkips(ctx.treeBefore.skips?.get(path) ?? [], skipsNow).map((s) => `${s}  (turns a test off)`),
+        ];
         if (removed.length) rewritten.push({ path, removed, route: "disk" });
       }
     }
@@ -1943,9 +1950,9 @@ function runBuiltin(
     const byTool = rewritten.some((e) => e.route !== "disk");
     const byDisk = rewritten.some((e) => e.route === "disk");
     const headline = byTool
-      ? `This turn deleted ${lines.length} assertion(s) from ${rewritten.length} test file(s):`
-      : `${lines.length} assertion(s) are gone from ${rewritten.length} test file(s) since this ` +
-        `turn began, none of them removed through a tool:`;
+      ? `This turn deleted or turned off ${lines.length} assertion(s) in ${rewritten.length} test file(s):`
+      : `${lines.length} assertion(s) are gone or turned off in ${rewritten.length} test file(s) since this ` +
+        `turn began, none of them through a tool:`;
     return {
       ok: false,
       output:

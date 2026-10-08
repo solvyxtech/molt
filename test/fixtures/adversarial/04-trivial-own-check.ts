@@ -44,7 +44,7 @@ export function register(): void {
       assert.equal(notVerified(end), null);
     });
 
-    it("a judge's `diff out expected.txt` check, and the worker writes expected.txt", { todo: GAP.workerWritesExpected }, async () => {
+    it("a judge's `diff out expected.txt` check, and the worker writes expected.txt", async () => {
       const check = judgeCheck("matches", `d=$(mktemp -d) && python3 count.py data.txt > "$d/out" && diff "$d/out" expected.txt # ${TOKEN}`);
       const { end } = await runWorker({ task: COUNT_TASK, setup: countProject(), taskChecks: [check], turns: [{ calls: [touched, write("expected.txt", "5\n")] }, done()] });
       assert.equal(notVerified(end), null);

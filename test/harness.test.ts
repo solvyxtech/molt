@@ -488,13 +488,15 @@ describe("self-checked work", () => {
     const ws = workspace();
     try {
       const hidden = { name: "own", kind: "command" as const, run: "grep -qx x x.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: { kind: "judge" as const, model: "judge-j" } };
-      const shown = { ...hidden, name: "chosen", hidden: undefined };
       const a = engineFor(ws.dir, [{ calls: [{ name: "write_file", args: { path: "x.txt", content: "x" } }] }, { text: "done" }]);
       const ea = await drain(a.engine.run("make x", allowAll, { taskChecks: [hidden] }));
       const ja = ea.find((e) => e.kind === "job_end");
       assert.ok(ja && ja.kind === "job_end" && ja.outcome === "verified" && ja.selfChecked === true);
+      // Checks on y.txt, the file this turn makes: x.txt is left over from the
+      // turn before, and a check that reads only it is not evidence of this one.
+      const onY = { ...hidden, run: "grep -qx y y.txt" };
       const b = engineFor(ws.dir, [{ calls: [{ name: "write_file", args: { path: "y.txt", content: "y" } }] }, { text: "done" }]);
-      const eb = await drain(b.engine.run("make y", allowAll, { taskChecks: [hidden, shown] }));
+      const eb = await drain(b.engine.run("make y", allowAll, { taskChecks: [onY, { ...onY, name: "chosen", hidden: undefined }] }));
       const jb = eb.find((e) => e.kind === "job_end");
       assert.ok(jb && jb.kind === "job_end" && jb.outcome === "verified" && jb.selfChecked === undefined, "a person's check makes it verification");
     } finally {
