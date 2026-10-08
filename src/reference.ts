@@ -167,9 +167,24 @@ export const SECOND_REFERENCE_SYSTEM = [
  * every input before the deliverable runs; judges the deliverable only where
  * they agree; and exits 3 — the check's own failure, never the work's — when
  * a reference fails, the two mostly disagree, or run_deliverable raises.
+ *
+ * The deliverable never runs in this process. Each input goes to a fresh
+ * child (RUNNER), which loads check.py, drops reference() and the inputs from
+ * it, calls run_deliverable and sends back repr() of the result on its own
+ * pipe. An import-style deliverable used to be imported here, so a module
+ * with `os._exit(0)` at top level ended the driver with exit 0 before any
+ * comparison, and the check passed on wrong work. Now a child that ends
+ * without sending a result (os._exit, sys.exit, a crash) is a result: "the
+ * deliverable ended the process", which matches nothing. Expected values
+ * live only in this process's memory: never on disk, never in a child.
+ *
+ * The last line is `REFERENCE COMPARED n/n`. Maat requires it for a pass
+ * (src/bar.ts referenceComparedAll): an exit 0 without it is a failure, so
+ * nothing that ends the driver early can pass for it.
  */
+export const REFERENCE_SENTINEL = "REFERENCE COMPARED";
 export const DRIVER = [
-  "import importlib.util, json, os, sys, traceback",
+  "import ast, importlib.util, json, os, pickle, signal, subprocess, sys, threading, traceback",
   "HERE = os.path.dirname(os.path.abspath(__file__))",
   "def load(name):",
   "    spec = importlib.util.spec_from_file_location(name, os.path.join(HERE, name + '.py'))",
@@ -179,6 +194,40 @@ export const DRIVER = [
   "    except Exception: return repr(v)",
   "def own(msg):",
   "    sys.stdout.flush(); sys.stderr.write('REFERENCE ERROR: ' + msg + '\\n'); sys.exit(3)",
+  "def deliver(x):",
+  "    # One child per input: the deliverable runs there, never in this process.",
+  "    r, w = os.pipe()",
+  "    got = []",
+  "    def drain():",
+  "        with os.fdopen(r, 'rb') as f: got.append(f.read(16 * 1024 * 1024))",
+  "    t = threading.Thread(target=drain, daemon=True); t.start()",
+  "    try:",
+  "        p = subprocess.Popen([sys.executable, os.path.join(HERE, 'runner.py'), os.path.join(HERE, 'check.py'), str(w)],",
+  "                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, pass_fds=(w,), start_new_session=True)",
+  "    finally:",
+  "        os.close(w)",
+  "    try:",
+  "        _, err = p.communicate(pickle.dumps(x), timeout=90)",
+  "    except subprocess.TimeoutExpired:",
+  "        try: os.killpg(p.pid, signal.SIGKILL)",
+  "        except Exception: pass",
+  "        p.communicate(); t.join(5)",
+  "        return ('value', '<the deliverable did not finish in 90 s>')",
+  "    try: os.killpg(p.pid, signal.SIGKILL)",
+  "    except Exception: pass",
+  "    t.join(10)",
+  "    raw = got[0] if got else b''",
+  "    try: msg = json.loads(raw.decode('utf-8')) if raw else None",
+  "    except Exception: msg = None",
+  "    if not isinstance(msg, dict):",
+  "        return ('value', '<the deliverable ended the process (exit %s) before run_deliverable returned>' % p.returncode)",
+  "    if 'raised' in msg:",
+  "        sys.stderr.write(str(msg['raised'])[-4000:]); return ('raised', None)",
+  "    if 'exited' in msg:",
+  "        return ('value', '<the deliverable exited the process (code %s) before run_deliverable returned>' % (msg['exited'],))",
+  "    text = str(msg.get('repr', ''))",
+  "    try: return ('value', ast.literal_eval(text))",
+  "    except Exception: return ('value', text)",
   "try:",
   "    a = load('check'); b = load('second'); inputs = list(a.INPUTS)[:200]",
   "except SystemExit: raise",
@@ -197,16 +246,62 @@ export const DRIVER = [
   "    x, ea, eb = disagreed[0]",
   "    own('the two independent references agree on only %d of %d inputs; first disagreement, input %r: %r vs %r' % (len(agreed), len(inputs), x, ea, eb))",
   "same = getattr(a, 'same', None)",
+  "compared = 0",
   "for x, e, _ in agreed:",
-  "    try: got = a.run_deliverable(x)",
-  "    except BaseException: traceback.print_exc(); own('run_deliverable raised on input %r' % (x,))",
+  "    how, got = deliver(x)",
+  "    if how == 'raised': own('run_deliverable raised on input %r' % (x,))",
   "    try: ok = same(e, got) if same else key(e) == key(got)",
   "    except BaseException: traceback.print_exc(); own('the comparison failed on input %r' % (x,))",
   "    if not ok:",
   "        print('input: %r\\nexpected: %r\\nactual:   %r\\n(two independent references agree on the expected result)' % (x, e, got)); sys.exit(1)",
-  "print('%d inputs match two independent references%s' % (len(agreed), '; %d where they disagreed were not judged' % len(disagreed) if disagreed else ''))",
+  "    compared += 1",
+  "print('%d inputs match two independent references%s' % (compared, '; %d where they disagreed were not judged' % len(disagreed) if disagreed else ''))",
+  "print('" + "REFERENCE COMPARED" + " %d/%d' % (compared, len(agreed)))",
   "",
 ].join("\n");
+
+/**
+ * The child the driver runs the deliverable in, one per input. It sends one
+ * JSON message on the pipe it is handed: {"repr": repr(result)}, {"raised":
+ * traceback} when run_deliverable raised, or {"exited": code} when the
+ * deliverable called sys.exit. A child that sends nothing ended early.
+ * reference() and INPUTS are removed from the module before the deliverable
+ * runs, so the work's code cannot simply call them.
+ */
+export const RUNNER = [
+  "import importlib.util, json, os, pickle, sys, traceback",
+  "out = os.fdopen(int(sys.argv[2]), 'w')",
+  "def send(d):",
+  "    try: out.write(json.dumps(d)); out.flush(); out.close()",
+  "    except Exception: pass",
+  "x = pickle.loads(sys.stdin.buffer.read())",
+  "try:",
+  "    spec = importlib.util.spec_from_file_location('check', sys.argv[1])",
+  "    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)",
+  "    for n in ('reference', 'INPUTS'):",
+  "        if hasattr(m, n): delattr(m, n)",
+  "    sys.modules.pop('check', None)",
+  "    got = m.run_deliverable(x)",
+  "except SystemExit as e:",
+  "    send({'exited': repr(e.code)}); os._exit(0)",
+  "except BaseException:",
+  "    send({'raised': traceback.format_exc()}); os._exit(0)",
+  "try: text = repr(got)",
+  "except BaseException: text = '<unprintable result>'",
+  "send({'repr': text})",
+  "os._exit(0)",
+  "",
+].join("\n");
+
+/**
+ * Did the reference driver say it compared every input it judged? A pass
+ * needs its last `REFERENCE COMPARED n/n` line with n > 0: an exit 0 without
+ * it (the driver ended early, or something else answered) is not a pass.
+ */
+export function referenceComparedAll(output: string): boolean {
+  const m = [...output.matchAll(/^REFERENCE COMPARED (\d+)\/(\d+)\s*$/gm)].at(-1);
+  return !!m && m[1] === m[2] && Number(m[1]) > 0;
+}
 
 /** What the second reviewer is told about the inputs: their format and a few of them, never an answer. */
 export const PROBE = [
@@ -347,6 +442,7 @@ async function writeAndTry(opts: Ask, prompt: string): Promise<Reference | { ok:
   writeFileSync(file, source);
   writeFileSync(join(dir, "probe.py"), PROBE);
   writeFileSync(join(dir, "driver.py"), DRIVER);
+  writeFileSync(join(dir, "runner.py"), RUNNER);
   // Every try runs on a scratch copy of the untouched project, never on the
   // project: by now the work may have begun.
   const scratch = mkdtempSync(join(tmpdir(), "ref-try-"));
