@@ -32,7 +32,7 @@ import { askModel, type AskOptions } from "./ask.js";
 import { runCommand, draftedShell, bashPath } from "./run.js";
 import { cannotFail, lintAll, readTree, type LintCtx, type Tree } from "./checklint.js";
 import { checkMutates } from "./checkwrites.js";
-import { copyTree, replacePathPrefix } from "./scratch.js";
+import { copyTree, replaceCommandPaths } from "./scratch.js";
 import { absolutePathArgs } from "./shellwords.js";
 import { diagnoseFailure } from "./bar.js";
 import { reportsFailure } from "./evidence.js";
@@ -414,7 +414,7 @@ export async function preflightCriteria(
     // `.git` included. A check that names the project by its absolute path is
     // pointed at the copy too, as the bar points it (src/bar.ts).
     const where = copy?.dir ?? opts.cwd;
-    const run = roots.reduce((t, r) => replacePathPrefix(t, r, where), c.run);
+    const run = roots.reduce((t, r) => replaceCommandPaths(t, r, where), c.run);
     try {
       const r = await runCommand(run, {
         cwd: where,
@@ -735,6 +735,10 @@ function parseDraft(text: string): Draft | null {
       return null;
     }
   }
+  // The model's reply never marks a guard (nor gets the guards' own slots):
+  // only the P1 screen does (guardsFrom).
+  const checks = (raw as { checks?: unknown })?.checks;
+  if (Array.isArray(checks)) for (const c of checks) if (c && typeof c === "object") delete (c as { guard?: unknown }).guard;
   return sanitizeCriteria(raw);
 }
 

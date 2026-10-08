@@ -40,6 +40,7 @@ import { chmod, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, realpa
 import { createHash } from "node:crypto";
 import { basename, join } from "node:path";
 import { STATE_DIRS } from "./statedir.js";
+import { absolutePathArgs } from "./shellwords.js";
 import { checkTmpDir, privSep } from "./privsep.js";
 
 /** Folders that are dependencies or caches, linked into the copy rather than copied. */
@@ -105,6 +106,32 @@ export function replacePathPrefix(text: string, from: string, to: string): strin
     // `/work/p` inside `/work/p2` or `/x/work/p` is another path.
     const whole = !/[\w.-]/.test(next) && !/[\w./-]/.test(prev);
     out += text.slice(i, at) + (whole ? to : from);
+    i = at + from.length;
+  }
+}
+
+/**
+ * replacePathPrefix over a shell command, limited to the words the shell
+ * will open as paths (shellwords.ts absolutePathArgs: operands, redirect
+ * targets, cd targets, assignments, inline programs' path literals). The
+ * project's path inside a grep pattern, a jq literal or echo's data is data,
+ * and is left alone: rewritten, `grep -q 'root /app/public;' nginx.conf`
+ * could never match, and failed before the work for the wrong reason.
+ */
+export function replaceCommandPaths(run: string, from: string, to: string): string {
+  if (!from || from === to || from === "/" || !run.includes(from)) return run;
+  const opened = new Set(absolutePathArgs(run).filter((a) => a === from || a.startsWith(`${from}/`)));
+  if (!opened.size) return run;
+  let out = "";
+  let i = 0;
+  for (;;) {
+    const at = run.indexOf(from, i);
+    if (at < 0) return out + run.slice(i);
+    const next = run[at + from.length] ?? "";
+    const prev = run[at - 1] ?? "";
+    const whole = !/[\w.-]/.test(next) && !/[\w./-]/.test(prev);
+    const token = /^[^\s'"`;|&<>()$]*/.exec(run.slice(at))![0];
+    out += run.slice(i, at) + (whole && opened.has(token) ? to : from);
     i = at + from.length;
   }
 }
@@ -336,7 +363,7 @@ export async function copyTreeOrWhy(
     },
     map: (text) => {
       let out = text;
-      for (const [to, from] of pairs) out = replacePathPrefix(out, from, to);
+      for (const [to, from] of pairs) out = replaceCommandPaths(out, from, to);
       return out;
     },
   };

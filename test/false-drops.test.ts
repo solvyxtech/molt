@@ -39,7 +39,7 @@ import {
 import { swallowsExit } from "../src/evidence.js";
 import { absolutePathArgs, parseShell } from "../src/shellwords.js";
 import { runCheck, type BarContext } from "../src/bar.js";
-import { replacePathPrefix } from "../src/scratch.js";
+import { replaceCommandPaths, replacePathPrefix } from "../src/scratch.js";
 import { Engine } from "../src/engine.js";
 import { Journal } from "../src/journal.js";
 import { Receipts } from "../src/receipts.js";
@@ -211,6 +211,28 @@ describe("a check names the project by its absolute path", () => {
       const failed: string[] = [];
       await preflightCriteria([{ name: "counts", kind: "command", run, expectExit: 0 }], { cwd: pre.dir, root: live.dir, passed, failed });
       assert.deepEqual([passed, failed], [[], ["counts"]]);
+    } finally {
+      live.cleanup();
+      pre.cleanup();
+    }
+  });
+
+  it("only paths the shell opens are pointed at the copy, never the project path inside data", () => {
+    assert.equal(replaceCommandPaths("cd /app && grep -q 'root /app/public;' nginx.conf", "/app", "/tmp/c"), "cd /tmp/c && grep -q 'root /app/public;' nginx.conf");
+    assert.equal(replaceCommandPaths(`jq -e '.out_dir == "/app/out"' /app/config.json`, "/app", "/tmp/c"), `jq -e '.out_dir == "/app/out"' /tmp/c/config.json`);
+    assert.equal(replaceCommandPaths("grep -q 'WORKDIR /app' Dockerfile", "/app", "/tmp/c"), "grep -q 'WORKDIR /app' Dockerfile");
+    assert.equal(replaceCommandPaths("cat /app/a.txt > /app/b.txt", "/app", "/tmp/c"), "cat /tmp/c/a.txt > /tmp/c/b.txt");
+  });
+
+  it("a check whose data quotes the project path passes before the work when the data is already there (P1, not discriminating)", async () => {
+    const live = workspace();
+    const pre = workspace();
+    try {
+      writeFileSync(join(pre.dir, "nginx.conf"), `root ${live.dir}/public;\n`);
+      const passed: string[] = [];
+      const failed: string[] = [];
+      await preflightCriteria([{ name: "root-kept", kind: "command", run: `grep -q 'root ${live.dir}/public;' nginx.conf`, expectExit: 0 }], { cwd: pre.dir, root: live.dir, passed, failed });
+      assert.deepEqual([passed, failed], [["root-kept"], []]);
     } finally {
       live.cleanup();
       pre.cleanup();
