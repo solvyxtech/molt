@@ -1,5 +1,5 @@
 # Desktop installers → GitHub Release.
-# CLI ships separately as npm package @solvyx/molt (see npm run pack:cli).
+# CLI is built from source at the same tag (not on npm; see README, CLI / TUI).
 name: release
 
 on:
@@ -116,7 +116,7 @@ jobs:
           body: |
             **A coding agent that cannot say "done" without proving it.**
 
-            This release ships the **desktop app** (macOS, Windows, Linux) and matches the **CLI** published as `@solvyx/molt` (binary `molt`) at the same version.
+            This release ships the **desktop app** (macOS, Windows, Linux) and the **CLI** (commands `maat` and `molt`) at the same version. The CLI is not on npm; build it from source.
 
             ### Desktop downloads
             - **macOS:** `.dmg` (arm64 and x64). Unsigned on purpose — first open: right-click the app → Open → Open.
@@ -125,9 +125,14 @@ jobs:
 
             ### CLI
             ```
-            npm i -g @solvyx/molt
+            git clone --branch ${{ steps.tag.outputs.name }} https://github.com/solvyxtech/molt.git maat
+            cd maat
+            npm ci
+            npm run pack:cli
+            npm i -g ./out-cli
+            maat --version
             ```
-            Do **not** install unscoped `molt` or `molt-cli` from npm — those are other projects. Use `@solvyx/molt`.
+            Or run it in place with `npm run build && node dist/cli.js`. See the README's CLI / TUI section. Do **not** install `molt` or `molt-cli` from npm; those are other projects.
 
             ### After install
             Pick a provider, add a key, point molt at a project. Completions are claims; `.molt/done.yml` has to pass against the real disk before "done" sticks. Every attempt gets a receipt.

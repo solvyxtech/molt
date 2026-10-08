@@ -155,14 +155,15 @@ node dist/cli.js run "…" --yes    # headless
 ```
 
 To get `maat` and `molt` commands on your PATH, stage the CLI package and
-install it from the local folder (nothing is downloaded from the registry; npm
-links the commands to that folder, so keep the clone where it is):
+install it from the local folder (nothing is downloaded from the registry):
 
 ```sh
 npm run pack:cli       # builds, then stages the CLI package under out-cli/
 npm i -g ./out-cli     # installs the maat and molt commands from that folder
 maat --version
 ```
+
+After pulling, re-run both commands to update the installed CLI.
 
 **Do not** `npm i -g molt` or `npm i -g molt-cli` — those are unrelated
 packages on the registry.

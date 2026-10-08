@@ -85,7 +85,9 @@ queue.
 
 ## Versioning
 
-Desktop and CLI ship the same semver from root `package.json`. The publishable
-CLI is staged with `npm run pack:cli` as `@solvyx/molt` (binary `molt`). See
-[docs/versioning.md](docs/versioning.md). Do not publish without COO say-so.
+Desktop and CLI ship the same semver from root `package.json`. The CLI is
+staged with `npm run pack:cli` under `out-cli/` (commands `maat` and `molt`)
+and installed from source with `npm i -g ./out-cli`. It is not published to npm:
+the staged package is marked `"private": true`, so `npm publish` refuses it.
+See [docs/versioning.md](docs/versioning.md).
 
