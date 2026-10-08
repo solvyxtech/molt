@@ -4,7 +4,9 @@
  *
  * Root package.json stays private for electron-builder. This script builds
  * dist/, then copies the CLI manifest + allowlisted files into out-cli/ so
- * `npm publish ./out-cli` ships the terminal binary (bin: molt) only.
+ * `npm i -g ./out-cli` installs the terminal binary (bin: maat, molt) only.
+ * The CLI is not published to npm (unpublished 2026-10-07), so the staged
+ * manifest is always private and `npm publish` refuses it.
  */
 import { cpSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -39,6 +41,9 @@ const manifest = JSON.parse(readFileSync(join(root, "package.cli.json"), "utf8")
 const rootPkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 // Unified versioning: CLI --version and npm tag follow root package.json.
 manifest.version = rootPkg.version;
+// Fail safe: an accidental `npm publish ./out-cli` must not bring the package back.
+manifest.private = true;
+delete manifest.publishConfig;
 writeFileSync(join(out, "package.json"), JSON.stringify(manifest, null, 2) + "\n");
 
 for (const name of ["dist", "examples", "README.md", "LICENSE", "NOTICE"]) {
@@ -56,6 +61,6 @@ process.stdout.write(
   `staged ${out}\n` +
     `  name: ${manifest.name}@${manifest.version}\n` +
     `  bin:  maat, molt → dist/cli.js\n` +
-    `next:  npm pack ./out-cli   # dry-run\n` +
-    `       npm publish ./out-cli --access public   # COO only\n`,
+    `next:  npm i -g ./out-cli   # install the maat and molt commands\n` +
+    `       (private: true, not published to npm)\n`,
 );

@@ -304,20 +304,60 @@ describe("what an Anthropic session costs", () => {
     // Every other provider molt talks to publishes a price list. Anthropic does
     // not, so the meter read "no price for this model" on precisely the
     // endpoint where caching does the most work.
-    const sonnet = anthropicPricing("claude-sonnet-5")!;
+    const sonnet = anthropicPricing("claude-sonnet-4-6")!;
     assert.equal(sonnet.in, 3);
     assert.equal(sonnet.out, 15);
-    // A cache read is a tenth of input — the whole reason the native protocol
-    // was worth writing.
+    // A cache read is a tenth of input on most models — the whole reason the
+    // native protocol was worth writing.
     assert.equal(sonnet.cached, 0.3);
 
     assert.equal(anthropicPricing("claude-opus-5")!.in, 5);
     assert.equal(anthropicPricing("claude-haiku-4-5")!.out, 5);
     assert.equal(anthropicPricing("claude-fable-5")!.in, 10);
     // Reached through a router, the model is still the model.
-    assert.equal(anthropicPricing("anthropic/claude-sonnet-5")!.in, 3);
+    assert.equal(anthropicPricing("anthropic/claude-sonnet-5")!.in, 2);
     // And nothing else is guessed at.
     assert.equal(anthropicPricing("grok-4.6"), null);
     assert.equal(anthropicPricing("gpt-5"), null);
+  });
+
+  // Checked against platform.claude.com/docs/en/about-claude/pricing on
+  // 2026-10-08. The table used to price by family, so Haiku 5.5 billed at
+  // Haiku 4.5's $1/$5. Haiku 5.5 is tiered by prompt length ($0.10/$0.50 up
+  // to 100k tokens, $0.50/$2.50 over); the meter cannot tell the tiers apart,
+  // so it uses the higher one: over-counting stops a budget early, which is
+  // the safe direction.
+  it("prices Haiku 5.5 at its own over-100k rate, not the Haiku family's", () => {
+    for (const id of ["claude-haiku-5-5", "claude-haiku-5.5", "anthropic/claude-haiku-5-5"]) {
+      const p = anthropicPricing(id)!;
+      assert.equal(p.in, 0.5, id);
+      assert.equal(p.out, 2.5, id);
+      assert.equal(p.cached, 0.05, id);
+    }
+    // The older Haiku keeps its own price.
+    assert.deepEqual(
+      [anthropicPricing("claude-haiku-4-5")!.in, anthropicPricing("claude-haiku-4-5")!.out],
+      [1, 5],
+    );
+  });
+
+  it("prices each version where the family shares no single rate", () => {
+    const rate = (id: string) => {
+      const p = anthropicPricing(id)!;
+      return [p.in, p.out, p.cached];
+    };
+    assert.deepEqual(rate("claude-opus-5-5"), [4, 20, 0.2]);
+    assert.deepEqual(rate("claude-opus-5"), [5, 25, 0.5]);
+    assert.deepEqual(rate("claude-opus-4-8"), [5, 25, 0.5]);
+    assert.deepEqual(rate("claude-opus-4-1-20250805"), [15, 75, 1.5]);
+    assert.deepEqual(rate("claude-opus-4-20250514"), [15, 75, 1.5]);
+    assert.deepEqual(rate("claude-opus-4-0"), [15, 75, 1.5]);
+    assert.deepEqual(rate("claude-opus-4"), [15, 75, 1.5]);
+    assert.deepEqual(rate("claude-sonnet-5-5"), [2, 10, 0.1]);
+    assert.deepEqual(rate("claude-sonnet-5"), [2, 10, 0.2]);
+    assert.deepEqual(rate("claude-sonnet-4-5"), [3, 15, 0.3]);
+    assert.deepEqual(rate("claude-fable-5-1"), [10, 50, 0.25]);
+    assert.deepEqual(rate("claude-mythos-5"), [10, 50, 1]);
+    assert.deepEqual(rate("claude-3-5-haiku-20241022"), [0.8, 4, 0.08]);
   });
 });

@@ -149,6 +149,26 @@
 
 ### Fixed
 
+- **Anthropic prices are per model version, checked 2026-10-08.** The table
+  priced by family: Opus 5.5 was billed at $5 / $25 per MTok instead of
+  $4 / $20, Sonnet 5 and 5.5 at $3 / $15 instead of $2 / $10, Opus 4 / 4.1 at
+  $5 / $25 instead of $15 / $75, and Haiku 5.5 at Haiku 4.5's $1 / $5. Haiku
+  5.5 is tiered by prompt length ($0.10 / $0.50 up to 100k tokens, $0.50 /
+  $2.50 over); the meter prices session totals, so it uses the over-100k
+  rates, because over-counting is the safe direction for a budget
+  (`/price 0.1 0.5 0.01` sets the lower tier). Cache reads now use each model's
+  published rate rather than a flat tenth of input (Fable/Mythos 5.1 $0.25,
+  Opus 5.5 $0.20, Sonnet 5.5 $0.10, Haiku 5.5 $0.05). The `claude-opus-4-0`
+  alias gets Opus 4's price instead of falling through to $5 / $25, and
+  Claude 3.5 Haiku ids are priced too. Tests pin Haiku 5.5 and each row.
+- **README install line.** `npm i -g @solvyx/molt` and `npx @solvyx/molt`
+  pointed at a package that was unpublished on 2026-10-07. The README now
+  builds the CLI from source (clone, `npm ci`, `npm run build`,
+  `node dist/cli.js`, or `npm run pack:cli && npm i -g ./out-cli` for the
+  `maat` / `molt` commands; re-run both after pulling), the npm badges are
+  gone, and docs/versioning.md, docs/acp-server.md, CONTRIBUTING.md and the
+  release notes in release.yml say the same. The staged `out-cli/` package is
+  now `"private": true`, so an accidental `npm publish` fails.
 - **Two lean-session defects (lean-sessions study, PR #50).** When the kept
   user turns are mostly Maat's notes, a shed cut on user turns must now free
   at least 25% of the history, or it cuts on recent messages instead: Maat's own notes (acceptance criteria, bar refusals) are

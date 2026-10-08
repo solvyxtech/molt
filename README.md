@@ -5,12 +5,10 @@
 > Maat (MAH-aht), the Egyptian goddess of truth: in the Weighing of the Heart, a
 > claim is weighed against her feather before it may pass. Maat Agent weighs a
 > model's "done" against checks set before the work began, on the real disk, and
-> writes the verdict down. It is built on the **molt** engine; the npm package is
-> still `@solvyx/molt` and both the `maat` and `molt` commands work.
+> writes the verdict down. It is built on the **molt** engine; both the `maat`
+> and `molt` commands work.
 
 [![check](https://github.com/solvyxtech/molt/actions/workflows/check.yml/badge.svg)](https://github.com/solvyxtech/molt/actions/workflows/check.yml)
-[![npm](https://img.shields.io/npm/v/@solvyx/molt.svg)](https://www.npmjs.com/package/@solvyx/molt)
-[![npm downloads](https://img.shields.io/npm/dm/@solvyx/molt.svg)](https://www.npmjs.com/package/@solvyx/molt)
 [![licence: Apache 2.0](https://img.shields.io/badge/licence-Apache%202.0-blue.svg)](LICENSE)
 
 Maat Agent is an open source coding agent for developers. Terminal CLI and Electron desktop. Written in TypeScript. It runs any OpenAI compatible model and Anthropic’s native API. Then it refuses to accept done until every check in your project’s `.maat/done.yml` passes (projects that already have `.molt/` keep using it) against the real state on disk. A completion is a claim. Maat checks the claim and writes a receipt either way.
@@ -144,15 +142,31 @@ macOS builds are unsigned on purpose. On first open, right-click the app, choose
 
 ### CLI / TUI
 
+The CLI is not on npm (the `@solvyx/molt` package was unpublished on
+2026-10-07); build it from source. Needs Node 20.11 or later and git.
+
 ```sh
-npm i -g @solvyx/molt
-molt                  # interactive TUI
-molt run "…" --yes    # headless
+git clone https://github.com/solvyxtech/molt.git maat
+cd maat
+npm ci
+npm run build          # compiles the CLI to dist/cli.js
+node dist/cli.js       # interactive TUI (same as: npm start)
+node dist/cli.js run "…" --yes    # headless
 ```
 
-Or without installing: `npx @solvyx/molt`.
+To get `maat` and `molt` commands on your PATH, stage the CLI package and
+install it from the local folder (nothing is downloaded from the registry):
 
-**Do not** `npm i -g molt` or `npm i -g molt-cli` — those are unrelated packages on the registry. The binary name is still `molt`; the package name is `@solvyx/molt`.
+```sh
+npm run pack:cli       # builds, then stages the CLI package under out-cli/
+npm i -g ./out-cli     # installs the maat and molt commands from that folder
+maat --version
+```
+
+After pulling, re-run both commands to update the installed CLI.
+
+**Do not** `npm i -g molt` or `npm i -g molt-cli` — those are unrelated
+packages on the registry.
 
 Desktop and CLI share one version. See [docs/versioning.md](docs/versioning.md).
 
@@ -161,10 +175,10 @@ Desktop and CLI share one version. See [docs/versioning.md](docs/versioning.md).
 For contributors working in this repository:
 
 ```sh
-npm install
+npm ci
 npm run app            # the desktop window
-npm start              # the terminal UI (node dist/cli.js)
-npm run pack:cli       # stage publishable @solvyx/molt under out-cli/ (do not publish without COO)
+npm start              # the terminal UI (node dist/cli.js, after npm run build)
+npm run pack:cli       # stage the CLI package under out-cli/ (not published to npm)
 ```
 
 First run: `/login`, pick a provider, paste a key, `/model`, go. Keys live in
