@@ -147,6 +147,23 @@
   background logs, and paths the task names). bash is not blocked; this is a
   budget control, not isolation.
 
+### Fixed
+
+- **Anthropic prices are per model version, checked 2026-10-08.** The table
+  priced by family, so Haiku 5.5 was billed at Haiku 4.5's $1 / $5 per MTok
+  instead of $0.10 / $0.50 (10x high), Opus 5.5 at $5 / $25 instead of
+  $4 / $20, Sonnet 5 and 5.5 at $3 / $15 instead of $2 / $10, and Opus 4 / 4.1
+  at $5 / $25 instead of $15 / $75. Cache reads now use each model's published
+  rate rather than a flat tenth of input (Fable/Mythos 5.1 $0.25, Opus 5.5
+  $0.20, Sonnet 5.5 $0.10, Haiku 5.5 $0.01). Claude 3.5 Haiku ids are priced
+  too. A test pins Haiku 5.5.
+- **README install line.** `npm i -g @solvyx/molt` and `npx @solvyx/molt`
+  pointed at a package that was unpublished on 2026-10-07. The README now
+  builds the CLI from source (clone, `npm ci`, `npm run build`,
+  `node dist/cli.js`, or `npm run pack:cli && npm i -g ./out-cli` for the
+  `maat` / `molt` commands), the npm badges are gone, and docs/versioning.md
+  and docs/acp-server.md say the same.
+
 ## 0.2.2 — subscription backends removed
 
 ### Removed
