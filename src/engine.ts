@@ -25,7 +25,7 @@ import { describeStart, listBackground, startBackground, stopBackground } from "
 import { objectionLine, readsTheWork, reviewClaim, type ExecutableReview, type ObjectionRun, type Review } from "./review.js";
 import { credentialFreeEnv } from "./credenv.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
-import { JudgeMeter, judgeTokens, type JudgeSpend } from "./judge-meter.js";
+import { JudgeMeter, judgeTokens, type AskMeter, type AskUsage, type JudgeSpend } from "./judge-meter.js";
 import { auditClaim, authorKey, authorWords, claimLabel, contradictions, independentOf, tierOf, withAuthor, type Tier } from "./tiers.js";
 import { recordGoldens, valueUnproven } from "./golden.js";
 import { discountedChecks } from "./control.js";
@@ -1873,6 +1873,12 @@ function fmtUsd(usd: number): string {
   return usd >= 0.1 ? `$${usd.toFixed(2)}` : usd >= 0.001 ? `$${usd.toFixed(3)}` : "<$0.001";
 }
 
+/** The sum of the values that are known, or undefined when none is. */
+function sumKnown(...xs: (number | undefined)[]): number | undefined {
+  const known = xs.filter((x): x is number => x !== undefined);
+  return known.length ? known.reduce((a, b) => a + b, 0) : undefined;
+}
+
 /** A tool argument that should be a non-empty string, or nothing. */
 function str(v: unknown): string | undefined {
   return typeof v === "string" && v.trim() !== "" ? v : undefined;
@@ -2436,11 +2442,49 @@ export class Engine {
         : null,
   }));
   /**
+   * The worker's meter for asks on its own model outside a turn (the
+   * interview): counted into the session meter as worker spend, like a step,
+   * and journalled as `worker_ask`. Not the judge's: it is the worker's model.
+   */
+  readonly workerAskMeter: AskMeter = { record: (u) => this.recordWorkerAsk(u) };
+
+  private recordWorkerAsk(u: AskUsage): void {
+    this.sessionPrompt += u.promptTokens;
+    this.sessionCompletion += u.completionTokens;
+    this.sessionCached += u.cacheReadTokens ?? 0;
+    if (u.estimated) this.estimatedSteps += 1;
+    if (typeof u.billedUsd === "number") this.sessionBilled += u.billedUsd;
+    else this.unbilledSteps += 1;
+    this.cfg.journal?.append("worker_ask", {
+      model: u.model,
+      ...(u.what ? { what: u.what } : {}),
+      promptTokens: u.promptTokens,
+      completionTokens: u.completionTokens,
+      ...(u.cacheReadTokens !== undefined ? { cacheReadTokens: u.cacheReadTokens } : {}),
+      ...(u.cacheWriteTokens !== undefined ? { cacheWriteTokens: u.cacheWriteTokens } : {}),
+      ...(typeof u.billedUsd === "number" ? { billedUsd: u.billedUsd } : {}),
+      estimated: u.estimated,
+    });
+  }
+
+  /**
    * Judge calls before this mark were reported in an earlier job_end. A job
    * reports every call since the last one, so the drafting that runs before a
    * turn starts is counted in the turn it was for.
    */
   private judgeReported = 0;
+  /**
+   * Where the judge's drafting for the next turn began: the meter's mark and
+   * what had been spent by then (draftingStarted). The budget-hit message says
+   * the drafting used the budget only when this turn's drafting is what took
+   * it over, not when earlier spend had already nearly used it up.
+   */
+  private draftStart: { mark: number; tokens: number } | undefined;
+
+  /** The caller is about to draft this turn's checks on the judge (cli.tsx). */
+  draftingStarted(): void {
+    this.draftStart ??= { mark: this.judgeMeter.mark(), tokens: this.spentTokens };
+  }
   /** Why the independent review was skipped this turn (see reviewSkipReason), if it was. */
   private reviewSkipped: string | undefined;
   /** Hidden checks whose commands were shown to the model this turn. */
@@ -3560,15 +3604,14 @@ export class Engine {
   }
 
   /**
-   * Worker and judge USD together: what a money budget counts. Undefined when
-   * the worker has no price. A judge with no price adds nothing here (its
+   * Worker and judge USD together: what a money budget counts. Defined when
+   * either is priced, so a local or subscription worker with a paid judge is
+   * still bounded by a dollar ceiling. An unpriced side adds nothing here (its
    * tokens still count toward a token budget, and every surface says its $ is
    * unknown); a judge on a subscription plan costs no money.
    */
   totalCostUsd(): number | undefined {
-    const worker = this.costUsd();
-    if (worker === undefined) return undefined;
-    return worker + (this.judgeMeter.total().costUsd ?? 0);
+    return sumKnown(this.costUsd(), this.judgeMeter.total().costUsd);
   }
 
   /** The whole session's judge spend (judge-meter.ts). */
@@ -5214,6 +5257,7 @@ export class Engine {
     // the review and the audit run after the receipt was written.
     const judge = this.judgeMeter.since(this.judgeReported);
     this.judgeReported = this.judgeMeter.mark();
+    this.draftStart = undefined;
     if (receiptPath && judge.calls) this.cfg.receipts?.amendJudge(basename(receiptPath), this.judgeMeter.total());
     yield {
       kind: "job_end",
@@ -6582,7 +6626,10 @@ export class Engine {
 
     // Both ceilings count the judge's spend too (overBudget).
     const turnStartTokens = this.spentTokens;
-    const turnStartCost = this.totalCostUsd();
+    // Priced per side: the worker's delta when the worker is priced, plus the
+    // judge's calls this turn when they are. Either one makes the turn priced.
+    const turnStartCost = this.costUsd();
+    const turnJudgeMark = this.judgeMeter.mark();
     let warned = 0;
     // The step guard is the last way out of a turn, and it had the same fault
     // the spending ceiling had: it stopped dead. A reported run reached it with
@@ -6700,7 +6747,17 @@ export class Engine {
           text:
             `budget hit (${this.budgetTokens} tokens` +
             (this.spentTokens > this.sessionTokens ? `, ${this.spentTokens - this.sessionTokens} of them the judge's` : "") +
-            `) — loop stopped. /budget to raise.`,
+            `) — loop stopped. /budget to raise.` +
+            // Hit before the worker took a step, by this turn's drafting: the
+            // judge drafted since draftingStarted, and the spend before it was
+            // still under the budget.
+            (step === 0 &&
+            this.draftStart !== undefined &&
+            this.judgeMeter.mark() > this.draftStart.mark &&
+            this.draftStart.tokens < (this.budgetTokens ?? 0)
+              ? ` The judge drafting this turn's checks used the budget before the worker's first step; ` +
+                `raise --budget to leave room for both.`
+              : ""),
           ceiling: "budget",
         };
         yield* this.salvage(`You have reached the token budget for this session.`, fetchFn, log);
@@ -6712,21 +6769,33 @@ export class Engine {
       // refuses to spend rather than what it noticed spending.
       // Money where a price is known, tokens only where it is not.
       const spentThisTurn = this.spentTokens - turnStartTokens;
-      const usdThisTurn =
-        turnStartCost === undefined ? undefined : (this.totalCostUsd() ?? 0) - turnStartCost;
+      const usdThisTurn = sumKnown(
+        turnStartCost === undefined ? undefined : (this.costUsd() ?? 0) - turnStartCost,
+        this.judgeMeter.since(turnJudgeMark).costUsd,
+      );
       // Zero unless someone set one. The self-hosted exception that used to
       // live here — no default ceiling on hardware you own — is gone with the
       // default itself: there is nothing left to make an exception to.
       const usdCeiling = this.cfg.maxTurnUsd ?? 0;
       const tokenCeiling = this.cfg.maxTurnTokens ?? 0;
-      const priced = usdThisTurn !== undefined && usdCeiling > 0;
-      const used = priced ? usdThisTurn : spentThisTurn;
+      // A priced worker is held in dollars, as it always was. An unpriced
+      // worker with a priced judge is held by both: dollars bound the part that
+      // has a price (the judge's), tokens bound the whole turn, and whichever
+      // is nearer its ceiling is the one that speaks and stops. Without the
+      // token side, one priced judge call flipped the turn to dollars and the
+      // worker's unpriced tokens ran on unbounded.
+      const usdShare = usdThisTurn !== undefined && usdCeiling > 0 ? usdThisTurn / usdCeiling : undefined;
+      const tokenShare = tokenCeiling > 0 ? spentThisTurn / tokenCeiling : undefined;
+      const priced =
+        usdShare !== undefined &&
+        (turnStartCost !== undefined || tokenShare === undefined || usdShare >= tokenShare);
+      const used = priced ? usdThisTurn! : spentThisTurn;
       const ceiling = priced ? usdCeiling : tokenCeiling;
       // Named for what it is, and not `shown` — which is the read-coverage map
       // a few lines down, and which this quietly shadowed until the compiler
       // said so.
       const ceilingLine = priced
-        ? `${fmtUsd(usdThisTurn)} of ${fmtUsd(usdCeiling)}`
+        ? `${fmtUsd(usdThisTurn!)} of ${fmtUsd(usdCeiling)}`
         : `${spentThisTurn} of ${tokenCeiling} tokens`;
 
       // Said on the way up, not only on arrival. A limit that speaks for the

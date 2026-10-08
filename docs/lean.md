@@ -94,7 +94,11 @@ the run had a judge, the detail shows the split, e.g. `cost $0.2800 (worker
 $0.0300 + judge $0.2500) > $0.1000 ...`, and the `STOPPED` row adds
 `worker_cost_usd`, `judge_cost_usd`, `worker_tokens_in` and `judge_tokens_in`;
 `cost_usd` and `tokens_in` there are the totals. The lane median is over the
-same totals. The run trips the alarm when:
+same totals, leaving out runs whose judge ran unpriced (a judge paid by a plan,
+`judge_plan`, cost no money and counts at the worker's cost; the split reads
+`judge (OpenCode plan)`): their total is only a
+lower bound, and mixed with priced runs it would pull the limit down unseen.
+Such a run's own alarm still uses that lower bound. The run trips the alarm when:
 
 - its cost exceeds **max(5x the lane's running median cost, $0.10)**. The
   median is over the lane's earlier runs that reported a cost (resumed rows

@@ -193,3 +193,53 @@ def test_a_lane_stops_on_a_runaway_judge(monkeypatch, tmp_path):
     assert stop["stopped"] is True and stop["run"] == "t2-molt-0"
     assert stop["worker_cost_usd"] == 0.02 and stop["judge_cost_usd"] == 0.90
     assert "(worker $0.0200 + judge $0.9000)" in stop["detail"]
+
+
+def test_a_run_with_an_unpriced_judge_is_left_out_of_the_median():
+    assert run.median_cost({"cost_usd": 0.02, "judge_calls": 3, "judge_cost_usd": None}) is None
+    assert run.median_cost({"cost_usd": 0.02, "judge_calls": 3, "judge_cost_usd": 0.01}) == pytest.approx(0.03)
+    assert run.median_cost({"cost_usd": 0.02}) == 0.02  # no judge: the worker's cost, as before
+    # Its own alarm still uses the lower bound.
+    assert run.cost_alarm({"cost_usd": 0.12, "judge_calls": 3, "judge_cost_usd": None}, [])
+
+
+def test_the_lane_median_skips_unpriced_judge_runs(monkeypatch, tmp_path):
+    # Priced-judge runs total $0.10; two runs with an unpriced judge cost $0.01 (worker
+    # only). Counted, they would drag the median to $0.01 and the limit to the $0.10
+    # floor, stopping the fifth run ($0.30). Left out, the median is $0.10, limit $0.50.
+    out = _lane(monkeypatch, tmp_path, [(0.02, 1), (0.01, 1), (0.01, 1), (0.02, 1), (0.02, 1)])
+    judge = iter([0.08, None, None, 0.08, 0.28])
+    inner = run.run_molt
+
+    def with_judge(d, prompt, log):
+        r = inner(d, prompt, log)
+        return {**r, "judge_calls": 2, "judge_cost_usd": next(judge), "judge_tokens_in": 1}
+
+    monkeypatch.setattr(run, "run_molt", with_judge)
+    run.main("molt", 1, None)
+    rows = [json.loads(x) for x in out.read_text().splitlines()]
+    assert len(rows) == 5 and not any(r.get("stopped") for r in rows)
+
+
+def test_a_plan_paid_judge_counts_in_the_median_at_the_workers_cost():
+    row = {"cost_usd": 0.15, "judge_calls": 3, "judge_cost_usd": None, "judge_plan": "OpenCode"}
+    assert run.median_cost(row) == 0.15, "a plan-paid judge cost no money: exact, not unknown"
+    a = run.cost_alarm(row, [])
+    assert a and "(worker $0.1500 + judge (OpenCode plan))" in a["detail"] and a["judge_plan"] == "OpenCode"
+
+
+def test_a_lane_with_a_plan_paid_judge_forms_its_median(monkeypatch, tmp_path):
+    # The documented OpenCode-judge arm: every judge is plan-paid. The median must
+    # form from the worker's costs (0.10), so a $0.15 run (limit max(0.50, 0.10)) passes;
+    # with the plan rows left out, the limit stayed at the $0.10 floor and stopped it.
+    out = _lane(monkeypatch, tmp_path, [(0.10, 1), (0.10, 1), (0.10, 1), (0.15, 1)])
+    inner = run.run_molt
+
+    def plan_judge(d, prompt, log):
+        return {**inner(d, prompt, log), "judge_calls": 3, "judge_cost_usd": None, "judge_plan": "OpenCode", "judge_tokens_in": 1}
+
+    monkeypatch.setattr(run, "run_molt", plan_judge)
+    run.main("molt", 1, None)
+    rows = [json.loads(x) for x in out.read_text().splitlines()]
+    assert len(rows) == 4 and not any(r.get("stopped") for r in rows)
+    assert all(r["judge_plan"] == "OpenCode" for r in rows)

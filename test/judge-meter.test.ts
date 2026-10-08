@@ -232,6 +232,138 @@ describe("a budget counts the judge's spend", () => {
   });
 });
 
+describe("the turn's money ceiling with an unpriced worker", () => {
+  it("still counts a priced judge's dollars", async () => {
+    const ws = workspace();
+    try {
+      const fetchFn = (async () =>
+        reply({ choices: [{ message: { role: "assistant", content: null, tool_calls: [{ id: "c", type: "function", function: { name: "list_files", arguments: "{}" } }] }, finish_reason: "tool_calls" }], usage: { prompt_tokens: 10, completion_tokens: 5 } })) as unknown as typeof fetch;
+      // No worker price at all: a local or subscription worker with a paid judge.
+      const engine = new Engine({ baseUrl: URL, model: "m", cwd: ws.dir, fetchFn, bar: null, stream: false, autonomy: "high", maxTurnUsd: 0.01, maxSteps: 4 });
+      engine.judgeMeter.setPricing(URL, JUDGE, { in: 1000, out: 1000, source: "test" });
+      assert.equal(engine.costUsd(), undefined);
+      const events: EngineEvent[] = [];
+      for await (const ev of engine.run("anything", allowAll)) {
+        events.push(ev);
+        if (ev.kind === "usage" && events.filter((x) => x.kind === "usage").length === 1) {
+          engine.judgeMeter.record({ baseUrl: URL, model: JUDGE, promptTokens: 10, completionTokens: 10, estimated: false });
+        }
+      }
+      assert.ok(Math.abs(engine.totalCostUsd()! - 0.02) < 1e-12, "the judge's $0.02 is the turn's priced spend");
+      assert.ok(
+        events.some((x) => (x.kind === "error" || x.kind === "info") && /\$0\.020 of \$0\.010/.test(x.text)),
+        "the dollar ceiling saw the judge's spend",
+      );
+    } finally {
+      ws.cleanup();
+    }
+  });
+});
+
+describe("an unpriced worker with a priced judge is held by both ceilings", () => {
+  // Grok's reproducer (#57 review, N1): one priced judge call flipped the turn
+  // to dollars and the worker's tokens ran to the step guard (700k).
+  it("stops at the token ceiling, not at the step guard", async () => {
+    const ws = workspace();
+    try {
+      let asked = 0;
+      const fetchFn = (async () => {
+        asked += 1;
+        return reply({ choices: [{ message: { role: "assistant", content: null, tool_calls: [{ id: `c${asked}`, type: "function", function: { name: "list_files", arguments: JSON.stringify({ path: `d${asked}` }) } }] }, finish_reason: "tool_calls" }], usage: { prompt_tokens: 100_000, completion_tokens: 0 } });
+      }) as unknown as typeof fetch;
+      const engine = new Engine({
+        baseUrl: URL, model: "m", cwd: ws.dir, fetchFn, bar: null, stream: false, autonomy: "high",
+        maxTurnUsd: 1, maxTurnTokens: 150_000, maxSteps: 7,
+      });
+      engine.judgeMeter.setPricing(URL, JUDGE, { in: 1, out: 1, source: "test" });
+      const events: EngineEvent[] = [];
+      let judged = false;
+      for await (const ev of engine.run("anything", allowAll)) {
+        events.push(ev);
+        if (ev.kind === "usage" && !judged) {
+          judged = true;
+          engine.judgeMeter.record({ baseUrl: URL, model: JUDGE, promptTokens: 10, completionTokens: 10, estimated: false });
+        }
+      }
+      // Stopped after two steps at 200,020 (the third request is the closing
+      // summary every stopped turn asks for), not run on to the step guard.
+      assert.ok(
+        events.some((x) => x.kind === "error" && /stopped: this turn has spent 200020 of 150000 tokens/.test(x.text)),
+        "the token ceiling stopped the turn at ~200k",
+      );
+      assert.equal(asked, 3, "two work steps and the closing summary, not seven steps");
+    } finally {
+      ws.cleanup();
+    }
+  });
+});
+
+describe("the budget-hit message", () => {
+  it("says the drafting used the budget when it was hit before the worker's first step", async () => {
+    const ws = workspace();
+    try {
+      const fetchFn = (async () => reply({ choices: [{ message: { role: "assistant", content: "Done." }, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 5 } })) as unknown as typeof fetch;
+      const engine = new Engine({ baseUrl: URL, model: "m", cwd: ws.dir, fetchFn, bar: null, stream: false, autonomy: "high" });
+      engine.setBudget(1_000);
+      engine.draftingStarted();
+      engine.judgeMeter.record({ baseUrl: URL, model: JUDGE, what: "drafting criteria", promptTokens: 1_200, completionTokens: 0, estimated: false });
+      const hit = (await drain(engine.run("anything", allowAll))).find((x) => x.kind === "error" && x.ceiling === "budget");
+      assert.ok(hit && hit.kind === "error");
+      assert.match(hit.text, /drafting this turn's checks used the budget before the worker's first step; raise --budget to leave room for both/);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("gives no drafting hint when the budget was already used up before the drafting began", async () => {
+    const ws = workspace();
+    try {
+      const fetchFn = (async () => reply({ choices: [{ message: { role: "assistant", content: "Done." }, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 5 } })) as unknown as typeof fetch;
+      const engine = new Engine({ baseUrl: URL, model: "m", cwd: ws.dir, fetchFn, bar: null, stream: false, autonomy: "high" });
+      engine.setBudget(1_000);
+      // A judge ask outside the drafting (an arbiter, say) already spent the budget.
+      engine.judgeMeter.record({ baseUrl: URL, model: JUDGE, what: "ruling on a disputed check", promptTokens: 1_100, completionTokens: 0, estimated: false });
+      engine.draftingStarted();
+      engine.judgeMeter.record({ baseUrl: URL, model: JUDGE, what: "drafting criteria", promptTokens: 50, completionTokens: 0, estimated: false });
+      const hit = (await drain(engine.run("anything", allowAll))).find((x) => x.kind === "error" && x.ceiling === "budget");
+      assert.ok(hit && hit.kind === "error");
+      assert.doesNotMatch(hit.text, /drafting/);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("gives no drafting hint for judge spend outside any drafting", async () => {
+    const ws = workspace();
+    try {
+      const fetchFn = (async () => reply({ choices: [{ message: { role: "assistant", content: "Done." }, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 5 } })) as unknown as typeof fetch;
+      const engine = new Engine({ baseUrl: URL, model: "m", cwd: ws.dir, fetchFn, bar: null, stream: false, autonomy: "high" });
+      engine.setBudget(1_000);
+      engine.judgeMeter.record({ baseUrl: URL, model: JUDGE, what: "reviewing the claim", promptTokens: 1_200, completionTokens: 0, estimated: false });
+      const hit = (await drain(engine.run("anything", allowAll))).find((x) => x.kind === "error" && x.ceiling === "budget");
+      assert.ok(hit && hit.kind === "error");
+      assert.doesNotMatch(hit.text, /drafting/);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("gives no drafting hint when the worker spent it", async () => {
+    const ws = workspace();
+    try {
+      const fetchFn = (async () =>
+        reply({ choices: [{ message: { role: "assistant", content: null, tool_calls: [{ id: "c", type: "function", function: { name: "list_files", arguments: "{}" } }] }, finish_reason: "tool_calls" }], usage: { prompt_tokens: 600, completion_tokens: 0 } })) as unknown as typeof fetch;
+      const engine = new Engine({ baseUrl: URL, model: "m", cwd: ws.dir, fetchFn, bar: null, stream: false, autonomy: "high", maxSteps: 5 });
+      engine.setBudget(1_000);
+      const hit = (await drain(engine.run("anything", allowAll))).find((x) => x.kind === "error" && x.ceiling === "budget");
+      assert.ok(hit && hit.kind === "error");
+      assert.doesNotMatch(hit.text, /drafting/);
+    } finally {
+      ws.cleanup();
+    }
+  });
+});
+
 describe("JudgeMeter", () => {
   const u = { baseUrl: URL, model: JUDGE, promptTokens: 1000, completionTokens: 200, cacheReadTokens: 400, estimated: false };
 
@@ -249,6 +381,16 @@ describe("JudgeMeter", () => {
     assert.equal(m.total().costUsd, undefined);
     m.setPricing(URL, JUDGE, PRICE);
     assert.ok(Math.abs(m.total().costUsd! - PER_CALL) < 1e-12);
+  });
+
+  it("a price cleared after a call is no longer applied to it", () => {
+    const m = new JudgeMeter();
+    m.setPricing(URL, JUDGE, PRICE);
+    m.record(u);
+    assert.ok(m.total().costUsd! > 0);
+    m.setPricing(URL, JUDGE, null);
+    assert.equal(m.total().costUsd, undefined, "re-priced now: no price, $ unknown");
+    assert.equal(m.all()[0]!.costUsd, PER_CALL, "the figure recorded at the time (the journal's) is kept on the call");
   });
 
   it("uses the provider's billed figure when it sends one", () => {

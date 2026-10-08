@@ -702,6 +702,8 @@ export function App({
           model: engine.model,
           cwd: engine.cwd,
           fetchFn: engine.cfg.fetchFn,
+          // The worker's own model: worker spend on the session meter.
+          meter: engine.workerAskMeter,
         });
         if (seq !== interviewSeq.current) return;
         if (r.kind === "error") {

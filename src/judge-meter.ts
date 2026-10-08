@@ -47,8 +47,8 @@ export interface AskMeter {
   record(u: AskUsage): void;
 }
 
-/** The judge's spend over some span of calls. */
-export type JudgeSpend = {
+/** The spend of a span of asks (the judge's, or the worker's planning ask). */
+export type AskSpend = {
   calls: number;
   promptTokens: number;
   completionTokens: number;
@@ -100,7 +100,12 @@ export function priceTokens(p: Pricing, u: Pick<AskUsage, "promptTokens" | "comp
   return (fresh / 1e6) * p.in + (cached / 1e6) * (p.cached ?? p.in) + (u.completionTokens / 1e6) * p.out;
 }
 
-export class JudgeMeter implements AskMeter {
+/**
+ * A meter of asks: counted and priced per call, read over any span. Neutral on
+ * purpose; the engine keeps one for the judge (`JudgeMeter`, the name the rest
+ * of the code uses), and `mission plan` one for the worker's planning ask.
+ */
+export class SpendMeter implements AskMeter {
   private readonly calls: JudgeCall[] = [];
   private readonly prices = new Map<string, Pricing | null>();
   private readonly listeners: ((c: JudgeCall) => void)[] = [];
@@ -180,17 +185,19 @@ export class JudgeMeter implements AskMeter {
   }
 
   /** The whole session's judge spend. */
-  total(): JudgeSpend {
+  total(): AskSpend {
     return this.since(0);
   }
 
   /**
    * The judge's spend since a mark. Priced now, not when recorded, so a price
    * that arrived after the first ask (a lookup still in flight, a /price) is
-   * applied to every call, as the worker's meter does.
+   * applied to every call, and a price that was cleared is no longer applied
+   * to any: the figure stored at record time (the journal's) is dropped before
+   * re-pricing. The worker's meter does the same with its session totals.
    */
-  since(mark: number): JudgeSpend {
-    const span = this.calls.slice(mark).map((c) => this.priced(c));
+  since(mark: number): AskSpend {
+    const span = this.calls.slice(mark).map(({ costUsd: _recorded, plan: _plan, ...u }) => this.priced(u));
     const models: string[] = [];
     let cost = 0;
     let unpriced = 0;
@@ -233,9 +240,15 @@ export class JudgeMeter implements AskMeter {
 }
 
 /** Tokens a judge spend counts toward a budget: everything sent and received. */
-export function judgeTokens(s: JudgeSpend | undefined): number {
+export function judgeTokens(s: AskSpend | undefined): number {
   return s ? s.promptTokens + s.completionTokens : 0;
 }
 
+/** The judge's spend: an AskSpend over the judge's calls. */
+export type JudgeSpend = AskSpend;
+/** The engine's meter of the judge's calls: a SpendMeter. */
+export const JudgeMeter = SpendMeter;
+export type JudgeMeter = SpendMeter;
+
 /** Said in one line by format.ts, which the renderer can import. */
-export { judgeSpendLine } from "./format.js";
+export { askSpendLine, judgeSpendLine } from "./format.js";

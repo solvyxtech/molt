@@ -17,6 +17,9 @@ import { removedSubscriptionProblem } from "./endpoint.js";
 import { errorText } from "./format.js";
 import { askError, askTimeoutMs, probeSignal } from "./watchdog.js";
 import { authHeaders } from "./providers.js";
+import { recordUsage } from "./ask.js";
+import type { AskMeter } from "./judge-meter.js";
+import type { Usage } from "./stream.js";
 import { loadBar, parseBar, barPath } from "./bar.js";
 import type { Bar, Check } from "./types.js";
 import {
@@ -277,6 +280,12 @@ export async function interviewTurn(opts: {
   acpSpawn?: typeof import("node:child_process").spawn;
   /** How long the HTTP question may wait for its answer; see askTimeoutMs. Tests only. */
   timeoutMs?: number;
+  /**
+   * Where the ask reports what it used. The interview asks the worker's own
+   * model, so callers pass the engine's worker meter (Engine.workerAskMeter):
+   * its tokens and cost are the worker's spend.
+   */
+  meter?: AskMeter;
 }): Promise<InterviewTurn> {
   const f = opts.fetchFn ?? fetch;
   const base = opts.baseUrl.replace(/\/$/, "");
@@ -320,6 +329,7 @@ export async function interviewTurn(opts: {
       ...(opts.acpSpawn ? { spawnFn: opts.acpSpawn } : {}),
     });
     if (!asked.ok) return { kind: "error", error: asked.error };
+    recordUsage(opts.meter, { baseUrl: opts.baseUrl, model: opts.model, what: "interviewing", sent: SYSTEM + context }, undefined, asked.text);
     return parseInterviewReply(asked.text, opts.round);
   }
 
@@ -340,8 +350,9 @@ export async function interviewTurn(opts: {
       }),
     });
     if (!res.ok) return { kind: "error", error: `HTTP ${res.status} interviewing` };
-    const json = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+    const json = (await res.json()) as { choices?: { message?: { content?: string } }[]; usage?: Usage };
     const text = json.choices?.[0]?.message?.content ?? "";
+    recordUsage(opts.meter, { baseUrl: opts.baseUrl, model: opts.model, what: "interviewing", sent: SYSTEM + context }, json.usage, text);
     /**
      * No last-round guard here, because there is nothing left to guard.
      *

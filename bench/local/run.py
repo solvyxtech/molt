@@ -682,6 +682,9 @@ def judge_columns(judge: dict | None) -> dict:
         "judge_cache_read": judge.get("cacheReadTokens"),
         "judge_cache_write": judge.get("cacheWriteTokens"),
         "judge_cost_usd": judge.get("costUsd"),
+        # The plan that paid for the judge's calls (e.g. "OpenCode"): no money, so a
+        # missing judge_cost_usd with a plan is exact, not unknown.
+        "judge_plan": judge.get("plan"),
     }
 
 
@@ -713,6 +716,20 @@ def run_cost(row: dict) -> float | None:
     return _sum_known(row.get("cost_usd"), row.get("judge_cost_usd"))
 
 
+def median_cost(row: dict) -> float | None:
+    """A run's cost as the lane median counts it, or None to leave it out.
+
+    A run whose judge ran but had no price (and no plan paying for it) is left out: its total is the worker's
+    cost alone, a lower bound, and averaged with runs whose judge was priced it would
+    pull the median (and so the limit) down without anyone seeing why. The alarm on
+    that run itself still uses the lower bound (run_cost): under-counting there only
+    makes the alarm late, never wrong."""
+    if row.get("judge_calls") is not None and row.get("judge_cost_usd") is None and not row.get("judge_plan"):
+        return None
+    # A plan-paid judge cost no money: the total is the worker's, and exact.
+    return run_cost(row)
+
+
 def run_tokens(row: dict) -> int | None:
     """A run's prompt tokens, the worker's plus the judge's."""
     return _sum_known(row.get("tokens_in"), row.get("judge_tokens_in"))
@@ -734,9 +751,15 @@ def cost_alarm(row: dict, prior_costs: list[float]) -> dict | None:
     def usd(x):
         return "$ unknown" if x is None else f"${x:.4f}"
 
+    def judge_usd():
+        plan, cost = row.get("judge_plan"), row.get("judge_cost_usd")
+        if plan and cost is None:
+            return f"({plan} plan)"
+        return usd(cost) + (f" + {plan} plan" if plan else "")
+
     why = []
     if cost is not None and cost > limit_usd:
-        split = f" (worker {usd(row.get('cost_usd'))} + judge {usd(row.get('judge_cost_usd'))})" if judged else ""
+        split = f" (worker {usd(row.get('cost_usd'))} + judge {judge_usd()})" if judged else ""
         why.append(f"cost ${cost:.4f}{split} > ${limit_usd:.4f} (max({lim['x']:g}x lane median "
                    f"{'n/a' if med is None else f'${med:.4f}'}, ${lim['usd']:g}))")
     if toks is not None and toks > lim["tokens"]:
@@ -747,6 +770,7 @@ def cost_alarm(row: dict, prior_costs: list[float]) -> dict | None:
         return None
     return {"detail": "; ".join(why), "cost_usd": cost, "tokens_in": toks,
             **({"worker_cost_usd": row.get("cost_usd"), "judge_cost_usd": row.get("judge_cost_usd"),
+                **({"judge_plan": row["judge_plan"]} if row.get("judge_plan") else {}),
                 "worker_tokens_in": row.get("tokens_in"), "judge_tokens_in": row.get("judge_tokens_in")}
                if judged else {}),
             "lane_median_usd": med, "limit_usd": round(limit_usd, 6), "limit_tokens": lim["tokens"]}
@@ -909,8 +933,8 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
         if r.get("stopped"):  # a STOPPED marker, not a run
             continue
         done.add((r["task"], r["agent"], r["rep"], r.get("arm")))
-        if run_cost(r) is not None:
-            lane_costs.setdefault(r.get("arm"), []).append(run_cost(r))
+        if median_cost(r) is not None:
+            lane_costs.setdefault(r.get("arm"), []).append(median_cost(r))
     global SCRUBBER
     SCRUBBER = make_scrubber()
     for rep in range(repeats):
@@ -968,8 +992,8 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
                     alarm = cost_alarm(r, costs)
                     if alarm:
                         stop_lane(out, tag, EXPORT / f"{tag}.log", alarm, arm, lid)
-                    if run_cost(r) is not None:
-                        costs.append(run_cost(r))
+                    if median_cost(r) is not None:
+                        costs.append(median_cost(r))
 
 
 def stop_lane(out: Path, tag: str, log: Path, alarm: dict, arm: str | None, lid: str | None = None) -> None:

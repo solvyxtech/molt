@@ -857,14 +857,10 @@ export class Receipts {
   }
 
   /**
-   * Record the independent review's objections on a receipt's index row: each
-   * with its command and result (`--review-executable`). Masked like every
-   * other write while hidden commands are withheld. The receipt file itself,
-   * hash-bound when it was written, is never rewritten.
-   */
-  /**
    * Bring a row's judge spend up to date at the end of its job: the review and
-   * the post-work audit ask the judge after the receipt is written.
+   * the post-work audit ask the judge after the receipt is written. Only the
+   * index row changes; the receipt file, hash-bound when it was written, keeps
+   * the "so far" figure it was written with.
    */
   amendJudge(file: string, judge: JudgeSpend): boolean {
     return this.amendRow(file, (r) => ({ ...r, judge }));
@@ -895,6 +891,12 @@ export class Receipts {
     }
   }
 
+  /**
+   * Record the independent review's objections on a receipt's index row: each
+   * with its command and result (`--review-executable`). Masked like every
+   * other write while hidden commands are withheld. The receipt file itself,
+   * hash-bound when it was written, is never rewritten.
+   */
   amendReview(file: string, objections: readonly Objection[]): boolean {
     return this.amendRow(file, (r) => ({ ...r, objections: maskDeep([...objections], this.withheld) }));
   }

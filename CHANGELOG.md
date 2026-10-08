@@ -4,6 +4,10 @@
 
 ### Added
 
+- **Interview and mission-planning asks are metered as worker spend.** The
+  interview's question is added to the session meter (journal: `worker_ask`);
+  `maat mission plan` prints the plan's tokens and cost at the worker's prices.
+
 - **The judge's spend is metered.** Every ask made around the work (drafting
   and its critic, the reference check, `--review`, the post-work audit, the
   arbiter) records its input, output, cache read and cache write tokens, priced
@@ -16,6 +20,11 @@
   columns to each row, and its cost alarm now judges worker + judge cost and
   prompt tokens (the detail shows the split), so a runaway judge stops the lane
   too. See `docs/transparency.md` and `docs/lean.md`.
+  The per-turn dollar ceiling counts a priced judge even when the worker is
+  unpriced, with the token ceiling still bounding the whole turn; the lane
+  median leaves out runs whose judge was unpriced (a plan-paid judge,
+  `judge_plan`, still counts); a budget used up by this turn's drafting before
+  the first step says so.
 
 - **`--review-executable`** (experimental, also `MAAT_REVIEW_EXECUTABLE=1`):
   every `--review` objection must carry a read-only command that demonstrates

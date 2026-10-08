@@ -189,10 +189,26 @@ the worker's tokens plus the judge's, and the per-turn ceiling in tokens or
 dollars counts the judge's spend in that turn too: a budget is what you are
 willing to spend, and the judge's tokens are billed like any others. When a
 budget is hit with judge spend in it, the message says how much was the
-judge's. A judge with no known price adds its tokens to a token budget and
-nothing to a dollar ceiling (its spend there is unknown, and said so). The
-budget is checked before every worker step; a judge ask already under way is
-not cut off.
+judge's; when the judge's drafting used it before the worker's first step,
+the message says that too (only when the spend before the drafting was still
+under the budget). The turn is priced in dollars when either side is priced: a
+local or subscription worker with a paid judge is held to a dollar ceiling by
+the judge's dollars and to the token ceiling by the whole turn's tokens, and
+stops at whichever it reaches first. A side with no known price adds its
+tokens to a token budget and nothing to a dollar ceiling (its spend there is
+unknown, and said so). The budget is checked before every worker step; a judge
+ask already under way is not cut off.
+
+The worker's own asks outside a turn are worker spend, not the judge's: the
+interview's question is added to the session meter like a step (and journalled
+as `worker_ask`). It is asked before the turn starts, so it is in the session
+total but in no job's `job_end` spend or receipt: a session total higher than
+the sum of its jobs is the interview, not a gap. And `maat mission plan` prints a `worker (planning) ...` line
+with the plan's tokens and cost at the worker's prices.
+
+Judge calls are priced when they are read, not when they were made: a price
+that arrives later applies to every call, and a price that is cleared stops
+applying (the journal keeps each call's figure as it stood at the time).
 
 ## Work that goes nowhere
 

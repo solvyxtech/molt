@@ -350,43 +350,45 @@ function count(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
 }
 
-/**
- * Report one answered HTTP ask to the meter: the provider's usage block when
- * it sent one, Maat's estimate (marked) when it did not.
- */
+/** Report one answered HTTP ask to its meter (see recordUsage). */
 function meterUsage(opts: AskOptions, u: Usage | undefined, reply: string): void {
-  if (!opts.meter) return;
+  recordUsage(opts.meter, { baseUrl: opts.baseUrl, model: opts.model, what: opts.what, sent: opts.system + opts.prompt }, u, reply);
+}
+
+/** An answered ask whose transport reports no usage (ACP, a CLI): estimated. */
+function meterEstimate(opts: AskOptions, reply: string): void {
+  meterUsage(opts, undefined, reply);
+}
+
+/**
+ * Report one answered ask to a meter: the provider's usage block when it sent
+ * one (input, output, cache read and write, its own dollar figure), Maat's
+ * estimate from `sent` and the reply, marked, when it did not. Exported for the
+ * asks that do not go through askModel (the interview).
+ */
+export function recordUsage(
+  meter: AskMeter | undefined,
+  ctx: { baseUrl: string; model: string; what?: string; sent: string },
+  u: Usage | undefined,
+  reply: string,
+): void {
+  if (!meter) return;
   const prompt = count(u?.prompt_tokens);
   const completion = count(u?.completion_tokens);
-  if (prompt === undefined && completion === undefined) {
-    meterEstimate(opts, reply);
-    return;
-  }
   const read = count(u?.prompt_tokens_details?.cached_tokens) ?? count(u?.cache_read_input_tokens);
   const write = count(u?.cache_creation_input_tokens);
   const billed = count(u?.cost);
-  opts.meter.record({
-    baseUrl: opts.baseUrl,
-    model: opts.model,
-    ...(opts.what ? { what: opts.what } : {}),
-    promptTokens: prompt ?? estTokens(opts.system + opts.prompt),
+  const reported = prompt !== undefined || completion !== undefined;
+  meter.record({
+    baseUrl: ctx.baseUrl,
+    model: ctx.model,
+    ...(ctx.what ? { what: ctx.what } : {}),
+    promptTokens: prompt ?? estTokens(ctx.sent),
     completionTokens: completion ?? estTokens(reply),
-    ...(read !== undefined ? { cacheReadTokens: read } : {}),
-    ...(write !== undefined ? { cacheWriteTokens: write } : {}),
-    ...(billed !== undefined ? { billedUsd: billed } : {}),
+    ...(reported && read !== undefined ? { cacheReadTokens: read } : {}),
+    ...(reported && write !== undefined ? { cacheWriteTokens: write } : {}),
+    ...(reported && billed !== undefined ? { billedUsd: billed } : {}),
     estimated: prompt === undefined || completion === undefined,
-  });
-}
-
-/** An answered ask whose transport reports no usage (ACP, a CLI, a bare reply): estimated. */
-function meterEstimate(opts: AskOptions, reply: string): void {
-  opts.meter?.record({
-    baseUrl: opts.baseUrl,
-    model: opts.model,
-    ...(opts.what ? { what: opts.what } : {}),
-    promptTokens: estTokens(opts.system + opts.prompt),
-    completionTokens: estTokens(reply),
-    estimated: true,
   });
 }
 
