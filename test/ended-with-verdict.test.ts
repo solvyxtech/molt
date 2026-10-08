@@ -14,7 +14,7 @@ import type { Check } from "../src/types.js";
 import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
 const greet = (hidden = true): Check => ({
-  name: "greeting", kind: "command", run: "grep -qx hello out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden,
+  name: "greeting", kind: "command", run: "grep -qx hello out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden,
   // Drafted by a separate judge model, not the worker "m".
   author: { kind: "judge", model: "judge-j" },
 });

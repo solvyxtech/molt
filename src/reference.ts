@@ -486,8 +486,9 @@ async function writeAndTry(opts: Ask, prompt: string): Promise<Reference | { ok:
     timeoutMs: REFERENCE_TIMEOUT_MS,
     expectExit: 0,
     // It runs the deliverable on inputs and compares what it returns to two
-    // independently written references: a run that asserts values.
-    tags: ["task", "reference", "value"],
+    // independently written references: a run that asserts values, and
+    // exact ones (equality with what the references return on each input).
+    tags: ["task", "reference", "value", "exact"],
     hidden: true,
     // Written by this model: independent of the work only when it is not the worker's.
     author: { kind: "reference", model: opts.model },

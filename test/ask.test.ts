@@ -61,11 +61,20 @@ describe("askModel", () => {
     assert.deepEqual(p.ceilings, [100, 400]);
   });
 
-  it("does not retry a reply that was cut off mid-answer: that one is the caller's to report", async () => {
-    const p = replying([{ content: '{"a":', finish: "length" }]);
+  it("asks once more, with room, when a reply was cut off mid-answer", async () => {
+    // A draft of exact, edge-case checks outgrew the ceiling: half a JSON reply proposes nothing.
+    const p = replying([{ content: '{"a":', finish: "length" }, { content: '{"a":1}' }]);
     const r = await ask(p.fetchFn);
-    assert.deepEqual(r, { ok: true, text: '{"a":', cutOff: true });
-    assert.equal(p.ceilings.length, 1);
+    assert.deepEqual(r, { ok: true, text: '{"a":1}', cutOff: false });
+    assert.equal(p.ceilings.length, 2);
+    assert.ok(p.ceilings[1]! > p.ceilings[0]!);
+  });
+
+  it("reports the second cut-off when the bigger ceiling is cut off too", async () => {
+    const p = replying([{ content: '{"a":', finish: "length" }, { content: '{"a":[1,', finish: "length" }]);
+    const r = await ask(p.fetchFn);
+    assert.deepEqual(r, { ok: true, text: '{"a":[1,', cutOff: true });
+    assert.equal(p.ceilings.length, 2);
   });
 
   it("reports an HTTP failure with what was being asked, and marks a rate limit worth asking again", async () => {

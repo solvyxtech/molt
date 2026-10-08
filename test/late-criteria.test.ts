@@ -15,7 +15,7 @@ import type { Check } from "../src/types.js";
 import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
 // Value-asserting checks (src/tiers.ts): a check that only looks cannot earn "verified".
-const mk = (name: string, run: string): Check => ({ name, kind: "command", run, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: { kind: "judge", model: "judge-j" } });
+const mk = (name: string, run: string): Check => ({ name, kind: "command", run, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true, author: { kind: "judge", model: "judge-j" } });
 const later = <T>(v: T, ms: number) => new Promise<T>((r) => setTimeout(() => r(v), ms));
 const nothing = async () => ({ taskChecks: [] as Check[], taskNotes: [] as string[] });
 const TASK = "write hello to out.txt";

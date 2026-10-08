@@ -12,7 +12,7 @@ import { tierOf } from "../src/tiers.js";
 
 describe("tierOf, review advisory", () => {
   const ck = (name: string, tags: string[]) => ({ name, ok: true, hidden: true as const, tags });
-  const strong = ck("task:counts", ["task", "value"]);
+  const strong = ck("task:counts", ["task", "value", "exact"]);
   // Drafted by a separate judge; tierOf's authorship rule has its own tests (independent-checks.test.ts).
   const J = {
     worker: "worker-m",
@@ -37,7 +37,7 @@ describe("tierOf, review advisory", () => {
     const r = tierOf({ ...J, results: [strong], guards, failedBefore, reviewAdvisory: true });
     assert.equal(r.tier, "passed-untested");
     assert.match(r.reason!, /`task:counts` passed before the work began too/);
-    const two = tierOf({ ...J, results: [strong, ck("task:other", ["task", "value"])], guards, failedBefore, reviewAdvisory: true });
+    const two = tierOf({ ...J, results: [strong, ck("task:other", ["task", "value", "exact"])], guards, failedBefore, reviewAdvisory: true });
     assert.equal(two.tier, "verified", "another value check that failed on the pristine tree carries it");
   });
 

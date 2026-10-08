@@ -21,7 +21,7 @@ const TASK_WITH_INPUT = "Read data.csv and write out.txt containing a greeting. 
 
 const hiddenChecks: Check[] = [
   { name: "made", kind: "command", run: "test -f out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true, author: { kind: "judge", model: "judge-j" } },
-  { name: "too-strict", kind: "command", run: "grep -q 366 out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: { kind: "judge", model: "judge-j" } },
+  { name: "too-strict", kind: "command", run: "grep -q 366 out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true, author: { kind: "judge", model: "judge-j" } },
 ];
 const personChecks: Check[] = hiddenChecks.map((c) => ({ ...c, hidden: false }));
 

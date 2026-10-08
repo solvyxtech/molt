@@ -584,9 +584,492 @@ export function assertsValue(run: string, goldenPredates?: (operand: string) => 
   return assertsBehaviour(run);
 }
 
-/** The tags a drafted check carries: surface from the critic, value from the command. */
+// ---------------------------------------------------------------- the exact tag
+
+/**
+ * Does this command compare the deliverable's output with an EXACT expected
+ * value, or only test a property of it?
+ *
+ * The 2026-10-07 lanes earned a wrong "verified" on cron-next with four
+ * passing judge checks that all tested properties: 8 lines, each minute a
+ * multiple of 15, sorted, unique; "every date is the 13th or a Friday"; two
+ * runs of the worker agree; "starts with 2024-06-1". Output that skips every
+ * other occurrence has all of those properties. An exact check would not
+ * have passed: from 00:07, `*\/15` gives 00:15 first, and the work gave 00:45.
+ *
+ * Exact, any one of these:
+ *  1. An equality (`==`, `===`, `-eq`, `=` in a test bracket, a failing `if
+ *     ... != ...` / `!==`, `assertEqual`/`strictEqual`/`deepEqual`) between
+ *     what the work produced and a literal: a number, a quoted string, a
+ *     list/dict/set of literals, true/false/null, `"$(printf '...')"`, or a
+ *     name bound to one (a table of cases). Asserted: under `assert`, `if ...:
+ *     exit/raise/throw`, `exit(0 if ...)`, a test bracket, or `jq -e`.
+ *  2. `diff`/`cmp` against a heredoc, a here-string, `<(printf ...)` /
+ *     `<(echo ...)`, or an expected file (the tier's pre-work record still
+ *     has to vouch for the file: `valueUnproven`).
+ *  3. `grep -x` (or a `^...$` pattern) of a literal line, with no regex
+ *     wildcards unless `-F`, over the work's output or a file it wrote.
+ *  4. `<call into the work on literal input> is None`, asserted.
+ *  5. A specific worked-out value with a digit in it found in what a program
+ *     printed on literal input: `nextrun.py '0 9 * * *' '2023-01-01 08:00' 1
+ *     | grep -q '2023-01-01 09:00'` (containsValue).
+ *  6. An oracle: the work's output equal to a value the check built from the
+ *     task's input files without running anything (oracleEquality).
+ *  7. An exit or HTTP status other than 0/200 the task names (`rc=$?; [ $rc
+ *     -eq 2 ]`), not read only on the path where the command failed.
+ * Forms 5 and 6 narrow the rule as first measured (literal equality, diff,
+ * grep -x only): over the 2026-10-07 lanes that kept 48 of 79 grader-right
+ * verifieds the base rule grants, under the two-thirds bar; with them, 56 of
+ * 79, and every grader-wrong verified is still removed
+ * (bench/local/exact_replay.py).
+ * Property, never exact, whatever the literal:
+ *  - counts and sizes: `len()`, `.length`, `wc`, `grep -c`, `count`, `sum()`,
+ *    jq `length`;
+ *  - types and shapes: `type()`, `typeof`, `isinstance`, `keys`;
+ *  - modulo (`% 15 == 0`), prefixes/suffixes and slices, membership in a
+ *    file, a format pattern, ordering;
+ *  - exit status 0 and HTTP 200: they say only that it ran;
+ *  - the same constant compared across every item (`all(...)`, `any(...)`,
+ *    a comprehension, a `for` loop, `find -exec`, `xargs`, jq `.[]`): each
+ *    item having the property is still a property;
+ *  - two unknowns compared (`[ "$a" = "$b" ]`, `L == sorted(set(L))`, two
+ *    runs of the work agreeing);
+ *  - a command that cannot fail (`... || echo fail`, `...; true`, `print(x == 1)`);
+ *  - a pattern the work wrote, tried on lines the check chose (`re.search(p, ...)`).
+ * A constant compared inside a loop over a literal table of cases
+ * (`for inp, want in CASES: assert f(inp) == want`) is exact: `want` changes
+ * with the input.
+ *
+ * `literalOnly` turns forms 5 and 6 off: the rule as first measured, for
+ * bench/local/exact_replay.py.
+ */
+export function assertsExact(run: string, opts: { literalOnly?: boolean } = {}): boolean {
+  // A pattern the work wrote, tried on lines the check chose: the judge's own examples
+  // missed the grader's near-miss (see "Not widened" under assertsValue).
+  if (cannotFail(run) || PATTERN_DELIVERABLE.test(run)) return false;
+  const names = exactNames(run);
+  const narrow = !opts.literalOnly;
+  if (exactEquality(run, names, narrow) || exactHelper(run, names) || exactDiff(run) || exactGrepLine(run) || exactNone(run, names) || (narrow && containsValue(run))) return true;
+  // `bash -c '<script>'`: the script is a command of its own. Not under `find -exec` or `xargs`: that runs it once per item.
+  for (const m of run.matchAll(/(?:^|[\s;&|(])(?:ba|z|da)?sh\s+-c\s+(['"])/g)) {
+    const open = (m.index ?? 0) + m[0].length;
+    const q = m[1]!;
+    let end = open;
+    while (end < run.length && !(run[end] === q && (q === "'" || run[end - 1] !== "\\"))) end++;
+    if (end >= run.length) continue;
+    const seg = shellSegments(run).find(([a, b]) => a <= (m.index ?? 0) && (m.index ?? 0) <= b);
+    if (seg && /\s-exec(?:dir)?\b|\bxargs\b|\bparallel\b/.test(run.slice(seg[0], open))) continue;
+    const body = q === '"' ? run.slice(open, end).replace(/\\(["\\$`])/g, "$1") : run.slice(open, end);
+    if (body.trim() && body !== run && assertsExact(body, opts)) return true;
+  }
+  return false;
+}
+
+/**
+ * Names bound to a WHOLE literal (`want = ['00:15', '00:30']`, `CASES = [('a', 1), ...]`)
+ * and loop variables over one: stricter than `literalNames`, which also takes
+ * `exp = [f"{n} {q}" for ...]`, a value the check computed.
+ */
+function exactNames(run: string): Set<string> {
+  const names = new Set<string>();
+  for (const m of run.matchAll(/(?<![\w.])([A-Za-z_]\w*)\s*(?<![=!<>])=(?!=)\s*/g)) {
+    const rhs = rightOperand(run, (m.index ?? 0) + m[0].length);
+    if (wholeLiteral(rhs, new Set())) names.add(m[1]!);
+  }
+  for (let pass = 0; pass < 2; pass++) {
+    for (const m of run.matchAll(/\bfor\s+\(?\s*([A-Za-z_][\w\s,]*?)\s*\)?\s+in\s+/g)) {
+      const at = (m.index ?? 0) + m[0].length;
+      const src = rightOperand(run, at).replace(/:$/, "");
+      const zipped = /^(?:zip|enumerate)\((.*)\)$/s.exec(src);
+      const parts = zipped ? splitTop(zipped[1]!, /,/y).map((x) => x.trim()) : [src];
+      if (parts.every((x) => names.has(x) || wholeLiteral(x, new Set()))) for (const v of m[1]!.split(",")) if (v.trim()) names.add(v.trim());
+    }
+  }
+  return names;
+}
+
+/** A command whose exit status cannot be non-zero: its last top-level command is `echo`, `true`, `:`, `kill`, `rm` or `exit 0` after `;` or `||`. */
+function cannotFail(run: string): boolean {
+  const segs = shellSegments(run);
+  if (segs.length < 2) return false;
+  const [a, b] = segs[segs.length - 1]!;
+  const last = run.slice(a, b).trim();
+  const sep = run.slice(segs[segs.length - 2]![1], a);
+  if (sep.trim() === "&&") return false;
+  return /^(?:echo|printf|true|kill|rm|wait|sleep|exit\s+0)\b/.test(last) || /^:(?:\s|$)/.test(last);
+}
+
+/** What the work's side of a comparison must not be: a count, a size, a type, a remainder, an exit code, a prefix. */
+const PROPERTY_SIDE =
+  /\blen\s*\(|\.length\b|\blength\b|\bwc\b|\bgrep\s+(?:-\w+\s+)*-\w*c|\buniq\s+-c|\.count\s*\(|\bcount\b|\bsum\s*\(|\btype\s*\(|\btypeof\b|\bisinstance\b|\bkeys\b|(?<![%\w'"])%\s*[\w(]|\breturncode\b|\$\?|\bexit_?[Cc]ode\b|\.(?:status|status_code|code)\b|\bhttp_code\b|\[\s*-?\d*\s*:\s*-?\d*\s*\]|\.\[\]|\.(?:startswith|endswith|startsWith|endsWith)\(/;
+
+/** An exit status or an HTTP status: `$?`, `returncode`, `exitCode`, `.status`, `status_code`, `http_code`. */
+const STATUS_SIDE = /\$\?|\breturncode\b|\bexit_?[Cc]ode\b|\.(?:status|status_code|code)\b|\bhttp_code\b/;
+
+/**
+ * A status counts as an exact output only when the task's specific one is
+ * named: `exit 2 on a bad -n`, `404 for a missing id`. 0 and 200 say only
+ * that it ran.
+ */
+function statusExpected(literal: string): boolean {
+  const n = literal.trim().replace(/^(["'])(.*)\1$/, "$2");
+  return /^-?\d+$/.test(n) && n !== "0" && n !== "200";
+}
+
+/** A shell word that prints literal text: `"$(printf 'a\nb')"`, `"$(echo ok)"`, with no expansion inside. */
+const PRINTF_LITERAL = /^"?\$\(\s*(?:printf|echo)(?:\s+-[ne]+)?\s+(?:'[^'$`]*'|"[^"$`]*"|[^\s$`'"();|&]+)\s*\)"?$/;
+
+/** A whole literal: a number, a quoted string with no expansion, a keyword, or a bracketed list/dict/set/tuple of literals. */
+function wholeLiteral(text: string, names: ReadonlySet<string>): boolean {
+  const t = text.trim().replace(/^\\(["'])/, "$1").replace(/\\(["'])$/, "$1");
+  if (!t) return false;
+  if (names.has(t)) return true;
+  if (/^-?\d+(?:\.\d+)?$/.test(t)) return true;
+  if (/^(?:True|False|None|true|false|null|undefined)$/.test(t)) return true;
+  if (/^[rbuf]{0,2}(["'])(?:(?!\1)[^\\$]|\\.)*\1$/s.test(t)) return true;
+  if (/^\$'(?:[^'\\]|\\.)*'$/.test(t)) return true;
+  if (/^[[({]/.test(t) && closeParen(t, 0) === t.length) {
+    const bare = t.replace(/\\?(["'])(?:(?!\1)[^\\]|\\.)*?\\?\1/g, "''");
+    return !/[A-Za-z_]\w*/.test(bare.replace(/\b(?:True|False|None|true|false|null)\b/g, ""));
+  }
+  return false;
+}
+
+const OPERAND_STOP_WORDS = /(?:^|[\s(;])(?:assert|and|or|not|if|elif|while|return|else|then|in|print|&&|\|\|)\s*$/;
+
+/** The operand ending just before `at` in code: back to an unmatched bracket, a top-level separator, or a keyword. */
+function leftOperand(s: string, at: number): { text: string; start: number } {
+  let depth = 0;
+  let i = at - 1;
+  while (i >= 0 && /\s/.test(s[i]!)) i--;
+  const end = i + 1;
+  for (; i >= 0; i--) {
+    const ch = s[i]!;
+    if (ch === "'" || ch === '"') {
+      const open = s.lastIndexOf(ch, i - 1);
+      if (depth === 0 && i + 1 !== end) break; // a quote that is not the operand's own string: the shell's
+      if (open < 0) break;
+      i = open;
+      if (s[i - 1] === "\\") i--;
+      continue;
+    }
+    if (")]}".includes(ch)) depth++;
+    else if ("([{".includes(ch)) {
+      if (depth === 0) break;
+      depth--;
+    } else if (depth === 0) {
+      if (",;\n?:=!<>".includes(ch) && !(ch === "=" && s[i - 1] === "=")) break;
+      if (/\s/.test(ch) && OPERAND_STOP_WORDS.test(s.slice(Math.max(0, i - 8), i + 1))) break;
+      if (/\s/.test(ch) && /^\s*(?:and|or|if|else|not)\b/.test(s.slice(i + 1, end))) break;
+    }
+  }
+  const start = i + 1;
+  return { text: s.slice(start, end).trim().replace(/^(?:assert|not|if|return)\s+/, ""), start };
+}
+
+/** The operand starting just after `from` in code: up to an unmatched bracket, a top-level separator, or a keyword. */
+function rightOperand(s: string, from: number): string {
+  let depth = 0;
+  let i = from;
+  while (i < s.length && /\s/.test(s[i]!)) i++;
+  const start = i;
+  for (; i < s.length; i++) {
+    const ch = s[i]!;
+    if (ch === "\\" && (s[i + 1] === '"' || s[i + 1] === "'")) {
+      if (depth === 0 && i !== start) break;
+      const q = s[i + 1]!;
+      const close = s.indexOf(`\\${q}`, i + 2);
+      if (close < 0) break;
+      i = close + 1;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      if (depth === 0 && i !== start && !/^[rbuf]{1,2}$/.test(s.slice(start, i))) break;
+      const close = s.indexOf(ch, i + 1);
+      if (close < 0) break;
+      i = close;
+      continue;
+    }
+    if ("([{".includes(ch)) depth++;
+    else if (")]}".includes(ch)) {
+      if (depth === 0) break;
+      depth--;
+    } else if (depth === 0) {
+      if (",;\n?:&|".includes(ch)) break;
+      if (/\s/.test(ch) && /^\s*(?:and|or|if|else|for)\b/.test(s.slice(i))) break;
+    }
+  }
+  return s.slice(start, i).trim();
+}
+
+/** The `(`/`[`/`{` openers enclosing `at`, innermost first. */
+function enclosing(s: string, at: number): number[] {
+  const out: number[] = [];
+  let depth = 0;
+  for (let i = at - 1; i >= 0; i--) {
+    const ch = s[i]!;
+    if (")]}".includes(ch)) depth++;
+    else if ("([{".includes(ch)) {
+      if (depth === 0) out.push(i);
+      else depth--;
+    }
+  }
+  return out;
+}
+
+/** `s` with nested brackets and quoted strings emptied: what is at its own top level. */
+function topLevelText(s: string): string {
+  let out = "";
+  let depth = 0;
+  let q: string | undefined;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]!;
+    if (q) {
+      if (ch === "\\") i++;
+      else if (ch === q) q = undefined;
+      continue;
+    }
+    if (ch === "'" || ch === '"') q = ch;
+    else if ("([{".includes(ch)) depth++;
+    else if (")]}".includes(ch)) depth--;
+    else if (depth === 0) out += ch;
+  }
+  return out;
+}
+
+/** Is the comparison at `at` made once per item of something: inside all()/any()/a comprehension, a for loop, find -exec, xargs, jq `.[]`? */
+function quantified(s: string, at: number): boolean {
+  for (const open of enclosing(s, at)) {
+    const before = s.slice(Math.max(0, open - 12), open);
+    if (/(?:\ball|\bany|\.every|\.some|\bfilter|\bmap|\.forEach|\bsum)\s*$/.test(before)) return true;
+    const end = closeParen(s, open);
+    const inner = s.slice(open + 1, end > 0 ? end - 1 : s.length);
+    // A comprehension: `for ... in` at the top level of this bracket, not in a call or string nested in it.
+    if (/\sfor\s[^\n]*?\sin\s/.test(topLevelText(inner)) && !/^\s*for\b/.test(inner)) return true;
+  }
+  const stmt = s.slice(0, at).split(/[;\n]/).pop() ?? "";
+  if (/(?:^|[\s(])for\s*\(|(?:^|\s)for\s+[\w,\s()]+\s+in\s/.test(stmt)) return true;
+  const seg = shellSegments(s).find(([a, b]) => a <= at && at <= b);
+  const segText = seg ? s.slice(seg[0], at) : "";
+  if (/\s-exec(?:dir)?\b|\bxargs\b|\bparallel\b/.test(segText)) return true;
+  const lastDo = s.lastIndexOf(" do ", at);
+  if (lastDo >= 0 && /\b(?:for|while)\b/.test(s.slice(0, lastDo)) && s.indexOf("done", at) > 0 && s.lastIndexOf("done", at) < lastDo) return true;
+  return false;
+}
+
+/** Is the comparison at `at` what decides the exit status: under assert/if-exit/exit(0 if ...)/throw, a test bracket, or `jq -e`? */
+function asserted(s: string, at: number): boolean {
+  const stmt = s.slice(Math.max(0, at - 300), at).split(/[;\n]/).pop() ?? "";
+  if (/(?:^|[\s(])assert(?:\.\w+)?[\s(]|\bif\s*\(|\bexit\(|\bSystemExit\(|\bexpect\(/.test(stmt)) return true;
+  if (/(?:^|\s)if\s/.test(stmt) && !/\bprint\s*\(/.test(stmt)) {
+    const after = s.slice(at, at + 400);
+    if (/\b(?:sys\.)?exit\(|\braise\b|\bthrow\b|process\.exit\(|\bexit\s+[1-9]/.test(after)) return true;
+  }
+  if (/\bjq\s+(?:-\w+\s+)*-\w*e\w*\s/.test(s.slice(0, at)) && /\bjq\b[^|;&]*$/.test(s.slice(0, at))) return true;
+  return false;
+}
+
+/** Rule 1: an asserted equality between the work's output and a literal. */
+function exactEquality(run: string, names: ReadonlySet<string>, oracle: boolean): boolean {
+  const ops = /(===|!==|==|!=|(?<=\s)-eq(?=\s)|(?<=\s)-ne(?=\s)|(?<=\s)=(?=\s))/g;
+  const d = shellDepths(run);
+  // Shell variables that hold an exit status: `rc=$?` makes `[ $rc -eq 2 ]` an exit-code check.
+  const statusVars = [...run.matchAll(/(?<![\w$])(\w+)=\$\?/g)].map((m) => m[1]!);
+  for (const m of run.matchAll(ops)) {
+    const at = m.index ?? 0;
+    const op = m[1]!;
+    const seg = shellSegments(run).find(([a, b]) => a <= at && at <= b);
+    const inBracket = !!seg && d[at] === 0 && BRACKET.test(run.slice(seg[0], at));
+    let left: string;
+    let right: string;
+    if (inBracket) {
+      [left, right] = shellWordAround(run, d, at, op.length);
+      // `[ x != "lit" ]` asserts a difference, unless a failure follows it: `[ x != y ] && exit 1`.
+      if ((op === "!=" || op === "-ne") && !/^\s*\]{1,2}\s*&&\s*(?:\{\s*)?(?:echo[^;&|]*[;&|]+\s*)?exit\s+[1-9]/.test(run.slice(at + op.length).replace(/^\s*\S+/, ""))) continue;
+      const lit = (w: string) => SHELL_LITERAL.test(w) || PRINTF_LITERAL.test(w) || wholeLiteral(w, names);
+      const work = lit(right) ? left : lit(left) ? right : undefined;
+      if (work === undefined || lit(work)) continue;
+      const expected = work === left ? right : left;
+      if (STATUS_SIDE.test(work) || statusVars.some((v) => new RegExp(`\\$\\{?${v}\\b`).test(work))) {
+        // `X || [ $? -eq 1 ]` passes whenever X succeeds: the status is only read on the path that failed.
+        const before = seg ? run.slice(0, seg[0]).trimEnd() : "";
+        if (!statusExpected(expected) || before.endsWith("||")) continue;
+      } else if (PROPERTY_SIDE.test(work)) continue;
+      if (quantified(run, at)) continue;
+      return true;
+    }
+    if (op === "=" || op === "-eq" || op === "-ne") continue;
+    const l = leftOperand(run, at);
+    const r = rightOperand(run, at + op.length);
+    // A difference counts only when it is what fails the check: `if (x !== "lit") throw`.
+    if (op.startsWith("!")) {
+      const stmt = run.slice(Math.max(0, l.start - 40), l.start);
+      if (!/\bif\s*\(?\s*(?:not\s+)?$/.test(stmt) && !/\bif\s*\(\s*$/.test(stmt)) continue;
+      const after = run.slice(at, at + 200);
+      if (!/\b(?:sys\.)?exit\(\s*[1-9"']|\braise\b|\bthrow\b|process\.exit\(\s*[1-9]/.test(after)) continue;
+    } else if (!asserted(run, at)) continue;
+    const litR = wholeLiteral(r, names);
+    const litL = wholeLiteral(l.text, names);
+    if (!litR && !litL) {
+      if (oracle && oracleEquality(run, l.text, r)) return true;
+      continue;
+    }
+    if (litR === litL) continue;
+    const work = litR ? l.text : r;
+    const expected = litR ? r : l.text;
+    if (!work) continue;
+    if (STATUS_SIDE.test(work)) {
+      if (!statusExpected(expected)) continue;
+    } else if (PROPERTY_SIDE.test(work)) continue;
+    if (quantified(run, at) && !names.has(expected.trim())) continue;
+    return true;
+  }
+  return false;
+}
+
+/** What builds a value by running something: then it is the work's output, not an expectation. */
+const RUNS_SOMETHING = /\bsubprocess\b|\bcheck_output\b|\bpopen\b|\bexec(?:File)?Sync\b|\bspawnSync\b|\bstdout\b|\bstdin\b|\binput\(|\$\(|`/;
+/** What reads the task's input files. */
+const READS_INPUT = /\bopen\(|\bjson\.load\(|\brequire\(\s*["'`]\.\/|\breadFileSync\(|\bcsv\.reader\(/;
+
+/**
+ * Rule 1, oracle form: the work's output equals a value the check computed
+ * from the task's own input files without running anything:
+ *   exp = [f"{n:>6} {q}" for q, n in top]  ...  assert open("report.txt").read().splitlines() == exp
+ * The expected side is one name (a trailing `.strip()`-style call allowed),
+ * assigned in the command from an expression that runs nothing and reads no
+ * output stream; the other side does not use that name (`L == sorted(set(L))`
+ * relates the output to itself).
+ */
+function oracleEquality(run: string, left: string, right: string): boolean {
+  if (!READS_INPUT.test(run)) return false;
+  const bare = (x: string) => /^([A-Za-z_]\w*)(?:\.(?:r?strip|splitlines)\([^()]*\))?$/.exec(x.trim())?.[1];
+  for (const [exp, work] of [
+    [bare(right), left],
+    [bare(left), right],
+  ] as const) {
+    if (!exp || !work.trim() || new RegExp(`\\b${exp}\\b`).test(work) || PROPERTY_SIDE.test(work) || STATUS_SIDE.test(work)) continue;
+    const defs = [...run.matchAll(new RegExp(`(?<![\\w.])${exp}\\s*(?<![=!<>])=(?!=)\\s*`, "g"))];
+    if (!defs.length) continue;
+    if (defs.every((m) => {
+      const rhs = rightOperand(run, (m.index ?? 0) + m[0].length);
+      return rhs && !RUNS_SOMETHING.test(rhs) && !wholeLiteral(rhs, new Set());
+    })) return true;
+  }
+  return false;
+}
+
+/** Rule 1, helper form: `assertEqual(f('x'), 'y')`, `assert.strictEqual(f(2), 4)`, `assert.deepEqual(...)`. */
+function exactHelper(run: string, names: ReadonlySet<string>): boolean {
+  for (const m of run.matchAll(/(?:\bassert_?[Ee]qual|\bassert_eq!?|\.(?:deep|strict|deepStrict)?[Ee]qual)\w*\s*\(/g)) {
+    const open = (m.index ?? 0) + m[0].length - 1;
+    const end = closeParen(run, open);
+    if (end < 0) continue;
+    const args = splitTop(run.slice(open + 1, end - 1), /,/y).map((a) => a.trim());
+    if (args.length < 2) continue;
+    const [a, b] = args as [string, string];
+    const la = wholeLiteral(a, names);
+    const lb = wholeLiteral(b, names);
+    if (la === lb) continue;
+    const work = la ? b : a;
+    if (PROPERTY_SIDE.test(work) || quantified(run, open)) continue;
+    return true;
+  }
+  return false;
+}
+
+/** Rule 2: `diff`/`cmp` against a heredoc, a here-string, `<(printf|echo ...)`, or an expected file. */
+function exactDiff(run: string): boolean {
+  for (const m of run.matchAll(/\b(?:diff|cmp)\b([^\n|;&]*)/g)) {
+    const args = m[1] ?? "";
+    if (/<<|<\(\s*(?:printf|echo|cat\s+<<)\b/.test(args) || GOLDEN_NAME.test(args)) return true;
+  }
+  return false;
+}
+
+/** Stages that turn output into a count: what a `grep -x '5'` after them reads. */
+const COUNTING_STAGE = /^(?:wc\b|uniq\s+(?:-\w+\s+)*-\w*c|grep\s+(?:-\w+\s+)*-\w*c|jq\s+[^|]*\blength\b|awk\b[^|]*\bNR\b|sort\s[^|]*\|\s*uniq\s+-c)/;
+
+/** Rule 3: `grep -x '<literal line>'` (or `^...$`) over the work's output or a file, not over a count. */
+function exactGrepLine(run: string): boolean {
+  for (const [a, b] of shellSegments(run)) {
+    const stages = pipeStages(run.slice(a, b));
+    if (/^\s*!\s/.test(stages[0] ?? "")) continue; // `! ... | grep -qx x` asserts the line is absent
+    for (let k = 0; k < stages.length; k++) {
+      const words: string[] = stages[k]!.trim().match(/"(?:[^"\\]|\\.)*"|'[^']*'|\S+/g) ?? [];
+      if (!/^[ef]?grep$/.test(words[0] ?? "")) continue;
+      const args = words.slice(1);
+      const flags = args.filter((w) => w.startsWith("-"));
+      if (hasFlag(flags, "vcLlo") || flags.some((f) => /^--(?:invert|count|files)/.test(f))) continue;
+      const e = args.indexOf("-e");
+      const pat = e >= 0 ? args[e + 1] : args.find((w) => !w.startsWith("-"));
+      if (!pat) continue;
+      let body = pat.replace(/^(["'])(.*)\1$/s, "$2");
+      if (/\$[\w{(]/.test(body)) continue;
+      const fixed = hasFlag(flags, "F");
+      const whole = hasFlag(flags, "x");
+      if (!whole) {
+        if (fixed || !/^\^.+\$$/s.test(body)) continue;
+        body = body.slice(1, -1);
+      }
+      if (!fixed && /(?<!\\)[*+?[\]{}()|^$]/.test(body)) continue;
+      if ((body.match(/\w/g) ?? []).length < 1) continue;
+      if (stages.slice(0, k).some((s) => COUNTING_STAGE.test(s.trim()))) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Rule 5: a specific expected value found in what a program printed on literal
+ * input: `python3 nextrun.py '0 9 * * *' '2023-01-01 08:00' 1 | grep -q
+ * '2023-01-01 09:00'`. Containment, not equality, but of one worked-out value
+ * with a digit in it, not a pattern: output that skips or shifts occurrences
+ * does not contain it. Not over a file (`head -1 clean.csv | grep -q
+ * 'id,name'` passed with wrong rows below a right header), never inverted or
+ * counted, and never a wildcard pattern (`^[0-9]{4}-...$` is a format).
+ */
+function containsValue(run: string): boolean {
+  for (const [a, b] of shellSegments(run)) {
+    const stages = pipeStages(run.slice(a, b));
+    if (stages.length < 2 || /^\s*!\s/.test(stages[0] ?? "")) continue;
+    const words: string[] = stages[stages.length - 1]!.trim().match(/"(?:[^"\\]|\\.)*"|'[^']*'|\S+/g) ?? [];
+    if (!/^[f]?grep$/.test(words[0] ?? "")) continue;
+    const args = words.slice(1);
+    const flags = args.filter((w) => w.startsWith("-"));
+    if (hasFlag(flags, "vcLloEiw") || flags.some((f) => f.startsWith("--"))) continue;
+    const e = args.indexOf("-e");
+    const pat = e >= 0 ? args[e + 1] : args.find((w) => !w.startsWith("-"));
+    if (!pat || args.filter((w) => !w.startsWith("-")).length > 1) continue; // a file operand: not the pipe's output
+    const body = pat.replace(/^(["'])(.*)\1$/s, "$2");
+    if (/\$[\w{(]/.test(body) || /(?<!\\)[*+?[\]{}()|^$\\]/.test(body) || body.length < 4 || !/\d/.test(body)) continue;
+    const upstream = stages.slice(0, -1);
+    if (upstream.some((x) => COUNTING_STAGE.test(x.trim()))) continue;
+    if (!RUNNER.test(stageProgram(upstream[0]!))) continue;
+    // The program is handed literal input: an argument or a redirect, not just run bare.
+    if (!/\s(?:'[^']*'|"[^"$]*"|-?\d[\w.:-]*|<\s*\S+)/.test(upstream[0]!.replace(/^\s*\S+/, ""))) continue;
+    return true;
+  }
+  return false;
+}
+
+/** Rule 4: `assert f('<literal>') is None`. */
+function exactNone(run: string, names: ReadonlySet<string>): boolean {
+  for (const m of run.matchAll(/\s+is\s+None\b/g)) {
+    const at = m.index ?? 0;
+    const l = leftOperand(run, at + 1);
+    if (!asserted(run, at) || PROPERTY_SIDE.test(l.text) || quantified(run, at)) continue;
+    if (PATTERN_DELIVERABLE.test(run)) continue;
+    if (callsIn(l.text).some((k) => deliverableCall(k, names))) return true;
+  }
+  return false;
+}
+
+/** The tags a drafted check carries: surface from the critic, value and exact from the command. */
 export function evidenceTags(run: string, surface: boolean | undefined): string[] {
-  return ["task", ...(surface ? ["surface"] : []), ...(assertsValue(run) ? ["value"] : [])];
+  const value = assertsValue(run);
+  return ["task", ...(surface ? ["surface"] : []), ...(value ? ["value"] : []), ...(value && assertsExact(run) ? ["exact"] : [])];
 }
 
 /**
@@ -611,7 +1094,7 @@ export type TierVerdict = {
   tier: Tier;
   reason?: string;
   /** The strongest class among the passing checks. */
-  evidence: "person" | "runs+value" | "runs" | "surface" | "none";
+  evidence: "person" | "runs+exact" | "runs+value" | "runs" | "surface" | "none";
   /** Advisory review mode only: what the review said, recorded on the receipt instead of gating. */
   reviewNote?: string;
   /**
@@ -753,6 +1236,14 @@ export function auditClaim(judge: string): string {
 }
 export const AUDIT_CLAIM_PREFIX = "verified (post-work audit: ";
 
+/**
+ * The reason a run whose passing independent checks only test properties of
+ * the output (a count, an order, a format, membership, a type, two runs of the
+ * work agreeing) gets "passed-checks": wrong output with the right shape passes
+ * them all. See assertsExact.
+ */
+export const PROPERTY_ONLY_REASON = "passed checks that test properties only";
+
 /** The claim for the "passed-untested" tier, on every surface. */
 export const UNTESTED_CLAIM = "passed checks that did not test this work, not verified";
 
@@ -763,8 +1254,8 @@ export const UNTESTED_CLAIM = "passed checks that did not test this work, not ve
 export function untestedWords(names: readonly string[], passedBefore: ReadonlySet<string> | undefined): string {
   const why = (n: string) => `\`${n}\` ${passedBefore?.has(n) ? "passed before the work began too" : "was not tried before the work began"}`;
   return names.length === 1
-    ? `the only independent check that ran the work and asserted a value did not fail before the work: ${why(names[0]!)}`
-    : `no independent check that ran the work and asserted a value failed before the work: ${names.map(why).join("; ")}`;
+    ? `the only independent check that ran the work and asserted an exact value did not fail before the work: ${why(names[0]!)}`
+    : `no independent check that ran the work and asserted an exact value failed before the work: ${names.map(why).join("; ")}`;
 }
 
 /** The parts of a job_end event the verdict words are made from. */
@@ -917,16 +1408,21 @@ export function tierOf(args: {
   const strongAll = drafted.filter((r) => !r.tags?.includes("surface") && r.tags?.includes("value"));
   const strongIndependent = strongAll.filter((r) => independentOf(authorOf(r), workerNames));
   const strong = strongAll.length > 0;
+  // Of those, the ones that compare the output with an exact expected value. A property
+  // (a count, an order, a format, two runs agreeing) holds of wrong output too.
+  const exactIndependent = strongIndependent.filter((r) => r.tags?.includes("exact"));
   // Of those, the ones that failed on the tree before the work and pass now:
   // the only passes that show THIS work did something.
   const gate = args.requireDiscriminating === true || args.reviewAdvisory === true;
-  const discriminating = gate ? strongIndependent.filter((r) => args.failedBefore?.has(r.name ?? "") === true) : strongIndependent;
+  const discriminating = gate ? exactIndependent.filter((r) => args.failedBefore?.has(r.name ?? "") === true) : exactIndependent;
   const by = [...new Set(strongIndependent.map((r) => authorOf(r).model ?? "another model"))];
   const basis: TierVerdict["basis"] = person ? "person" : strongIndependent.length ? "independent" : strong ? "own" : undefined;
   const who = { ...(basis ? { basis } : {}), ...(by.length && !person ? { by } : {}), ...(worker ? { worker } : {}) };
   const evidence: TierVerdict["evidence"] = person
     ? "person"
-    : strong
+    : strongAll.some((r) => r.tags?.includes("exact"))
+      ? "runs+exact"
+      : strong
       ? "runs+value"
       : drafted.some((r) => !r.tags?.includes("surface"))
         ? "runs"
@@ -935,13 +1431,14 @@ export function tierOf(args: {
           : "none";
   const ownReason = `every passing check that ran the work and asserted a value was written by the worker model${worker ? ` (${worker})` : ""}`;
   const earned = person || discriminating.length > 0;
-  const untestedReason = untestedWords(strongIndependent.map((r) => r.name ?? ""), args.guards);
+  const untestedReason = untestedWords(exactIndependent.map((r) => r.name ?? ""), args.guards);
   if (args.reviewAdvisory) {
     const n = contradictions(args.review);
     const reviewNote = n > 0 ? `advisory: the independent review found ${args.review!.votes} contradicting the task` : args.unreviewed ? "advisory: the independent review did not run" : undefined;
     const gap: Pick<TierVerdict, "reviewGap"> = n > 0 ? { reviewGap: "unconfirmed" } : args.unreviewed ? { reviewGap: "unreviewed" } : {};
     if (earned) return { tier: "verified", evidence, ...who, ...(reviewNote ? { reviewNote } : {}), ...gap };
-    if (strongIndependent.length) return { tier: "passed-untested", evidence, ...who, reason: untestedReason, ...(reviewNote ? { reviewNote } : {}), ...gap };
+    if (exactIndependent.length) return { tier: "passed-untested", evidence, ...who, reason: untestedReason, ...(reviewNote ? { reviewNote } : {}), ...gap };
+    if (strongIndependent.length) return { tier: "passed-checks", evidence, ...who, reason: PROPERTY_ONLY_REASON, ...(reviewNote ? { reviewNote } : {}) };
     if (strong) return { tier: "passed-own-checks", evidence, ...who, reason: ownReason, ...(reviewNote ? { reviewNote } : {}), ...gap };
     return {
       tier: "passed-checks",
@@ -959,7 +1456,8 @@ export function tierOf(args: {
   }
   if (args.unreviewed && !person) return { tier: "passed-checks", evidence, ...who, reason: "the independent review did not run" };
   if (earned) return { tier: "verified", evidence, ...who };
-  if (strongIndependent.length) return { tier: "passed-untested", evidence, ...who, reason: untestedReason };
+  if (exactIndependent.length) return { tier: "passed-untested", evidence, ...who, reason: untestedReason };
+  if (strongIndependent.length) return { tier: "passed-checks", evidence, ...who, reason: PROPERTY_ONLY_REASON };
   if (strong) return { tier: "passed-own-checks", evidence, ...who, reason: ownReason };
   return {
     tier: "passed-checks",
