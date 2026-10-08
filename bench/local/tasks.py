@@ -14,12 +14,19 @@ import datetime as dt
 import os
 import random
 import re
+import shutil
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from grading import py_values  # noqa: E402
 
-def sh(cmd: str, cwd: Path) -> str:
-    return subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True).stdout
+
+def sh(cmd: str, cwd: Path, timeout: float = 120) -> str:
+    # errors="replace": one non-UTF-8 byte in a deliverable's output made graders raise.
+    return subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout).stdout
 
 
 # ---------------------------------------------------------------- 1. lost git work
@@ -175,20 +182,27 @@ class DurationBug:
             "def test_mixed():\n    assert parse_duration('1h30m') == 5400\n"
         )
 
+    CASES = {"90s": 90, "5m": 300, "1h30m": 5400, "2h": 7200, "1h5m10s": 3910, "45": 45, " 7m ": 420}
+
     @staticmethod
     def grade(d: Path):
-        cases = {"90s": 90, "5m": 300, "1h30m": 5400, "2h": 7200, "1h5m10s": 3910, "45": 45, " 7m ": 420}
-        code = (
-            "import sys\nsys.path.insert(0, '.')\nfrom dur import parse_duration as p\n"
-            f"cases={cases!r}\nbad=[k for k,v in cases.items() if p(k)!=v]\nprint('BAD', bad)\n"
-        )
-        out = subprocess.run(["python3", "-c", code], cwd=d, capture_output=True, text=True)
-        tests = (d / "test_dur.py").read_text()
+        t = d / "test_dur.py"
+        tests = t.read_text(errors="replace") if t.is_file() else ""
         if "1h30m" not in tests or "5400" not in tests:
             return False, "the tests were changed"
-        if "BAD []" in out.stdout:
+        # The worker's module only computes; the verdict is taken here, out of its process. It used
+        # to print "BAD [...]" and the grader looked for "BAD []" anywhere in stdout.
+        code = (
+            "import sys\nsys.path.insert(0, '.')\nfrom dur import parse_duration as p\n"
+            f"emit({{k: call(p, k)[:2] for k in {list(DurationBug.CASES)!r}}})\n"
+        )
+        got, diag = py_values(d, code, timeout=60)
+        if not isinstance(got, dict):
+            return False, diag[-160:]
+        bad = [k for k, v in DurationBug.CASES.items() if not (isinstance(got.get(k), list) and got[k][:1] == ["ok"] and got[k][1:2] == [v])]
+        if not bad:
             return True, "all formats"
-        return False, (out.stdout + out.stderr).strip()[-160:]
+        return False, f"BAD {bad}"[-160:]
 
 
 # ---------------------------------------------------------------- 5. small CLI tool
@@ -214,11 +228,20 @@ class Wc:
         extra = [x.name for x in d.iterdir() if x.name not in ("wc.py", ".molt", ".maat", "__pycache__")]
         if extra:
             return False, f"extra files left behind: {extra}"
-        tmp = Path(os.environ.get("TMPDIR", "/tmp")) / "wc-grade"
-        tmp.mkdir(exist_ok=True)
+        # A fresh private folder: a fixed /tmp/wc-grade could be pre-made by the worker with a.txt
+        # a symlink to any file the grader can write.
+        tmp = Path(tempfile.mkdtemp(prefix="wc-grade-"))
+        try:
+            return Wc._grade(p, tmp)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @staticmethod
+    def _grade(p: Path, tmp: Path):
         a = tmp / "a.txt"; b = tmp / "b.txt"
         a.write_text("one two\nthree\n"); b.write_text("four five six\n\nseven\n")
-        run = lambda args, inp=None: subprocess.run(["python3", str(p), *args], capture_output=True, text=True, input=inp).stdout.strip()
+        run = lambda args, inp=None: subprocess.run(["python3", str(p), *args], capture_output=True, text=True, errors="replace",
+                                                    input=inp, timeout=30).stdout.strip()
         want1 = f"2 3 {a.stat().st_size} {a}"
         got1 = run([str(a)])
         got2 = run([str(a), str(b)]).splitlines()

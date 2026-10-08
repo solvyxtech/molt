@@ -283,7 +283,7 @@ class GradedAsTheAgentUser(unittest.TestCase):
             run.TASKS[0].grade = staticmethod(grade)
             run.main("molt", 1, "iso-a")
             # The grader ran in a child: what it saw comes back only through its verdict, so ask again directly.
-            ok, why = run.grade(type("T", (), {"grade": staticmethod(lambda d: (True, repr((os.getuid(), subprocess.run(["python3", "-c", "import os;print(os.getuid(), os.environ.get('FAKE_API_KEY'))"], capture_output=True, text=True).stdout.strip()))))}), Path("/tmp"))
+            ok, why, _ = run.grade(type("T", (), {"grade": staticmethod(lambda d: (True, repr((os.getuid(), subprocess.run(["python3", "-c", "import os;print(os.getuid(), os.environ.get('FAKE_API_KEY'))"], capture_output=True, text=True).stdout.strip()))))}), Path("/tmp"))
         finally:
             h.restore()
             os.environ.pop("FAKE_API_KEY", None)

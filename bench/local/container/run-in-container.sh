@@ -4,7 +4,7 @@
 # Make the tarball with: npm run pack:cli && npm pack ./out-cli
 # The image is maat-bench:<sha8 of the tarball>, built once and reused, so every run
 # records exactly which Maat it tested. Env passed through: REFERENCE BENCH_MODEL
-# BENCH_URL BENCH_LIMIT RESULTS (file name). Results land in
+# BENCH_URL BENCH_LIMIT RESULTS (file name; run.py refuses a file holding another lane's rows). Results land in
 # ~/.cache/maat-bench/container-results/; each task's folder and Maat's log are copied,
 # once the task is graded, to ~/.cache/maat-bench/container-work/<name>/ (the only host
 # path it can write; the agent never sees it, see "Task isolation" below).
@@ -99,9 +99,12 @@ if [ "$OPENCODE" = 1 ]; then
   startcmd='install -d -o agent -g agent -m 700 /home/agent/.local /home/agent/.local/share /home/agent/.local/share/opencode && install -o agent -g agent -m 600 /root/oc-cred/auth.json /home/agent/.local/share/opencode/auth.json && '$startcmd
 fi
 echo "maat $img → $out/${RESULTS:-results.jsonl}"
-docker run --rm --name "maat-bench-$name" \
+# Pinned CPU and memory (BENCH_CPUS, BENCH_MEMORY): perf graders have wall-clock limits, and lanes
+# often run side by side on the Mac. Recorded in every row's lane.
+cpus=${BENCH_CPUS:-2}; mem=${BENCH_MEMORY:-4g}
+docker run --rm --name "maat-bench-$name" --cpus "$cpus" --memory "$mem" \
   -v "$local_dir":/root/bench-src:ro -v "$out":/root/bench-results -v "$work":/root/bench-export ${=credmount} \
   --env-file "$envf" -e REFERENCE="${REFERENCE:-0}" -e BENCH_MODEL="${BENCH_MODEL:-}" \
   -e ARMS="${ARMS:-}" -e BENCH_TASKS="${BENCH_TASKS:-}" -e BENCH_URL="$url" -e BENCH_LIMIT="${BENCH_LIMIT:-600}" -e BENCH_REASONING="${BENCH_REASONING:-}" -e BENCH_GATE="${BENCH_GATE:-}" -e RESULTS="${RESULTS:-results.jsonl}" \
-  -e MAAT_BUILD="$sha" -e PYTHONDONTWRITEBYTECODE=1 \
+  -e MAAT_BUILD="$sha" -e PYTHONDONTWRITEBYTECODE=1 -e BENCH_CPUS="$cpus" -e BENCH_MEMORY="$mem" \
   "$img" sh -c "$startcmd" run "$@"

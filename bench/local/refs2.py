@@ -161,7 +161,7 @@ while IFS= read -r f; do
   i=$((i + 1))
   if [ "$i" -gt "$n" ]; then echo "$f"; fi
 done < <(cd "$dir" && ls -t -- *.log 2>/dev/null | while IFS= read -r x; do [ -f "$x" ] && echo "$x"; done) > "${TMPDIR:-/tmp}/rot.$$"
-tail -r "${TMPDIR:-/tmp}/rot.$$" | while IFS= read -r f; do rm -f -- "$dir/$f"; echo "$f"; done
+{ tac "${TMPDIR:-/tmp}/rot.$$" 2>/dev/null || tail -r "${TMPDIR:-/tmp}/rot.$$"; } | while IFS= read -r f; do rm -f -- "$dir/$f"; echo "$f"; done
 rm -f "${TMPDIR:-/tmp}/rot.$$"
 exit 0
 ''')
