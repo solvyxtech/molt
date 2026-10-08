@@ -23,7 +23,7 @@ import { Receipts } from "../src/receipts.js";
 import { Integrity } from "../src/integrity.js";
 import { runCommand } from "../src/run.js";
 import { stateDir } from "../src/statedir.js";
-import { checkUserFrom, DEFAULT_WORKER_USER, defaultWorkerUser, disablePrivSep, enablePrivSep, gitSync, isolationLine, privSep, safeRel, type PrivSep } from "../src/privsep.js";
+import { checkUserFrom, DEFAULT_WORKER_USER, defaultWorkerUser, disablePrivSep, inContainer, enablePrivSep, gitSync, isolationLine, privSep, safeRel, type PrivSep } from "../src/privsep.js";
 import { runCheck, type BarContext } from "../src/bar.js";
 import { runAssertions, type Contract } from "../src/mission.js";
 import { snapshotProject } from "../src/reference.js";
@@ -735,33 +735,58 @@ describe("privilege separation off (the default)", () => {
 });
 
 describe("the default worker user for unattended runs", () => {
-  it("as root on Linux: the existing maat-worker account", () => {
-    const d = defaultWorkerUser({ platform: "linux", euid: 0, exists: () => true, create: () => assert.fail("not made when it exists") });
+  const box = { env: {} as NodeJS.ProcessEnv, container: true };
+  it("as root on Linux in a container: the existing maat-worker account", () => {
+    const d = defaultWorkerUser({ platform: "linux", euid: 0, ...box, exists: () => true, create: () => assert.fail("not made when it exists") });
     assert.equal(d.user, DEFAULT_WORKER_USER);
     assert.match(d.notice, /run as maat-worker .*--worker-user none/);
   });
 
-  it("as root on Linux: made when missing, and root with a notice when it cannot be made", () => {
+  it("in a container: made when missing (no login shell), and root with a notice when it cannot be made", () => {
     let made = "";
-    const ok = defaultWorkerUser({ platform: "linux", euid: 0, exists: () => false, create: (n) => ((made = n), null) });
+    const ok = defaultWorkerUser({ platform: "linux", euid: 0, ...box, exists: () => false, create: (n) => ((made = n), null) });
     assert.deepEqual([ok.user, made], [DEFAULT_WORKER_USER, DEFAULT_WORKER_USER]);
-    assert.match(ok.notice, /made the system account maat-worker/);
-    const no = defaultWorkerUser({ platform: "linux", euid: 0, exists: () => false, create: () => "useradd is not on the PATH" });
+    assert.match(ok.notice, /made the system account maat-worker \(no login shell\)/);
+    const no = defaultWorkerUser({ platform: "linux", euid: 0, ...box, exists: () => false, create: () => "useradd is not on the PATH" });
     assert.equal(no.user, undefined);
     assert.match(no.notice, /tools run as root.*--worker-user/);
   });
 
+  it("as root on a machine that is not disposable (no container, no CI): no change, and a notice suggesting --worker-user", () => {
+    const d = defaultWorkerUser({ platform: "linux", euid: 0, env: {}, container: false, exists: () => assert.fail("not looked up"), create: () => assert.fail("not made") });
+    assert.equal(d.user, undefined);
+    assert.match(d.notice, /Pass --worker-user <u>/);
+  });
+
+  it("in CI or a folder made for the run: an existing account is used, but none is ever made outside a container", () => {
+    for (const env of [{ CI: "true" }, { MAAT_DISPOSABLE_PROJECT: "1" }] as NodeJS.ProcessEnv[]) {
+      assert.equal(defaultWorkerUser({ platform: "linux", euid: 0, env, container: false, exists: () => true }).user, DEFAULT_WORKER_USER);
+      const d = defaultWorkerUser({ platform: "linux", euid: 0, env, container: false, exists: () => false, create: () => assert.fail("never made outside a container") });
+      assert.equal(d.user, undefined);
+      assert.match(d.notice, /only inside a container/);
+    }
+  });
+
   it("anywhere else: no change, and a notice that says so", () => {
     for (const [platform, euid] of [["linux", 1000], ["darwin", 0], ["darwin", 501]] as const) {
-      const d = defaultWorkerUser({ platform, euid, exists: () => assert.fail("not looked up"), create: () => assert.fail("not made") });
+      const d = defaultWorkerUser({ platform, euid, ...box, exists: () => assert.fail("not looked up"), create: () => assert.fail("not made") });
       assert.equal(d.user, undefined, `${platform} ${euid}`);
       assert.match(d.notice, /the same account as Maat/);
     }
   });
+
+  it("knows a container by its marker files or PID 1's cgroup, and MAAT_ASSUME_CONTAINER overrides both", () => {
+    assert.equal(inContainer({ env: {}, exists: (p) => p === "/.dockerenv", read: () => "" }), true);
+    assert.equal(inContainer({ env: {}, exists: () => false, read: () => "0::/system.slice/docker-abc.scope\n" }), true);
+    assert.equal(inContainer({ env: {}, exists: () => false, read: () => "0::/init.scope\n" }), false);
+    assert.equal(inContainer({ env: { MAAT_ASSUME_CONTAINER: "0" }, exists: () => true }), false);
+    assert.equal(inContainer({ env: { MAAT_ASSUME_CONTAINER: "1" }, exists: () => false, read: () => "" }), true);
+  });
 });
 
 describe("the default worker user, end to end (Linux, root)", { skip: linuxRoot ? false : "needs Linux and root (CI's Linux job)" }, () => {
-  it("an unattended `maat run` as root runs the worker's tools as maat-worker, in a project handed to it", async () => {
+  /** `maat run` as root in a fresh root-owned folder, with a scripted provider whose one tool call writes `id -u` to who.txt. */
+  async function run(extraEnv: NodeJS.ProcessEnv): Promise<{ dir: string; err: string; cleanup: () => void }> {
     let n = 0;
     const server = createServer((req, res) => {
       req.resume();
@@ -779,25 +804,86 @@ describe("the default worker user, end to end (Linux, root)", { skip: linuxRoot 
     const url = `http://127.0.0.1:${typeof addr === "object" && addr ? addr.port : 0}/v1`;
     const dir = mkdtempSync(join(tmpdir(), "maat-default-worker-"));
     chmodSync(dir, 0o755);
+    mkdirSync(join(dir, "conf"));
+    writeFileSync(join(dir, "conf", "site.conf"), "root /srv;\n");
+    chmodSync(join(dir, "conf", "site.conf"), 0o640);
     const cfg = mkdtempSync(join(tmpdir(), "maat-default-cfg-"));
+    const cli = join(process.cwd(), "dist-test", "src", "cli.js");
+    const env: NodeJS.ProcessEnv = { ...process.env, MOLT_CONFIG_DIR: cfg, MAAT_API_KEY: "k", ...extraEnv };
+    delete env.MAAT_WORKER_USER;
+    delete env.CI;
+    const child = spawn(process.execPath, [cli, "run", "say who you are", "--url", url, "--model", "m", "--cwd", dir, "--no-stream", "--sandbox"], { env, stdio: ["ignore", "ignore", "pipe"] });
+    let err = "";
+    child.stderr?.on("data", (d) => (err += d));
+    await new Promise<void>((r) => child.on("exit", () => r()));
+    await new Promise<void>((r) => server.close(() => r()));
+    return {
+      dir,
+      err,
+      cleanup: () => {
+        rmSync(dir, { recursive: true, force: true });
+        rmSync(cfg, { recursive: true, force: true });
+      },
+    };
+  }
+
+  it("files handed to the worker are given back on close, and when Maat dies of SIGTERM", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "maat-handback-"));
     try {
-      const cli = join(process.cwd(), "dist-test", "src", "cli.js");
-      const env: NodeJS.ProcessEnv = { ...process.env, MOLT_CONFIG_DIR: cfg, MAAT_API_KEY: "k" };
-      delete env.MAAT_WORKER_USER;
-      const child = spawn(process.execPath, [cli, "run", "say who you are", "--url", url, "--model", "m", "--cwd", dir, "--no-stream", "--sandbox"], { env, stdio: ["ignore", "ignore", "pipe"] });
-      let err = "";
-      child.stderr?.on("data", (d) => (err += d));
-      await new Promise<void>((r) => child.on("exit", () => r()));
-      assert.match(err, /maat-worker/, err);
-      const who = execFileSync("id", ["-u", "maat-worker"], { encoding: "utf8" }).trim();
-      assert.ok(existsSync(join(dir, "who.txt")), `the worker could not write the project:\n${err}`);
-      assert.equal(readFileSync(join(dir, "who.txt"), "utf8").trim(), who);
-      assert.ok(existsSync(join(dir, ".maat", "log")), `the records were not copied into the project:\n${err}`);
-      assert.doesNotMatch(err, /could not copy the records/);
+      chmodSync(dir, 0o755);
+      writeFileSync(join(dir, "a.txt"), "a\n");
+      chmodSync(join(dir, "a.txt"), 0o640);
+      if (spawnSync("id", ["-u", "maat-worker"]).status !== 0) execFileSync("useradd", ["--system", "--create-home", "--home-dir", "/var/lib/maat-worker", "--shell", "/usr/sbin/nologin", "maat-worker"]);
+      const mod = join(process.cwd(), "dist-test", "src", "privsep.js");
+      const helper = join(process.cwd(), "dist-test", "src", "fs-helper.js");
+      const script = join(dir, "..", `maat-sig-${process.pid}.mjs`);
+      writeFileSync(
+        script,
+        `import { enablePrivSep } from ${JSON.stringify(mod)};\n` +
+          `const ps = enablePrivSep({ user: "maat-worker", project: ${JSON.stringify(dir)}, helper: ${JSON.stringify(helper)}, pidns: false });\n` +
+          `ps.handBack();\nprocess.stdout.write("handed\\n");\nsetInterval(() => {}, 1000);\n`,
+      );
+      const child = spawn(process.execPath, [script], { stdio: ["ignore", "pipe", "inherit"] });
+      await new Promise<void>((r) => child.stdout!.on("data", () => r()));
+      const wuid = Number(execFileSync("id", ["-u", "maat-worker"], { encoding: "utf8" }).trim());
+      assert.equal(statSync(join(dir, "a.txt")).uid, wuid, "handed to the worker while the run is live");
+      child.kill("SIGTERM");
+      const sig = await new Promise<NodeJS.Signals | null>((r) => child.on("exit", (_c, s) => r(s)));
+      assert.equal(sig, "SIGTERM", "the signal still ends the process");
+      for (const p of [dir, join(dir, "a.txt")]) assert.equal(statSync(p).uid, 0, `${p} was not given back`);
+      assert.equal(statSync(join(dir, "a.txt")).mode & 0o7777, 0o640);
+      rmSync(script, { force: true });
     } finally {
-      await new Promise<void>((r) => server.close(() => r()));
       rmSync(dir, { recursive: true, force: true });
-      rmSync(cfg, { recursive: true, force: true });
+    }
+  });
+
+  it("on a machine that is not disposable, a root run changes no ownership and only suggests --worker-user", async () => {
+    const r = await run({ MAAT_ASSUME_CONTAINER: "0" });
+    try {
+      assert.match(r.err, /Pass --worker-user <u>/, r.err);
+      assert.doesNotMatch(r.err, /made the system account/);
+      for (const p of [r.dir, join(r.dir, "conf"), join(r.dir, "conf", "site.conf")]) assert.equal(statSync(p).uid, 0, `${p} changed owner`);
+      assert.equal(statSync(join(r.dir, "conf", "site.conf")).mode & 0o7777, 0o640);
+      assert.equal(readFileSync(join(r.dir, "who.txt"), "utf8").trim(), "0", "the tools ran as root, as before");
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it("in a container, the tools run as maat-worker and every file it was handed is given back when the run ends", async () => {
+    const r = await run({ MAAT_ASSUME_CONTAINER: "1" });
+    try {
+      assert.match(r.err, /maat-worker/, r.err);
+      const who = execFileSync("id", ["-u", "maat-worker"], { encoding: "utf8" }).trim();
+      assert.ok(existsSync(join(r.dir, "who.txt")), `the worker could not write the project:\n${r.err}`);
+      assert.equal(readFileSync(join(r.dir, "who.txt"), "utf8").trim(), who);
+      assert.ok(existsSync(join(r.dir, ".maat", "log")), `the records were not copied into the project:\n${r.err}`);
+      for (const p of [r.dir, join(r.dir, "conf"), join(r.dir, "conf", "site.conf")]) assert.equal(statSync(p).uid, 0, `${p} was not given back to root`);
+      assert.equal(statSync(join(r.dir, "conf", "site.conf")).mode & 0o7777, 0o640);
+      assert.equal(execFileSync("getent", ["passwd", "maat-worker"], { encoding: "utf8" }).trim().split(":").at(-1), "/usr/sbin/nologin");
+    } finally {
+      r.cleanup();
     }
   });
 });

@@ -51,6 +51,7 @@ import {
   closeSync,
   constants,
   existsSync,
+  fchmodSync,
   fchownSync,
   fstatSync,
   lstatSync,
@@ -294,6 +295,25 @@ export class PrivSep {
   private helper?: FsHelper;
   private closed = false;
   private onExit = () => this.close();
+  /**
+   * Every entry handBack gave the worker, by real path, with what it was
+   * before: put back on close, at exit and on a terminating signal, so a run
+   * never leaves the person's files owned by the worker account.
+   */
+  private readonly handedBack = new Map<string, { dev: number; ino: number; uid: number; gid: number; mode: number }>();
+  private readonly onSignal = (sig: NodeJS.Signals) => {
+    this.restoreOwners();
+    // Ours was the only handler: the signal does what it would have done.
+    if (process.listenerCount(sig) <= 1) {
+      this.removeSignalHooks();
+      process.kill(process.pid, sig);
+    }
+  };
+  private signalHooks: [NodeJS.Signals, () => void][] = [];
+  private removeSignalHooks(): void {
+    for (const [sig, fn] of this.signalHooks) process.removeListener(sig, fn);
+    this.signalHooks = [];
+  }
   private readonly savedEnv: Record<string, string | undefined> = {};
 
   constructor(opts: PrivSepOptions) {
@@ -396,6 +416,11 @@ export class PrivSep {
         })
       : [];
     process.on("exit", this.onExit);
+    for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as NodeJS.Signals[]) {
+      const fn = () => this.onSignal(sig);
+      process.on(sig, fn);
+      this.signalHooks.push([sig, fn]);
+    }
 
     // Maat's own temp files (reference tries, check copies, drafts, judge
     // scratch) land in the state dir; the worker's get /tmp (workerEnv).
@@ -926,7 +951,10 @@ export class PrivSep {
       if (!inside(dfd)) return;
       const st = fstatSync(dfd);
       if (st.dev !== this.projectId.dev) return;
-      if (st.uid === this.maatUid) fchownSync(dfd, uid, gid);
+      if (st.uid === this.maatUid) {
+        this.remember(dfd, st);
+        fchownSync(dfd, uid, gid);
+      }
       if (depth > 256) return;
       let names: string[];
       try {
@@ -965,7 +993,10 @@ export class PrivSep {
           }
           try {
             const fst = fstatSync(f);
-            if (fst.isFile() && fst.uid === this.maatUid && fst.nlink === 1 && fst.dev === this.projectId.dev) fchownSync(f, uid, gid);
+            if (fst.isFile() && fst.uid === this.maatUid && fst.nlink === 1 && fst.dev === this.projectId.dev) {
+              this.remember(f, fst);
+              fchownSync(f, uid, gid);
+            }
           } catch {
             /* not ours to change */
           } finally {
@@ -1020,11 +1051,49 @@ export class PrivSep {
     return dest;
   }
 
+  /** Note what an open entry was before handBack changes its owner. */
+  private remember(fd: number, st: import("node:fs").Stats): void {
+    try {
+      const p = readlinkSync(`/proc/self/fd/${fd}`);
+      if (!this.handedBack.has(p)) this.handedBack.set(p, { dev: st.dev, ino: st.ino, uid: st.uid, gid: st.gid, mode: st.mode & 0o7777 });
+    } catch {
+      /* not recorded, so not changed back: never guessed */
+    }
+  }
+
+  /**
+   * Put every entry handBack gave the worker back to the owner and mode it
+   * had, if it is still the same entry (device and inode) and still the
+   * worker's. Never follows a link. Idempotent. What the worker created stays
+   * the worker's.
+   */
+  restoreOwners(): void {
+    for (const [p, was] of this.handedBack) {
+      let fd: number | undefined;
+      try {
+        // On the open entry, never by path: a component the worker swapped
+        // for a link reaches another inode, which the check below refuses.
+        fd = openSync(p, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK | constants.O_NOCTTY);
+        const st = fstatSync(fd);
+        if (st.dev !== was.dev || st.ino !== was.ino || st.uid !== this.worker.uid) continue;
+        fchownSync(fd, was.uid, was.gid);
+        fchmodSync(fd, was.mode);
+      } catch {
+        /* gone, or not ours to change */
+      } finally {
+        if (fd !== undefined) closeSync(fd);
+      }
+    }
+    this.handedBack.clear();
+  }
+
   /** Stop the helper and the namespace, and put Maat's records back where they were looked for. */
   close(): void {
     if (this.closed) return;
     this.closed = true;
     process.removeListener("exit", this.onExit);
+    this.removeSignalHooks();
+    this.restoreOwners();
     this.helper?.stop();
     this.killNamespace();
     if (this.checkRoot) {
@@ -1273,18 +1342,54 @@ export function workerUserFrom(flag?: string): string | undefined {
 export const DEFAULT_WORKER_USER = "maat-worker";
 
 /**
+ * Whether this run is in a container: /.dockerenv, /run/.containerenv, or a
+ * container named in PID 1's cgroup. MAAT_ASSUME_CONTAINER=1/0 overrides it
+ * (tests, and a person who knows better).
+ */
+export function inContainer(o: { exists?: (p: string) => boolean; read?: (p: string) => string; env?: NodeJS.ProcessEnv } = {}): boolean {
+  const env = o.env ?? process.env;
+  const forced = env.MAAT_ASSUME_CONTAINER;
+  if (forced === "1" || forced === "0") return forced === "1";
+  const exists = o.exists ?? existsSync;
+  if (exists("/.dockerenv") || exists("/run/.containerenv")) return true;
+  try {
+    const cg = (o.read ?? ((p: string) => readFileSync(p, "utf8")))("/proc/1/cgroup");
+    return /docker|kubepods|containerd|libpod|podman|lxc/.test(cg);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether the run's machine and project are disposable enough to separate by
+ * default: a container, a CI job (CI=true), or a project folder made for this
+ * run (MAAT_DISPOSABLE_PROJECT=1, which the bench sets on its per-task
+ * folders). A server's /etc/nginx is none of these.
+ */
+export function disposableRun(o: { env?: NodeJS.ProcessEnv; container?: boolean } = {}): { disposable: boolean; container: boolean; why?: string } {
+  const env = o.env ?? process.env;
+  const container = o.container ?? inContainer({ env });
+  if (container) return { disposable: true, container, why: "a container" };
+  if (/^(1|true)$/i.test(env.CI ?? "")) return { disposable: true, container, why: "a CI job" };
+  if (env.MAAT_DISPOSABLE_PROJECT === "1") return { disposable: true, container, why: "a project folder made for this run" };
+  return { disposable: false, container };
+}
+
+/**
  * What an unattended run (`maat run`, `ask`, `mission run`) does when no
- * worker user was named. As root on Linux the worker's tools run as
- * DEFAULT_WORKER_USER: the account is used if it exists and made (a system
- * account with its own home) if it does not. Anywhere else nothing changes:
- * the worker's tools run as Maat's own user, and the notice says so.
- * `--worker-user none` (MAAT_WORKER_USER=none) keeps today's behaviour as
- * root too. Never throws; a failure to make the account is a notice.
+ * worker user was named. As root on Linux, in a disposable run (disposableRun:
+ * a container, CI, a folder made for the run), the worker's tools run as
+ * DEFAULT_WORKER_USER. The account is used if it exists, and made (a system
+ * account, no login shell) only inside a container. Everywhere else nothing
+ * changes and the notice suggests --worker-user. `--worker-user none`
+ * (MAAT_WORKER_USER=none) keeps today's behaviour. Never throws.
  */
 export function defaultWorkerUser(
   o: {
     platform?: NodeJS.Platform;
     euid?: number;
+    env?: NodeJS.ProcessEnv;
+    container?: boolean;
     exists?: (name: string) => boolean;
     create?: (name: string) => string | null;
   } = {},
@@ -1296,8 +1401,14 @@ export function defaultWorkerUser(
     const who = euid === 0 ? "root" : "the user Maat runs as";
     return {
       notice:
-        `worker tools run as ${who}, the same account as Maat: privilege separation is the default only for root on Linux ` +
+        `worker tools run as ${who}, the same account as Maat: privilege separation is the default only for root on Linux in a container or CI ` +
         `(--worker-user <u> asks for it${platform === "linux" ? " with root or passwordless sudo" : ""})`,
+    };
+  }
+  const d = disposableRun({ env: o.env, ...(o.container !== undefined ? { container: o.container } : {}) });
+  if (!d.disposable) {
+    return {
+      notice: `running as root: the worker's tools run as root too. Pass --worker-user <u> to run them as another account (separation is the default only in a container, in CI, or in a folder made for the run)`,
     };
   }
   const exists =
@@ -1310,19 +1421,23 @@ export function defaultWorkerUser(
         return false;
       }
     });
+  if (exists(name)) return { user: name, notice: `running as root in ${d.why}: the worker's tools run as ${name} (the default there; --worker-user none keeps them as root)` };
+  if (!d.container) {
+    return { notice: `running as root in ${d.why}, but there is no ${name} account and Maat makes one only inside a container: the worker's tools run as root. Pass --worker-user <u>` };
+  }
   const create =
     o.create ??
     ((n: string) => {
       if (!which("useradd")) return "useradd is not on the PATH";
-      const r = spawnSync("useradd", ["--system", "--create-home", "--home-dir", `/var/lib/${n}`, "--shell", "/bin/sh", n], { encoding: "utf8" });
+      const shell = existsSync("/usr/sbin/nologin") ? "/usr/sbin/nologin" : existsSync("/sbin/nologin") ? "/sbin/nologin" : "/bin/false";
+      const r = spawnSync("useradd", ["--system", "--create-home", "--home-dir", `/var/lib/${n}`, "--shell", shell, n], { encoding: "utf8" });
       return r.status === 0 ? null : (r.stderr || `useradd exited ${r.status}`).trim();
     });
-  if (exists(name)) return { user: name, notice: `running as root: the worker's tools run as ${name} (the default for unattended runs; --worker-user none keeps them as root)` };
   const failed = create(name);
   if (failed === null) {
-    return { user: name, notice: `running as root: made the system account ${name}, and the worker's tools run as it (the default for unattended runs; --worker-user none keeps them as root)` };
+    return { user: name, notice: `running as root in a container: made the system account ${name} (no login shell), and the worker's tools run as it (--worker-user none keeps them as root)` };
   }
-  return { notice: `running as root and could not make the account ${name} (${failed}): the worker's tools run as root. Pass --worker-user <u> to separate them` };
+  return { notice: `running as root in a container and could not make the account ${name} (${failed}): the worker's tools run as root. Pass --worker-user <u> to separate them` };
 }
 
 /** The check account asked for, from the flag or MAAT_CHECK_USER. */
