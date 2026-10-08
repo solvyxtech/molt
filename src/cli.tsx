@@ -7,6 +7,7 @@
  * bar is not met, so molt can sit in CI, in a script, or in a benchmark
  * harness without a human watching.
  */
+import { captureSecrets } from "./secrets.js";
 import { acpAgentFor, acpHealth } from "./acp.js";
 import { endpointDeprecation, expandEndpointShorthand, isOpencodeUrl, opencodeModelProblem } from "./endpoint.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -2274,6 +2275,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   // (Terminal-Bench kv-store-grpc, rstan-to-pystan: exit 143, no verdict).
   // A plain title keeps the task out of `ps`, `pgrep -f` and `pkill -f`.
   if (argv.length > 1) process.title = "maat";
+  // Credentials out of the environment and into memory before anything is
+  // spawned, so no child inherits one (src/secrets.ts). MAAT_KEYS_FD and
+  // MAAT_KEYS_FILE deliver keys that were never in the environment at all.
+  const keys = captureSecrets();
+  if (keys.problems.length) {
+    process.stderr.write(keys.problems.map((p) => `maat: ${p}\n`).join(""));
+    return 2;
+  }
   let args: Args;
   try {
     args = parseArgs(argv, storedEndpoint());

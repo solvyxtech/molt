@@ -349,6 +349,9 @@ export async function preflightCriteria(
         // `[ ]`, `echo -e`) failed here under dash and passed at the bar, and
         // counted as a check that tells the work from none.
         shell: draftedShell(c),
+        // A trial run of a check still being drafted runs while the worker
+        // works: its text stays out of argv (src/run.ts).
+        hideCommand: true,
         timeoutMs: opts.timeoutMs ?? 5_000,
         maxBuffer: 1024 * 1024,
         signal: opts.signal,

@@ -20,6 +20,7 @@
  */
 import { bashPath, runCommand } from "./run.js";
 import { copyTreeOrWhy } from "./scratch.js";
+import { scrubEnv, secretValue, secretValues } from "./secrets.js";
 import { describeStart, listBackground, startBackground, stopBackground } from "./background.js";
 import { objectionLine, readsTheWork, reviewClaim, type ExecutableReview, type ObjectionRun, type Review } from "./review.js";
 import { credentialFreeEnv } from "./credenv.js";
@@ -1111,15 +1112,6 @@ export function expandAct(call: { id: string; function?: { name?: string; argume
   return { analysis, subs, unusable };
 }
 
-const SECRET_ENV = [
-  "MOLT_API_KEY",
-  "OPENAI_API_KEY",
-  "OPENROUTER_API_KEY",
-  "ANTHROPIC_API_KEY",
-  "GROQ_API_KEY",
-  "MISTRAL_API_KEY",
-];
-
 /** Per-turn options. Nothing here changes the session's configuration. */
 export type RunOptions = {
   /**
@@ -1755,10 +1747,13 @@ function exitWord(e: { code: number | null; signal: string | null }): string {
   return e.code !== null ? `with exit ${e.code}` : `on ${e.signal ?? "a signal"}`;
 }
 
+/**
+ * The environment the worker's commands get: no credential of any shape
+ * (src/secrets.ts). Normally `captureSecrets()` has already emptied
+ * process.env of them at startup; this covers a library caller that did not.
+ */
 function scrubbedEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  for (const k of SECRET_ENV) delete env[k];
-  return env;
+  return scrubEnv(process.env);
 }
 
 function sha256Of(p: string): string | null {
@@ -2976,7 +2971,7 @@ export class Engine {
 
   /** Values that must not appear on screen or in a file molt writes. */
   private secrets(): (string | undefined)[] {
-    return [this.cfg.apiKey, env("API_KEY"), process.env.OPENAI_API_KEY];
+    return [this.cfg.apiKey, env("API_KEY"), secretValue("OPENAI_API_KEY"), ...secretValues()];
   }
 
   get autonomy(): Autonomy {

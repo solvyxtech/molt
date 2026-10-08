@@ -36,7 +36,7 @@
  * then runs in place and says so; a reviewer's objection is not run).
  */
 import { constants } from "node:fs";
-import { chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, realpath, rm, symlink, writeFile, type FileHandle } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { basename, join } from "node:path";
 import { STATE_DIRS } from "./statedir.js";
@@ -197,24 +197,11 @@ export async function copyTreeOrWhy(
   let bytes = 0;
   const linked: string[] = [];
   const copyOne = async (s: string, d: string): Promise<void> => {
-    let st;
-    try {
-      st = await lstat(s);
-    } catch (e) {
-      if (vanished(e)) return;
-      throw e;
-    }
-    files += 1;
-    bytes += st.size;
-    if (files > maxFiles || bytes > maxBytes) throw new TooBig();
-    try {
-      await copyFile(s, d, constants.COPYFILE_FICLONE);
-      // Same mtimes: `make`, git's index and a check that compares ages all read them.
-      await utimes(d, st.atime, st.mtime);
-    } catch (e) {
-      if (!vanished(e)) throw e;
-      await rm(d, { force: true }).catch(() => {});
-    }
+    await copyRegular(s, d, (size) => {
+      files += 1;
+      bytes += size;
+      if (files > maxFiles || bytes > maxBytes) throw new TooBig();
+    });
   };
   const copyLink = async (s: string, d: string): Promise<void> => {
     try {
@@ -400,5 +387,49 @@ export async function preWorkCopy(root: string): Promise<PreWorkCopy | null> {
   } catch {
     await c.cleanup();
     return null;
+  }
+}
+
+/**
+ * Copy one regular file, judged at the moment it is opened, not from a
+ * directory listing: between `readdir` and the copy the worker can swap a
+ * file for a symlink to something only Maat can read (or a FIFO that never
+ * ends), and a path-based copy follows it into the check's copy. Opened with
+ * O_NOFOLLOW (and O_NONBLOCK, so a FIFO cannot hold the open) and fstat'ed on
+ * the open descriptor; anything that is not a regular file by then is
+ * skipped. `admit` sees the size before a byte is written and may throw.
+ * True when it was copied.
+ */
+export async function copyRegular(s: string, d: string, admit?: (size: number) => void): Promise<boolean> {
+  let src: FileHandle;
+  try {
+    src = await open(s, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+  } catch (e) {
+    // ELOOP: a symlink by now. Not copied, not followed.
+    if (vanished(e) || (e as NodeJS.ErrnoException).code === "ELOOP") return false;
+    throw e;
+  }
+  try {
+    const st = await src.stat();
+    if (!st.isFile()) return false;
+    admit?.(st.size);
+    const out = await open(d, "wx", st.mode & 0o777);
+    try {
+      const buf = Buffer.allocUnsafe(1024 * 1024);
+      for (;;) {
+        const { bytesRead } = await src.read(buf, 0, buf.length, null);
+        if (bytesRead === 0) break;
+        let off = 0;
+        while (off < bytesRead) off += (await out.write(buf, off, bytesRead - off)).bytesWritten;
+      }
+      await out.chmod(st.mode & 0o7777);
+      // Same mtimes: `make`, git's index and a check that compares ages all read them.
+      await out.utimes(st.atime, st.mtime);
+    } finally {
+      await out.close();
+    }
+    return true;
+  } finally {
+    await src.close();
   }
 }

@@ -66,7 +66,11 @@ url=${BENCH_URL:-https://openrouter.ai/api/v1}
 # The NUC tunnel is the Mac's localhost; from the container it is host.docker.internal.
 url=${url//127.0.0.1/host.docker.internal}; url=${url//localhost/host.docker.internal}
 # The key goes in through a file only this user can read, removed when the
-# run ends: on the command line (-e KEY=...) it showed in every `ps` listing.
+# run ends: on the command line (-e KEY=...) it showed in every `ps` listing,
+# and as --env-file it sat in the container's environment (docker inspect, and
+# every process of the run). It is mounted read-only under /root (mode 700, so
+# the agent user cannot reach it); run.py reads it into memory and hands it to
+# Maat on a pipe (MAAT_KEYS_FD), so it is in no environment at all.
 envf=$(mktemp); chmod 600 "$envf"; trap 'rm -f "$envf"' EXIT
 printf 'OPENROUTER_API_KEY=%s\n' "$key" > "$envf"
 # Anthropic API lanes (BENCH_URL=https://api.anthropic.com/v1): the key comes from the
@@ -124,7 +128,7 @@ echo "maat $img → $out/${RESULTS:-results.jsonl}"
 cpus=${BENCH_CPUS:-2}; mem=${BENCH_MEMORY:-4g}
 docker run --rm --name "maat-bench-$name" --cpus "$cpus" --memory "$mem" ${=caps} \
   -v "$local_dir":/root/bench-src:ro -v "$out":/root/bench-results -v "$work":/root/bench-export ${=credmount} \
-  --env-file "$envf" -e REFERENCE="${REFERENCE:-0}" -e BENCH_MODEL="${BENCH_MODEL:-}" \
+  -v "$envf":/root/bench-keys/keys:ro -e BENCH_KEYS_FILE=/root/bench-keys/keys -e REFERENCE="${REFERENCE:-0}" -e BENCH_MODEL="${BENCH_MODEL:-}" \
   -e ARMS="${ARMS:-}" -e BENCH_TASKS="${BENCH_TASKS:-}" -e BENCH_URL="$url" -e BENCH_LIMIT="${BENCH_LIMIT:-600}" -e BENCH_REASONING="${BENCH_REASONING:-}" -e BENCH_GATE="${BENCH_GATE:-}" -e RESULTS="${RESULTS:-results.jsonl}" \
   -e MAAT_BUILD="$sha" -e PYTHONDONTWRITEBYTECODE=1 -e BENCH_CPUS="$cpus" -e BENCH_MEMORY="$mem" -e BENCH_PRIVSEP="$privsep" \
   "$img" sh -c "$startcmd" run "$@"

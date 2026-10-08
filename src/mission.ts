@@ -467,6 +467,7 @@ export async function runAssertions(
         maxBuffer: 256 * 1024,
         signal,
         asCheck: copy ? "copy" : "in-place",
+        hideCommand: true,
       });
       const d = diagnoseFailure(r.code ?? 0, r.stdout, r.stderr);
       const text = `${r.stdout}${r.stderr}`;

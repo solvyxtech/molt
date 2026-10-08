@@ -46,7 +46,32 @@ export type RunOptions = {
    * checks run as Maat, as before.
    */
   asCheck?: "copy" | "in-place";
+  /**
+   * Keep the command text out of every process's argv and environment. The
+   * shell is started with a fixed wrapper (`HIDDEN_WRAPPER`) as its only
+   * script; the command arrives on fd 3, which the wrapper reads to the end
+   * and closes before it runs a word of it. Used for every check run: a
+   * hidden check's text in `/proc/<pid>/cmdline` was readable by any process
+   * of the same user, including the worker's own deliverable when the check
+   * runs it (`/proc/$PPID/cmdline`).
+   */
+  hideCommand?: boolean;
 };
+
+/**
+ * The only script a hidden-command shell is given. Fixed text: nothing of the
+ * command is in it. It reads the command from fd 3 (a socket, which another
+ * process cannot reopen through /proc/<pid>/fd), closes fd 3 so nothing the
+ * command starts inherits it, and evals the text with the holding variable
+ * unset first: the variable is never exported, and it is gone before the
+ * first command of the check runs.
+ */
+export const HIDDEN_WRAPPER = '__maat_c=$(cat <&3) || exit 125; exec 3<&-; eval "unset __maat_c; $__maat_c"';
+
+/** The shell binary a `shell` option names: `true` is the platform's sh. */
+function shellFile(shell: string | true | undefined): string {
+  return shell === undefined || shell === true ? "/bin/sh" : shell;
+}
 
 export type RunResult = {
   stdout: string;
@@ -107,35 +132,47 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
   return new Promise<RunResult>((resolve, reject) => {
     let child: ChildProcess;
     let cleanup: (() => void) | undefined;
+    // With hideCommand the shell is given only HIDDEN_WRAPPER, and the command
+    // arrives on fd 3; that holds on every path below, privilege separation included.
+    const hide = opts.hideCommand === true && process.platform !== "win32";
+    const script = hide ? HIDDEN_WRAPPER : command;
+    const stdio: ("ignore" | "pipe")[] = hide ? ["ignore", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"];
     try {
       const sep = privSep();
       const ps = opts.asWorker ? sep : undefined;
       if (opts.asCheck && sep?.check) {
-        const made = sep.checkSpec(command, opts.shell ?? true, opts.cwd, opts.asCheck === "copy" ? "check" : "worker", opts.env ?? process.env);
+        const made = sep.checkSpec(script, opts.shell ?? true, opts.cwd, opts.asCheck === "copy" ? "check" : "worker", opts.env ?? process.env);
         cleanup = made.cleanup;
         const spec = made.spec;
         child = spawn(spec.file, spec.args, {
           cwd: opts.cwd,
           env: spec.env,
-          stdio: ["ignore", "pipe", "pipe"],
+          stdio,
           detached: true,
           ...(spec.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
         });
       } else if (ps) {
-        const spec = ps.commandSpec(command, opts.shell ?? true, opts.cwd, opts.env);
+        const spec = ps.commandSpec(script, opts.shell ?? true, opts.cwd, opts.env);
         child = spawn(spec.file, spec.args, {
           cwd: opts.cwd,
           env: spec.env,
-          stdio: ["ignore", "pipe", "pipe"],
+          stdio,
           detached: true,
           ...(spec.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
+        });
+      } else if (hide) {
+        child = spawn(shellFile(opts.shell), ["-c", HIDDEN_WRAPPER], {
+          cwd: opts.cwd,
+          env: opts.env,
+          stdio,
+          detached: true,
         });
       } else {
         child = spawn(command, {
           cwd: opts.cwd,
           shell: opts.shell ?? true,
           env: opts.env,
-          stdio: ["ignore", "pipe", "pipe"],
+          stdio,
           // Its own process group, so a timeout can kill everything the command
           // started and not just the shell (see `kill`).
           detached: process.platform !== "win32",
@@ -145,6 +182,15 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
       cleanup?.();
       reject(e as Error);
       return;
+    }
+    if (hide) {
+      const feed = child.stdio[3] as import("node:stream").Duplex | null | undefined;
+      // A shell that died before reading (or a wrapper that failed) closes
+      // its end: EPIPE here is the same fact as its exit, reported there.
+      feed?.on("error", () => {});
+      // Written, then dropped: data already sent stays readable by the shell
+      // after this end closes, and an open end would hold "close" back.
+      feed?.end(command, () => feed.destroy());
     }
 
     const cap = opts.maxBuffer ?? Infinity;
