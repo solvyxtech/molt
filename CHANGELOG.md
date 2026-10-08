@@ -149,6 +149,13 @@
 
 ### Fixed
 
+- **"Already shown, nothing has changed since" is checked, not assumed.** A
+  file changed outside the file tools (a bash `sed -i` or `printf >`, a
+  generator, the person's editor) was still answered with the pointer on a
+  re-read, so the model was told its stale copy was current. Each read now
+  records the file's size, mtime and, under 1 MB, a content hash; the
+  fingerprint is re-taken before a pointer is sent, and a changed file is
+  returned in full. A deleted file gives its read error, never a pointer.
 - **A re-read after an edit returns the file, whatever the path's spelling.**
   The engine recorded which lines of a file the model had been shown under the
   path as spelled, so `read_file dur.py`, then `edit_file ./dur.py`, then

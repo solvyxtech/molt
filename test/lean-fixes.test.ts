@@ -13,7 +13,7 @@
  *    marker saying the current copy was further down. It was not.
  */
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { Engine } from "../src/engine.js";
@@ -348,5 +348,76 @@ describe("shown map: one spelling per file", () => {
     t.push({ role: "assistant", content: null, tool_calls: [toolCall("edit_file", { path: "sub/../dur.py", old_text: "x", new_text: "y" }, "e")] });
     t.push({ role: "tool", tool_call_id: "e", content: "edited" });
     assert.equal(t.elideSupersededReads().elided, 1);
+  });
+});
+
+/**
+ * "You have already been shown … nothing has changed since" was a claim the
+ * engine never checked. A bash `sed -i`, a generator or the person's editor
+ * changes the file behind the file tools' back, and the re-read was still
+ * answered with the pointer. Each entry now carries a fingerprint of the file
+ * (size, mtime, and a hash under 1 MB), re-taken before a pointer is sent.
+ */
+describe("shown map: the pointer is checked against the file", () => {
+  async function reread(change: (dir: string) => object, setup?: (dir: string) => void) {
+    const ws = workspace();
+    try {
+      writeFileSync(join(ws.dir, "x.py"), "value = 1  # OLD_MARK\n");
+      setup?.(ws.dir);
+      const p = scriptedProvider([
+        { calls: [{ name: "read_file", args: { path: "x.py" } }] },
+        { calls: [change(ws.dir)] },
+        { calls: [{ name: "read_file", args: { path: "x.py" } }] },
+        { text: "Done." },
+      ] as never);
+      const e = new Engine({ baseUrl: "http://p.test/v1", model: "m", cwd: ws.dir, fetchFn: p.fetchFn, bar: null, stream: false, autonomy: "high", maxSteps: 0 });
+      await drain(e.run("look at x.py", allowAll));
+      const tools = (JSON.parse(p.bodies.at(-1)!) as { messages: { role: string; content: string }[] }).messages.filter((m) => m.role === "tool");
+      return tools.at(-1)!.content;
+    } finally {
+      ws.cleanup();
+    }
+  }
+
+  it("bash sed -i changes the file: the re-read returns the new contents", async () => {
+    const got = await reread(() => ({ name: "bash", args: { command: "sed -i.bak 's/OLD_MARK/NEW_MARK/' x.py" } }));
+    assert.doesNotMatch(got, /already been shown/);
+    assert.match(got, /NEW_MARK/);
+  });
+
+  it("bash printf > x.py changes the file: the re-read returns the new contents", async () => {
+    const got = await reread(() => ({ name: "bash", args: { command: "printf 'value = 2  # NEW_MARK\\n' > x.py" } }));
+    assert.doesNotMatch(got, /already been shown/);
+    assert.match(got, /NEW_MARK/);
+  });
+
+  it("same size, same mtime: the hash catches the change", async () => {
+    // Both versions are the same length and stamped with the same whole-second
+    // mtime, so size and mtime match exactly and only the content differs.
+    const T = 1_700_000_000;
+    const got = await reread(
+      () => ({
+        name: "bash",
+        args: {
+          command:
+            `node -e "const fs=require('fs');fs.writeFileSync('x.py','value = 1  # NEW_MARK\\n');` +
+            `fs.utimesSync('x.py',${T},${T})"`,
+        },
+      }),
+      (dir) => utimesSync(join(dir, "x.py"), T, T),
+    );
+    assert.doesNotMatch(got, /already been shown/);
+    assert.match(got, /NEW_MARK/);
+  });
+
+  it("an unchanged file still gets the pointer", async () => {
+    const got = await reread(() => ({ name: "bash", args: { command: "true" } }));
+    assert.match(got, /already been shown/);
+  });
+
+  it("a deleted file gives an error, not a pointer", async () => {
+    const got = await reread(() => ({ name: "bash", args: { command: "rm x.py" } }));
+    assert.doesNotMatch(got, /already been shown/);
+    assert.match(got, /no such file|ENOENT|not found/i);
   });
 });

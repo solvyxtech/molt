@@ -592,6 +592,8 @@ export function historyBudget(window: number, fixedEst: number, scale: number): 
 }
 
 export const TOOL_RESULT_MAX_BYTES = 8192;
+/** Files under this size are hashed for the "already shown" check; larger ones are stat-only. */
+const SHOWN_HASH_MAX_BYTES = 1024 * 1024;
 /**
  * How much of a file one `read_file` may return.
  *
@@ -2035,8 +2037,12 @@ type ToolContext = {
   userText: string;
   confirm: Confirm;
   log?: Journal;
-  /** Line ranges of each file already shown, so a re-read can be named as one. */
-  shown: Map<string, { from: number; to: number }[]>;
+  /**
+   * Line ranges of each file already shown, so a re-read can be named as one,
+   * and the file's fingerprint when they were shown: the pointer says nothing
+   * has changed since, and that is checked, not assumed.
+   */
+  shown: Map<string, { ranges: { from: number; to: number }[]; fp: string | null }>;
   /** The last result of each distinct call, so an identical one can be pointed at. */
   answered: Map<string, { step: number; sha: string }>;
 };
@@ -3480,6 +3486,27 @@ export class Engine {
   private async fileExists(abs: string): Promise<boolean> {
     const wfs = this.workerFs;
     return wfs ? wfs.exists(abs) : existsSync(abs);
+  }
+
+  /**
+   * A cheap fingerprint of a file, for "has it changed since it was shown":
+   * size and mtime, and a content hash when the file is under 1 MB, which
+   * catches a same-size edit inside one mtime tick. Under privilege
+   * separation the worker's hash, as the worker sees the file. Null when
+   * there is no such file.
+   */
+  private async fingerprint(abs: string): Promise<string | null> {
+    const wfs = this.workerFs;
+    if (wfs) return wfs.sha256(abs);
+    try {
+      const st = statSync(abs);
+      if (!st.isFile()) return null;
+      const stamp = `${st.size}:${st.mtimeMs}`;
+      if (st.size >= SHOWN_HASH_MAX_BYTES) return stamp;
+      return `${stamp}:${createHash("sha256").update(readFileSync(abs)).digest("hex")}`;
+    } catch {
+      return null;
+    }
   }
 
   private async fileSha(abs: string): Promise<string | null> {
@@ -5762,7 +5789,13 @@ export class Engine {
         // Keyed by the file, not the spelling: an edit of `./dur.py` has to
         // clear what a read of `dur.py` recorded.
         const file = canonPath(path, this.cwd);
-        const covered = ctx.shown.get(file) ?? [];
+        // "Nothing has changed since" is a claim about the file, and bash,
+        // a generator or the person's editor can change it behind the file
+        // tools' back. Re-take the fingerprint; if it moved, what was shown
+        // is history and this read is new.
+        const fp = await this.fingerprint(resolve(this.cwd, path));
+        const entry = ctx.shown.get(file);
+        const covered = entry && entry.fp === fp ? entry.ranges : [];
         // How much of this window is genuinely new. Containment alone is
         // too strict: a read that overlaps an earlier one by 99% and
         // runs three lines past it is not contained, and a model
@@ -5786,7 +5819,7 @@ export class Engine {
           repeatedHere = true;
         } else {
           covered.push({ from, to });
-          ctx.shown.set(file, covered);
+          ctx.shown.set(file, { ranges: covered, fp });
         }
       }
 
@@ -6113,7 +6146,7 @@ export class Engine {
      * actually matters — "has this already been shown?" — rather than "is this
      * byte-identical to something?".
      */
-    const shown = new Map<string, { from: number; to: number }[]>();
+    const shown: ToolContext["shown"] = new Map();
     /** Consecutive steps in which nothing new came back. */
     let dryStreak = 0;
     /** Consecutive assistant turns that arrived with nothing in them. */
