@@ -41,7 +41,7 @@ describe("tierOf, review advisory", () => {
   });
 
   it("a person's passing check still verifies", () => {
-    assert.equal(tierOf({ ...J, results: [{ ok: true, tags: [] }], reviewAdvisory: true, review: { votes: "3/3", violations: [] } }).tier, "verified");
+    assert.equal(tierOf({ ...J, results: [{ ok: true, kind: "command" as const, tags: [] }], reviewAdvisory: true, review: { votes: "3/3", violations: [] } }).tier, "verified");
   });
 });
 

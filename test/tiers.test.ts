@@ -76,7 +76,7 @@ describe("the value tag", () => {
 });
 
 describe("tierOf", () => {
-  const ok = (tags: string[], hidden = true) => ({ name: "c", ok: true, hidden: hidden || undefined, tags });
+  const ok = (tags: string[], hidden = true) => ({ name: "c", ok: true, hidden: hidden || undefined, kind: "command" as const, tags });
   // Drafted by a separate judge model: the authorship rule is pinned in independent-checks.test.ts.
   const J = { worker: "worker-m", authors: new Map([["c", { kind: "judge" as const, model: "judge-j" }]]) };
   it("needs a passing check that runs the work and asserts a value", () => {

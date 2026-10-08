@@ -16,6 +16,7 @@ import { renderMarkdown } from "./markdown.js";
 import { nextWaitWord } from "./wait-words.js";
 import { playMaatSplash } from "./maat-splash.js";
 import { fmtCost, spendLine, stepDid } from "../src/format.js";
+import { jobEndWords, type JobEndWords } from "../src/tiers.js";
 import { expandEndpointShorthand, typedEndpointProblem } from "../src/endpoint.js";
 import { matchCommands } from "../src/commands.js";
 import { JOURNAL_RENDER_CAP, STREAM_CAP, contextCap, contextFill, newest, trimOldest } from "./bounds.js";
@@ -1139,19 +1140,7 @@ molt.onEvent((ev) => {
 
     case "job_end": {
       // The same words the terminal uses for the verdict (cli.tsx).
-      const review = ev.review as { confirmed?: boolean } | undefined;
-      const said =
-        typeof ev.claim === "string" && (ev.tier === "passed-own-checks" || ev.outcome === "verified")
-          ? `${ev.claim}${ev.outcome === "verified" && review?.confirmed ? ", independently reviewed" : ""}`
-          : ev.outcome === "verified" && review && review.confirmed === false
-          ? "passed its checks, unconfirmed"
-          : ev.outcome === "verified" && review?.confirmed
-            ? "verified, independently reviewed"
-            : ev.outcome === "verified" && ev.selfChecked
-              ? "passed its own checks"
-              : ev.outcome === "unverified" && Array.isArray(ev.checksDisagree) && ev.checksDisagree.length
-                ? "unverified, its own drafted checks disagree"
-                : String(ev.outcome);
+      const said = jobEndWords(ev as JobEndWords);
       say(
         "",
         `job ${said} · ${ev.steps} step(s) · ${spendLine(ev.spend)} · ${fmtMs(Number(ev.durationMs) || 0)}`,

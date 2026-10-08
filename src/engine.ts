@@ -23,6 +23,7 @@ import { describeStart, listBackground, startBackground, stopBackground } from "
 import { reviewClaim, type Review } from "./review.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
 import { authorKey, authorWords, claimLabel, tierOf, withAuthor } from "./tiers.js";
+import { recordGoldens, valueUnproven } from "./golden.js";
 import { arbitrate, parseDisputes, type Ruling } from "./dispute.js";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -2187,6 +2188,13 @@ export class Engine {
    * `pass (nothing to establish)` for it rather than presenting it as proof.
    */
   private passedBeforeWork: ReadonlySet<string> = new Set();
+  /**
+   * The expected-looking operands of `diff`/`cmp` task checks, with their
+   * content as the turn found them (src/golden.ts). Recorded at the seal,
+   * before the first step; a golden file not in here, or changed since,
+   * proves no value.
+   */
+  private goldensBefore: Map<string, string | null> = new Map();
   /** True only while `proveNow` runs: a bar with no turn behind it. */
   private standalone = false;
   private barHash: string | null;
@@ -3687,9 +3695,20 @@ export class Engine {
     return [...new Set([this.cfg.model, this.modelOfRecord()].filter((m): m is string => typeof m === "string" && m.trim().length > 0))];
   }
 
-  /** Everything tierOf weighs beside the results: advisory mode, the worker, and who wrote each check. */
-  private tierContext(): { reviewAdvisory?: true; guards?: ReadonlySet<string>; worker: string[]; authors: Map<string, CheckAuthor> } {
-    return { ...this.advisoryTier(), worker: this.workerNames(), authors: this.sealedAuthors() };
+  /** Everything tierOf weighs beside the results: advisory mode, the worker, who wrote each check, and which golden files predate the work. */
+  private tierContext(): {
+    reviewAdvisory?: true;
+    guards?: ReadonlySet<string>;
+    worker: string[];
+    authors: Map<string, CheckAuthor>;
+    valueUnproven: Set<string>;
+  } {
+    return {
+      ...this.advisoryTier(),
+      worker: this.workerNames(),
+      authors: this.sealedAuthors(),
+      valueUnproven: valueUnproven(this.sealedChecks.map((c) => ({ name: c.name, run: c.kind === "command" ? c.run : undefined, tags: c.tags })), this.cwd, this.goldensBefore),
+    };
   }
 
   /** The receipt's authorship map: sealed checks by bar name, as recorded. */
@@ -5288,6 +5307,7 @@ export class Engine {
     let requirements = normalizeRequirements(opts.requirements);
     let signedOut = false;
     this.passedBeforeWork = new Set();
+    this.goldensBefore = new Map();
     const log = this.cfg.journal;
     /**
      * This turn's criteria, copied and sealed before anything runs.
@@ -5354,6 +5374,8 @@ export class Engine {
       // meant to fail before the work; it is not meant to be unrunnable, and
       // the difference is cheap to establish here and expensive to discover
       // at the end of a turn.
+      // What each expected-looking file held before the work (src/golden.ts).
+      self.goldensBefore = recordGoldens(taskChecks.map((c) => ({ run: c.kind === "command" ? c.run : undefined })), self.cwd);
       if (taskChecks.length) {
         // Through `running`, so ctrl+C at the very start of a turn kills the
         // preflight rather than waiting it out.

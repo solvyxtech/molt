@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { MIN_SECRET_CHARS, redact } from "./redact.js";
 import type { BarResult, CheckAuthor } from "./types.js";
-import { authorWords, claimLabel } from "./tiers.js";
+import { authorWords, claimLabel, resultAuthorWords } from "./tiers.js";
 import { stateDir } from "./statedir.js";
 import { WITHHELD, maskDeep, maskText } from "./withhold.js";
 
@@ -612,7 +612,7 @@ export class Receipts {
         "",
         `check: ${r.name}`,
         `kind: ${r.kind}`,
-        `written by: ${authorWords(args.authors?.[r.name] ?? (r.hidden ? undefined : { kind: "person" }))}`,
+        `written by: ${resultAuthorWords(r, args.authors?.[r.name])}`,
         `command: ${r.detail}`,
         ...(r.ranInPlace ? [`ran in place: no throwaway copy of the tree — ${r.ranInPlace}`] : []),
         `exit: ${r.exitCode ?? "n/a"}`,

@@ -55,14 +55,39 @@ function hasFlag(flags: string[], letters: string): boolean {
  *  3. `diff` or `cmp` against an expected file (a name with expect, golden,
  *     want, answer, baseline or correct in it) or against a heredoc, here
  *     string or `<(...)` written in the command. `diff out.txt in.txt` does
- *     not count: two files are not a value.
+ *     not count: two files are not a value. With `goldenPredates` (the
+ *     tier's pre-work record), each expected-file operand must also have
+ *     existed before the work, unchanged since: otherwise the worker could
+ *     have written it.
  *  4. `grep` with `-q` or `-x` whose pattern is a literal holding a
  *     standalone number, a whole expected line (`-x`), or anchored at both
  *     ends (`^...$`). `grep -q "def main"` does not count.
  * Conservative on purpose: a check missed here costs one claim the word
  * "verified"; a check counted wrongly costs the word its meaning.
  */
-export function assertsValue(run: string): boolean {
+/** A diff/cmp operand named like an expected file: what rule 3 trusts as "the value". */
+const GOLDEN_NAME = /(?:^|[\s/'"])[\w.-]*(?:expect|golden|want|answer|baseline|correct)/i;
+
+/**
+ * The operands of `diff`/`cmp` in `run` that are named like an expected file
+ * (rule 3 of assertsValue), unquoted. A golden file only stands for a value
+ * when it predates the work: a worker that writes both `out.txt` and
+ * `expected.txt` makes `diff out.txt expected.txt` pass on anything.
+ */
+export function goldenOperands(run: string): string[] {
+  const out: string[] = [];
+  for (const m of run.matchAll(/\b(?:diff|cmp)\b([^\n|;&]*)/g)) {
+    const words: string[] = (m[1] ?? "").match(/"(?:[^"\\]|\\.)*"|'[^']*'|\S+/g) ?? [];
+    for (const w of words) {
+      if (w.startsWith("-") || w.startsWith("<")) continue;
+      const bare = w.replace(/^(["'])(.*)\1$/s, "$2");
+      if (GOLDEN_NAME.test(` ${bare}`)) out.push(bare);
+    }
+  }
+  return out;
+}
+
+export function assertsValue(run: string, goldenPredates?: (operand: string) => boolean): boolean {
   const ops = /(==|!=|(?<=\s)-eq(?=\s)|(?<=\s)-ne(?=\s)|(?<=\s)=(?=\s))/g;
   for (const m of run.matchAll(ops)) {
     const at = m.index ?? 0;
@@ -77,7 +102,13 @@ export function assertsValue(run: string): boolean {
   for (const m of run.matchAll(/\b(?:diff|cmp)\b([^\n|;&]*)/g)) {
     const args = m[1] ?? "";
     if (/<<|<\(/.test(args)) return true;
-    if (/(?:^|[\s/'"])[\w.-]*(?:expect|golden|want|answer|baseline|correct)/i.test(args)) return true;
+    if (GOLDEN_NAME.test(args)) {
+      // Without a pre-work record (the drafter tagging a check), the name is
+      // taken at its word; the tier asks again with one (`goldenPredates`).
+      if (!goldenPredates) return true;
+      const named = goldenOperands(m[0]);
+      if (named.length && named.every((g) => goldenPredates(g))) return true;
+    }
   }
   for (const m of run.matchAll(/\bgrep\b([^\n|;&]*)/g)) {
     const words: string[] = (m[1] ?? "").match(/"(?:[^"\\]|\\.)*"|'[^']*'|\S+/g) ?? [];
@@ -115,6 +146,12 @@ export type TierVerdict = {
   /** Advisory review mode only: what the review said, recorded on the receipt instead of gating. */
   reviewNote?: string;
   /**
+   * Advisory review mode only: the review contradicted the task, or was asked
+   * for and did not run. The tier still stands (the review gates nothing in
+   * that mode), but every label says so: ", unconfirmed" / ", unreviewed".
+   */
+  reviewGap?: "unconfirmed" | "unreviewed";
+  /**
    * Who stood behind the word, when the passing runs+value (or person) checks
    * decided it: "person", "independent" (another model), or "own" (the worker).
    */
@@ -143,6 +180,10 @@ export function normalizeModelId(id: string): string {
   // Dated and alias releases of the same model: `-20250805`, `-2025-08-05`, `-latest`,
   // Bedrock's `-20240620-v1`. A bare `-v3` is a different model (deepseek-v3), never stripped.
   s = s.replace(/-(?:\d{8}(?:-v\d+)?|\d{4}-\d{2}-\d{2}|latest)$/, "");
+  // Tuning names one provider spells and another drops: `qwen3-235b-a22b-instruct-2507`
+  // on one is `qwen3-235b-a22b-2507` on another; `gemma-3-27b-it`. Erring toward
+  // "same model" fails closed: it can only cost a judge its independence.
+  s = s.replace(/-(?:instruct|chat|it)(?=-|$)/g, "");
   return s;
 }
 
@@ -166,6 +207,22 @@ export function independentOf(author: CheckAuthor | undefined, worker: string | 
   const names = (typeof worker === "string" ? [worker] : [...(worker ?? [])]).filter((w) => w.trim());
   if (!names.length) return false;
   return !names.some((w) => sameModel(author.model, w));
+}
+
+/**
+ * Can this result stand for a person's judgment of the task? Only a command
+ * check (`kind: "command"`, never a builtin) that is not one of the session
+ * checks. A result with no recorded kind cannot: every real result carries
+ * one, so a missing kind is a caller that did not say, and that fails closed.
+ */
+export function personCheck(r: { kind?: CheckResult["kind"]; tags?: readonly string[] }): boolean {
+  return r.kind === "command" && !r.tags?.includes("session");
+}
+
+/** One line for a receipt: who wrote this result's check. Builtins and session checks are Maat's, whatever done.yml says. */
+export function resultAuthorWords(r: { kind?: CheckResult["kind"]; tags?: readonly string[]; hidden?: boolean }, a: CheckAuthor | undefined): string {
+  if (r.kind === "builtin" || r.tags?.includes("session")) return "Maat (a session check: how the turn was done, never whether the task is right; does not count toward verified)";
+  return authorWords(a ?? (r.hidden ? undefined : { kind: "person" }));
 }
 
 /** One line for a receipt: who wrote this check. */
@@ -203,13 +260,58 @@ export function withAuthor<T extends { hidden?: boolean; tags?: readonly string[
  *   passed own checks (<worker model>), not verified
  * Anything else is the outcome word unchanged.
  */
-export function claimLabel(outcome: string, tier: Pick<TierVerdict, "tier" | "basis" | "by" | "worker"> | undefined): string {
-  if (tier?.tier === "passed-own-checks") return `passed own checks (${tier.worker || "the worker model"}), not verified`;
+export function claimLabel(outcome: string, tier: Pick<TierVerdict, "tier" | "basis" | "by" | "worker" | "reviewGap"> | undefined): string {
+  const gap = tier?.reviewGap ? `, ${tier.reviewGap}` : "";
+  if (tier?.tier === "passed-own-checks") return `passed own checks (${tier.worker || "the worker model"}), not verified${gap}`;
   if (outcome === "verified" && tier?.tier === "verified") {
-    if (tier.basis === "person") return "verified (your checks)";
-    if (tier.basis === "independent") return `verified (independent checks: ${(tier.by ?? []).join(", ") || "another model"})`;
+    if (tier.basis === "person") return `verified (your checks)${gap}`;
+    if (tier.basis === "independent") return `verified (independent checks: ${(tier.by ?? []).join(", ") || "another model"})${gap}`;
   }
   return outcome;
+}
+
+/** The parts of a job_end event the verdict words are made from. */
+export type JobEndWords = {
+  outcome?: unknown;
+  tier?: unknown;
+  tierReason?: unknown;
+  claim?: unknown;
+  revealed?: unknown;
+  review?: { confirmed?: boolean } | null;
+  unreviewed?: unknown;
+  selfChecked?: unknown;
+  checksDisagree?: unknown;
+};
+
+/**
+ * How a job ended, in the words the terminal and the window both print.
+ *
+ * Order matters: a review that contradicted the task, or one that was asked
+ * for and did not run, qualifies every "verified", including one that carries
+ * a claim. In review-advisory mode the tier stays verified with a review note,
+ * and a claim branch tested first used to print "verified (independent checks:
+ * j)" with no qualifier. The qualifier is now in the claim itself (claimLabel's
+ * `reviewGap`); a claim from a build that did not put it there gets it added.
+ */
+export function jobEndWords(ev: JobEndWords): string {
+  const claim = typeof ev.claim === "string" && ev.claim ? ev.claim : undefined;
+  const verified = ev.outcome === "verified";
+  const contradicted = verified && !!ev.review && ev.review.confirmed === false;
+  const unreviewed = verified && !ev.review && !!ev.unreviewed;
+  if (ev.tier === "passed-checks") return passedChecksWords(typeof ev.tierReason === "string" ? ev.tierReason : undefined);
+  if (ev.tier === "passed-own-checks" && claim) return claim;
+  if (verified && Array.isArray(ev.revealed) && ev.revealed.length) return "verified (checks shown after a repeat failure)";
+  if (verified && claim) {
+    if (contradicted) return /, unconfirmed$/.test(claim) ? claim : `${claim}, unconfirmed`;
+    if (unreviewed) return /, unreviewed$/.test(claim) ? claim : `${claim}, unreviewed`;
+    return `${claim}${ev.review?.confirmed ? ", independently reviewed" : ""}`;
+  }
+  if (contradicted) return "passed its checks, unconfirmed";
+  if (verified && ev.review?.confirmed) return "verified, independently reviewed";
+  if (unreviewed) return "passed its checks, unreviewed";
+  if (verified && ev.selfChecked) return "passed its own checks";
+  if (ev.outcome === "unverified" && Array.isArray(ev.checksDisagree) && ev.checksDisagree.length) return "unverified, its own drafted checks disagree";
+  return String(ev.outcome);
 }
 
 /**
@@ -236,9 +338,11 @@ export function contradictions(review: { votes: string; violations: unknown[] } 
  * contradiction. (c) — the turn not ended by the clock or the provider — is
  * decided before this, by `passedAtEnd`.
  *
- * A person's check is not Maat's to second-guess: a passing check from the
- * project's done.yml (not hidden), or one a person approved, carries
- * "verified" as it always did.
+ * A person's check is not Maat's to second-guess: a passing command check
+ * from the project's done.yml (not hidden), or one a person approved, carries
+ * "verified". Builtins and `session` checks never do (`personCheck`): they
+ * are in every `maat init` bar, nobody wrote them for this task, and any
+ * worker that changes a file passes them.
  *
  * Never let a model both find and judge: when every passing runs+value check
  * was written by the worker model (no judge, or a judge that is the same
@@ -246,7 +350,7 @@ export function contradictions(review: { votes: string; violations: unknown[] } 
  * A check whose author was never recorded counts as the worker's.
  */
 export function tierOf(args: {
-  results: readonly (Pick<CheckResult, "ok" | "hidden" | "advisory" | "skipped" | "tags"> & { name?: string })[];
+  results: readonly (Pick<CheckResult, "ok" | "hidden" | "advisory" | "skipped" | "tags"> & { name?: string; kind?: CheckResult["kind"] })[];
   review?: { votes: string; violations: unknown[] } | null;
   /** An independent review was asked for and did not run: it cannot have found nothing. */
   unreviewed?: boolean;
@@ -265,8 +369,16 @@ export function tierOf(args: {
   worker?: string | readonly string[];
   /** Who wrote each check, by result name, recorded at seal time. */
   authors?: ReadonlyMap<string, CheckAuthor>;
+  /**
+   * Checks whose `value` tag rests only on a `diff`/`cmp` against an
+   * expected-looking file that was not there before the work, or changed
+   * since (src/golden.ts). Their value tag does not count.
+   */
+  valueUnproven?: ReadonlySet<string>;
 }): TierVerdict {
-  const passing = args.results.filter((r) => r.ok && !r.advisory && !r.skipped);
+  const passing = args.results
+    .filter((r) => r.ok && !r.advisory && !r.skipped)
+    .map((r) => (args.valueUnproven?.has(r.name ?? "") && r.tags?.includes("value") ? { ...r, tags: r.tags.filter((t) => t !== "value") } : r));
   const workerNames = (typeof args.worker === "string" ? [args.worker] : [...(args.worker ?? [])]).filter((w) => w.trim());
   const worker = workerNames[0];
   // A mission's assertions are its contract, written before the work and
@@ -275,7 +387,12 @@ export function tierOf(args: {
   const authorOf = (r: (typeof passing)[number]): CheckAuthor =>
     args.authors?.get(r.name ?? "") ??
     (r.hidden !== true || r.tags?.includes("mission") ? { kind: "person" } : { kind: "worker", ...(worker ? { model: worker } : {}) });
-  const person = passing.some((r) => authorOf(r).kind === "person");
+  // Only a command a person wrote or approved can carry the word for them.
+  // Maat's builtins (work-landed, record-intact, claims-grounded, ...) and the
+  // session checks every `maat init` bar ships say the turn was well-formed,
+  // never that the task is right: nobody wrote them for this task, and a
+  // worker that changes any file passes them.
+  const person = passing.some((r) => personCheck(r) && authorOf(r).kind === "person");
   const drafted = passing.filter((r) => r.hidden === true && r.tags?.includes("task") && authorOf(r).kind !== "person");
   const strongAll = drafted.filter(
     (r) => !r.tags?.includes("surface") && r.tags?.includes("value") && !(args.reviewAdvisory && args.guards?.has(r.name ?? "")),
@@ -299,8 +416,9 @@ export function tierOf(args: {
   if (args.reviewAdvisory) {
     const n = contradictions(args.review);
     const reviewNote = n > 0 ? `advisory: the independent review found ${args.review!.votes} contradicting the task` : args.unreviewed ? "advisory: the independent review did not run" : undefined;
-    if (earned) return { tier: "verified", evidence, ...who, ...(reviewNote ? { reviewNote } : {}) };
-    if (strong) return { tier: "passed-own-checks", evidence, ...who, reason: ownReason, ...(reviewNote ? { reviewNote } : {}) };
+    const gap: Pick<TierVerdict, "reviewGap"> = n > 0 ? { reviewGap: "unconfirmed" } : args.unreviewed ? { reviewGap: "unreviewed" } : {};
+    if (earned) return { tier: "verified", evidence, ...who, ...(reviewNote ? { reviewNote } : {}), ...gap };
+    if (strong) return { tier: "passed-own-checks", evidence, ...who, reason: ownReason, ...(reviewNote ? { reviewNote } : {}), ...gap };
     return {
       tier: "passed-checks",
       evidence,
