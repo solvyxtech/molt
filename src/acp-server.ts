@@ -896,6 +896,7 @@ export class AcpServer {
     let truncated = false;
     let lastError: string | undefined;
     let spend: Spend | undefined;
+    let judge: import("./judge-meter.js").JudgeSpend | undefined;
     let exhaustedSeen = false;
     /** A message ended; the next text starts a new paragraph. */
     let paragraph = false;
@@ -1133,6 +1134,7 @@ export class AcpServer {
         case "job_end":
           record.outcome = ev.outcome;
           spend = ev.spend;
+          judge = ev.judge;
           break;
         default:
           break;
@@ -1199,6 +1201,8 @@ export class AcpServer {
               }
             : {}),
           ...(spend?.costUsd !== undefined ? { costUsd: spend.costUsd, costEstimated: spend.estimated } : {}),
+          // The judge's spend, apart from the worker's `usage` (judge-meter.ts).
+          ...(judge ? { judge } : {}),
         },
       },
     };

@@ -25,6 +25,7 @@ import { describeStart, listBackground, startBackground, stopBackground } from "
 import { objectionLine, readsTheWork, reviewClaim, type ExecutableReview, type ObjectionRun, type Review } from "./review.js";
 import { credentialFreeEnv } from "./credenv.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
+import { JudgeMeter, judgeTokens, type JudgeSpend } from "./judge-meter.js";
 import { auditClaim, authorKey, authorWords, claimLabel, contradictions, independentOf, tierOf, withAuthor, type Tier } from "./tiers.js";
 import { recordGoldens, valueUnproven } from "./golden.js";
 import { discountedChecks } from "./control.js";
@@ -2415,6 +2416,31 @@ export class Engine {
   get askLatency(): LatencyLearner | undefined {
     return isSelfHosted(this.cfg.baseUrl) ? undefined : this.latency;
   }
+  /**
+   * The judge's meter (src/judge-meter.ts): every ask made around the work —
+   * drafting, the critic, the reference check, the review, the post-work
+   * audit, the arbiter — with its tokens and price, kept apart from the
+   * worker's. A judge that is the worker's own model is priced as the worker is.
+   */
+  readonly judgeMeter: JudgeMeter = new JudgeMeter(() => ({
+    baseUrl: this.cfg.baseUrl,
+    model: this.cfg.model,
+    pricing:
+      this.cfg.priceInPerMtok !== undefined && this.cfg.priceOutPerMtok !== undefined
+        ? {
+            in: this.cfg.priceInPerMtok,
+            out: this.cfg.priceOutPerMtok,
+            ...(this.cfg.priceCachedInPerMtok !== undefined ? { cached: this.cfg.priceCachedInPerMtok } : {}),
+            source: this.cfg.priceSource ?? "the worker's prices",
+          }
+        : null,
+  }));
+  /**
+   * Judge calls before this mark were reported in an earlier job_end. A job
+   * reports every call since the last one, so the drafting that runs before a
+   * turn starts is counted in the turn it was for.
+   */
+  private judgeReported = 0;
   /** Why the independent review was skipped this turn (see reviewSkipReason), if it was. */
   private reviewSkipped: string | undefined;
   /** Hidden checks whose commands were shown to the model this turn. */
@@ -2469,6 +2495,23 @@ export class Engine {
     // Under --worker-user, one line in the journal saying what isolation was
     // actually in effect (src/privsep.ts), e.g.
     // "isolation: worker uid 1001, check uid 1002, pid namespace on".
+    // Every judge call, as it returns: what it used and what it cost, beside
+    // the worker's `response` entries (judge-meter.ts).
+    this.judgeMeter.onRecord((c) => {
+      this.cfg.journal?.append("judge_usage", {
+        model: c.model,
+        ...(c.what ? { what: c.what } : {}),
+        promptTokens: c.promptTokens,
+        completionTokens: c.completionTokens,
+        ...(c.cacheReadTokens !== undefined ? { cacheReadTokens: c.cacheReadTokens } : {}),
+        ...(c.cacheWriteTokens !== undefined ? { cacheWriteTokens: c.cacheWriteTokens } : {}),
+        // null is "no price known", never 0.
+        costUsd: c.costUsd ?? null,
+        billed: typeof c.billedUsd === "number",
+        estimated: c.estimated,
+        ...(c.plan ? { plan: c.plan } : {}),
+      });
+    });
     const isolation = isolationLine();
     if (isolation && cfg.journal && !isolationNoted.has(cfg.journal)) {
       isolationNoted.add(cfg.journal);
@@ -3187,6 +3230,7 @@ export class Engine {
       costUsd: this.costUsd(),
       costEstimated: this.costEstimated,
       budgetTokens: this.budgetTokens,
+      ...(this.judgeMeter.mark() ? { judge: this.judgeMeter.total() } : {}),
     };
   }
 
@@ -3501,8 +3545,35 @@ export class Engine {
     return existsSync(p) ? readFileSync(p, "utf8") : undefined;
   }
 
+  /**
+   * A budget counts everything spent: the worker's tokens and the judge's.
+   * The judge's asks are not the worker's requests (the step lines and
+   * sessionTokens stay the worker's), but they are billed all the same.
+   */
   private overBudget(): boolean {
-    return this.budgetTokens !== undefined && this.sessionTokens >= this.budgetTokens;
+    return this.budgetTokens !== undefined && this.spentTokens >= this.budgetTokens;
+  }
+
+  /** Worker and judge tokens together: what a token budget counts. */
+  get spentTokens(): number {
+    return this.sessionTokens + judgeTokens(this.judgeMeter.total());
+  }
+
+  /**
+   * Worker and judge USD together: what a money budget counts. Undefined when
+   * the worker has no price. A judge with no price adds nothing here (its
+   * tokens still count toward a token budget, and every surface says its $ is
+   * unknown); a judge on a subscription plan costs no money.
+   */
+  totalCostUsd(): number | undefined {
+    const worker = this.costUsd();
+    if (worker === undefined) return undefined;
+    return worker + (this.judgeMeter.total().costUsd ?? 0);
+  }
+
+  /** The whole session's judge spend (judge-meter.ts). */
+  judgeSpend(): JudgeSpend {
+    return this.judgeMeter.total();
   }
 
   /**
@@ -4109,6 +4180,7 @@ export class Engine {
         fetchFn: this.cfg.fetchFn,
         acpSpawn: this.cfg.acpSpawn,
         reasoningEffort: judgeEffort(this.cfg.reasoningEffort),
+        meter: this.judgeMeter,
         deadlineAt,
         signal: this.running.signal,
         // Masked like every hidden check while it runs, released below.
@@ -4561,6 +4633,7 @@ export class Engine {
         provider: this.provider,
         sessionTokens: this.sessionTokens,
         shedBatches: this.transcript.shedCount,
+        ...(this.judgeMeter.mark() ? { judge: this.judgeMeter.total() } : {}),
         ...(endedBy ? { endedBy } : {}),
       });
       log?.append("receipt", { verdict: "exhausted", file: receipt.path, attempt: attempts });
@@ -5001,6 +5074,7 @@ export class Engine {
           reasoningEffort: judgeEffort(this.cfg.review.reasoningEffort ?? this.cfg.reasoningEffort),
           fetchFn: this.cfg.fetchFn,
           acpSpawn: this.cfg.acpSpawn,
+          meter: this.judgeMeter,
           // Never longer than the turn has left: a review that outlives the clock ends it without a verdict.
           ...(this.timeLeftMs() !== undefined ? { timeoutMs: Math.max(1_000, this.timeLeftMs()!) } : {}),
           // And every retry and pause inside it, not just one ask.
@@ -5135,11 +5209,18 @@ export class Engine {
         this.cfg.journal?.append("note", { text: "tier: verified-audit", claim, by: [audit.judge], accepted: audit.accepted.map((n) => `audit:${n}`) });
       }
     }
+    // The judge's calls since the last job reported, the drafting before this
+    // turn included; and the receipt's row brought up to date with them, since
+    // the review and the audit run after the receipt was written.
+    const judge = this.judgeMeter.since(this.judgeReported);
+    this.judgeReported = this.judgeMeter.mark();
+    if (receiptPath && judge.calls) this.cfg.receipts?.amendJudge(basename(receiptPath), this.judgeMeter.total());
     yield {
       kind: "job_end",
       job,
       steps,
       spend: this.spendSince(before),
+      ...(judge.calls ? { judge } : {}),
       durationMs: Date.now() - startedAt,
       outcome,
       ...(tier ? { tier, ...(tierReason ? { tierReason } : {}) } : {}),
@@ -6449,6 +6530,7 @@ export class Engine {
             claim, result, attempt: proofAttempts, verdict, head,
             model: self.modelOfRecord(), provider: self.provider, sessionTokens: self.sessionTokens,
             session: self.cfg.journal?.sessionId, costUsd: self.costUsd(), costEstimated: self.costEstimated,
+            ...(self.judgeMeter.mark() ? { judge: self.judgeMeter.total() } : {}),
             shedBatches: self.transcript.shedCount, endedBy: why,
             changed: self.turnLedger().map((e) => ({
               path: e.path, before: e.before, after: e.after,
@@ -6495,8 +6577,9 @@ export class Engine {
       }
     }
 
-    const turnStartTokens = this.sessionTokens;
-    const turnStartCost = this.costUsd();
+    // Both ceilings count the judge's spend too (overBudget).
+    const turnStartTokens = this.spentTokens;
+    const turnStartCost = this.totalCostUsd();
     let warned = 0;
     // The step guard is the last way out of a turn, and it had the same fault
     // the spending ceiling had: it stopped dead. A reported run reached it with
@@ -6611,7 +6694,10 @@ export class Engine {
       if (this.overBudget()) {
         yield {
           kind: "error",
-          text: `budget hit (${this.budgetTokens} tokens) — loop stopped. /budget to raise.`,
+          text:
+            `budget hit (${this.budgetTokens} tokens` +
+            (this.spentTokens > this.sessionTokens ? `, ${this.spentTokens - this.sessionTokens} of them the judge's` : "") +
+            `) — loop stopped. /budget to raise.`,
           ceiling: "budget",
         };
         yield* this.salvage(`You have reached the token budget for this session.`, fetchFn, log);
@@ -6622,9 +6708,9 @@ export class Engine {
       // before the request rather than after, so the limit is what molt
       // refuses to spend rather than what it noticed spending.
       // Money where a price is known, tokens only where it is not.
-      const spentThisTurn = this.sessionTokens - turnStartTokens;
+      const spentThisTurn = this.spentTokens - turnStartTokens;
       const usdThisTurn =
-        turnStartCost === undefined ? undefined : (this.costUsd() ?? 0) - turnStartCost;
+        turnStartCost === undefined ? undefined : (this.totalCostUsd() ?? 0) - turnStartCost;
       // Zero unless someone set one. The self-hosted exception that used to
       // live here — no default ceiling on hardware you own — is gone with the
       // default itself: there is nothing left to make an exception to.
@@ -8175,6 +8261,7 @@ export class Engine {
               reasoningEffort: this.cfg.review?.reasoningEffort ?? this.cfg.reasoningEffort,
               fetchFn: this.cfg.fetchFn,
               acpSpawn: this.cfg.acpSpawn,
+              meter: this.judgeMeter,
               deadlineAt: this.deadlineAt(),
             },
           }).catch(() => null);
@@ -8448,6 +8535,7 @@ export class Engine {
           session: this.cfg.journal?.sessionId,
           costUsd: this.costUsd(),
           costEstimated: this.costEstimated,
+          ...(this.judgeMeter.mark() ? { judge: this.judgeMeter.total() } : {}),
           shedBatches: this.transcript.shedCount,
           // A question the bar could not refuse is recorded as one, so stats
           // never count an answer as a verified change.
@@ -8510,6 +8598,7 @@ export class Engine {
             reasoningEffort: judgeEffort(this.cfg.review.reasoningEffort ?? this.cfg.reasoningEffort),
             fetchFn: this.cfg.fetchFn,
             acpSpawn: this.cfg.acpSpawn,
+            meter: this.judgeMeter,
             ...(this.timeLeftMs() !== undefined ? { timeoutMs: Math.max(1_000, this.timeLeftMs()!) } : {}),
             deadlineAt: this.deadlineAt(),
           },

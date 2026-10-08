@@ -623,6 +623,8 @@ export async function postWorkAudit(opts: {
   fetchFn?: typeof fetch;
   acpSpawn?: AskOptions["acpSpawn"];
   cliRun?: AskOptions["cliRun"];
+  /** Where each ask reports its tokens (the judge's meter). */
+  meter?: AskOptions["meter"];
   reasoningEffort?: string;
   askTimeoutMs?: number;
   deadlineAt?: number;
@@ -656,6 +658,7 @@ export async function postWorkAudit(opts: {
         fetchFn: opts.fetchFn,
         acpSpawn: opts.acpSpawn,
         cliRun: opts.cliRun,
+        meter: opts.meter,
         reasoningEffort: opts.reasoningEffort,
         timeoutMs: opts.askTimeoutMs,
         deadlineAt: opts.deadlineAt,

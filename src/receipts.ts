@@ -17,6 +17,8 @@ import { stateDir } from "./statedir.js";
 import { WITHHELD, maskDeep, maskText } from "./withhold.js";
 import type { Objection } from "./review.js";
 import { isolationLine } from "./privsep.js";
+import type { JudgeSpend } from "./judge-meter.js";
+import { judgeSpendLine } from "./format.js";
 
 
 /**
@@ -110,6 +112,13 @@ export type ReceiptRecord = {
    * written (`amendReview`), like the tier.
    */
   objections?: Objection[];
+  /**
+   * The judge's session spend, apart from the worker's `costUsd`
+   * (src/judge-meter.ts). Written with the receipt, then brought up to date at
+   * the end of the job (`amendJudge`), because the review and the post-work
+   * audit run after the receipt is written. `costUsd` absent means unknown.
+   */
+  judge?: JudgeSpend;
 };
 
 /** What `repair()` changed, and what it left alone. */
@@ -389,6 +398,8 @@ export class Receipts {
     costUsd?: number;
     /** True when that figure rests on molt's own token estimate. */
     costEstimated?: boolean;
+    /** The judge's session spend so far, apart from the worker's (judge-meter.ts). */
+    judge?: JudgeSpend;
     /** The tier the passing checks earned, before any independent review (src/tiers.ts). */
     tier?: { tier: Tier; reason?: string; evidence: string; basis?: "person" | "independent" | "own"; by?: string[]; worker?: string };
     /**
@@ -731,7 +742,10 @@ export class Receipts {
       `- session tokens: ${args.sessionTokens}`,
       ...(args.costUsd === undefined
         ? []
-        : [`- session cost: ${args.costEstimated ? "~" : ""}$${args.costUsd.toFixed(4)}`]),
+        : [`- session cost: ${args.costEstimated ? "~" : ""}$${args.costUsd.toFixed(4)}${args.judge ? " (worker)" : ""}`]),
+      // The judge's spend so far, on its own line: the review and the audit
+      // that follow this claim are added to the index row when the job ends.
+      ...(args.judge ? [`- ${judgeSpendLine(args.judge, (usd) => `$${usd.toFixed(4)}`)} so far`] : []),
       `- shed batches archived: ${args.shedBatches}`,
       `- bar duration: ${args.result.durationMs}ms`,
       "",
@@ -775,6 +789,7 @@ export class Receipts {
       ...(args.session ? { session: args.session } : {}),
       ...(args.costUsd === undefined ? {} : { costUsd: args.costUsd }),
       ...(args.costEstimated ? { costEstimated: true } : {}),
+      ...(args.judge ? { judge: args.judge } : {}),
       ...(args.ask ? { ask: true } : {}),
       ...(args.revealed?.length ? { revealed: [...args.revealed] } : {}),
       ...(args.endedBy ? { endedBy: args.endedBy } : {}),
@@ -847,7 +862,16 @@ export class Receipts {
    * other write while hidden commands are withheld. The receipt file itself,
    * hash-bound when it was written, is never rewritten.
    */
-  amendReview(file: string, objections: readonly Objection[]): boolean {
+  /**
+   * Bring a row's judge spend up to date at the end of its job: the review and
+   * the post-work audit ask the judge after the receipt is written.
+   */
+  amendJudge(file: string, judge: JudgeSpend): boolean {
+    return this.amendRow(file, (r) => ({ ...r, judge }));
+  }
+
+  /** Rewrite one index row, by receipt file name. False when there is none. */
+  private amendRow(file: string, change: (r: ReceiptRecord) => ReceiptRecord): boolean {
     try {
       if (!existsSync(this.indexPath)) return false;
       let hit = false;
@@ -859,7 +883,7 @@ export class Receipts {
             const r = JSON.parse(l) as ReceiptRecord;
             if (r.file !== file) return l;
             hit = true;
-            return redact(JSON.stringify({ ...r, objections: maskDeep([...objections], this.withheld) }), this.secrets);
+            return redact(JSON.stringify(change(r)), this.secrets);
           } catch {
             return l;
           }
@@ -870,6 +894,11 @@ export class Receipts {
       return false;
     }
   }
+
+  amendReview(file: string, objections: readonly Objection[]): boolean {
+    return this.amendRow(file, (r) => ({ ...r, objections: maskDeep([...objections], this.withheld) }));
+  }
+
 
   /**
    * Reconcile the index against the files on disk.

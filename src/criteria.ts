@@ -793,6 +793,7 @@ async function edgeProbes(opts: Parameters<typeof draftCriteria>[0], view: strin
     deadlineAt: opts.deadlineAt,
     reasoningEffort: opts.reasoningEffort,
     latency: opts.latency,
+    meter: opts.meter,
   }).catch(() => null);
   if (!asked?.ok) return "";
   let probes: { input?: unknown; readingA?: unknown; outputA?: unknown; readingB?: unknown; outputB?: unknown; quote?: unknown }[] = [];
@@ -838,6 +839,8 @@ export async function draftCriteria(opts: {
   reasoningEffort?: string;
   /** Learns from completed asks (AskOptions.latency). */
   latency?: AskOptions["latency"];
+  /** Where each ask reports its tokens (AskOptions.meter; the judge's meter). */
+  meter?: AskOptions["meter"];
   /** What is installed, so a check never calls a command that is not (see commandsHere). */
   commands?: { present: string[]; missing: string[] };
   /**
@@ -904,6 +907,7 @@ export async function draftCriteria(opts: {
     deadlineAt: opts.deadlineAt,
     reasoningEffort: opts.reasoningEffort,
     latency: opts.latency,
+    meter: opts.meter,
   });
   if (!asked.ok) return asked;
   const first = drafted(asked.text, asked.cutOff);
@@ -925,6 +929,7 @@ export async function draftCriteria(opts: {
     deadlineAt: opts.deadlineAt,
     reasoningEffort: opts.reasoningEffort,
     latency: opts.latency,
+    meter: opts.meter,
   });
   if (!again.ok) return first;
   const second = drafted(again.text, again.cutOff);
@@ -950,6 +955,7 @@ export async function draftCriteria(opts: {
         deadlineAt: opts.deadlineAt,
       reasoningEffort: opts.reasoningEffort,
       latency: opts.latency,
+      meter: opts.meter,
     });
     if (!more.ok) break;
     const d = drafted(more.text, more.cutOff);
@@ -1345,6 +1351,7 @@ async function critiqued(
         deadlineAt: opts.deadlineAt,
       reasoningEffort: opts.reasoningEffort,
       latency: opts.latency,
+      meter: opts.meter,
     });
     return asked.ok ? applyCritique(d, asked.text, opts.task) : null;
   };

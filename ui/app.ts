@@ -15,7 +15,7 @@
 import { renderMarkdown } from "./markdown.js";
 import { nextWaitWord } from "./wait-words.js";
 import { playMaatSplash } from "./maat-splash.js";
-import { fmtCost, spendLine, stepDid } from "../src/format.js";
+import { fmtCost, judgeSpendLine, spendLine, stepDid } from "../src/format.js";
 import { jobEndWords, type JobEndWords } from "../src/tiers.js";
 import { expandEndpointShorthand, typedEndpointProblem } from "../src/endpoint.js";
 import { matchCommands } from "../src/commands.js";
@@ -1143,7 +1143,9 @@ molt.onEvent((ev) => {
       const said = jobEndWords(ev as JobEndWords);
       say(
         "",
-        `job ${said} · ${ev.steps} step(s) · ${spendLine(ev.spend)} · ${fmtMs(Number(ev.durationMs) || 0)}`,
+        `job ${said} · ${ev.steps} step(s) · ${spendLine(ev.spend)} · ${fmtMs(Number(ev.durationMs) || 0)}` +
+          // The judge's share, apart from the worker's (judge-meter.ts).
+          (ev.judge ? ` · ${judgeSpendLine(ev.judge)}` : ""),
         "step",
       );
       void refreshStats();
