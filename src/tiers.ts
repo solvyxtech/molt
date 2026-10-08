@@ -17,8 +17,8 @@
  */
 import type { CheckAuthor, CheckResult } from "./types.js";
 
-/** An operand that is a literal: a number, a quoted string without a variable in it, a list/dict opener, or a keyword value. */
-const LIT_AFTER = /^(?:\\?["'](?![^"']*\$)[^"']|-?\d|[[{]|(?:True|False|None|true|false|null)\b)/;
+/** An operand that is a literal: a number, a quoted string without a variable in it (or a `$'...'` ANSI-C string), a list/dict opener, or a keyword value. */
+const LIT_AFTER = /^(?:\\?["'](?![^"']*\$)[^"']|\$'[^']|-?\d|[[{]|(?:True|False|None|true|false|null)\b)/;
 /** The operand just before an operator, when it is wholly a literal and not the tail of a name like `x2`. */
 const LIT_BEFORE = /(?:(?<![\w.$)\]])-?\d+(?:\.\d+)?|\\?"[^"$]*\\?"|'[^']*')\s*$/;
 /** A number that stands alone (`42`, `3.5`), not the 3 in `python3` or `x2`. */
@@ -62,6 +62,36 @@ function hasFlag(flags: string[], letters: string): boolean {
  *  4. `grep` with `-q` or `-x` whose pattern is a literal holding a
  *     standalone number, a whole expected line (`-x`), or anchored at both
  *     ends (`^...$`). `grep -q "def main"` does not count.
+ *  5. A behavioural assertion: the deliverable is called or run on literal
+ *     input and the outcome is asserted (`assertsBehaviour`), by
+ *     a. `is None` / `is not None` on a call into the deliverable with a
+ *        literal argument (rule 1 already takes `== None`), or a literal
+ *        `in` / `not in` the result of such a call, under `assert`,
+ *        `sys.exit(0 if ... else 1)` or `if ...: sys.exit(1)`.
+ *     b. a specific exception: `try: f('<literal>')` / `except KeyError:`
+ *        where only the path without the exception exits non-zero, or
+ *        `pytest.raises(E)` / `assertRaises(E, ...)` / `assert.throws(...)`
+ *        around a call with a literal argument. `except Exception` does not
+ *        count, nor a handler that only prints.
+ *     c. `grep` (plain, `-q`, `-x`; never `-v`, `-c`, `-l`) of a literal at
+ *        the end of a pipeline that runs a program (python3, node, bash, sh,
+ *        make, curl, `./tool`, `tool.py`, ...): `python3 slugify.py <<< '!!'
+ *        | grep -q untitled`. A pipeline that only reads a file or git
+ *        (`head -1 out.csv | grep -q id,name`, `git log | grep -q msg`) does
+ *        not count: that is the shape of an output, not its behaviour.
+ *     Structural checks (exists, `isinstance`, `hasattr`, `len(...) > 0`,
+ *     non-empty), the truthiness of an arbitrary call, and timing bounds
+ *     (`time.time() - t < 5`, `timeout 5`) never count. A specific exit code
+ *     with literal stdin already counts through rule 1 (`[ $? -eq 2 ]`).
+ *
+ *     Not widened: a pattern the work wrote, tried on strings the check
+ *     chose (`re.search(p, '10.0.0.1 2024-01-05')`, `p = re.compile(open(
+ *     'regex.txt').read())`). Replayed over 2026-10-07's lanes, every run
+ *     such a check alone would have verified was a regex task, and 4 of 7
+ *     were grader failures: the judges' example lines all missed the case the
+ *     grader tried (`x 1.2.3.4.5 on 2024-01-05`). A command that does this
+ *     gets none of rule 5, and rule 1 reads its `[ ... = ... ]` as before
+ *     (bench/local/value_replay.py).
  * Conservative on purpose: a check missed here costs one claim the word
  * "verified"; a check counted wrongly costs the word its meaning.
  */
@@ -87,14 +117,444 @@ export function goldenOperands(run: string): string[] {
   return out;
 }
 
+// ---------------------------------------------------------------- rule 5: behavioural assertions
+
+/**
+ * The shell nesting depth before each character of `s`: 0 at top level, more
+ * inside quotes, `$(...)`, `(...)` and backticks. A heuristic scanner, not a
+ * shell parser: it only has to tell `a; b` from `"$(x; y)"`.
+ */
+function shellDepths(s: string): number[] {
+  const out: number[] = new Array(s.length);
+  const stack: string[] = [];
+  for (let i = 0; i < s.length; i++) {
+    out[i] = stack.length;
+    const ch = s[i]!;
+    const top = stack[stack.length - 1];
+    if (top === "'") {
+      if (ch === "'") stack.pop();
+      continue;
+    }
+    if (ch === "\\") {
+      if (i + 1 < s.length) out[i + 1] = stack.length;
+      i++;
+      continue;
+    }
+    if (top === "$'") {
+      if (ch === "'") stack.pop();
+      continue;
+    }
+    if (top === '"') {
+      if (ch === '"') stack.pop();
+      else if (ch === "$" && s[i + 1] === "(") (stack.push("("), (out[i + 1] = stack.length - 1), i++);
+      else if (ch === "`") stack.push("`");
+      continue;
+    }
+    if (top === "`" && ch === "`") {
+      stack.pop();
+      continue;
+    }
+    if (ch === "'") stack.push(s[i - 1] === "$" ? "$'" : "'");
+    else if (ch === '"') stack.push('"');
+    else if (ch === "`") stack.push("`");
+    else if (ch === "(") stack.push("(");
+    else if (ch === ")" && top === "(") stack.pop();
+  }
+  return out;
+}
+
+/** Top-level command segments of `s` (split on `;`, newline, `&&`, `||` outside quotes and substitutions), as [start, end). */
+function shellSegments(s: string): [number, number][] {
+  const d = shellDepths(s);
+  const out: [number, number][] = [];
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (d[i] !== 0) continue;
+    const two = s.slice(i, i + 2);
+    const sep = two === "&&" || two === "||" ? 2 : s[i] === ";" || s[i] === "\n" ? 1 : 0;
+    if (!sep) continue;
+    out.push([start, i]);
+    start = i + sep;
+    i += sep - 1;
+  }
+  out.push([start, s.length]);
+  return out;
+}
+
+/** Asks what type or shape a thing has: `type(x).__name__`, `isinstance`, `hasattr`, `callable`. */
+const TYPE_PROBE = /\btype\([^()]*(?:\([^()]*\)[^()]*)*\)\.__name__|\.__class__|\b(?:isinstance|issubclass|hasattr|callable)\(/;
+const BRACKET = /(?:^|\s)(?:\[\[?|test)\s/;
+/** A whole shell word that is a literal: a non-empty quoted string with no expansion in it, `$'...'`, a number, or a keyword value. */
+const SHELL_LITERAL = /^(?:"[^"$`]+"|'[^']+'|\$'(?:[^'\\]|\\.)+'|-?\d+(?:\.\d+)?|true|false|null|True|False|None)$/;
+
+/** The shell word ending just before `at` (or starting just after `at + len`), quotes and substitutions kept whole. */
+function shellWordAround(s: string, d: number[], at: number, len: number): [string, string] {
+  let i = at - 1;
+  while (i >= 0 && /\s/.test(s[i]!) && d[i] === 0) i--;
+  let a = i;
+  while (a >= 0 && !(d[a] === 0 && /\s/.test(s[a]!))) a--;
+  let j = at + len;
+  while (j < s.length && /\s/.test(s[j]!) && d[j] === 0) j++;
+  let b = j;
+  while (b < s.length && !(d[b] === 0 && /\s/.test(s[b]!))) b++;
+  return [s.slice(a + 1, i + 1), s.slice(j, b)];
+}
+
+/** A top-level `=` inside `[ ]`/`[[ ]]`/`test`, with a literal shell word on either side. */
+function bracketLiteral(s: string, at: number): boolean {
+  const d = shellDepths(s);
+  if (d[at] !== 0) return false;
+  const seg = shellSegments(s).find(([a, b]) => a <= at && at <= b);
+  if (!seg || !BRACKET.test(s.slice(seg[0], at))) return false;
+  const [left, right] = shellWordAround(s, d, at, 1);
+  return SHELL_LITERAL.test(left) || SHELL_LITERAL.test(right);
+}
+
+/** The stages of one top-level command split on `|` (never `||`). */
+function pipeStages(cmd: string): string[] {
+  const d = shellDepths(cmd);
+  const out: string[] = [];
+  let start = 0;
+  for (let i = 0; i < cmd.length; i++) {
+    if (d[i] === 0 && cmd[i] === "|" && cmd[i + 1] !== "|" && cmd[i - 1] !== "|" && cmd[i - 1] !== ">") {
+      out.push(cmd.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(cmd.slice(start));
+  return out;
+}
+
+/** The program a pipeline stage runs: leading `!`, `VAR=x`, `timeout 5`, `env`, `time` taken off. */
+function stageProgram(stage: string): string {
+  let t = stage.trim();
+  for (;;) {
+    const n = t.replace(/^(?:!\s*|\w+=\S*\s+|(?:env|time|nice|exec|command)\s+|timeout\s+(?:-\S+\s+)*\S+\s+)/, "");
+    if (n === t) break;
+    t = n;
+  }
+  return t.split(/\s+/)[0] ?? "";
+}
+
+/** A program that runs something: an interpreter, a build tool, a client of a server the work runs, or a script by path. */
+const RUNNER = /^(?:python[\d.]*|node|bash|sh|zsh|dash|ruby|perl|php|deno|bun|npx|npm|make|gmake|java|go|cargo|sqlite3|curl|\.{1,2}\/\S+|\S+\.(?:py|js|mjs|cjs|ts|sh|rb|pl))$/;
+
+/** Rule 5c: `<runs something> | ... | grep [-q] '<literal>'`. */
+function grepsRunOutput(run: string): boolean {
+  for (const [a, b] of shellSegments(run)) {
+    const stages = pipeStages(run.slice(a, b));
+    if (stages.length < 2) continue;
+    const last = stages[stages.length - 1]!.trim();
+    const words: string[] = last.match(/"(?:[^"\\]|\\.)*"|'[^']*'|\S+/g) ?? [];
+    if (!/^[ef]?grep$/.test(words[0] ?? "")) continue;
+    const args = words.slice(1);
+    const flags = args.filter((w) => w.startsWith("-"));
+    if (hasFlag(flags, "vcLl") || flags.some((f) => /^--(?:invert|count|files)/.test(f))) continue;
+    const e = args.indexOf("-e");
+    const pat = e >= 0 ? args[e + 1] : args.find((w) => !w.startsWith("-"));
+    if (!pat || pat.startsWith(">") || pat.startsWith("<")) continue;
+    const body = pat.replace(/^(["'])(.*)\1$/s, "$2");
+    if (/\$[\w{(]/.test(body) || (body.match(/\w/g) ?? []).length < 2) continue;
+    if (stages.slice(0, -1).some((s) => RUNNER.test(stageProgram(s)))) return true;
+  }
+  return false;
+}
+
+/** Python/JS names whose call is never "the deliverable on an input": builtins, the stdlib, string and container methods. */
+const NOT_DELIVERABLE = new Set(
+  (
+    "all any bool list tuple set frozenset dict sorted reversed sum min max next iter zip map filter enumerate range str int float abs round " +
+    "strip lstrip rstrip split rsplit splitlines join replace lower upper casefold startswith endswith find rfind index count get keys values items " +
+    "read readline readlines write encode decode format append extend pop add update copy compile escape print open repr chr ord " +
+    "isinstance issubclass hasattr getattr setattr callable len type id dir vars hash super object exit quit"
+  ).split(" "),
+);
+/** Calls whose contents never count: they ask about a thing's shape, not what the work does. */
+const OPAQUE = /^(?:isinstance|issubclass|hasattr|getattr|callable|len|type|id|dir|vars|open|print|repr|os(?:\.\w+)*|glob(?:\.\w+)*|json\.\w+|csv\.\w+|inspect\.\w+|time\.\w+|shutil\.\w+|subprocess\.\w+|Path|pathlib\.\w+)$/;
+/**
+ * A pattern the work wrote, tried on strings the check chose: `re.search(p, ...)`
+ * or `re.compile(open('regex.txt').read())` with a pattern that is not a literal.
+ * See "Not widened" under assertsValue.
+ */
+const PATTERN_DELIVERABLE = /(?<![\w.])re\.(?:compile|search|match|fullmatch|findall|finditer)\(\s*(?![rbuf]{0,2}\\?["'])/;
+
+/** One balanced span starting at the `(` at `open`; its end index (exclusive), or -1. String-aware for '...' and "...". */
+function closeParen(s: string, open: number): number {
+  let depth = 0;
+  let q: string | undefined;
+  for (let i = open; i < s.length; i++) {
+    const ch = s[i]!;
+    if (q) {
+      if (ch === "\\") i++;
+      else if (ch === q) q = undefined;
+      else if (ch === "\n") return -1;
+      continue;
+    }
+    if (ch === "\\" && (s[i + 1] === '"' || s[i + 1] === "'")) {
+      q = s[i + 1];
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') q = ch;
+    else if (ch === "(" || ch === "[" || ch === "{") depth++;
+    else if (ch === ")" || ch === "]" || ch === "}") {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+/** Split `s` on top-level (outside brackets and strings) matches of `sep`, a sticky (`y`) regex. */
+function splitTop(s: string, sep: RegExp): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let q: string | undefined;
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]!;
+    if (q) {
+      if (ch === "\\") i++;
+      else if (ch === q) q = undefined;
+      continue;
+    }
+    if (ch === "\\" && (s[i + 1] === '"' || s[i + 1] === "'")) {
+      q = s[i + 1];
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') q = ch;
+    else if ("([{".includes(ch)) depth++;
+    else if (")]}".includes(ch)) depth--;
+    else if (depth === 0) {
+      sep.lastIndex = i;
+      const m = sep.exec(s);
+      if (m) {
+        out.push(s.slice(start, i));
+        start = i + m[0].length;
+        i = start - 1;
+      }
+    }
+  }
+  out.push(s.slice(start));
+  return out;
+}
+
+/** A literal argument: a quoted string, a number, or a list/tuple/dict that opens with one. */
+const LITERAL_ARG = /^\s*(?:[rbuf]{0,2}\\?["']|-?\d|[[({]\s*(?:[rbuf]{0,2}\\?["']|-?\d|[[(]))/;
+
+/**
+ * Names bound to literal input in the command: `bad = ['a', 'b']`,
+ * `line = '10.0.0.1 2024-01-05'`, and loop variables over such a name or a
+ * literal (`for s in bad`, `for line, exp in zip(lines, expected)`).
+ */
+function literalNames(run: string): Set<string> {
+  const names = new Set<string>();
+  for (const m of run.matchAll(/(?<![\w.])([A-Za-z_]\w*)\s*(?<![=!<>])=(?!=)\s*/g)) {
+    if (LITERAL_ARG.test(run.slice((m.index ?? 0) + m[0].length, (m.index ?? 0) + m[0].length + 12))) names.add(m[1]!);
+  }
+  for (let pass = 0; pass < 2; pass++) {
+    for (const m of run.matchAll(/\bfor\s+\(?\s*([A-Za-z_][\w\s,]*?)\s*\)?\s+in\s+(?:(?:zip|enumerate|sorted|list)\(\s*)?([A-Za-z_][\w]*|[[({])/g)) {
+      const src = m[2]!;
+      if (/^[[({]$/.test(src) || names.has(src)) for (const v of m[1]!.split(",")) if (v.trim()) names.add(v.trim());
+    }
+  }
+  return names;
+}
+
+/** Is this argument text literal input: a literal, or a name bound to one? */
+function literalInput(arg: string, names: ReadonlySet<string>): boolean {
+  const a = arg.trim().replace(/^[A-Za-z_]\w*\s*=(?!=)\s*/, "");
+  return LITERAL_ARG.test(a) || names.has(a);
+}
+
+/** A call: its name and top-level arguments. */
+type Call = { name: string; args: string[] };
+
+/** The calls in `expr` outside opaque ones (isinstance, len, open, ...), with their top-level arguments. */
+function callsIn(expr: string): Call[] {
+  const out: Call[] = [];
+  const re = /([A-Za-z_][\w.]*)\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(expr))) {
+    const open = m.index + m[0].length - 1;
+    const end = closeParen(expr, open);
+    if (end < 0) continue;
+    const name = m[1]!;
+    if (OPAQUE.test(name)) {
+      re.lastIndex = end;
+      continue;
+    }
+    out.push({ name, args: splitTop(expr.slice(open + 1, end - 1), /,/y) });
+  }
+  return out;
+}
+
+/** A call into the work's code (not a builtin, the stdlib or a string method) handed literal input. */
+function deliverableCall(c: Call, names: ReadonlySet<string>): boolean {
+  const last = c.name.split(".").pop() ?? c.name;
+  if (NOT_DELIVERABLE.has(last) || /^(?:re|json|csv|os|sys|time|math|random|itertools|collections|datetime)\./.test(c.name)) return false;
+  return c.args.some((a) => literalInput(a, names));
+}
+
+const COMPARISON = /==|!=|<=|>=|<|>|\s(?:not\s+)?in\s/y;
+
+/** One `and`-conjunct of an asserted condition: does it assert the work's behaviour on literal input? */
+function conjunctAsserts(raw: string, names: ReadonlySet<string>): boolean {
+  let c = raw.trim();
+  for (;;) {
+    const n = c.replace(/^not\s+/, "").replace(/^\((.*)\)$/s, (all, inner: string) => (closeParen(all, 0) === all.length ? inner : all)).trim();
+    if (n === c) break;
+    c = n;
+  }
+  // `'x' in f('lit')` / `'x' not in f('lit')`: a literal in the work's answer.
+  const member = /^([rbuf]{0,2}\\?["'][^"']*\\?["']|-?\d+)\s+(?:not\s+)?in\s+(.+)$/s.exec(c);
+  if (member) return callsIn(member[2]!).some((k) => deliverableCall(k, names));
+  const none = /\s+is\s+(?:not\s+)?None\s*$/.test(c);
+  const body = c.replace(/\s+is\s+(?:not\s+)?None\s*$/, "");
+  // A comparison with no literal side is rule 1's to refuse (`f(x) == g(x)`), and an ordering is a bound, not a value.
+  if (!none || splitTop(body, COMPARISON).length > 1) return false;
+  return callsIn(body).some((k) => deliverableCall(k, names));
+}
+
+/** The condition text starting at `from`: up to a top-level `,`, `;`, `:`, newline, closing bracket, or `stop`. */
+function conditionAt(s: string, from: number, stop?: RegExp): string {
+  let depth = 0;
+  let q: string | undefined;
+  for (let i = from; i < s.length; i++) {
+    const ch = s[i]!;
+    if (q) {
+      if (ch === "\\") i++;
+      else if (ch === q) q = undefined;
+      else if (ch === "\n") return s.slice(from, i);
+      continue;
+    }
+    if (ch === "\\" && (s[i + 1] === '"' || s[i + 1] === "'")) {
+      q = s[i + 1];
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      // A quote that never closes on this line is the shell's, not Python's: the code ends here.
+      const rest = s.slice(i + 1);
+      const close = rest.search(new RegExp(`(?<!\\\\)${ch}`));
+      const nl = rest.indexOf("\n");
+      if (close < 0 || (nl >= 0 && nl < close)) return s.slice(from, i);
+      q = ch;
+      continue;
+    }
+    if ("([{".includes(ch)) depth++;
+    else if (")]}".includes(ch)) {
+      if (depth === 0) return s.slice(from, i);
+      depth--;
+    } else if (depth === 0 && (ch === "," || ch === ";" || ch === "\n" || ch === ":")) return s.slice(from, i);
+    else if (depth === 0 && stop) {
+      stop.lastIndex = i;
+      if (stop.test(s)) return s.slice(from, i);
+    }
+  }
+  return s.slice(from);
+}
+
+/** Rule 5a: an asserted condition (`assert`, `sys.exit(0 if ... else 1)`, `if ...: sys.exit(1)`) on the work's behaviour. */
+function assertsCondition(run: string, names: ReadonlySet<string>): boolean {
+  const conditions: string[] = [];
+  for (const m of run.matchAll(/(?<![\w.])assert(?:\.ok)?(?=[\s(])\s*/g)) conditions.push(conditionAt(run, (m.index ?? 0) + m[0].length));
+  for (const m of run.matchAll(/(?:(?<![\w.])(?:sys\.)?exit|SystemExit)\(\s*[01]\s+if\s+/g)) conditions.push(conditionAt(run, (m.index ?? 0) + m[0].length, /\s+else\s/y));
+  for (const m of run.matchAll(/(?<![\w.])if\s+/g)) {
+    const at = (m.index ?? 0) + m[0].length;
+    const cond = conditionAt(run, at);
+    if (/^:\s*(?:(?:sys\.)?exit\(\s*[1-9]|raise\s+(?:SystemExit\(\s*[1-9]|AssertionError))/.test(run.slice(at + cond.length))) conditions.push(cond);
+  }
+  return conditions.some((cond) => {
+    // `a or b` asserts neither: one may be the always-true branch.
+    if (splitTop(cond, /\sor\s/y).length > 1) return false;
+    return splitTop(cond, /\sand\s/y).some((c) => conjunctAsserts(c, names));
+  });
+}
+
+/** Exits non-zero: what makes the path that did NOT raise fail the check. */
+const FAIL_EXIT = /(?:(?<![\w.])(?:sys\.)?exit\(\s*(?:[1-9]|True|["'])|SystemExit\(\s*(?:[1-9]|True|["'])|raise\s+AssertionError|(?<![\w.])assert\s+(?:False|0)\b|process\.exit\(\s*[1-9])/;
+
+/** Rule 5b: a specific exception from a call on literal input, where only the raising path passes. */
+function assertsException(run: string, names: ReadonlySet<string>): boolean {
+  const literalCall = (text: string) => callsIn(text).some((k) => deliverableCall(k, names));
+  // pytest.raises(KeyError) / assertRaises(KeyError, f, 'x') / assert.throws(() => f('x'))
+  for (const m of run.matchAll(/(?:pytest\.raises|assertRaises)\(\s*([\w.]+)/g)) {
+    if (/^(?:Base)?Exception$/.test(m[1]!)) continue;
+    const tail = run.slice(m.index ?? 0, (m.index ?? 0) + 300);
+    if (literalCall(tail) || /assertRaises\(\s*[\w.]+\s*,\s*[\w.]+\s*,\s*(?:[rbuf]{0,2}\\?["']|-?\d|[[({])/.test(tail)) return true;
+  }
+  for (const m of run.matchAll(/assert\.(?:throws|rejects)\(/g)) {
+    const open = (m.index ?? 0) + m[0].length - 1;
+    const end = closeParen(run, open);
+    if (end > 0 && literalCall(run.slice(open, end))) return true;
+  }
+  // try: f('x') / except KeyError: ... with a failing exit outside the handler.
+  for (const m of run.matchAll(/(?<![\w.])try\s*:/g)) {
+    const start = (m.index ?? 0) + m[0].length;
+    const ex = /(?<![\w.])except\s+\(?\s*([\w.]+)[^:\n]*:/g;
+    ex.lastIndex = start;
+    const e = ex.exec(run);
+    if (!e || /^(?:Base)?Exception$/.test(e[1]!)) continue;
+    const body = run.slice(start, e.index);
+    const calls = callsIn(body);
+    const hit = calls.findIndex((k) => deliverableCall(k, names));
+    if (hit < 0) continue;
+    // In the try block after the call: reached only when the call did not raise.
+    if (FAIL_EXIT.test(body.slice(body.indexOf(calls[hit]!.name)))) return true;
+    // After the handler: a line indented no deeper than `except` (or an `else:`).
+    const lineStart = run.lastIndexOf("\n", e.index) + 1;
+    const indent = e.index - lineStart;
+    const handlerEnd = run.indexOf("\n", e.index + e[0].length);
+    if (handlerEnd < 0) continue;
+    const handler: string[] = [];
+    let after = "";
+    const lines = run.slice(handlerEnd + 1).split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      const ind = line.length - line.trimStart().length;
+      if (line.trim() && ind <= indent) {
+        after = lines.slice(i).join("\n");
+        break;
+      }
+      handler.push(line);
+    }
+    const handlerText = `${run.slice(e.index + e[0].length, handlerEnd)}\n${handler.join("\n")}`;
+    if (!FAIL_EXIT.test(handlerText) && FAIL_EXIT.test(after.split(/\n\S*(?:except|finally)\b/)[0] ?? "")) return true;
+  }
+  return false;
+}
+
+/**
+ * Rule 5 of assertsValue: the deliverable is called or run on literal input
+ * and the outcome is asserted: `is None`, a literal in its answer, a specific
+ * exception, or a literal grepped from its output. Never for a pattern the
+ * work wrote tried on the check's own strings (PATTERN_DELIVERABLE).
+ * Exported for the tests.
+ */
+export function assertsBehaviour(run: string): boolean {
+  if (PATTERN_DELIVERABLE.test(run)) return false;
+  if (grepsRunOutput(run)) return true;
+  const names = literalNames(run);
+  return assertsCondition(run, names) || assertsException(run, names);
+}
+
 export function assertsValue(run: string, goldenPredates?: (operand: string) => boolean): boolean {
   const ops = /(==|!=|(?<=\s)-eq(?=\s)|(?<=\s)-ne(?=\s)|(?<=\s)=(?=\s))/g;
   for (const m of run.matchAll(ops)) {
     const at = m.index ?? 0;
     if (m[1] === "=") {
-      // A lone `=` is an assignment unless it sits in a test bracket.
+      // A lone `=` is an assignment unless it sits in a test bracket. A `;` or
+      // newline inside `$(python3 -c "a; b")` does not end the bracket's command.
       const segment = run.slice(0, at).split(/[;\n]|&&|\|\|/).pop() ?? "";
-      if (!/(?:^|\s)(?:\[\[?|test)\s/.test(segment)) continue;
+      if (!BRACKET.test(segment)) {
+        // A `;` or newline inside `[ "$(python3 -c "a; b")" = "2" ]` does not end the bracket's
+        // command: read that one shell-aware, its operands as whole shell words.
+        // Not when what is compared is a type probe (`print(type(x).__name__)" = "int"`): that is a shape.
+        if (!PATTERN_DELIVERABLE.test(run) && !TYPE_PROBE.test(run) && bracketLiteral(run, at)) return true;
+        continue;
+      }
     }
     if (literalAround(run, at, m[1]!.length)) return true;
   }
@@ -121,7 +581,7 @@ export function assertsValue(run: string, goldenPredates?: (operand: string) => 
     if (!body || /\$[\w{(]/.test(body)) continue;
     if (STANDALONE_NUMBER.test(body) || /^\^.{3,}\$$/s.test(body) || (hasFlag(flags, "x") && /\S/.test(body))) return true;
   }
-  return false;
+  return assertsBehaviour(run);
 }
 
 /** The tags a drafted check carries: surface from the critic, value from the command. */
