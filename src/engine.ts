@@ -69,7 +69,7 @@ import {
   substanceOf,
   walkAsync,
   isTestPath,
-  removedAssertions,
+  specWeakened,
   snapshotTree,
   type TreeSnapshot,
 } from "./files.js";
@@ -3319,7 +3319,7 @@ export class Engine {
         const after = createHash("sha256").update(content, "utf8").digest("hex");
         const at = isAbsolute(rel) ? relative(this.cwd, abs) : rel;
         if (!isGenerated(at)) {
-          const specGone = isTestPath(at) ? removedAssertions(priorText, content) : [];
+          const specGone = isTestPath(at) ? specWeakened(priorText, content) : [];
           this.ledger.push({
             path: at,
             before,
@@ -3392,7 +3392,7 @@ export class Engine {
         // prove a surgical edit the same way they prove a whole-file rewrite.
         const editedAt = isAbsolute(rel) ? relative(this.cwd, abs) : rel;
         if (!isGenerated(editedAt)) {
-          const specGone = isTestPath(editedAt) ? removedAssertions(current, landed) : [];
+          const specGone = isTestPath(editedAt) ? specWeakened(current, landed) : [];
           this.ledger.push({
             path: editedAt,
             before,

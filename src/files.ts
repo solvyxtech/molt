@@ -428,13 +428,88 @@ export function isCatastrophic(pattern: string): boolean {
 /**
  * A file whose job is to pin behaviour down.
  *
- * Anything under a `test/` or `tests/` directory, or named `*.test.*` /
- * `*.spec.*`. The distinction matters because editing a line of source is
- * ordinary work, and editing the line that says what the source must do is a
- * change to the specification — a different act, needing a different answer.
+ * Anything under a `test/`, `tests/`, `spec/` or `__tests__/` directory, or
+ * named by a test runner's own convention: `*.test.*` / `*.spec.*` (JS),
+ * `test_*.py` / `*_test.py` and pytest's `conftest.py`, `*_test.go`,
+ * `*_spec.rb`, `*Test.java` and its kin. The distinction matters because
+ * editing a line of source is ordinary work, and editing the line that says
+ * what the source must do is a change to the specification — a different
+ * act, needing a different answer. A Python project's `test_count.py` at the
+ * root used to read as source, so a rewritten assertion in it was ordinary
+ * work to `spec-intact`.
  */
 export function isTestPath(path: string): boolean {
-  return /(^|\/)tests?\//.test(path) || /\.(test|spec)\.[cm]?[jt]sx?$/.test(path);
+  return (
+    /(^|\/)(?:tests?|spec|__tests__)\//.test(path) ||
+    /\.(test|spec)\.[cm]?[jt]sx?$/.test(path) ||
+    /(^|\/)(?:test_[^/]+\.py|[^/]+_test\.(?:py|go)|conftest\.py|[^/]+_spec\.rb|[^/]+Tests?\.(?:java|kt|cs|swift))$/.test(path)
+  );
+}
+
+/**
+ * A line that turns a test off: a skip, an expected failure, or a `.only`
+ * that silently drops every test beside it.
+ *
+ * Deleting an assertion is one way to make a specification stop speaking;
+ * leaving it in place and skipping the test around it is the same act with
+ * the text intact, and `spec-intact` compared text. Matched on the trimmed
+ * line, test files only.
+ */
+const SKIP_MARKER = new RegExp(
+  [
+    // Python: unittest and pytest decorators, calls and raises.
+    String.raw`^@(?:unittest\.)?(?:skip|skipIf|skipUnless|expectedFailure)\b`,
+    String.raw`^@(?:pytest\.)?mark\.(?:skip|skipif|xfail)\b`,
+    String.raw`\bpytest\.(?:skip|xfail)\s*\(`,
+    String.raw`\bself\.skipTest\s*\(`,
+    String.raw`\braise\s+(?:unittest\.)?SkipTest\b`,
+    // JS runners: it.skip / test.only / describe.todo, xit, node:test's { skip } / t.skip().
+    String.raw`\b(?:it|test|describe|context|suite|specify)\.(?:skip|only|todo|fixme)\b`,
+    String.raw`^(?:xit|xtest|xdescribe|xcontext|xspecify)\s*\(`,
+    String.raw`[{,]\s*(?:skip|todo)\s*:(?!\s*(?:false|undefined)\b)`,
+    String.raw`\bt\.(?:skip|todo)\s*\(`,
+    // Go, Rust, JUnit, RSpec.
+    String.raw`\bt\.Skip(?:f|Now)?\s*\(`,
+    String.raw`^#\[ignore\b`,
+    String.raw`^@(?:Disabled|Ignore)\b`,
+    String.raw`^(?:skip|pending)(?:\s*\(|\s+["']|$)`,
+  ].join("|"),
+);
+
+/** The lines of a test file that turn a test off (see SKIP_MARKER), normalised. */
+export function skipsIn(text: string): string[] {
+  const out: string[] = [];
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t || (t.startsWith("#") && !t.startsWith("#[")) || t.startsWith("//")) continue;
+    if (SKIP_MARKER.test(t)) out.push(t.replace(/\s+/g, " "));
+  }
+  return out;
+}
+
+/** Skip lines in `after` beyond those `before` already had, counted as a multiset. */
+export function addedSkips(before: string[], after: string[]): string[] {
+  const had = new Map<string, number>();
+  for (const s of before) had.set(s, (had.get(s) ?? 0) + 1);
+  const out: string[] = [];
+  for (const s of after) {
+    const n = had.get(s) ?? 0;
+    if (n > 0) had.set(s, n - 1);
+    else out.push(s);
+  }
+  return out;
+}
+
+/**
+ * Everything a change takes away from a test file's specification: the
+ * assertions it removed (or rewrote — a rewritten assertion is the old one
+ * removed), and the skips it added. Each skip reads as what it is.
+ */
+export function specWeakened(before: string, after: string): string[] {
+  return [
+    ...removedAssertions(before, after),
+    ...addedSkips(skipsIn(before), skipsIn(after)).map((s) => `${s}  (turns a test off)`),
+  ];
 }
 
 /**
@@ -449,7 +524,15 @@ export function assertionsIn(text: string): string[] {
   const out: string[] = [];
   for (const line of text.split("\n")) {
     const t = line.trim();
-    if (!/^(?:await\s+)?(?:assert|expect|chai|should)\b|\bexpect\(|\bassert\(/.test(t)) continue;
+    // `assert x`, `assert.equal(`, `expect(`, and the method forms every
+    // xUnit family uses — `self.assertEqual(`, `assertEquals(`, `assert_eq!(`,
+    // `t.assert.ok(` — which the first rule missed, so a Python test's
+    // `self.assertEqual(out, '3')` could be rewritten into a tautology and
+    // `spec-intact` saw no assertion leave.
+    if (
+      !/^(?:await\s+)?(?:assert|expect|chai|should)\b|\bexpect\(|\bassert\(/.test(t) &&
+      !/^(?:await\s+)?(?:[\w$]+\.)*assert[A-Z_]\w*!?\s*\(/.test(t)
+    ) continue;
     out.push(t.replace(/\s+/g, " "));
   }
   return out;
@@ -505,6 +588,8 @@ export type TreeSnapshot = {
   files: Map<string, string>;
   /** test path -> its assertions, normalised, at snapshot time. */
   assertions: Map<string, string[]>;
+  /** test path -> the lines in it that turn a test off (`skipsIn`), at snapshot time. */
+  skips?: Map<string, string[]>;
   /**
    * test path -> its text at snapshot time, for files under TEST_TEXT_CAP.
    *
@@ -529,6 +614,7 @@ export function snapshotTree(root: string): TreeSnapshot {
     takenAt: Date.now(),
     files: new Map(),
     assertions: new Map(),
+    skips: new Map(),
     testTexts: new Map(),
     truncated: false,
     examined: 0,
@@ -554,6 +640,7 @@ export function snapshotTree(root: string): TreeSnapshot {
       if (isTestPath(e.path) && isText(buf)) {
         const text = buf.toString("utf8");
         out.assertions.set(e.path, assertionsIn(text));
+        out.skips?.set(e.path, skipsIn(text));
         if (buf.length <= TEST_TEXT_CAP) out.testTexts?.set(e.path, text);
       }
     } catch {

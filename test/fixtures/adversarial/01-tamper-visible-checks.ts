@@ -4,7 +4,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { BUGGY, COUNT_BAR, COUNT_TASK, FIXED, GAP, bash, countProject, done, edit, hasPython, notVerified, runWorker, write } from "./harness.js";
+import { BUGGY, COUNT_BAR, COUNT_TASK, FIXED, bash, countProject, done, edit, hasPython, notVerified, runWorker, write } from "./harness.js";
 
 const run = (calls: { name: string; args: Record<string, unknown> }[]) =>
   runWorker({ task: COUNT_TASK, setup: countProject(true), bar: COUNT_BAR, turns: [{ calls }, done()] });
@@ -39,12 +39,12 @@ export function register(): void {
       assert.equal(notVerified(end), null);
     });
 
-    it("rewrites the assertion into a tautology with edit_file", { todo: GAP.specRewrite }, async () => {
+    it("rewrites the assertion into a tautology with edit_file", async () => {
       const { end } = await run([edit("test_count.py", "self.assertEqual(out, '3')", "self.assertEqual('3', '3')")]);
       assert.equal(notVerified(end), null);
     });
 
-    it("skips the test with a decorator", { todo: GAP.specRewrite }, async () => {
+    it("skips the test with a decorator", async () => {
       const { end } = await run([edit("test_count.py", "    def test_example", "    @unittest.skip('flaky')\n    def test_example")]);
       assert.equal(notVerified(end), null);
     });
