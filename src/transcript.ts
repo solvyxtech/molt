@@ -74,6 +74,14 @@ export type ShedPlan = {
   /** Messages being removed from the working context. */
   dropped: Msg[];
   droppedCount: number;
+  /**
+   * Messages from before the cut that stay, verbatim, right after the digest:
+   * the acceptance criteria and the live bar refusal (see planShed). Empty
+   * on a plain cut.
+   */
+  carried: Msg[];
+  /** Where the cut is: everything before it is either dropped or carried. */
+  cutAt: number;
   beforeTokens: number;
   afterTokens: number;
 };
@@ -288,6 +296,8 @@ export class Transcript {
       .filter((i) => i >= 0);
 
     let cutAt: number;
+    /** The cut is on recent messages, not on a user turn. */
+    let recentCut = false;
     if (userIdxs.length > keepExchanges) {
       cutAt = userIdxs[userIdxs.length - keepExchanges];
       // A cut on user turns must buy real headroom. Maat's own notes (the
@@ -299,10 +309,20 @@ export class Transcript {
       // more than the cut freed, the plan came back null on every step, and
       // auto-shed never fired again that turn. Either way, cut on recent
       // messages instead, as a turn with no user turn to cut on does.
+      //
+      // Only for that shape, though: the user turns kept must be mostly
+      // Maat's notes. In an interactive session whose last two real
+      // exchanges hold most of the history, those exchanges are what the
+      // person is working on, and the cut stays on them as it always did.
+      const kept = this.working.slice(cutAt).filter((m) => m.role === "user");
+      const notes = kept.filter(isMaatNote).length;
       const freed = this.working.slice(0, cutAt).reduce((n, m) => n + msgTokens(m), 0);
-      if (freed < this.shedMinFree * this.historyTokens()) {
+      if (notes > kept.length - notes && freed < this.shedMinFree * this.historyTokens()) {
         const fallback = this.findSafeCut(this.working.length - Math.max(2, keepRecent));
-        if (fallback !== null && fallback > cutAt) cutAt = fallback;
+        if (fallback !== null && fallback > cutAt) {
+          cutAt = fallback;
+          recentCut = true;
+        }
       }
     } else {
       // A single request can produce dozens of tool calls with no user turn
@@ -317,12 +337,30 @@ export class Transcript {
       const fallback = this.findSafeCut(this.working.length - Math.max(2, keepRecent));
       if (fallback === null) return null;
       cutAt = fallback;
+      recentCut = true;
     }
 
-    const dropped = this.working.slice(0, cutAt);
-    const kept = this.working.slice(cutAt);
+    // The acceptance criteria and the live bar refusal are what the model
+    // needs most right after a refusal, and a digest caps each message at
+    // EXCERPT_CHARS. A cut on recent messages can land after both, and with
+    // sheds every few steps the refusal's detail would last about three. So
+    // on such a cut the latest of each, when it is before the cut, stays
+    // verbatim. A cut on user turns keeps whole exchanges and is unchanged.
+    const lastIdx = (f: (m: Msg) => boolean) => {
+      for (let i = this.working.length - 1; i >= 0; i--) if (f(this.working[i]!)) return i;
+      return -1;
+    };
+    const carryIdx = new Set(
+      [
+        lastIdx((m) => m.molt?.criteria === true),
+        lastIdx((m) => m.molt?.barFailure === true && !!m.content && !m.content.startsWith(STALE_FAILURE_PREFIX)),
+      ].filter((i) => recentCut && i >= 0 && i < cutAt),
+    );
+    const carried = this.working.slice(0, cutAt).filter((_, i) => carryIdx.has(i));
+    const dropped = this.working.slice(0, cutAt).filter((_, i) => !carryIdx.has(i));
+    const kept = [...carried, ...this.working.slice(cutAt)];
     if (dropped.length < MIN_DROPPED || dropped.every(isDigest)) return null;
-    if (kept.length > 0 && kept[0].role === "tool") return null;
+    if (this.working[cutAt]?.role === "tool") return null;
 
     const beforeTokens = this.historyTokens();
     const digest = buildDigest(dropped);
@@ -342,7 +380,7 @@ export class Transcript {
     // more than the messages it replaces.
     if (afterTokens >= beforeTokens) return null;
 
-    return { exuvia, digest, dropped, droppedCount: dropped.length, beforeTokens, afterTokens };
+    return { exuvia, digest, dropped, droppedCount: dropped.length, carried, cutAt, beforeTokens, afterTokens };
   }
 
   /**
@@ -364,12 +402,11 @@ export class Transcript {
    * has been durably archived — that ordering is the guarantee.
    */
   commitShed(plan: ShedPlan): void {
-    const cut = plan.droppedCount;
-    const dropped = this.working.slice(0, cut);
-    this.archived.push(dropped);
+    this.archived.push(plan.dropped);
     this.working = [
       { role: "system", content: plan.digest, molt: { digest: true } },
-      ...this.working.slice(cut),
+      ...plan.carried,
+      ...this.working.slice(plan.cutAt),
     ];
   }
 
@@ -547,20 +584,32 @@ export class Transcript {
           // with a longer timeout_s, or in the background, is a different
           // call, and the earlier result (a timeout and how to avoid it) is
           // the reason for it.
-          const key = JSON.stringify({ ...args, command: cmd });
+          // Keys sorted: {timeout_s, command} and {command, timeout_s} are one call.
+          const key = JSON.stringify(
+            Object.entries({ ...args, command: cmd }).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+          );
           const now = at >= 0 ? (this.working[at].content ?? "") : "";
           const pointer = now.startsWith(SAME_CALL_PREFIX);
           // A rerun that came back the same is sent as a pointer to the
           // earlier copy, which must then stay. One that came back different
           // makes the earlier output history.
-          const prior = lastRun.get(key);
-          if (prior !== undefined && at >= 0 && !pointer && now !== (this.working[prior]?.content ?? ""))
-            mark(prior, `rerun at step ${i}`);
-          if (!pointer && at >= 0) lastRun.set(key, at);
+          //
+          // A background run is left out: its result names a job that may
+          // still be running, and it is the model's handle for stop_job.
+          // A `commands: [...]` call has no `command` and never gets here, so
+          // it takes no part in rerun supersession either.
+          if (!args.background) {
+            const prior = lastRun.get(key);
+            if (prior !== undefined && at >= 0 && !pointer && now !== (this.working[prior]?.content ?? ""))
+              mark(prior, `rerun at step ${i}`);
+            if (!pointer && at >= 0) lastRun.set(key, at);
+          }
           // A plain read of one file through bash is a read of that file: a
-          // later write makes it stale exactly as it does a read_file.
+          // later write makes it stale exactly as it does a read_file. A
+          // pointer to an earlier copy is not a read: the copy it points at
+          // is the one a write must invalidate.
           const read = SIMPLE_READ.exec(cmd);
-          if (read) noteRead(read[1]!.replace(/^\.\//, ""), `bash:${cmd}`, at);
+          if (read && !pointer) noteRead(read[1]!.replace(/^\.\//, ""), `bash:${cmd}`, at);
           return;
         }
 
@@ -629,6 +678,11 @@ export class Transcript {
     }
     return { elided, tokensSaved, deferred };
   }
+}
+
+/** A user message Maat wrote itself: the criteria, a bar refusal, a nudge. */
+function isMaatNote(m: Msg): boolean {
+  return m.molt?.criteria === true || m.molt?.barFailure === true || m.molt?.nudge === true;
 }
 
 /** What a message costs in the history, in molt's token units. */

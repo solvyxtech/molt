@@ -1,6 +1,6 @@
 /**
- * Two defects found by the lean-sessions study (reports/lean-sessions-study.md),
- * fixed as defaults. Each test is built from the real case.
+ * Two defects found by the lean-sessions study (PR #50), fixed as defaults.
+ * Each test is built from the real case.
  *
  * 1. Shed min-free. Maat's own notes (acceptance criteria, a bar refusal) are
  *    user messages, so the cut on user turns could land near the start of a
@@ -38,12 +38,12 @@ describe("shed min-free (default)", () => {
       t.push({ role: "tool", tool_call_id: "r1", content: firstRead });
       t.push({ role: "assistant", content: "Reading done." });
     }
-    t.push({ role: "user", content: "Acceptance criteria for this task: ..." });
+    t.push({ role: "user", content: "Acceptance criteria for this task: ...", molt: { criteria: true } });
     for (let i = 0; i < 40; i++) {
       t.push({ role: "assistant", content: null, tool_calls: [toolCall("bash", { command: `s${i}` }, `a${i}`)] });
       t.push({ role: "tool", tool_call_id: `a${i}`, content: `${i}:${"o".repeat(3000)}` });
     }
-    t.push({ role: "user", content: "[molt] You indicated the task is complete, but 1 of 3 checks did not pass." });
+    t.pushBarFailure("[molt] You indicated the task is complete, but 1 of 3 checks did not pass.");
     for (let i = 0; i < 40; i++) {
       t.push({ role: "assistant", content: null, tool_calls: [toolCall("bash", { command: `t${i}` }, `b${i}`)] });
       t.push({ role: "tool", tool_call_id: `b${i}`, content: `${i}:${"p".repeat(3000)}` });
@@ -109,6 +109,65 @@ describe("shed min-free (default)", () => {
     const plan = t.planShed()!;
     // Two of four exchanges go: the cut is the user turn, not the recent fallback.
     assert.equal(plan.droppedCount, 22);
+  });
+
+  it("keeps the criteria and the live bar refusal verbatim through a fallback shed (review probe)", () => {
+    const t = new Transcript("SYSTEM");
+    t.push({ role: "user", content: "Fix the duration parser so `1h30m` parses." });
+    t.push({ role: "assistant", content: null, tool_calls: [toolCall("read_file", { path: "dur.py" }, "r0")] });
+    t.push({ role: "tool", tool_call_id: "r0", content: "f".repeat(800) });
+    const criteria = `Acceptance criteria for this task: ${"c".repeat(560)} CRITERIA_END`;
+    t.push({ role: "user", content: criteria, molt: { criteria: true } });
+    for (let i = 0; i < 40; i++) {
+      t.push({ role: "assistant", content: null, tool_calls: [toolCall("bash", { command: `s${i}` }, `a${i}`)] });
+      t.push({ role: "tool", tool_call_id: `a${i}`, content: `${i}:${"o".repeat(3000)}` });
+    }
+    const failure = `[molt] attempt 1 was refused: ${"e".repeat(1150)} FAILURE_END`;
+    t.pushBarFailure(failure);
+    const steps = (from: number, n: number) => {
+      for (let i = from; i < from + n; i++) {
+        t.push({ role: "assistant", content: null, tool_calls: [toolCall("bash", { command: `t${i}` }, `b${i}`)] });
+        t.push({ role: "tool", tool_call_id: `b${i}`, content: `${i}:${"p".repeat(3000)}` });
+      }
+    };
+    steps(0, 4);
+    const plan = t.planShed()!;
+    assert.ok(plan.afterTokens / plan.beforeTokens < 0.5, `${plan.beforeTokens} -> ${plan.afterTokens}`);
+    assert.equal(plan.carried.length, 2);
+    t.commitShed(plan);
+    const onWire = () => t.wire().map((m) => m.content ?? "");
+    assert.ok(onWire().includes(failure), "the refusal's detail was digested");
+    assert.ok(onWire().includes(criteria), "the criteria were digested");
+    // And the next shed, a few steps on, keeps them too.
+    steps(4, 10);
+    const again = t.planShed()!;
+    t.commitShed(again);
+    assert.ok(onWire().includes(failure) && onWire().includes(criteria), "lost on the second shed");
+    // A stale refusal is not carried: the next one replaces it.
+    t.pushBarFailure("[molt] attempt 2 was refused: SECOND");
+    steps(14, 10);
+    t.commitShed(t.planShed()!);
+    assert.ok(!onWire().includes(failure));
+    assert.ok(onWire().some((c) => c.includes("SECOND")) && onWire().includes(criteria));
+  });
+
+  it("an interactive session whose last two exchanges hold most of the history is unchanged", () => {
+    const t = new Transcript("S");
+    for (let k = 0; k < 3; k++) {
+      t.push({ role: "user", content: `ask ${k}` });
+      const n = k === 0 ? 1 : 15;
+      for (let i = 0; i < n; i++) {
+        t.push({ role: "assistant", content: null, tool_calls: [toolCall("bash", { command: `${k}.${i}` }, `c${k}.${i}`)] });
+        t.push({ role: "tool", tool_call_id: `c${k}.${i}`, content: "x".repeat(2000) });
+      }
+    }
+    const plan = t.planShed()!;
+    // The first exchange alone goes, though it frees well under 25%: the
+    // two kept exchanges are the person's, not Maat's notes.
+    assert.ok(plan.beforeTokens - plan.afterTokens < 0.25 * plan.beforeTokens);
+    assert.equal(plan.cutAt, 3);
+    assert.equal(plan.droppedCount, 3);
+    assert.equal(plan.carried.length, 0);
   });
 });
 
@@ -194,5 +253,30 @@ describe("per-call elision (default)", () => {
     } finally {
       ws.cleanup();
     }
+  });
+
+  it("a plain cat whose rerun came back as a pointer is still invalidated by a write", () => {
+    const t = new Transcript("S");
+    step(t, [["bash", { command: "cat dur.py" }, "a", body("DUR_OLD")]]);
+    step(t, [["bash", { command: "cat dur.py" }, "b", "[molt: this is the same bash call you made at step 1, and nothing has changed since.]"]]);
+    step(t, [["write_file", { path: "dur.py", content: "new" }, "w", "wrote"]]);
+    assert.equal(t.elideSupersededReads().elided, 1);
+    assert.ok(!JSON.stringify(t.wire()).includes("DUR_OLD"));
+  });
+
+  it("the rerun key does not depend on argument order", () => {
+    const t = new Transcript("S");
+    t.push({ role: "assistant", content: null, tool_calls: [{ id: "a", type: "function", function: { name: "bash", arguments: '{"timeout_s":600,"command":"make"}' } }] });
+    t.push({ role: "tool", tool_call_id: "a", content: body("1 error") });
+    t.push({ role: "assistant", content: null, tool_calls: [{ id: "b", type: "function", function: { name: "bash", arguments: '{"command":"make","timeout_s":600}' } }] });
+    t.push({ role: "tool", tool_call_id: "b", content: body("built") });
+    assert.equal(t.elideSupersededReads().elided, 1);
+  });
+
+  it("a background rerun is left alone: its result is the handle for the job", () => {
+    const t = new Transcript("S");
+    step(t, [["bash", { command: "npm run dev", background: true }, "a", body("started job 1")]]);
+    step(t, [["bash", { command: "npm run dev", background: true }, "b", body("started job 2")]]);
+    assert.equal(t.elideSupersededReads().elided, 0);
   });
 });
