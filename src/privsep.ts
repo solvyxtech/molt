@@ -90,6 +90,8 @@ export type WorkerFs = {
   exists(abs: string): Promise<boolean>;
   isDir(abs: string): Promise<boolean>;
   sha256(abs: string): Promise<string | null>;
+  /** fileFingerprint (src/files.ts), taken as the worker. */
+  fingerprint(abs: string): Promise<string | null>;
   walk(abs: string, opts: WalkOptions): Promise<WalkResult>;
   grep(abs: string, pattern: string, opts: { glob?: string; ignoreCase?: boolean }): Promise<GrepResult>;
   inspectDir(abs: string, rel: string): Promise<string>;
@@ -1232,6 +1234,9 @@ class FsHelper implements WorkerFs {
   }
   sha256(abs: string) {
     return this.call<string | null>("sha256", abs);
+  }
+  fingerprint(abs: string) {
+    return this.call<string | null>("fingerprint", abs);
   }
   walk(abs: string, opts: WalkOptions) {
     const { skip: _skip, ...plain } = opts;

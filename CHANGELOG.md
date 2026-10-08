@@ -153,9 +153,14 @@
   file changed outside the file tools (a bash `sed -i` or `printf >`, a
   generator, the person's editor) was still answered with the pointer on a
   re-read, so the model was told its stale copy was current. Each read now
-  records the file's size, mtime and, under 1 MB, a content hash; the
-  fingerprint is re-taken before a pointer is sent, and a changed file is
-  returned in full. A deleted file gives its read error, never a pointer.
+  takes the file's size, mtime and, under 1 MB, a content hash, before and
+  after reading it (as the worker, under privilege separation); the pointer
+  is sent only when before, after and the last time it was shown all match,
+  so a write that lands during the read is caught too. A fingerprint that
+  cannot be taken counts as a change. A deleted file gives its read error,
+  never a pointer. At 1 MB and over the check is size and mtime only, so on a
+  filesystem with a coarse mtime (HFS+, FAT, some network mounts) a same-size
+  edit within one tick can still be missed.
 - **A re-read after an edit returns the file, whatever the path's spelling.**
   The engine recorded which lines of a file the model had been shown under the
   path as spelled, so `read_file dur.py`, then `edit_file ./dur.py`, then
@@ -163,8 +168,8 @@
   changed since", while the transcript had already elided the old copy: the
   model held no copy of the file it had just edited. The engine and the
   transcript now key files through one normaliser (`canonPath`), which also
-  treats `sub/../dur.py` and an absolute path inside the workspace as the same
-  file.
+  treats `sub/../dur.py`, an absolute path inside the workspace and, on
+  Windows, `src\dur.py` as the same file.
 - **Anthropic prices are per model version, checked 2026-10-08.** The table
   priced by family: Opus 5.5 was billed at $5 / $25 per MTok instead of
   $4 / $20, Sonnet 5 and 5.5 at $3 / $15 instead of $2 / $10, Opus 4 / 4.1 at
