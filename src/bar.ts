@@ -2208,7 +2208,11 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
     // Not execSync: a bar check is the longest thing molt runs (`npm test`,
     // two minutes by default) and running it synchronously froze the terminal
     // for its whole duration — including the ctrl+C that would have stopped it.
-    const r = await runCommand(check.run, {
+    // A check that names the project by its absolute path reads the copy
+    // too: otherwise `cd /app && git checkout …` reaches past the copy into
+    // the work, and the seal-time try (criteria.ts preflightCriteria), which
+    // points the same path at its own copy, judged a different tree.
+    const r = await runCommand(copy ? copy.map(check.run) : check.run, {
       cwd: copy?.dir ?? ctx.cwd,
       shell: draftedShell(check),
       // Never in argv: a hidden check's text there is readable by every
@@ -2507,6 +2511,7 @@ export function formatBarFailure(result: BarResult, attempt: number, maxAttempts
   if (failed.some((r) => r.hidden)) lines.push(DISPUTE_HINT, "");
   for (const r of failed) {
     lines.push(`--- FAILED: ${r.name} (${r.hidden ? "command withheld" : r.detail})`);
+    if (r.tags?.includes("guard")) lines.push("a guard: this held on the project before the work, and it does not now.");
     if (r.exitCode !== undefined) lines.push(`exit code: ${r.exitCode}`);
     lines.push(r.output.trim() || "(no output)");
     lines.push("");

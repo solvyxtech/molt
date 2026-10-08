@@ -15,7 +15,8 @@ passed-own-checks`, exit 3), never `verified`. Set `MAAT_JUDGE_MODEL` (and
 `MAAT_JUDGE_URL` / `MAAT_JUDGE_KEY`) in the container to another model to make "verified"
 reachable. Drafted checks that pass on the untouched task, or cannot fail
 by construction, are redrafted once and then dropped before they are
-sealed. With `--require-discriminating` (or `MAAT_REQUIRE_DISCRIMINATING=1`)
+sealed; the ones that only passed before the work are kept as refuse-only
+guards (they can fail a run, never verify it). With `--require-discriminating` (or `MAAT_REQUIRE_DISCRIMINATING=1`)
 a run whose independent checks never failed before the work ends
 `passed-untested`, also exit 3. The exit code never fails a trial (see
 below).

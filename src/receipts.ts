@@ -492,7 +492,8 @@ export class Receipts {
         for (const c of task.checks) {
           const name = c.slice(0, c.indexOf(": ") >= 0 ? c.indexOf(": ") : c.length);
           const a = args.authors?.[name] ?? args.authors?.[`task:${name}`];
-          asked.push(`- \`${c}\` — written by ${authorWords(a)}`);
+          const guard = args.result.results.some((r) => (r.name === name || r.name === `task:${name}`) && r.tags?.includes("guard"));
+          asked.push(`- \`${c}\` — written by ${authorWords(a)}${guard ? " · refuse-only guard: it can refuse this claim, never verify it" : ""}`);
         }
         asked.push("");
       }
@@ -656,6 +657,9 @@ export class Receipts {
         `check: ${r.name}`,
         `kind: ${r.kind}`,
         `written by: ${resultAuthorWords(r, args.authors?.[r.name])}`,
+        ...(r.tags?.includes("guard")
+          ? ["role: refuse-only guard (it passed before the work: it can refuse this claim, never count toward verified)"]
+          : []),
         ...(r.beforeWork
           ? [
               `before the work: ${

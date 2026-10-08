@@ -133,8 +133,33 @@ export function readSummary(output: string): RunnerSummary | null {
 const SWALLOW_TAIL = /(?:\|\|\s*(?:true|:|exit\s+0)|;\s*(?:true|:|exit\s+0))\s*$/;
 
 export function swallowsExit(run: string): string | null {
-  const m = SWALLOW_TAIL.exec(run.trim());
-  return m ? m[0].trim() : null;
+  const cmd = run.trim();
+  const m = SWALLOW_TAIL.exec(cmd);
+  if (!m) return null;
+  // `cond && exit 1 || exit 0` is `! cond`: the `exit 1` ends the shell
+  // before the `||` is reached. A redact-secrets check of exactly this shape
+  // was dropped on 2026-10-07 as one that could not fail.
+  const steps = topLevelCommands(cmd);
+  const before = steps.at(-2);
+  if (steps.at(-1)?.op === "||" && before?.op === "&&" && /^exit\s+[1-9]\d*$/.test(before.text)) return null;
+  // `for f in …; do … || exit 1; done; exit 0`: an earlier `exit N` in this
+  // same shell can still end the check non-zero; the tail only names the
+  // success path. Not one inside `( … )`, `$( … )` or a quoted `sh -c`.
+  if (/^;/.test(m[0].trim()) && exitsEarlier(cmd.slice(0, m.index))) return null;
+  return m[0].trim();
+}
+
+/** An `exit N` (N > 0) at the top level of the shell, outside quotes, heredocs and subshells. */
+function exitsEarlier(head: string): boolean {
+  const masked = maskShell(head);
+  let depth = 0;
+  for (let i = 0; i < masked.length; i++) {
+    const c = masked[i]!;
+    if (c === "(") depth++;
+    else if (c === ")") depth = Math.max(0, depth - 1);
+    else if (depth === 0 && c === "e" && /^exit\s+[1-9]/.test(masked.slice(i, i + 8)) && !/[\w$-]/.test(masked[i - 1] ?? "")) return true;
+  }
+  return false;
 }
 
 /** A top-level pipe (`a | b`, not `a || b`), without pipefail in force. */

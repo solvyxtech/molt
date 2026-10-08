@@ -20,6 +20,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { parseArgs } from "../src/cli.js";
 import { diagnoseFailure } from "../src/bar.js";
+import { missingDeliverable } from "../src/criteria.js";
 import { Engine } from "../src/engine.js";
 import { Journal } from "../src/journal.js";
 import { Receipts } from "../src/receipts.js";
@@ -154,16 +155,36 @@ describe("the rule in a turn", () => {
     assert.deepEqual(tried[0]!.data.failed, ["task:greeting"]);
   });
 
-  it("a check that could not run before the work has no pre-work try: not verified, on every platform", async () => {
+  it("a check whose script the work creates failed before the work: it discriminates, on every platform", async () => {
     // Before tool.sh exists, `bash tool.sh` exits 127, and `sh tool.sh` exits 127
-    // where sh is bash (macOS) and 2 where it is dash (Debian, Ubuntu): both are
-    // read as broken, not failing, so neither counts as tried.
-    for (const run of ["bash tool.sh", "sh tool.sh"]) {
-      const { end, receipt } = await turn([check("tool", run)]);
-      assert.deepEqual([end.outcome, end.tier], ["unverified", "passed-untested"], run);
-      assert.match(end.tierReason!, /`task:tool` was not tried before the work began/);
-      assert.match(receipt, /before the work: not tried/);
+    // where sh is bash (macOS) and 2 where it is dash (Debian, Ubuntu). The
+    // shell could not open a project file that is not there yet: that is the
+    // deliverable missing, which is what a check is for, not a check that
+    // cannot run. On 2026-10-07 six `./rotate.sh …` checks were dropped as
+    // "the command was not found" this way.
+    for (const run of ["bash tool.sh", "sh tool.sh", "./tool.sh"]) {
+      const { end, receipt, tried } = await turn([check("tool", run)]);
+      if (run === "./tool.sh") {
+        // The work wrote tool.sh without the execute bit: 126 at the bar.
+        assert.notEqual(end.outcome, "verified", run);
+        continue;
+      }
+      assert.deepEqual([end.outcome, end.tier], ["verified", "verified"], run);
+      assert.match(receipt, /before the work: failed/);
+      assert.deepEqual(tried[0]!.data.failed, ["task:tool"], run);
     }
+  });
+
+  it("a tool the machine lacks is still not tried: only a missing project file counts as failing", async () => {
+    const { receipt, tried } = await turn([check("tool", "no-such-tool-xyz --version")]);
+    assert.deepEqual([tried[0]!.data.failed, tried[0]!.data.passed], [[], []]);
+    assert.match(receipt, /before the work: not tried/);
+    assert.equal(missingDeliverable("bash: line 1: pytest: command not found\n", "/nonexistent"), null);
+    assert.equal(missingDeliverable("sh: 1: rg: not found\n", "/nonexistent"), null);
+    assert.equal(missingDeliverable("bash: line 1: ./rotate.sh: No such file or directory\n", "/nonexistent"), "./rotate.sh");
+    assert.equal(missingDeliverable("sh: 1: ./rotate.sh: not found\n", "/nonexistent"), "./rotate.sh");
+    assert.equal(missingDeliverable("sh: 0: cannot open backup.sh: No such file\n", "/nonexistent"), "backup.sh");
+    assert.equal(missingDeliverable("bash: /opt/x/run.sh: No such file or directory\n", "/nonexistent"), null, "an absolute path is not the project's");
   });
 
   it("dash's missing-script exit reads as bash's", () => {

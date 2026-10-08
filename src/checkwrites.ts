@@ -91,6 +91,20 @@ export function maskQuoted(cmd: string): string {
 function tempVars(cmd: string): Set<string> {
   const out = new Set(["TMPDIR", "TMP", "TEMP", "TEMPDIR"]);
   for (const m of cmd.matchAll(/\b([A-Za-z_]\w*)=["']?(?:\$\(|`)\s*mktemp\b/g)) out.add(m[1]!);
+  // And what is built on one: `f="$d/f $i.log"` names a file in the mktemp
+  // directory, so `echo x > "$f"` writes there. Followed to a fixed point:
+  // `g=$f.bak` is scratch once f is.
+  const assigns = [...cmd.matchAll(/(?<![\w$])([A-Za-z_]\w*)=("(?:\\.|[^"\\])*"|'[^']*'|[^\s;&|()]+)/g)];
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const m of assigns) {
+      if (out.has(m[1]!)) continue;
+      if (isScratchPath(shellWordValue(m[2]!), out)) {
+        out.add(m[1]!);
+        grew = true;
+      }
+    }
+  }
   return out;
 }
 
@@ -253,7 +267,9 @@ export function checkMutates(cmd: string, outer?: { temps: Set<string>; depth: n
       if (!tm) continue;
       const target = seg.raw.slice(start, start + tm[0].length);
       for (let k = r.index ?? 0; k < start + tm[0].length; k++) consumed.add(k);
-      if (!isScratchPath(target, temps) && !inScratch[seg.at + start]) {
+      // `> "$(mktemp -d)/out"`: the segment stops at the `$(`, so read the target from the whole command.
+      const intoTemp = /^["']?(?:\$\(|`)\s*mktemp\b/.test(cmd.slice(seg.at + start));
+      if (!intoTemp && !isScratchPath(target, temps) && !inScratch[seg.at + start]) {
         return `it writes to ${unquote(target)} with a redirect; a check only reads (write to a mktemp directory instead)`;
       }
     }
@@ -344,9 +360,18 @@ export function checkMutates(cmd: string, outer?: { temps: Set<string>; depth: n
       }
       case "touch":
       case "mkdir":
-      case "mkfifo":
-        if (!allScratch(operands)) return `it creates ${quoteOne(operands.find((o) => !scratch(o)))} (\`${name}\`) in the project; a check only reads`;
+      case "mkfifo": {
+        // `touch -d "2020-01-01" f`, `touch -t 2001010000 f`, `touch -r ref f`, `mkdir -m 700 d`:
+        // the option's value is not a file it creates.
+        const valued = name === "touch" ? /^(-[dtr]|--date|--reference)$/ : /^(-m|--mode|-Z|--context)$/;
+        const files: Word[] = [];
+        for (let k = 0; k < args.length; k++) {
+          if (valued.test(args[k]!.text)) k++;
+          else if (!isFlag(args[k]!.text)) files.push(args[k]!);
+        }
+        if (!allScratch(files)) return `it creates ${quoteOne(files.find((o) => !scratch(o)))} (\`${name}\`) in the project; a check only reads`;
         break;
+      }
       case "chmod":
       case "chown":
       case "chgrp":
