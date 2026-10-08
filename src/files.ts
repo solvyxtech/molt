@@ -343,6 +343,33 @@ export function formatListing(
  * identical — would have to be a same-length edit written within the
  * filesystem's timestamp granularity, and molt's own writes always move mtime.
  */
+/** Files under this size are content-hashed by fileFingerprint; larger ones are stat-only. */
+export const FILE_FP_HASH_MAX_BYTES = 1024 * 1024;
+
+/**
+ * One file's fingerprint, for "has it changed since it was shown": size and
+ * mtime, plus a sha256 of the content under FILE_FP_HASH_MAX_BYTES, which
+ * catches a same-size edit inside one mtime tick. At that size and above it
+ * is size and mtime only, so on a filesystem with a coarse mtime (HFS+ 1 s,
+ * FAT 2 s, some network mounts) a same-size edit inside one tick is missed.
+ * Null when it cannot be taken (no such file, not a regular file, no access):
+ * callers treat null as unknown, never as a match.
+ *
+ * Run by Maat on the host and by the worker's fs-helper under privilege
+ * separation, so both take the same fingerprint at the same cost.
+ */
+export function fileFingerprint(abs: string): string | null {
+  try {
+    const st = statSync(abs);
+    if (!st.isFile()) return null;
+    const stamp = `${st.size}:${st.mtimeMs}`;
+    if (st.size >= FILE_FP_HASH_MAX_BYTES) return stamp;
+    return `${stamp}:${createHash("sha256").update(readFileSync(abs)).digest("hex")}`;
+  } catch {
+    return null;
+  }
+}
+
 /** Makes every unreadable-scope signature unique, even within a millisecond. */
 let unreadable = 0;
 

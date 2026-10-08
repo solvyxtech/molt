@@ -19,7 +19,7 @@
  * No filesystem access here — archiving lives in archive.ts so this whole
  * module stays pure and testable.
  */
-import { isAbsolute, posix, relative } from "node:path";
+import * as nodePath from "node:path";
 import { parseLenient } from "./lenient-json.js";
 import { estTokens, type Bom, type Msg } from "./types.js";
 
@@ -34,21 +34,28 @@ const SHOWN_PREFIX = "[molt: you have already been shown";
  * One spelling per file, for every map that is keyed by path: `dur.py`,
  * `./dur.py` and `sub/../dur.py` are one file, and with `root` (the
  * workspace) so is its absolute path. A path outside `root` stays absolute.
- * An empty path stays empty: it names no file.
+ * An empty path stays empty: it names no file. Where the separator is `\`
+ * (Windows), `src\dur.py` and `src/dur.py` are one file too; `path` is the
+ * platform's path module, injectable so that case can be tested anywhere.
  *
  * The engine's read-coverage map and this module's elision have to agree on
  * it. When they did not, an edit of `./dur.py` cleared the wrong key, the
  * transcript elided the old copy, and the re-read was answered "you have
  * already been shown it": the model held no copy of the file it had edited.
  */
-export function canonPath(path: string, root?: string): string {
-  if (!path) return path;
-  let p = path;
-  if (root && isAbsolute(p)) {
-    const rel = relative(root, p);
-    if (rel !== ".." && !rel.startsWith("../") && !isAbsolute(rel)) p = rel || ".";
+export function canonPath(
+  file: string,
+  root?: string,
+  path: Pick<typeof nodePath, "isAbsolute" | "relative" | "sep"> = nodePath,
+): string {
+  if (!file) return file;
+  const slashes = (s: string) => (path.sep === "\\" ? s.replace(/\\/g, "/") : s);
+  let p = file;
+  if (root && path.isAbsolute(p)) {
+    const rel = slashes(path.relative(root, p));
+    if (rel !== ".." && !rel.startsWith("../") && !path.isAbsolute(rel)) p = rel || ".";
   }
-  return posix.normalize(p).replace(/^(?:\.\/)+/, "") || ".";
+  return nodePath.posix.normalize(slashes(p)).replace(/^(?:\.\/)+/, "") || ".";
 }
 
 /**
@@ -120,7 +127,14 @@ export class Transcript {
   /** See SHED_MIN_FREE. 0 restores the plain cut on user turns. */
   shedMinFree = SHED_MIN_FREE;
 
-  constructor(systemPrompt: string) {
+  /**
+   * @param root The workspace, so an absolute path inside it keys the same
+   *   file as its relative spelling, exactly as the engine keys it.
+   */
+  constructor(
+    systemPrompt: string,
+    private readonly root?: string,
+  ) {
     this.system = { role: "system", content: systemPrompt };
   }
 
@@ -633,11 +647,11 @@ export class Transcript {
           // pointer to an earlier copy is not a read: the copy it points at
           // is the one a write must invalidate.
           const read = SIMPLE_READ.exec(cmd);
-          if (read && !pointer) noteRead(canonPath(read[1]!), `bash:${cmd}`, at);
+          if (read && !pointer) noteRead(canonPath(read[1]!, this.root), `bash:${cmd}`, at);
           return;
         }
 
-        const path = canonPath(String(args.path ?? ""));
+        const path = canonPath(String(args.path ?? ""), this.root);
         if (!path) return;
 
         if (call.function.name === "read_file") {

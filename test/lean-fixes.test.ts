@@ -13,10 +13,13 @@
  *    marker saying the current copy was further down. It was not.
  */
 import assert from "node:assert/strict";
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { join, win32 } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import { Engine } from "../src/engine.js";
+import { FILE_FP_HASH_MAX_BYTES, fileFingerprint } from "../src/files.js";
 import { ELIDED_PREFIX, SHED_MIN_FREE, Transcript, canonPath } from "../src/transcript.js";
 import { allowAll, drain, scriptedProvider, toolCall, workspace } from "./helpers.js";
 
@@ -341,6 +344,29 @@ describe("shown map: one spelling per file", () => {
     assert.equal(canonPath(""), "");
   });
 
+  it("canonPath on Windows: backslashes are separators, and ..\\ is outside", () => {
+    assert.equal(canonPath("C:\\ws\\src\\dur.py", "C:\\ws", win32), "src/dur.py");
+    assert.equal(canonPath("src\\dur.py", "C:\\ws", win32), "src/dur.py");
+    assert.equal(canonPath(".\\src\\..\\dur.py", "C:\\ws", win32), "dur.py");
+    assert.equal(canonPath("C:\\ws", "C:\\ws", win32), ".");
+    assert.equal(canonPath("C:\\ws2\\dur.py", "C:\\ws", win32), "C:/ws2/dur.py");
+    assert.equal(canonPath("D:\\ws\\dur.py", "C:\\ws", win32), "D:/ws/dur.py");
+    // relative("C:\\ws\\a", "C:\\ws\\b") is "..\\b": outside, so it stays absolute.
+    assert.equal(canonPath("C:\\ws\\b\\x.py", "C:\\ws\\a", win32), "C:/ws/b/x.py");
+    // On POSIX a backslash is a file-name character, not a separator.
+    assert.equal(canonPath("src\\dur.py", "/ws"), "src\\dur.py");
+  });
+
+  it("the transcript folds an absolute path inside its workspace: read /ws/dur.py, edit dur.py", () => {
+    const t = new Transcript("S", "/ws");
+    t.push({ role: "assistant", content: null, tool_calls: [toolCall("read_file", { path: "/ws/dur.py" }, "a")] });
+    t.push({ role: "tool", tool_call_id: "a", content: `DUR_OLD\n${"x".repeat(2000)}` });
+    t.push({ role: "assistant", content: null, tool_calls: [toolCall("edit_file", { path: "dur.py", old_text: "x", new_text: "y" }, "e")] });
+    t.push({ role: "tool", tool_call_id: "e", content: "edited" });
+    assert.equal(t.elideSupersededReads().elided, 1);
+    assert.ok(!JSON.stringify(t.wire()).includes("DUR_OLD"));
+  });
+
   it("the transcript keys elision the same way: a write to sub/../dur.py elides the read of dur.py", () => {
     const t = new Transcript("S");
     t.push({ role: "assistant", content: null, tool_calls: [toolCall("read_file", { path: "dur.py" }, "a")] });
@@ -348,5 +374,174 @@ describe("shown map: one spelling per file", () => {
     t.push({ role: "assistant", content: null, tool_calls: [toolCall("edit_file", { path: "sub/../dur.py", old_text: "x", new_text: "y" }, "e")] });
     t.push({ role: "tool", tool_call_id: "e", content: "edited" });
     assert.equal(t.elideSupersededReads().elided, 1);
+  });
+});
+
+/**
+ * "You have already been shown … nothing has changed since" was a claim the
+ * engine never checked. A bash `sed -i`, a generator or the person's editor
+ * changes the file behind the file tools' back, and the re-read was still
+ * answered with the pointer. Each entry now carries a fingerprint of the file
+ * (size, mtime, and a hash under 1 MB), re-taken before a pointer is sent.
+ */
+describe("shown map: the pointer is checked against the file", () => {
+  async function reread(change: (dir: string) => object, setup?: (dir: string) => void) {
+    const ws = workspace();
+    try {
+      writeFileSync(join(ws.dir, "x.py"), "value = 1  # OLD_MARK\n");
+      setup?.(ws.dir);
+      const p = scriptedProvider([
+        { calls: [{ name: "read_file", args: { path: "x.py" } }] },
+        { calls: [change(ws.dir)] },
+        { calls: [{ name: "read_file", args: { path: "x.py" } }] },
+        { text: "Done." },
+      ] as never);
+      const e = new Engine({ baseUrl: "http://p.test/v1", model: "m", cwd: ws.dir, fetchFn: p.fetchFn, bar: null, stream: false, autonomy: "high", maxSteps: 0 });
+      await drain(e.run("look at x.py", allowAll));
+      const tools = (JSON.parse(p.bodies.at(-1)!) as { messages: { role: string; content: string }[] }).messages.filter((m) => m.role === "tool");
+      return tools.at(-1)!.content;
+    } finally {
+      ws.cleanup();
+    }
+  }
+
+  it("bash sed -i changes the file: the re-read returns the new contents", async () => {
+    const got = await reread(() => ({ name: "bash", args: { command: "sed -i.bak 's/OLD_MARK/NEW_MARK/' x.py" } }));
+    assert.doesNotMatch(got, /already been shown/);
+    assert.match(got, /NEW_MARK/);
+  });
+
+  it("bash printf > x.py changes the file: the re-read returns the new contents", async () => {
+    const got = await reread(() => ({ name: "bash", args: { command: "printf 'value = 2  # NEW_MARK\\n' > x.py" } }));
+    assert.doesNotMatch(got, /already been shown/);
+    assert.match(got, /NEW_MARK/);
+  });
+
+  it("same size, same mtime: the hash catches the change", async () => {
+    // Both versions are the same length and stamped with the same whole-second
+    // mtime, so size and mtime match exactly and only the content differs.
+    const T = 1_700_000_000;
+    const got = await reread(
+      () => ({
+        name: "bash",
+        args: {
+          command:
+            `node -e "const fs=require('fs');fs.writeFileSync('x.py','value = 1  # NEW_MARK\\n');` +
+            `fs.utimesSync('x.py',${T},${T})"`,
+        },
+      }),
+      (dir) => utimesSync(join(dir, "x.py"), T, T),
+    );
+    assert.doesNotMatch(got, /already been shown/);
+    assert.match(got, /NEW_MARK/);
+  });
+
+  it("an unchanged file still gets the pointer", async () => {
+    const got = await reread(() => ({ name: "bash", args: { command: "true" } }));
+    assert.match(got, /already been shown/);
+  });
+
+  it("a deleted file gives an error, not a pointer", async () => {
+    const got = await reread(() => ({ name: "bash", args: { command: "rm x.py" } }));
+    assert.doesNotMatch(got, /already been shown/);
+    assert.match(got, /no such file|ENOENT|not found/i);
+  });
+});
+
+describe("shown map: the fingerprint is taken around the read", () => {
+  async function twoReads(rig: (e: Engine, dir: string) => void) {
+    const ws = workspace();
+    try {
+      writeFileSync(join(ws.dir, "x.py"), "value = 1  # OLD_MARK\n");
+      const p = scriptedProvider([
+        { calls: [{ name: "read_file", args: { path: "x.py" } }] },
+        // A different call over the same lines: only the coverage pointer
+        // ("already been shown") can answer it, not the byte-compared
+        // same-call pointer.
+        { calls: [{ name: "read_file", args: { path: "x.py", limit: 50 } }] },
+        { text: "Done." },
+      ] as never);
+      const e = new Engine({ baseUrl: "http://p.test/v1", model: "m", cwd: ws.dir, fetchFn: p.fetchFn, bar: null, stream: false, autonomy: "high", maxSteps: 0 });
+      rig(e, ws.dir);
+      const events = await drain(e.run("look at x.py", allowAll));
+      const tools = (JSON.parse(p.bodies.at(-1)!) as { messages: { role: string; content: string }[] }).messages.filter((m) => m.role === "tool");
+      return { first: tools.at(-2)!.content, second: tools.at(-1)!.content, events: JSON.stringify(events) };
+    } finally {
+      ws.cleanup();
+    }
+  }
+
+  it("a write that lands right after the read is not recorded as what was shown", async () => {
+    const { first, second } = await twoReads((e, dir) => {
+      const inner = e as unknown as { readText(abs: string): Promise<string> };
+      const orig = inner.readText.bind(e);
+      let once = true;
+      inner.readText = async (abs: string) => {
+        const text = await orig(abs);
+        if (once && abs.endsWith("x.py")) {
+          once = false;
+          writeFileSync(join(dir, "x.py"), "value = 2  # NEW_MARK\n");
+        }
+        return text;
+      };
+    });
+    assert.match(first, /OLD_MARK/);
+    assert.doesNotMatch(second, /already been shown/, "the pointer claimed nothing had changed");
+    assert.match(second, /NEW_MARK/);
+  });
+
+  it("control: the same shape, with nothing changing, gets the pointer", async () => {
+    const { second } = await twoReads(() => {});
+    assert.match(second, /already been shown/);
+  });
+
+  it("an unknown (null) fingerprint never matches: no pointer", async () => {
+    const { second } = await twoReads((e) => {
+      (e as unknown as { fingerprint(abs: string): Promise<string | null> }).fingerprint = async () => null;
+    });
+    assert.doesNotMatch(second, /already been shown/);
+    assert.match(second, /OLD_MARK/);
+  });
+
+  it("a worker whose fingerprint call rejects: the read still succeeds, with no pointer", async () => {
+    const { first, second } = await twoReads((e) => {
+      Object.defineProperty(e, "workerFs", {
+        get: () => ({
+          read: async (abs: string) => readFileSync(abs, "utf8"),
+          fingerprint: async () => {
+            throw new Error("helper died");
+          },
+        }),
+      });
+    });
+    assert.match(first, /OLD_MARK/);
+    assert.match(second, /OLD_MARK/);
+    assert.doesNotMatch(second, /already been shown|helper died|tool error/);
+  });
+
+  it("the worker's fs-helper takes the same fingerprint, and hashes only under the cap", () => {
+    const ws = workspace();
+    try {
+      const small = join(ws.dir, "small.txt");
+      const big = join(ws.dir, "big.txt");
+      writeFileSync(small, "hello\n");
+      writeFileSync(big, Buffer.alloc(FILE_FP_HASH_MAX_BYTES + 1, 97));
+      const helper = fileURLToPath(new URL("../src/fs-helper.js", import.meta.url));
+      const input = [small, big, join(ws.dir, "missing")]
+        .map((f, i) => JSON.stringify({ id: i, op: "fingerprint", args: [f] }))
+        .join("\n");
+      const r = spawnSync(process.execPath, [helper], { input: input + "\n", encoding: "utf8" });
+      const got = new Map(r.stdout.trim().split("\n").map((l) => {
+        const m = JSON.parse(l) as { id: number; value: string | null };
+        return [m.id, m.value] as const;
+      }));
+      assert.equal(got.get(0), fileFingerprint(small));
+      assert.equal(got.get(0)!.split(":").length, 3, "a small file is hashed");
+      assert.equal(got.get(1), fileFingerprint(big));
+      assert.equal(got.get(1)!.split(":").length, 2, "a file over the cap is stat-only");
+      assert.equal(got.get(2), null);
+    } finally {
+      ws.cleanup();
+    }
   });
 });

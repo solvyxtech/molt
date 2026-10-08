@@ -68,6 +68,7 @@ import {
   applyEdit,
   diffSyntaxIn,
   diffSyntaxRefusal,
+  fileFingerprint,
   isPatchPath,
   formatListing,
   formatMatches,
@@ -2036,8 +2037,12 @@ type ToolContext = {
   userText: string;
   confirm: Confirm;
   log?: Journal;
-  /** Line ranges of each file already shown, so a re-read can be named as one. */
-  shown: Map<string, { from: number; to: number }[]>;
+  /**
+   * Line ranges of each file already shown, so a re-read can be named as one,
+   * and the file's fingerprint when they were shown: the pointer says nothing
+   * has changed since, and that is checked, not assumed.
+   */
+  shown: Map<string, { ranges: { from: number; to: number }[]; fp: string | null }>;
   /** The last result of each distinct call, so an identical one can be pointed at. */
   answered: Map<string, { step: number; sha: string }>;
 };
@@ -2477,7 +2482,7 @@ export class Engine {
     this.repoMapText = cfg.repoMap ?? "";
     this.briefText = cfg.brief ?? "";
     for (const p of cfg.readOnly ?? []) this.readOnlyPaths.add(p);
-    this.transcript = new Transcript(this.systemPrompt());
+    this.transcript = new Transcript(this.systemPrompt(), this.cwd);
     this.barHash = barFingerprint(this.cwd);
     // The key molt was handed is the one secret it can mask exactly.
     cfg.journal?.protect(cfg.apiKey, env("API_KEY"));
@@ -2639,7 +2644,7 @@ export class Engine {
   }
 
   reset(): void {
-    this.transcript = new Transcript(this.systemPrompt());
+    this.transcript = new Transcript(this.systemPrompt(), this.cwd);
     this.ledger = [];
     this.archivedWrites = 0;
     this.sessionArchives = new Set();
@@ -3524,6 +3529,22 @@ export class Engine {
   private async fileExists(abs: string): Promise<boolean> {
     const wfs = this.workerFs;
     return wfs ? wfs.exists(abs) : existsSync(abs);
+  }
+
+  /**
+   * fileFingerprint (src/files.ts) of a file, as the file tools see it: under
+   * privilege separation the worker takes it. Never throws: a read that
+   * succeeded must not turn into a failed step because its fingerprint could
+   * not be taken (a dying helper, EACCES, a swap to a directory). Null is
+   * "unknown" and never matches.
+   */
+  private async fingerprint(abs: string): Promise<string | null> {
+    try {
+      const wfs = this.workerFs;
+      return wfs ? await wfs.fingerprint(abs) : fileFingerprint(abs);
+    } catch {
+      return null;
+    }
   }
 
   private async fileSha(abs: string): Promise<string | null> {
@@ -5779,6 +5800,8 @@ export class Engine {
     // tool is not the tool being slow, and folding the two together
     // would make every gated call look like one.
     let durationMs: number | undefined;
+    /** read_file only: the file's fingerprint just before it was read. */
+    let fpBefore: string | null = null;
     if (!allowed) {
       result = outOfTime
         ? `[molt: the time budget for this turn is up — ${name} was not run, and no further ` +
@@ -5796,6 +5819,10 @@ export class Engine {
         id: callId,
         args: redact(capture(call.rawArgs), this.secrets()),
       };
+      // Taken before the read as well as after it: a write that lands
+      // between the read and a fingerprint taken only afterwards would be
+      // recorded as the state of what the model was shown.
+      if (name === "read_file") fpBefore = await this.fingerprint(resolve(this.cwd, String(args.path ?? "")));
       const toolStartedAt = Date.now();
       // Scoped to this one call, so ctrl+C reaches the command that is
       // actually running and nothing that ran before it.
@@ -5843,7 +5870,15 @@ export class Engine {
         // Keyed by the file, not the spelling: an edit of `./dur.py` has to
         // clear what a read of `dur.py` recorded.
         const file = canonPath(path, this.cwd);
-        const covered = ctx.shown.get(file) ?? [];
+        // "Nothing has changed since" is a claim about the file, and bash,
+        // a generator or the person's editor can change it behind the file
+        // tools' back. The file is the same only if it was the same before
+        // this read, after it, and when it was last shown; null is unknown
+        // and never the same. Anything else and what was shown is history.
+        const fpAfter = await this.fingerprint(resolve(this.cwd, path));
+        const fp = fpBefore !== null && fpBefore === fpAfter ? fpBefore : null;
+        const entry = ctx.shown.get(file);
+        const covered = entry && fp !== null && entry.fp === fp ? entry.ranges : [];
         // How much of this window is genuinely new. Containment alone is
         // too strict: a read that overlaps an earlier one by 99% and
         // runs three lines past it is not contained, and a model
@@ -5867,7 +5902,7 @@ export class Engine {
           repeatedHere = true;
         } else {
           covered.push({ from, to });
-          ctx.shown.set(file, covered);
+          ctx.shown.set(file, { ranges: covered, fp });
         }
       }
 
@@ -6194,7 +6229,7 @@ export class Engine {
      * actually matters — "has this already been shown?" — rather than "is this
      * byte-identical to something?".
      */
-    const shown = new Map<string, { from: number; to: number }[]>();
+    const shown: ToolContext["shown"] = new Map();
     /** Consecutive steps in which nothing new came back. */
     let dryStreak = 0;
     /** Consecutive assistant turns that arrived with nothing in them. */

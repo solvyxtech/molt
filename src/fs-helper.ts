@@ -23,7 +23,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { grepFiles, walkAsync, type WalkOptions } from "./files.js";
+import { fileFingerprint, grepFiles, walkAsync, type WalkOptions } from "./files.js";
 import { inspectDir, inspectFile } from "./inspect.js";
 
 type Op = (...args: never[]) => unknown;
@@ -38,6 +38,7 @@ const ops: Record<string, Op> = {
   exists: (p: string) => existsSync(p),
   isDir: (p: string) => statSync(p).isDirectory(),
   sha256: (p: string) => (existsSync(p) ? createHash("sha256").update(readFileSync(p)).digest("hex") : null),
+  fingerprint: (p: string) => fileFingerprint(p),
   walk: (p: string, o: WalkOptions) => walkAsync(p, o),
   grep: (p: string, pattern: string, o: { glob?: string; ignoreCase?: boolean }) => grepFiles(p, pattern, o),
   inspectDir: (p: string, rel: string) => inspectDir(p, rel),
