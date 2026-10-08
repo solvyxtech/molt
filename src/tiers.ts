@@ -423,8 +423,10 @@ export function tierOf(args: {
    */
   valueUnproven?: ReadonlySet<string>;
 }): TierVerdict {
+  // A guard (tag `guard`, criteria.ts guardsFrom) passed before the work by
+  // construction: it can refuse a claim at the bar, never carry the word.
   const passing = args.results
-    .filter((r) => r.ok && !r.advisory && !r.skipped)
+    .filter((r) => r.ok && !r.advisory && !r.skipped && !r.tags?.includes("guard"))
     .map((r) => (args.valueUnproven?.has(r.name ?? "") && r.tags?.includes("value") ? { ...r, tags: r.tags.filter((t) => t !== "value") } : r));
   const workerNames = (typeof args.worker === "string" ? [args.worker] : [...(args.worker ?? [])]).filter((w) => w.trim());
   const worker = workerNames[0];

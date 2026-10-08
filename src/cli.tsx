@@ -1388,7 +1388,7 @@ async function sealDraft(draft: Draft, args: Args, late = false): Promise<Return
   const taskChecks = sealed.taskChecks.filter((c) => !drop.has(c.name));
   if (!args.json) {
     // Names only: the commands are printed when the job releases them (checks_released).
-    for (const c of taskChecks) process.stdout.write(`· criterion ${c.name} (command withheld until the job ends)\n`);
+    for (const c of taskChecks) process.stdout.write(`· ${c.tags.includes("guard") ? "guard" : "criterion"} ${c.name} (command withheld until the job ends)\n`);
     for (const n of sealed.taskNotes) process.stdout.write(`· note ${n}\n`);
   }
   return { taskChecks, taskNotes: sealed.taskNotes, ...(sealed.requirements ? { requirements: sealed.requirements } : {}) };

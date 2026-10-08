@@ -67,6 +67,33 @@
   a copy that changed during the work, or a check that names the project's
   absolute path, counts as not tried. The copy's size and timing are
   journalled (`pre-work-copy`).
+- **Checks that pass before the work are kept as refuse-only guards.** A
+  drafted check the pre-work screen drops (P1) is still sealed, tagged
+  `guard`: it runs at the bar and a failure refuses the claim, but it never
+  counts toward "verified", and receipts label it "refuse-only guard". Up to
+  four, beside (not inside) the four-check cap. Not kept: a duplicate of a
+  sealed check, and one that pins today's output of the project's program on
+  the project's own data (`node summarize.js transactions.json | jq -e
+  '.zoe == "-3.50"'`, `sqlite3 app.db 'PRAGMA user_version' | grep -q '^1$'`),
+  which on the 2026-10-07 lanes failed 13 finished trees the grader accepted.
+- **Fewer good drafted checks dropped before sealing** (measured with
+  `bench/local/drop_audit.py` over the 2026-10-07 lanes):
+  - the absolute-path rule reads what each program opens (a shell parser,
+    `src/shellwords.ts`), not the raw text: a sed program's `/g`, an awk
+    program, a grep pattern, a jq filter, printf's data and `sys.argv[1] +
+    "/old.py"` are not paths. Its four drops that day were all wrong.
+  - `./rotate.sh …` before rotate.sh exists is the deliverable missing:
+    tried before the work it now counts as failing there (it discriminates),
+    not as a command that could not run. A tool missing from PATH is still
+    broken.
+  - the mutation rule (L15) skips the value of `touch -d/-t/-r` and
+    `mkdir -m`, follows variables built on a mktemp directory
+    (`f="$d/x"; echo > "$f"`), and lets `> "$(mktemp -d)/out"` through.
+  - the cannot-fail rule (L16) no longer flags `…; exit 0` after an earlier
+    `exit 1` in the same shell, or `cond && exit 1 || exit 0`.
+  - a check that names the project by its absolute path is tried on the
+    pre-work copy, and run in the bar's throwaway copy, instead of reaching
+    the live folder.
 - **Claims say who stood behind them** on the terminal, the window, job_end's
   `claim`, the receipt index and the receipt: `verified (independent checks:
   <judge>)`, `verified (your checks)`, `passed own checks (<worker>), not

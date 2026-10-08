@@ -84,7 +84,30 @@ export type TreeCopy = {
   cleanup: () => Promise<void>;
   /** Rewrite the copy's path back to the project's in text a check printed. */
   unmap: (text: string) => string;
+  /**
+   * Rewrite the project's absolute path to the copy's in a command, so a
+   * check that names the project (`cd /app && …`, `/work/x/out.csv`) reads
+   * and writes the copy like every relative path in it does.
+   */
+  map: (text: string) => string;
 };
+
+/** Replace `from` with `to` wherever `from` is a whole path or a path's leading part. */
+export function replacePathPrefix(text: string, from: string, to: string): string {
+  if (!from || from === to || from === "/") return text;
+  let out = "";
+  let i = 0;
+  for (;;) {
+    const at = text.indexOf(from, i);
+    if (at < 0) return out + text.slice(i);
+    const next = text[at + from.length] ?? "";
+    const prev = text[at - 1] ?? "";
+    // `/work/p` inside `/work/p2` or `/x/work/p` is another path.
+    const whole = !/[\w.-]/.test(next) && !/[\w./-]/.test(prev);
+    out += text.slice(i, at) + (whole ? to : from);
+    i = at + from.length;
+  }
+}
 
 class TooBig extends Error {}
 
@@ -317,6 +340,11 @@ export async function copyTreeOrWhy(
     unmap: (text) => {
       let out = text;
       for (const [from, to] of pairs) if (from !== to) out = out.split(from).join(to);
+      return out;
+    },
+    map: (text) => {
+      let out = text;
+      for (const [to, from] of pairs) out = replacePathPrefix(out, from, to);
       return out;
     },
   };
