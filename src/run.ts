@@ -30,7 +30,32 @@ export type RunOptions = {
   shell?: string | true;
   /** Kills the command when it aborts, so a turn can be cancelled mid-command. */
   signal?: AbortSignal;
+  /**
+   * Keep the command text out of every process's argv and environment. The
+   * shell is started with a fixed wrapper (`HIDDEN_WRAPPER`) as its only
+   * script; the command arrives on fd 3, which the wrapper reads to the end
+   * and closes before it runs a word of it. Used for every check run: a
+   * hidden check's text in `/proc/<pid>/cmdline` was readable by any process
+   * of the same user, including the worker's own deliverable when the check
+   * runs it (`/proc/$PPID/cmdline`).
+   */
+  hideCommand?: boolean;
 };
+
+/**
+ * The only script a hidden-command shell is given. Fixed text: nothing of the
+ * command is in it. It reads the command from fd 3 (a socket, which another
+ * process cannot reopen through /proc/<pid>/fd), closes fd 3 so nothing the
+ * command starts inherits it, and evals the text with the holding variable
+ * unset first: the variable is never exported, and it is gone before the
+ * first command of the check runs.
+ */
+export const HIDDEN_WRAPPER = '__maat_c=$(cat <&3) || exit 125; exec 3<&-; eval "unset __maat_c; $__maat_c"';
+
+/** The shell binary a `shell` option names: `true` is the platform's sh. */
+function shellFile(shell: string | true | undefined): string {
+  return shell === undefined || shell === true ? "/bin/sh" : shell;
+}
 
 export type RunResult = {
   stdout: string;
@@ -90,19 +115,36 @@ export function draftedShell(check: { hidden?: boolean; tags?: readonly string[]
 export function runCommand(command: string, opts: RunOptions): Promise<RunResult> {
   return new Promise<RunResult>((resolve, reject) => {
     let child: ChildProcess;
+    const hide = opts.hideCommand === true && process.platform !== "win32";
     try {
-      child = spawn(command, {
-        cwd: opts.cwd,
-        shell: opts.shell ?? true,
-        env: opts.env,
-        stdio: ["ignore", "pipe", "pipe"],
-        // Its own process group, so a timeout can kill everything the command
-        // started and not just the shell (see `kill`).
-        detached: process.platform !== "win32",
-      });
+      child = hide
+        ? spawn(shellFile(opts.shell), ["-c", HIDDEN_WRAPPER], {
+            cwd: opts.cwd,
+            env: opts.env,
+            stdio: ["ignore", "pipe", "pipe", "pipe"],
+            detached: true,
+          })
+        : spawn(command, {
+            cwd: opts.cwd,
+            shell: opts.shell ?? true,
+            env: opts.env,
+            stdio: ["ignore", "pipe", "pipe"],
+            // Its own process group, so a timeout can kill everything the command
+            // started and not just the shell (see `kill`).
+            detached: process.platform !== "win32",
+          });
     } catch (e) {
       reject(e as Error);
       return;
+    }
+    if (hide) {
+      const feed = child.stdio[3] as import("node:stream").Duplex | null | undefined;
+      // A shell that died before reading (or a wrapper that failed) closes
+      // its end: EPIPE here is the same fact as its exit, reported there.
+      feed?.on("error", () => {});
+      // Written, then dropped: data already sent stays readable by the shell
+      // after this end closes, and an open end would hold "close" back.
+      feed?.end(command, () => feed.destroy());
     }
 
     const cap = opts.maxBuffer ?? Infinity;

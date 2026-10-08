@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -38,8 +39,28 @@ MODEL = os.environ.get("BENCH_MODEL") or "nvidia/nemotron-3-ultra-550b-a55b:free
 URL = os.environ.get("BENCH_URL") or "https://openrouter.ai/api/v1"
 
 
+def load_keys_file() -> dict:
+    """BENCH_KEYS_FILE: NAME=value lines in a root-only file (the containers mount it). Read into
+    memory here, never put in an environment: `--env-file` put the key in the container's own
+    environment, in `docker inspect`, and in every process of the run."""
+    path = os.environ.get("BENCH_KEYS_FILE")
+    if not path:
+        return {}
+    keys = {}
+    for line in Path(path).read_text().splitlines():
+        name, sep, value = line.strip().partition("=")
+        if sep and name and not name.startswith("#"):
+            keys[name] = value
+    return keys
+
+
+KEYS = load_keys_file()
+
+
 def openrouter_key() -> str:
-    if os.environ.get("OPENROUTER_API_KEY"):  # the container is given the key, not the Mac's auth file
+    if KEYS.get("OPENROUTER_API_KEY"):  # the container is given the key, not the Mac's auth file
+        return KEYS["OPENROUTER_API_KEY"]
+    if os.environ.get("OPENROUTER_API_KEY"):
         return os.environ["OPENROUTER_API_KEY"]
     return subprocess.run(
         ["node", "-e", "import('%s').then(m=>process.stdout.write(m.readAuth().openrouter||''))" % (Path.home() / "Documents/molt-desktop/dist/providers.js")],
@@ -64,6 +85,33 @@ def as_agent(cmd: list, env: dict | None = None) -> tuple[list, dict | None]:
     import pwd
     home = pwd.getpwnam(AGENT_USER).pw_dir
     return ["runuser", "-u", AGENT_USER, "--", "env", f"HOME={home}", *cmd], env
+
+
+# The same shapes Maat treats as credentials (src/secrets.ts).
+SECRET_SUFFIX = re.compile(r"(?:^|_)(?:API_?KEY|ACCESS_?KEY|SECRET(?:_ACCESS)?_?KEY|PRIVATE_?KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIALS?)$", re.I)
+SECRET_PREFIX = re.compile(r"^(?:XAI|GROK|TOGETHER)_", re.I)
+SECRET_NAMES = {"MAAT_API_KEY", "MOLT_API_KEY", "MAAT_JUDGE_KEY", "MOLT_JUDGE_KEY", "MAAT_KEYS_FD", "MAAT_KEYS_FILE"}
+
+
+def is_secret(name: str) -> bool:
+    return name.upper() in SECRET_NAMES or bool(SECRET_SUFFIX.search(name)) or bool(SECRET_PREFIX.match(name))
+
+
+def keys_by_fd(env: dict) -> tuple[dict, dict, int]:
+    """Take every credential out of the agent's environment and hand it over on a pipe instead
+    (MAAT_KEYS_FD). In the environment it stayed in Maat's /proc/<pid>/environ for the whole run,
+    and a worker of Maat's own user read it back with `cat /proc/$PPID/environ`; deleting it inside
+    Maat does not change that copy. Returns (clean env, Popen kwargs, read end to close after Popen)."""
+    secrets = {k: v for k, v in env.items() if is_secret(k)}
+    clean = {k: v for k, v in env.items() if not is_secret(k)}
+    payload = json.dumps(secrets).encode()
+    if len(payload) > 60_000:  # one write into an empty pipe must not block
+        raise SystemExit("keys too large for the handover pipe")
+    r, w = os.pipe()
+    os.write(w, payload)
+    os.close(w)
+    clean["MAAT_KEYS_FD"] = str(r)
+    return clean, {"pass_fds": (r,)}, r
 
 
 def kill_tree(proc: subprocess.Popen) -> None:
@@ -94,7 +142,7 @@ def provider_capped(out: str, steps: int) -> bool:
 
 def run_molt(d: Path, prompt: str, log: Path) -> dict:
     key = openrouter_key() if "openrouter.ai" in URL else "local"
-    env = os.environ | {"MOLT_API_KEY": key, "MOLT_JUDGMENT": "0"}  # nobody rules on a benchmark run
+    env = os.environ | KEYS | {"MOLT_API_KEY": key, "MOLT_JUDGMENT": "0"}  # nobody rules on a benchmark run
     cmd = [
         "node", str(MOLT), "run", "--url", URL, "--model", os.environ.get("BENCH_MODEL") or MODEL,
         "--reasoning", os.environ.get("BENCH_REASONING") or "low", *(["--yes"] if os.environ.get("BENCH_GATE") == "yes" else ["--sandbox"]), "--json", "--criteria", "auto", "--batch", "--review", "3", "--steps", "200",
@@ -105,11 +153,15 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
     ]
     t0 = time.time()
     cmd, env = as_agent(cmd, env)
+    env, fds, keys_fd = keys_by_fd(env)
     # Own session, so the backstop kills the whole tree. subprocess.run's timeout killed only
     # the top process (runuser in the containers) and then waited on the pipe Maat and its
     # backend still held: one hung Grok turn ran 3570 s against a 600 s limit (2026-10-07).
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
-                            start_new_session=True)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+                                start_new_session=True, **fds)
+    finally:
+        os.close(keys_fd)
     try:
         out, err = proc.communicate(timeout=LIMIT)
         timed_out = False

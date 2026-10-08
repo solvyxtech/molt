@@ -36,6 +36,7 @@
  * - The project directory comes from `PWD` as well as the cwd, so both are set
  *   to the empty temp directory, and `--dir` is passed too.
  */
+import { withSecrets } from "./secrets.js";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -100,7 +101,7 @@ const FOREIGN_ENV =
  * The OpenCode child's environment: the caller's, minus every other provider's
  * credentials and any config path, plus Maat's own config (Zen only).
  */
-export function opencodeChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function opencodeChildEnv(base: NodeJS.ProcessEnv = withSecrets(process.env)): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(base)) {
     // OpenCode's own key (OPENCODE_API_KEY) is the Zen account, so it stays.
@@ -111,7 +112,7 @@ export function opencodeChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.
   return out;
 }
 
-export function opencodeEnv(dir: string, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function opencodeEnv(dir: string, base: NodeJS.ProcessEnv = withSecrets(process.env)): NodeJS.ProcessEnv {
   return { ...opencodeChildEnv(base), PWD: dir };
 }
 

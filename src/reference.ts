@@ -394,7 +394,7 @@ async function writeAndTry(opts: Ask, prompt: string): Promise<Reference | { ok:
     tags: ["task", "reference", "value"],
     hidden: true,
   };
-  const tried = await runCommand(check.run, { cwd: scratch, timeoutMs: REFERENCE_TIMEOUT_MS, maxBuffer: 1024 * 1024 });
+  const tried = await runCommand(check.run, { cwd: scratch, timeoutMs: REFERENCE_TIMEOUT_MS, maxBuffer: 1024 * 1024, hideCommand: true });
   if (tried.timedOut) return { ok: false, why: "the references did not finish on the untouched project" };
   if (tried.code === REFERENCE_SELF_ERROR) {
     const said = lastLines(`${tried.stdout}\n${tried.stderr}`);
