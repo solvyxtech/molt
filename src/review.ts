@@ -58,7 +58,14 @@ export function groundedViolations(reply: string, task: string): Violation[] {
 
 /** The receipt as evidence: everything above its raw output section, capped. */
 export function receiptEvidence(receipt: string, cap = 14_000): string {
-  return receipt.split("## Output")[0]!.slice(0, cap);
+  // Cut at the receipt's own "## Output" section heading — a line that is
+  // exactly that, anchored at column 0. The worker's final message is quoted
+  // into the receipt with "> " on every line (src/receipts.ts), so a
+  // "## Output" the worker writes there becomes "> ## Output" and must not be
+  // taken for the heading. Splitting on the bare substring let a worker put
+  // "## Output" in its final message and end the evidence early, hiding every
+  // failing check from the reviewer, which then confirms the claim.
+  return receipt.split(/^## Output$/m)[0]!.slice(0, cap);
 }
 
 /**
