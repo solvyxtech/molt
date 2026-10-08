@@ -53,3 +53,13 @@ def test_passed_own_checks_is_a_tier_of_its_own():
     assert "passed-own-checks" in stats.TIERS
     rows = [{"tier": "passed-own-checks", "passed": True}, {"tier": "verified", "passed": False}]
     assert stats.tier_breakdown(rows) == {"passed-own-checks": (1, 1), "verified": (1, 0)}
+
+
+UNTESTED = "passed checks that did not test this work, not verified"
+
+
+def test_passed_untested_is_its_own_tier_and_never_verified():
+    assert "passed-untested" in stats.TIERS
+    assert not stats.is_verified(UNTESTED)
+    assert stats.claim_basis(UNTESTED) == "untested"
+    assert run.claim_of({"outcome": "unverified", "tier": "passed-untested", "claim": UNTESTED}) == UNTESTED

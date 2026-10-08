@@ -9,7 +9,7 @@
  * Nothing here asks a model anything. A bar result is an exit code.
  */
 import { DISPUTE_HINT } from "./dispute.js";
-import { judgePass } from "./evidence.js";
+import { judgePass, reportsFailure } from "./evidence.js";
 import { REFERENCE_SENTINEL, referenceComparedAll } from "./reference.js";
 import { testsRealFor } from "./tests-real.js";
 import { runCommand, draftedShell } from "./run.js";
@@ -625,6 +625,15 @@ export function diagnoseFailure(
     return {
       didNotRun: true,
       hint: "the command was not found, so nothing ran and nothing was established",
+    };
+  }
+  // dash (Debian's and Ubuntu's /bin/sh) exits 2, not 127, for `sh tool.sh`
+  // when tool.sh is missing. Read the same way on every platform: on macOS,
+  // where sh is bash, the same check exits 127.
+  if (exitCode === 2 && /^\S*sh: \d+: (?:cannot open|Can't open) [^\n]*(?:No such file|nonexistent)/im.test(stderr)) {
+    return {
+      didNotRun: true,
+      hint: "the script it runs was not found, so nothing ran and nothing was established",
     };
   }
   if (exitCode === 126) {
@@ -2178,6 +2187,7 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
 
   let exitCode = 0;
   let output = "";
+  let stdout = "";
   let diagnosis: CommandDiagnosis = { didNotRun: false };
   let timedOut = false;
   // A task check runs in a throwaway copy of the tree, so a check that writes,
@@ -2199,6 +2209,7 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
       signal: ctx.signal,
     });
     output = copy ? copy.unmap(`${r.stdout}${r.stderr}`) : `${r.stdout}${r.stderr}`;
+    stdout = r.stdout;
     exitCode = r.code ?? 1;
     if (r.timedOut) {
       timedOut = true;
@@ -2236,6 +2247,14 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
       output =
         "[molt] the reference check exited 0 without reporting that it compared every input " +
         `(no \`${REFERENCE_SENTINEL} n/n\` line), so nothing was shown to match\n\n${output}`;
+    }
+    // A task check whose exit code does not carry its verdict (`print(x == y)`,
+    // `jq '…'` without -e, `…; echo $?`) is read by its own words: one that
+    // printed False or FAIL failed, whatever it exited.
+    const said = passed && check.tags.includes("task") ? reportsFailure(check.run, stdout) : null;
+    if (said) {
+      passed = false;
+      output = `[molt] ${said}\n\n${output}`;
     }
   }
   return {

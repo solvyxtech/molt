@@ -78,7 +78,8 @@ describe("the value tag", () => {
 describe("tierOf", () => {
   const ok = (tags: string[], hidden = true) => ({ name: "c", ok: true, hidden: hidden || undefined, kind: "command" as const, tags });
   // Drafted by a separate judge model: the authorship rule is pinned in independent-checks.test.ts.
-  const J = { worker: "worker-m", authors: new Map([["c", { kind: "judge" as const, model: "judge-j" }]]) };
+  // ...and it failed on the tree before the work (the discrimination rule is pinned in discriminating-checks.test.ts).
+  const J = { worker: "worker-m", authors: new Map([["c", { kind: "judge" as const, model: "judge-j" }]]), failedBefore: new Set(["c"]) };
   it("needs a passing check that runs the work and asserts a value", () => {
     assert.equal(tierOf({ ...J, results: [ok(["task", "value"])] }).tier, "verified");
     assert.equal(tierOf({ ...J, results: [ok(["task"]), ok(["task", "value"])] }).tier, "verified");

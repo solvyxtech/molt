@@ -137,7 +137,16 @@ export function evidenceTags(run: string, surface: boolean | undefined): string[
  * bench, self-judged arms were right in 125 of 174 "verified" claims (72%),
  * separate-judge arms in 48 of 55 (87%).
  */
-export type Tier = "verified" | "passed-checks" | "passed-own-checks";
+/**
+ * "passed-untested": an independent check that ran the work and asserted a
+ * value passed, but none of them FAILED on the tree as it was before the work.
+ * A check that passes on the untouched tree too cannot tell this work from no
+ * work; it guards against a regression and proves nothing here. On the
+ * 2026-10-07 container bench, a judge's `python3 server.py & sleep 1; curl
+ * ... || echo fail` passed before server.py existed and earned a wrong
+ * "verified" (the grader got a non-JSON 404).
+ */
+export type Tier = "verified" | "passed-checks" | "passed-own-checks" | "passed-untested";
 export type TierVerdict = {
   tier: Tier;
   reason?: string;
@@ -263,11 +272,26 @@ export function withAuthor<T extends { hidden?: boolean; tags?: readonly string[
 export function claimLabel(outcome: string, tier: Pick<TierVerdict, "tier" | "basis" | "by" | "worker" | "reviewGap"> | undefined): string {
   const gap = tier?.reviewGap ? `, ${tier.reviewGap}` : "";
   if (tier?.tier === "passed-own-checks") return `passed own checks (${tier.worker || "the worker model"}), not verified${gap}`;
+  if (tier?.tier === "passed-untested") return `${UNTESTED_CLAIM}${gap}`;
   if (outcome === "verified" && tier?.tier === "verified") {
     if (tier.basis === "person") return `verified (your checks)${gap}`;
     if (tier.basis === "independent") return `verified (independent checks: ${(tier.by ?? []).join(", ") || "another model"})${gap}`;
   }
   return outcome;
+}
+
+/** The claim for the "passed-untested" tier, on every surface. */
+export const UNTESTED_CLAIM = "passed checks that did not test this work, not verified";
+
+/**
+ * Why the passing independent value checks did not test this work: each one
+ * either passed on the tree before the work too, or was never tried there.
+ */
+export function untestedWords(names: readonly string[], passedBefore: ReadonlySet<string> | undefined): string {
+  const why = (n: string) => `\`${n}\` ${passedBefore?.has(n) ? "passed before the work began too" : "was not tried before the work began"}`;
+  return names.length === 1
+    ? `the only independent check that ran the work and asserted a value did not fail before the work: ${why(names[0]!)}`
+    : `no independent check that ran the work and asserted a value failed before the work: ${names.map(why).join("; ")}`;
 }
 
 /** The parts of a job_end event the verdict words are made from. */
@@ -299,7 +323,7 @@ export function jobEndWords(ev: JobEndWords): string {
   const contradicted = verified && !!ev.review && ev.review.confirmed === false;
   const unreviewed = verified && !ev.review && !!ev.unreviewed;
   if (ev.tier === "passed-checks") return passedChecksWords(typeof ev.tierReason === "string" ? ev.tierReason : undefined);
-  if (ev.tier === "passed-own-checks" && claim) return claim;
+  if ((ev.tier === "passed-own-checks" || ev.tier === "passed-untested") && claim) return claim;
   if (verified && Array.isArray(ev.revealed) && ev.revealed.length) return "verified (checks shown after a repeat failure)";
   if (verified && claim) {
     if (contradicted) return /, unconfirmed$/.test(claim) ? claim : `${claim}, unconfirmed`;
@@ -334,7 +358,8 @@ export function contradictions(review: { votes: string; violations: unknown[] } 
  * The tier a passing turn has earned. "verified" needs (a) a passing check a
  * person wrote, or a passing drafted check that runs the deliverable (not
  * surface) AND asserts a value AND was written by someone other than the
- * worker model, and (b) an independent review, when one ran, that found no
+ * worker model (and, with `requireDiscriminating`, failed on the tree before
+ * the work began: see `failedBefore`), and (b) an independent review, when one ran, that found no
  * contradiction. (c) — the turn not ended by the clock or the provider — is
  * decided before this, by `passedAtEnd`.
  *
@@ -348,6 +373,11 @@ export function contradictions(review: { votes: string; violations: unknown[] } 
  * was written by the worker model (no judge, or a judge that is the same
  * model reached another way), the best the turn earns is "passed-own-checks".
  * A check whose author was never recorded counts as the worker's.
+ *
+ * With `requireDiscriminating`, never let a check that cannot tell the work
+ * from no work vouch for it: when independent runs+value checks passed but
+ * none had failed before the work, the turn earns "passed-untested" — they
+ * guard against a regression and did not test this work.
  */
 export function tierOf(args: {
   results: readonly (Pick<CheckResult, "ok" | "hidden" | "advisory" | "skipped" | "tags"> & { name?: string; kind?: CheckResult["kind"] })[];
@@ -356,14 +386,31 @@ export function tierOf(args: {
   unreviewed?: boolean;
   /**
    * Experimental (MAAT_REVIEW_ADVISORY=1, `--review-advisory`): the review is
-   * recorded but gates nothing, and the evidence rule is stricter in return —
-   * the passing runs+value drafted check must also have FAILED on the untouched
-   * project, i.e. not be in `guards` (the checks that passed before the work).
-   * reports/checkquality-2026-10-06.md §2.5 measured the 3-vote review as a
+   * recorded but gates nothing, and the evidence rule is stricter in return:
+   * it implies `requireDiscriminating`. reports/checkquality-2026-10-06.md §2.5 measured the 3-vote review as a
    * likelihood ratio of about 1.
    */
   reviewAdvisory?: boolean;
-  /** Names (as in `results`) of checks that already passed before the work. */
+  /**
+   * Opt-in (MAAT_REQUIRE_DISCRIMINATING=1, `--require-discriminating`; implied
+   * by `reviewAdvisory`): only a check in `failedBefore` can earn "verified".
+   * Off, `failedBefore` is ignored and the tier is #32's. Replayed over the
+   * 2026-10-07 lanes the gate removed 2 wrong verifieds and denied 10 right
+   * ones, so the default fixes the cause at seal time instead: a drafted
+   * check that already passes before the work is redrafted or dropped.
+   */
+  requireDiscriminating?: boolean;
+  /**
+   * Names (as in `results`) of checks that were tried on the tree before the
+   * work began and FAILED there. Only such a check discriminates: with
+   * `requireDiscriminating`, "verified" needs a passing independent runs+value
+   * check named here. A check that
+   * passed before the work, could not run then, or joined after the work
+   * began (no try) is not named here and cannot earn the word. Absent means
+   * no check was tried, so none discriminates.
+   */
+  failedBefore?: ReadonlySet<string>;
+  /** Names of checks that passed before the work too: only words the reason, never the tier. */
   guards?: ReadonlySet<string>;
   /** The worker model, under every name it ran as (configured id, the id the backend reported). */
   worker?: string | readonly string[];
@@ -394,11 +441,13 @@ export function tierOf(args: {
   // worker that changes any file passes them.
   const person = passing.some((r) => personCheck(r) && authorOf(r).kind === "person");
   const drafted = passing.filter((r) => r.hidden === true && r.tags?.includes("task") && authorOf(r).kind !== "person");
-  const strongAll = drafted.filter(
-    (r) => !r.tags?.includes("surface") && r.tags?.includes("value") && !(args.reviewAdvisory && args.guards?.has(r.name ?? "")),
-  );
+  const strongAll = drafted.filter((r) => !r.tags?.includes("surface") && r.tags?.includes("value"));
   const strongIndependent = strongAll.filter((r) => independentOf(authorOf(r), workerNames));
   const strong = strongAll.length > 0;
+  // Of those, the ones that failed on the tree before the work and pass now:
+  // the only passes that show THIS work did something.
+  const gate = args.requireDiscriminating === true || args.reviewAdvisory === true;
+  const discriminating = gate ? strongIndependent.filter((r) => args.failedBefore?.has(r.name ?? "") === true) : strongIndependent;
   const by = [...new Set(strongIndependent.map((r) => authorOf(r).model ?? "another model"))];
   const basis: TierVerdict["basis"] = person ? "person" : strongIndependent.length ? "independent" : strong ? "own" : undefined;
   const who = { ...(basis ? { basis } : {}), ...(by.length && !person ? { by } : {}), ...(worker ? { worker } : {}) };
@@ -412,20 +461,21 @@ export function tierOf(args: {
           ? "surface"
           : "none";
   const ownReason = `every passing check that ran the work and asserted a value was written by the worker model${worker ? ` (${worker})` : ""}`;
-  const earned = person || strongIndependent.length > 0;
+  const earned = person || discriminating.length > 0;
+  const untestedReason = untestedWords(strongIndependent.map((r) => r.name ?? ""), args.guards);
   if (args.reviewAdvisory) {
     const n = contradictions(args.review);
     const reviewNote = n > 0 ? `advisory: the independent review found ${args.review!.votes} contradicting the task` : args.unreviewed ? "advisory: the independent review did not run" : undefined;
     const gap: Pick<TierVerdict, "reviewGap"> = n > 0 ? { reviewGap: "unconfirmed" } : args.unreviewed ? { reviewGap: "unreviewed" } : {};
     if (earned) return { tier: "verified", evidence, ...who, ...(reviewNote ? { reviewNote } : {}), ...gap };
+    if (strongIndependent.length) return { tier: "passed-untested", evidence, ...who, reason: untestedReason, ...(reviewNote ? { reviewNote } : {}), ...gap };
     if (strong) return { tier: "passed-own-checks", evidence, ...who, reason: ownReason, ...(reviewNote ? { reviewNote } : {}), ...gap };
     return {
       tier: "passed-checks",
       evidence,
       ...who,
-      reason: drafted.some((r) => !r.tags?.includes("surface") && r.tags?.includes("value"))
-        ? "the only passing value check also passed before the work began"
-        : evidence === "runs"
+      reason:
+        evidence === "runs"
           ? "no check that ran the work asserted an expected value"
           : "no passing check ran the work and asserted an expected value",
       ...(reviewNote ? { reviewNote } : {}),
@@ -436,6 +486,7 @@ export function tierOf(args: {
   }
   if (args.unreviewed && !person) return { tier: "passed-checks", evidence, ...who, reason: "the independent review did not run" };
   if (earned) return { tier: "verified", evidence, ...who };
+  if (strongIndependent.length) return { tier: "passed-untested", evidence, ...who, reason: untestedReason };
   if (strong) return { tier: "passed-own-checks", evidence, ...who, reason: ownReason };
   return {
     tier: "passed-checks",
@@ -446,4 +497,32 @@ export function tierOf(args: {
         ? "no check that ran the work asserted an expected value"
         : "no passing check ran the work and asserted an expected value",
   };
+}
+
+const COVER_STOP = new Set(
+  "the and for with that this from into must should shall will each every only all any are has have not but its was were been being file files output input when then than also exactly whole same handle handles".split(" "),
+);
+
+/** The words of a note or check that carry meaning: 3+ letters, not glue. */
+function contentWords(text: string): Set<string> {
+  return new Set((text.toLowerCase().match(/[a-z][a-z0-9]{2,}/g) ?? []).filter((w) => !COVER_STOP.has(w)));
+}
+
+/**
+ * Which discriminating checks plausibly cover each "Recorded, not verified"
+ * note, matched by the words they share: at least two, and at least 60% of
+ * the note's meaningful words appearing in the check's name or command.
+ * Display only — it gates nothing, and a word match is a hint, not proof.
+ */
+export function noteCoverage(
+  notes: readonly string[],
+  checks: readonly { name: string; text: string }[],
+): { note: string; by: string[] }[] {
+  const cw = checks.map((c) => ({ name: c.name, words: contentWords(`${c.name.replace(/^task:/, "")} ${c.text}`) }));
+  return notes.map((note) => {
+    const nw = [...contentWords(note)];
+    const need = Math.max(2, Math.ceil(nw.length * 0.6));
+    const by = cw.filter((c) => nw.filter((w) => c.words.has(w)).length >= need).map((c) => c.name);
+    return { note, by };
+  });
 }

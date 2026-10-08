@@ -36,7 +36,8 @@
  * then runs in place and says so; a reviewer's objection is not run).
  */
 import { constants } from "node:fs";
-import { copyFile, lstat, mkdir, mkdtemp, readdir, readlink, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { STATE_DIRS } from "./statedir.js";
@@ -332,4 +333,67 @@ export function runsInCopy(check: { kind: string; hidden?: boolean; tags?: reado
   if (process.env.MAAT_CHECK_COPY === "0") return false;
   if (check.kind !== "command") return false;
   return check.hidden === true || (check.tags ?? []).some((t) => t === "task" || t === "mission");
+}
+
+/**
+ * A digest of a tree as it stands: every path, its type and mode, each file's
+ * size and content hash, each link's target. Links are not followed. Two
+ * calls agree only if nothing under `dir` was added, removed or changed.
+ */
+export async function digestTree(dir: string): Promise<string> {
+  const h = createHash("sha256");
+  const walk = async (abs: string, rel: string): Promise<void> => {
+    const names = (await readdir(abs)).sort();
+    for (const n of names) {
+      const p = join(abs, n);
+      const r = rel ? `${rel}/${n}` : n;
+      const st = await lstat(p);
+      if (st.isSymbolicLink()) h.update(`l ${r} ${await readlink(p)}\0`);
+      else if (st.isDirectory()) {
+        h.update(`d ${r} ${st.mode}\0`);
+        await walk(p, r);
+      } else if (st.isFile()) {
+        h.update(`f ${r} ${st.mode} ${st.size} `).update(createHash("sha256").update(await readFile(p)).digest("hex")).update("\0");
+      } else h.update(`o ${r} ${st.mode}\0`);
+    }
+  };
+  await walk(dir, "");
+  return h.digest("hex");
+}
+
+/**
+ * A copy of the project taken before the work, that can say whether it is
+ * still as it was taken.
+ *
+ * The copy lives in a fresh 0700 directory under Maat's temporary folder
+ * (with --worker-user that folder is Maat's private state dir, out of the
+ * worker uid's reach). A worker running as Maat's own uid can still reach it,
+ * and editing it would turn a check that passes on the pristine tree into one
+ * that "failed before the work". So its digest is taken when it is made and
+ * checked around every later try: a copy that changed is not the tree before
+ * the work, and checks tried on it count as not tried.
+ */
+export type PreWorkCopy = TreeCopy & { digest: string; intact: () => Promise<boolean> };
+
+export async function preWorkCopy(root: string): Promise<PreWorkCopy | null> {
+  const c = await copyTree(root);
+  if (!c) return null;
+  try {
+    await chmod(join(c.dir, ".."), 0o700);
+    const digest = await digestTree(c.dir);
+    return {
+      ...c,
+      digest,
+      intact: async () => {
+        try {
+          return (await digestTree(c.dir)) === digest;
+        } catch {
+          return false;
+        }
+      },
+    };
+  } catch {
+    await c.cleanup();
+    return null;
+  }
 }

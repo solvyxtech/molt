@@ -34,6 +34,39 @@
   module the work's code can reach, and expected values never leave the
   driver's memory. A pass also needs the driver's final `REFERENCE COMPARED
   n/n` line: an exit 0 without it is a failure.
+- **Drafted checks that pass before the work are redrafted, then dropped.**
+  With `--criteria auto` each drafted check is tried on a copy of the project
+  taken before the first step. One that already passes there cannot show the
+  task was done: it goes back to the drafter once, and is dropped if the
+  redraft still passes (journal: `check-lint-dropped`, rule
+  `P1-passes-before-work`). An always-on lint (L16) does the same for checks
+  that cannot fail by construction: `|| echo …`, `|| true`, `; exit 0`,
+  `…; echo $?`, `find … -exec … \;`, an `if … fi` with no failing branch,
+  and inline programs whose exit code does not depend on what they assert
+  (`python3 -c "print(x == y)"`, `node -e "console.log(a === b)"`, `jq`
+  without `-e`, `awk` with no `exit`, a printed PASS/FAIL).
+- **A task check that prints its failure has failed.** A drafted or approved
+  check that exits 0 but whose last line of output is `False`, `FAIL`,
+  `FAILED` or `NO` (or whose `echo $?` tail printed non-zero) is read as a
+  failure at the bar and before the work. `print(rows == expected)` printing
+  False on wrong work used to pass and earn "verified".
+- **`--require-discriminating`** (`MAAT_REQUIRE_DISCRIMINATING=1`, off by
+  default; `--review-advisory` implies it): "verified" needs an independent
+  value check that failed on the tree before the work and passes now.
+  Otherwise the new tier **`passed-untested`** ("passed checks that did not
+  test this work, not verified"): outcome `unverified`, exit code 3. Each
+  receipt row says how its check fared before the work.
+- **Checks are tried before the work under the shell the bar runs them
+  with** (bash for drafted checks), so a bashism no longer "fails before the
+  work" under dash and passes at the bar. dash's exit 2 for a missing
+  `sh script` is read like bash's 127. A try that timed out counts as not
+  tried, not as failing.
+- **The pre-work copy is checked before it is trusted.** Late checks (drafts
+  past the time cut, the reference check) are tried on a copy taken at turn
+  start. Its digest is taken when it is made and compared around every try;
+  a copy that changed during the work, or a check that names the project's
+  absolute path, counts as not tried. The copy's size and timing are
+  journalled (`pre-work-copy`).
 - **Claims say who stood behind them** on the terminal, the window, job_end's
   `claim`, the receipt index and the receipt: `verified (independent checks:
   <judge>)`, `verified (your checks)`, `passed own checks (<worker>), not

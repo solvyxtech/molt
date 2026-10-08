@@ -84,6 +84,7 @@ def trial_row(d: Path) -> dict | None:
             "unconfirmed" if (je or {}).get("outcome") == "verified" and ((je or {}).get("review") or {}).get("confirmed") is False
             # Builds from 2026-10-07 say who wrote the checks in job_end's `claim`.
             else "passed-own-checks" if (je or {}).get("tier") == "passed-own-checks"
+            else "passed-untested" if (je or {}).get("tier") == "passed-untested"
             else "self-checked" if (je or {}).get("outcome") == "verified" and (je or {}).get("selfChecked") and not (je or {}).get("claim")
             else (je or {}).get("outcome")
         ),
