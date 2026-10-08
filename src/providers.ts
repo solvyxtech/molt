@@ -285,15 +285,19 @@ export function openrouterPricing(json: unknown, model: string): Pricing | null 
  * meter bills written tokens at the base input rate.
  *
  * Checked against https://platform.claude.com/docs/en/about-claude/pricing
- * on 2026-10-08. Haiku 5.5 is priced by prompt length; these are the rates for
- * prompts up to 100k tokens (over 100k: $0.50 in / $2.50 out / $0.05 cached).
+ * on 2026-10-08. Haiku 5.5 is priced by prompt length: $0.10 / $0.50 / $0.01
+ * for prompts up to 100k tokens, $0.50 / $2.50 / $0.05 over 100k. The meter
+ * prices session totals, not each request, so it cannot tell the tiers apart;
+ * the row uses the over-100k rates, because a coding session regularly sends
+ * long prompts and the cheaper tier would under-count those fivefold. For
+ * short-prompt work, `/price 0.1 0.5 0.01` sets the lower rates.
  */
 const ANTHROPIC_PRICES: { match: RegExp; in: number; out: number; cached: number }[] = [
   { match: /^claude-(fable|mythos)-5[-.]1(?!\d)/, in: 10, out: 50, cached: 0.25 },
   { match: /^claude-(fable|mythos)-5/, in: 10, out: 50, cached: 1 },
   { match: /^claude-opus-5[-.]5(?!\d)/, in: 4, out: 20, cached: 0.2 },
   { match: /^claude-opus-4[-.]1(?!\d)/, in: 15, out: 75, cached: 1.5 },
-  { match: /^claude-opus-4(?:-\d{8})?$/, in: 15, out: 75, cached: 1.5 },
+  { match: /^claude-opus-4(?:-0)?(?:-\d{8})?$/, in: 15, out: 75, cached: 1.5 },
   // Opus 5 and 4.5-4.8, and any Opus not listed above.
   { match: /^claude-opus-/, in: 5, out: 25, cached: 0.5 },
   { match: /^claude-sonnet-5[-.]5(?!\d)/, in: 2, out: 10, cached: 0.1 },
@@ -301,7 +305,8 @@ const ANTHROPIC_PRICES: { match: RegExp; in: number; out: number; cached: number
   { match: /^claude-sonnet-5(?![-.]?\d)|^claude-sonnet-5-\d{8}/, in: 2, out: 10, cached: 0.2 },
   // Sonnet 4.x, and any Sonnet not listed above.
   { match: /^claude-sonnet-/, in: 3, out: 15, cached: 0.3 },
-  { match: /^claude-haiku-5[-.]5(?!\d)/, in: 0.1, out: 0.5, cached: 0.01 },
+  // Over-100k tier on purpose: see above.
+  { match: /^claude-haiku-5[-.]5(?!\d)/, in: 0.5, out: 2.5, cached: 0.05 },
   { match: /^claude-3[-.]5-haiku/, in: 0.8, out: 4, cached: 0.08 },
   // Haiku 4.5, and any Haiku not listed above.
   { match: /^claude-haiku-/, in: 1, out: 5, cached: 0.1 },

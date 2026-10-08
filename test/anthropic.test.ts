@@ -323,13 +323,16 @@ describe("what an Anthropic session costs", () => {
 
   // Checked against platform.claude.com/docs/en/about-claude/pricing on
   // 2026-10-08. The table used to price by family, so Haiku 5.5 billed at
-  // Haiku 4.5's $1/$5 — ten times what it costs.
-  it("prices Haiku 5.5 at its own rate, not the Haiku family's", () => {
+  // Haiku 4.5's $1/$5. Haiku 5.5 is tiered by prompt length ($0.10/$0.50 up
+  // to 100k tokens, $0.50/$2.50 over); the meter cannot tell the tiers apart,
+  // so it uses the higher one: over-counting stops a budget early, which is
+  // the safe direction.
+  it("prices Haiku 5.5 at its own over-100k rate, not the Haiku family's", () => {
     for (const id of ["claude-haiku-5-5", "claude-haiku-5.5", "anthropic/claude-haiku-5-5"]) {
       const p = anthropicPricing(id)!;
-      assert.equal(p.in, 0.1, id);
-      assert.equal(p.out, 0.5, id);
-      assert.equal(p.cached, 0.01, id);
+      assert.equal(p.in, 0.5, id);
+      assert.equal(p.out, 2.5, id);
+      assert.equal(p.cached, 0.05, id);
     }
     // The older Haiku keeps its own price.
     assert.deepEqual(
@@ -348,6 +351,8 @@ describe("what an Anthropic session costs", () => {
     assert.deepEqual(rate("claude-opus-4-8"), [5, 25, 0.5]);
     assert.deepEqual(rate("claude-opus-4-1-20250805"), [15, 75, 1.5]);
     assert.deepEqual(rate("claude-opus-4-20250514"), [15, 75, 1.5]);
+    assert.deepEqual(rate("claude-opus-4-0"), [15, 75, 1.5]);
+    assert.deepEqual(rate("claude-opus-4"), [15, 75, 1.5]);
     assert.deepEqual(rate("claude-sonnet-5-5"), [2, 10, 0.1]);
     assert.deepEqual(rate("claude-sonnet-5"), [2, 10, 0.2]);
     assert.deepEqual(rate("claude-sonnet-4-5"), [3, 15, 0.3]);
