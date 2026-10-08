@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Engine, MALFORMED_STOP } from "../src/engine.js";
 import { Transcript, excerpt, MALFORMED_EXCERPT_CHARS, wireArgs } from "../src/transcript.js";
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { Receipts } from "../src/receipts.js";
+import { parseBar } from "../src/bar.js";
 import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
 /**
@@ -68,5 +72,59 @@ describe("malformed tool calls stay cheap", () => {
     } finally {
       ws.cleanup();
     }
+  });
+
+  it("tells the model firmly at three in a row", async () => {
+    const ws = workspace();
+    try {
+      const bad = { calls: [{ name: "act", args: { actions: "not a list" } }] };
+      const provider = scriptedProvider([bad, bad, bad, { text: "Done." }]);
+      const engine = new Engine({ baseUrl: "http://p.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high" });
+      await drain(engine.run("go", allowAll));
+      assert.ok(provider.bodies.some((b) => b.includes("3 malformed calls in a row")));
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("calls to a tool that does not exist count toward the streak", async () => {
+    const ws = workspace();
+    try {
+      const ghost = { calls: [{ name: "no_such_tool", args: { payload: BIG } }] };
+      const provider = scriptedProvider([...Array.from({ length: 8 }, () => ghost), { text: "Done." }]);
+      const engine = new Engine({ baseUrl: "http://p.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high" });
+      const ev = await drain(engine.run("go", allowAll));
+      assert.ok(ev.some((e) => e.kind === "info" && /malformed tool calls in a row/.test(e.text)));
+      assert.ok(Math.max(...provider.bodies.map((b) => b.length)) < 40_000);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("with work on disk, the turn ends as the model's doing and the receipt says so", async () => {
+    const ws = workspace();
+    try {
+      const write = { calls: [{ name: "write_file", args: { path: "out.txt", content: "y" } }] };
+      const bad = { calls: [{ name: "act", args: { actions: "not a list" } }] };
+      const provider = scriptedProvider([write, bad, bad, bad, bad, bad, bad, bad, { text: "Done." }]);
+      const engine = new Engine({ baseUrl: "http://p.test/v1", model: "m", cwd: ws.dir, fetchFn: provider.fetchFn, bar: parseBar("version: 1\nchecks:\n  - name: has-out\n    run: test -f out.txt\n")!, receipts: new Receipts(ws.dir), stream: false, autonomy: "high" });
+      const ev = await drain(engine.run("write out.txt", allowAll));
+      const end = ev.find((e) => e.kind === "job_end") as { endedBy?: string } | undefined;
+      assert.equal(end?.endedBy, "malformed");
+      const dir = join(ws.dir, ".maat", "receipts");
+      const text = readdirSync(dir).filter((f) => f.endsWith(".md")).map((f) => readFileSync(join(dir, f), "utf8")).join("\n");
+      assert.match(text, /malformed tool calls several times in a row/);
+      assert.doesNotMatch(text, /The provider failed/);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("the excerpt mark lives on the message", () => {
+    const t = new Transcript("sys");
+    t.push({ role: "assistant", content: null, tool_calls: [{ id: "c9", type: "function", function: { name: "act", arguments: BIG } }] });
+    t.markMalformedCall("c9");
+    const rec = t.record().find((m) => m.role === "assistant")!;
+    assert.deepEqual(rec.molt?.refusedCalls, ["c9"]);
   });
 });

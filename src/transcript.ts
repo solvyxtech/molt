@@ -70,14 +70,6 @@ export class Transcript {
   private archived: Msg[][] = [];
   /** What this turn is for. Sent every request, shed never. */
   private task: string | null = null;
-  /**
-   * Tool calls Maat refused as malformed. Their arguments go back to the
-   * provider as a short excerpt, not in full: a run that made 17 malformed
-   * `act` calls in a row resent every one of them on every step, prompts grew
-   * to 630k tokens, and one task cost $0.82 for a 181-byte file (2026-10-07).
-   * The record and captures keep the full text.
-   */
-  private malformedCalls = new Set<string>();
 
   constructor(systemPrompt: string) {
     this.system = { role: "system", content: systemPrompt };
@@ -87,9 +79,23 @@ export class Transcript {
     this.working.push(msg);
   }
 
-  /** Send this call's arguments as an excerpt from now on (see `malformedCalls`). */
+  /**
+   * Send this call's arguments as an excerpt from now on. A run that made 17
+   * malformed `act` calls in a row resent every one of them on every step,
+   * prompts grew to 630k tokens, and one task cost $0.82 for a 181-byte file
+   * (2026-10-07). The mark lives on the message, so it survives a restore; the
+   * record and captures keep the full text.
+   */
   markMalformedCall(id: string): void {
-    this.malformedCalls.add(id);
+    for (let i = this.working.length - 1; i >= 0; i--) {
+      const m = this.working[i]!;
+      if (m.role === "assistant" && m.tool_calls?.some((c) => c.id === id)) {
+        const refused = new Set(m.molt?.refusedCalls ?? []);
+        refused.add(id);
+        this.working[i] = { ...m, molt: { ...m.molt, refusedCalls: [...refused] } };
+        return;
+      }
+    }
   }
 
   /**
@@ -171,11 +177,12 @@ export class Transcript {
     // llama.cpp Qwen failed with a 500. Leading system messages are joined
     // in order; a system message anywhere later goes as a user message.
     const out: Omit<Msg, "molt">[] = [];
-    for (const { molt: _molt, ...m } of this.all()) {
+    for (const { molt, ...m } of this.all()) {
+      const refused = new Set(molt?.refusedCalls ?? []);
       if (m.role !== "system")
         out.push(
           repair && Array.isArray(m.tool_calls)
-            ? { ...m, tool_calls: m.tool_calls.map((c) => (c.id && this.malformedCalls.has(c.id) ? excerptCall(c) : wireCall(c))) }
+            ? { ...m, tool_calls: m.tool_calls.map((c) => (c.id && refused.has(c.id) ? excerptCall(c) : wireCall(c))) }
             : m,
         );
       else if (out.length === 0) out.push({ ...m });
