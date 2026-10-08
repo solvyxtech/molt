@@ -80,6 +80,25 @@ export class Transcript {
   }
 
   /**
+   * Send this call's arguments as an excerpt from now on. A run that made 17
+   * malformed `act` calls in a row resent every one of them on every step,
+   * prompts grew to 630k tokens, and one task cost $0.82 for a 181-byte file
+   * (2026-10-07). The mark lives on the message, so it survives a restore; the
+   * record and captures keep the full text.
+   */
+  markMalformedCall(id: string): void {
+    for (let i = this.working.length - 1; i >= 0; i--) {
+      const m = this.working[i]!;
+      if (m.role === "assistant" && m.tool_calls?.some((c) => c.id === id)) {
+        const refused = new Set(m.molt?.refusedCalls ?? []);
+        refused.add(id);
+        this.working[i] = { ...m, molt: { ...m.molt, refusedCalls: [...refused] } };
+        return;
+      }
+    }
+  }
+
+  /**
    * Fold the tool results for `parts` into one result for the call `id`.
    *
    * Batch mode (see ACT_TOOL in engine.ts) runs each action of one `act` call
@@ -158,8 +177,14 @@ export class Transcript {
     // llama.cpp Qwen failed with a 500. Leading system messages are joined
     // in order; a system message anywhere later goes as a user message.
     const out: Omit<Msg, "molt">[] = [];
-    for (const { molt: _molt, ...m } of this.all()) {
-      if (m.role !== "system") out.push(repair && Array.isArray(m.tool_calls) ? { ...m, tool_calls: m.tool_calls.map(wireCall) } : m);
+    for (const { molt, ...m } of this.all()) {
+      const refused = new Set(molt?.refusedCalls ?? []);
+      if (m.role !== "system")
+        out.push(
+          repair && Array.isArray(m.tool_calls)
+            ? { ...m, tool_calls: m.tool_calls.map((c) => (c.id && refused.has(c.id) ? excerptCall(c) : wireCall(c))) }
+            : m,
+        );
       else if (out.length === 0) out.push({ ...m });
       else if (out.length === 1 && out[0]!.role === "system") out[0] = { ...out[0]!, content: `${out[0]!.content ?? ""}\n\n${m.content ?? ""}` };
       else out.push({ role: "user", content: m.content ?? "" });
@@ -556,7 +581,8 @@ export function buildDigest(dropped: Msg[]): string {
       } catch {
         detail = "(unparseable arguments)";
       }
-      actions.push(`${c.function.name}: ${detail}`);
+      // Capped: an act whose actions arrived as one huge string printed all of it here.
+      actions.push(`${c.function.name}: ${cap(detail, 200)}`);
     }
   }
 
@@ -653,11 +679,26 @@ export function wireArgs(text: string): string {
     } catch {
       /* fall through */
     }
-    return JSON.stringify({ _unparsed: text });
+    return JSON.stringify({ _unparsed: excerpt(text) });
   }
   if (isObject(v)) return text;
   if (v === null) return "{}";
-  return JSON.stringify({ _unparsed: text });
+  return JSON.stringify({ _unparsed: excerpt(text) });
+}
+
+/** How much of a refused call's arguments goes back to the provider. */
+export const MALFORMED_EXCERPT_CHARS = 300;
+
+/** The start of `text`, and how much was left out. Enough for the model to see its own mistake. */
+export function excerpt(text: string, max = MALFORMED_EXCERPT_CHARS): string {
+  return text.length <= max ? text : `${text.slice(0, max)}…[${text.length - max} more characters not resent]`;
+}
+
+/** A refused call as it goes back to the provider: always an object, never the whole text. */
+function excerptCall<T extends { function?: { arguments?: unknown } }>(c: T): T {
+  const a = c.function?.arguments;
+  const text = typeof a === "string" ? a : JSON.stringify(a ?? {});
+  return { ...c, function: { ...c.function!, arguments: JSON.stringify({ _refused: excerpt(text) }) } };
 }
 
 function wireCall<T extends { function?: { arguments?: unknown } }>(c: T): T {

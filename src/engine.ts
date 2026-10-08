@@ -112,7 +112,7 @@ import { takeTurn } from "./localgate.js";
 import { parseLenient } from "./lenient-json.js";
 import { LONG_RATE_LIMIT_MS, longQuotaText, rateLimitResetAt, untilText, providerErrorText, normalizeMessage, readStream, transientProviderError, type ProviderError, type StreamAccumulator, type Usage } from "./stream.js";
 import { Fragments, SafeStream } from "./live.js";
-import { Transcript, toolDetail } from "./transcript.js";
+import { Transcript, excerpt, toolDetail } from "./transcript.js";
 import { acpAgentFor, acpHealth, acpModels, AcpSession, backendStallMs, isAcp } from "./acp.js";
 import { type BackendSession, type ToolRunner } from "./backend.js";
 import { endpointProblem, removedSubscriptionProblem } from "./endpoint.js";
@@ -285,6 +285,10 @@ export function systemPromptFor(cwd: string, extra?: string): string {
 
 /** Fractions of the ceiling at which molt says something, once each. */
 const CEILING_WARNINGS = [0.5, 0.8];
+
+/** Malformed tool calls in a row before the model is told firmly, and before the turn ends. */
+export const MALFORMED_WARN = 3;
+export const MALFORMED_STOP = 6;
 
 /**
  * When working history gets compacted, unless told otherwise.
@@ -2350,7 +2354,14 @@ export class Engine {
    * all because the clock or a failed request stopped the turn before any check
    * ran; two of them had passing work on disk.
    */
-  private turnEndedBy: "deadline" | "provider" | undefined;
+  private turnEndedBy: "deadline" | "provider" | "malformed" | undefined;
+  /**
+   * Malformed tool calls in a row this turn. One is a slip; a run that kept
+   * sending broken `act` calls made 17 in a row and paid for every one
+   * (2026-10-07). After MALFORMED_WARN the model is told firmly; after
+   * MALFORMED_STOP the turn ends and the work on disk is judged.
+   */
+  private malformedStreak = 0;
   /** A subprocess backend went silent past the stall allowance this turn (a provider issue). */
   private turnProviderStall = false;
   /** `--revert` put this turn's work back, so a person cannot accept it as it stands. */
@@ -4066,7 +4077,7 @@ export class Engine {
     result: BarResult,
     attempts: number,
     log?: Journal,
-    endedBy?: "deadline" | "provider",
+    endedBy?: "deadline" | "provider" | "malformed",
   ): AsyncGenerator<EngineEvent> {
     const onlyWrites = failedOnlyWriteChecks(result);
     if (this.cfg.receipts) {
@@ -4362,6 +4373,7 @@ export class Engine {
     this.turnAllRetired = false;
     this.turnRevealed = [];
     this.turnEndedBy = undefined;
+    this.malformedStreak = 0;
     this.turnProviderStall = false;
     this.turnRestored = false;
     this.refusedThisTurn = false;
@@ -4454,7 +4466,7 @@ export class Engine {
       outcome = "unverified";
       yield {
         kind: "info",
-        text: `the checks passed on the work as it stood when the ${this.turnEndedBy === "deadline" ? "clock" : "provider"} stopped the model, but it never said it was done — unverified.`,
+        text: `the checks passed on the work as it stood when the ${this.turnEndedBy === "deadline" ? "clock" : this.turnEndedBy === "malformed" ? "malformed-call limit" : "provider"} stopped the model, but it never said it was done — unverified.`,
       };
     }
 
@@ -5055,6 +5067,11 @@ export class Engine {
       // sent. Say what actually happened instead.
       malformed = true;
     }
+    // An act reaches a tool call as itself only when its actions could not be
+    // read (expandAct), so it counts as malformed here too.
+    const known = TOOLS.some((t) => t.function.name === name);
+    const refused = malformed || name === "act" || !known;
+    this.malformedStreak = refused ? this.malformedStreak + 1 : 0;
     const detail = toolDetail(name, args);
     this.turnCalls.add(callId);
     // What the current autonomy level says about this exact call. The
@@ -5128,8 +5145,13 @@ export class Engine {
           ? `[molt: the arguments for ${name} do not fit its schema, so nothing ran: ` +
             `${violations.join("; ")}. Send the call again with them fixed.]`
           : `[molt: the arguments for ${name} were not valid JSON, so nothing ran. ` +
-            `Send them again as a JSON object. What arrived was: ${raw}]`;
-      this.transcript.push({ role: "tool", tool_call_id: callId, content: complaint });
+            `Send them again as a JSON object. What arrived began: ${excerpt(raw)}]`;
+      const firm =
+        this.malformedStreak >= MALFORMED_WARN
+          ? ` [molt: that is ${this.malformedStreak} malformed calls in a row. Send ONE call whose arguments are a single JSON object matching the ${name} schema, or finish; after ${MALFORMED_STOP} the turn ends.]`
+          : "";
+      this.transcript.push({ role: "tool", tool_call_id: callId, content: complaint + firm });
+      this.transcript.markMalformedCall(callId);
       return { name, result: complaint, auto: true, repeated: false };
     }
     // Timed around execution only. Waiting on a human to approve a gated
@@ -5302,7 +5324,12 @@ export class Engine {
       preview: hide(capture(result)),
       auto: !decision.ask,
     };
-    this.transcript.push({ role: "tool", tool_call_id: callId, content: result });
+    const firmHere =
+      refused && this.malformedStreak >= MALFORMED_WARN
+        ? ` [molt: that is ${this.malformedStreak} malformed calls in a row. Send ONE call whose arguments are a single JSON object matching the tool's schema, or finish; after ${MALFORMED_STOP} the turn ends.]`
+        : "";
+    this.transcript.push({ role: "tool", tool_call_id: callId, content: result + firmHere });
+    if (refused) this.transcript.markMalformedCall(callId);
     return { name, result, auto: !decision.ask, repeated: repeatedHere };
   }
 
@@ -5789,7 +5816,7 @@ export class Engine {
      * is what it says: verified only if it passed, not proven if it did not,
      * unverified when nothing was sealed. Returns whether a bar ran.
      */
-    async function* judgeOnDisk(why: "deadline" | "provider", claim: string): AsyncGenerator<EngineEvent, boolean> {
+    async function* judgeOnDisk(why: "deadline" | "provider" | "malformed", claim: string): AsyncGenerator<EngineEvent, boolean> {
       self.turnEndedBy = why;
       if (opts.ask) return false;
       let barThis = barNow();
@@ -5949,6 +5976,21 @@ export class Engine {
         // provider: a closing summary can take the minutes the verdict needs.
         const judged = yield* judgeOnDisk("deadline", "");
         if (!judged) yield* this.salvage("Your time budget for this turn is up.", fetchFn, log);
+        return;
+      }
+
+      // A model that keeps sending malformed calls is stopped like a clock that
+      // ran out: no more tool calls, the work on disk is judged, and the
+      // receipt says the model, not the provider, ended the turn.
+      if (this.malformedStreak >= MALFORMED_STOP) {
+        log?.append("note", { text: `ended: malformed tool calls (${this.malformedStreak} in a row)`, malformedStop: true });
+        yield {
+          kind: "info",
+          text: `ended: ${this.malformedStreak} malformed tool calls in a row — no more tool calls this turn. The work on disk is judged as it stands.`,
+        };
+        this.turnEndedBy = "malformed";
+        const judged = this.turnWrites.length > 0 ? yield* judgeOnDisk("malformed", "") : false;
+        if (!judged) yield* this.salvage("You sent several malformed tool calls in a row, so this turn has ended.", fetchFn, log);
         return;
       }
 
