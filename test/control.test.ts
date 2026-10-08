@@ -3,7 +3,7 @@
  * the tier rule does with it (src/tiers.ts `discounted`).
  */
 import assert from "node:assert/strict";
-import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { discountedChecks, pathWords, plantedBins, suppliesOwnInput, visibleInputs } from "../src/control.js";
@@ -110,9 +110,17 @@ describe("a shadowed runner", () => {
       const bin = join(t.dir, "node_modules", ".bin");
       mkdirSync(join(t.dir, "node_modules", "pkg"), { recursive: true });
       mkdirSync(bin, { recursive: true });
+      // As npm installs it: a package.json that declares the bin, files with npm's fixed old mtime.
+      writeFileSync(join(t.dir, "node_modules", "pkg", "package.json"), JSON.stringify({ name: "pkg", bin: { "pkg-cli-for-tests": "cli.js" } }));
       writeFileSync(join(t.dir, "node_modules", "pkg", "cli.js"), "");
+      const old = new Date("1985-10-26T08:15:00Z");
+      utimesSync(join(t.dir, "node_modules", "pkg", "cli.js"), old, old);
       symlinkSync("../pkg/cli.js", join(bin, "pkg-cli-for-tests"));
       assert.deepEqual(plantedBins(t.dir, t.before.takenAt), [], "an install's link into node_modules");
+      // The installed program edited in place: the link is old, the target is new.
+      writeFileSync(join(t.dir, "node_modules", "pkg", "cli.js"), "process.exit(0)\n");
+      assert.deepEqual(plantedBins(t.dir, t.before.takenAt), ["node_modules/.bin/pkg-cli-for-tests (pkg/cli.js was modified this turn)"]);
+      utimesSync(join(t.dir, "node_modules", "pkg", "cli.js"), old, old);
       writeFileSync(join(bin, "node"), "#!/bin/sh\nexit 0\n");
       assert.deepEqual(plantedBins(t.dir, t.before.takenAt), ["node_modules/.bin/node"]);
       const d = discountedChecks([pass("tests", "npm test --silent"), pass("py", "python3 count.py")], { cwd: t.dir, before: t.before, written: [] });
