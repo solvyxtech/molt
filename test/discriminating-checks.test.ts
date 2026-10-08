@@ -26,7 +26,7 @@ import { Journal } from "../src/journal.js";
 import { Receipts } from "../src/receipts.js";
 import { preWorkCopy } from "../src/scratch.js";
 import { claimLabel, noteCoverage, tierOf, UNTESTED_CLAIM } from "../src/tiers.js";
-import type { Check, CheckAuthor } from "../src/types.js";
+import type { Check, CheckAuthor, EngineEvent } from "../src/types.js";
 import { allowAll, drain, scriptedProvider, workspace, type ScriptedTurn } from "./helpers.js";
 
 const JUDGE: CheckAuthor = { kind: "judge", model: "qwen3-coder-30b-a3b" };
@@ -213,7 +213,6 @@ describe("parseArgs --require-discriminating", () => {
 });
 
 describe("late checks and the copy taken before the work", () => {
-  const later = <T>(v: T, ms: number) => new Promise<T>((r) => setTimeout(() => r(v), ms));
   const nothing = async () => ({ taskChecks: [] as Check[], taskNotes: [] as string[] });
   const mk = (name: string, run: string): Check => ({ name, kind: "command", run, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true, author: JUDGE }) as Check;
 
@@ -226,7 +225,26 @@ describe("late checks and the copy taken before the work", () => {
       requireDiscriminating: true,
     });
     engine.setTurnDeadline(600_000);
-    const events = await drain(engine.run(TASK, allowAll, { pendingCriteria: later({ taskChecks: checks, taskNotes: [] }, 300), criteriaSoFar: nothing, criteriaWaitMs: 100 }));
+    // The draft lands once the engine has cut its wait with none ready, so the
+    // checks really are late. On a 300 ms timer started before the run, a
+    // start-up slowed by load (150 CPU burners, 2026-10-08) let the draft be
+    // ready at the 100 ms cut: it was sealed there, rightly, no copy was
+    // tried, and these cases failed 1 run in 20. The fallback only bounds an
+    // engine that never cuts.
+    let cut!: () => void;
+    let fallback: ReturnType<typeof setTimeout> | undefined;
+    const pendingCriteria = new Promise<void>((r) => {
+      cut = r;
+      fallback = setTimeout(r, 10_000);
+    }).then(() => {
+      clearTimeout(fallback);
+      return { taskChecks: checks, taskNotes: [] as string[] };
+    });
+    const events: EngineEvent[] = [];
+    for await (const e of engine.run(TASK, allowAll, { pendingCriteria, criteriaSoFar: nothing, criteriaWaitMs: 100 })) {
+      events.push(e);
+      if (e.kind === "info" && /none was ready; not sealing an empty set/.test(e.text)) cut();
+    }
     const end = events.find((e) => e.kind === "job_end");
     assert.ok(end && end.kind === "job_end");
     return { end, tried: Journal.read(journal.path).filter((e) => e.kind === "note" && e.data.kind === "pre-work-try"), copies: Journal.read(journal.path).filter((e) => e.kind === "note" && e.data.kind === "pre-work-copy") };
