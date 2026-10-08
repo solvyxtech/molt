@@ -16,7 +16,6 @@
  * "verified" needs a passing check that is runs AND value.
  */
 import type { CheckAuthor, CheckResult } from "./types.js";
-import { env } from "./env.js";
 
 /** An operand that is a literal: a number, a quoted string without a variable in it (or a `$'...'` ANSI-C string), a list/dict opener, or a keyword value. */
 const LIT_AFTER = /^(?:\\?["'](?![^"']*\$)[^"']|\$'[^']|-?\d|[[{]|(?:True|False|None|true|false|null)\b)/;
@@ -1331,7 +1330,9 @@ export const AUDIT_CLAIM_PREFIX = "verified (post-work audit: ";
  * post-audit.ts auditSystem), and the audit drops property-only checks.
  */
 export function exactRuleOn(): boolean {
-  return env("REQUIRE_EXACT") === "1";
+  // Read here, not through env.ts: the window's renderer bundles this module, and env.ts brings node:fs.
+  const e = typeof process === "undefined" ? undefined : process.env;
+  return (e?.MAAT_REQUIRE_EXACT ?? e?.MOLT_REQUIRE_EXACT) === "1";
 }
 
 export const PROPERTY_ONLY_REASON = "passed checks that test properties only";
