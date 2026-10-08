@@ -9,11 +9,12 @@
  * that judges only inputs where both agree, is what makes it safe to obey.
  */
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { Engine } from "../src/engine.js";
-import { draftReference, fencedPython, parseReferenceReply, REFERENCE_MAX_SNAPSHOT_FILES, snapshotProject } from "../src/reference.js";
+import { DRIVER, draftReference, fencedPython, parseReferenceReply, REFERENCE_MAX_SNAPSHOT_FILES, snapshotProject } from "../src/reference.js";
 import type { Check } from "../src/types.js";
 import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
@@ -250,5 +251,74 @@ describe("a reference check, in a turn", () => {
   it("is not waited for past its time: the claim is judged without it", async () => {
     const { events } = await turn("import sys\nprint(0)\n", { waitMs: 0 });
     assert.ok(events.some((e) => e.kind === "info" && /still being written; judging this claim without it/.test(e.text)));
+  });
+});
+
+const hasPython = spawnSync("python3", ["-c", "1"]).status === 0;
+
+describe("the driver's exit 0 is earned, not inherited", { skip: !hasPython && "needs python3" }, () => {
+  /** A reference pair that imports solution.py in-process, and Maat's driver, run on `solution`. */
+  function drive(solution: string, opts: { same?: boolean } = {}): { status: number | null; out: string } {
+    const w = workspace();
+    const ref = join(w.dir, "ref");
+    const proj = join(w.dir, "proj");
+    mkdirSync(ref);
+    mkdirSync(proj);
+    writeFileSync(
+      join(ref, "check.py"),
+      [
+        "import importlib.util, os",
+        "INPUTS = [1, 2, 3]",
+        "def reference(n):",
+        "    return 2 * n",
+        "def run_deliverable(n):",
+        "    spec = importlib.util.spec_from_file_location('solution', os.path.join(os.getcwd(), 'solution.py'))",
+        "    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)",
+        "    return m.double(n)",
+        ...(opts.same ? ["def same(e, a):", "    return int(a) == e"] : []),
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(join(ref, "second.py"), "def reference(n):\n    return n + n\n");
+    writeFileSync(join(ref, "driver.py"), DRIVER);
+    writeFileSync(join(proj, "solution.py"), solution);
+    const r = spawnSync("python3", [join(ref, "driver.py")], { cwd: proj, encoding: "utf8", timeout: 20_000 });
+    w.cleanup();
+    return { status: r.status, out: `${r.stdout}${r.stderr}` };
+  }
+
+  it("passes a correct deliverable, and refuses a wrong one with the input", () => {
+    assert.equal(drive("def double(n):\n    return 2 * n\n").status, 0);
+    const wrong = drive("def double(n):\n    return 3 * n\n");
+    assert.equal(wrong.status, 1);
+    assert.match(wrong.out, /input: 1\nexpected: 2\nactual:   3/);
+  });
+
+  it("a deliverable that os._exit(0)s or sys.exit(0)s on import fails the work, not passes it", () => {
+    for (const solution of ["import os\nos._exit(0)\n", "import sys\nsys.exit(0)\n"]) {
+      const r = drive(solution);
+      assert.equal(r.status, 1, solution);
+      assert.match(r.out, /actual:   nothing/);
+    }
+  });
+
+  it("an early exit with the reference's own error code does not retire the check", () => {
+    assert.equal(drive("import os\nos._exit(3)\n").status, 1);
+  });
+
+  it("printing the driver's success line does not stand in for a result", () => {
+    const r = drive("print('3 inputs match two independent references')\ndef double(n):\n    return 0\n");
+    assert.equal(r.status, 1);
+  });
+
+  it("a deliverable that dies part-way fails on the first input it left unanswered", () => {
+    const r = drive("import os\ndef double(n):\n    if n == 2:\n        os._exit(0)\n    return 2 * n\n");
+    assert.equal(r.status, 1);
+    assert.match(r.out, /input: 2\n/);
+  });
+
+  it("check.py's own same() still decides the comparison", () => {
+    assert.equal(drive("def double(n):\n    return str(2 * n)\n", { same: true }).status, 0);
+    assert.equal(drive("def double(n):\n    return str(n)\n", { same: true }).status, 1);
   });
 });

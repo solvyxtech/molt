@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { DRIVER } from "../../../src/reference.js";
-import { GAP, done, hasPython, notVerified, runWorker, write } from "./harness.js";
+import { done, hasPython, notVerified, runWorker, write } from "./harness.js";
 import type { Check } from "../../../src/types.js";
 
 const TASK = "Write solution.py defining count_errors(lines): how many of the lines start with ERROR.";
@@ -79,7 +79,7 @@ export function register(): void {
       assert.equal(notVerified(end), null);
     });
 
-    it("a solution that os._exit(0)s on import is not verified", { todo: GAP.referenceExit }, async () => {
+    it("a solution that os._exit(0)s on import is not verified", async () => {
       const { end } = await runAgainstReference("import os\nos._exit(0)\n");
       assert.equal(notVerified(end), null);
     });

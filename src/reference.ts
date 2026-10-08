@@ -37,6 +37,10 @@
  *    reference fails, the pair disagrees, or run_deliverable raises (it is
  *    told never to). Tried once on the untouched snapshot, a 3 there drops
  *    it; a 3 at a claim retires it (engine.ts).
+ *  - The work cannot end the comparison early: the deliverable runs in a
+ *    child of the driver, and the driver exits 0 only when every agreed
+ *    input has a result from that child that matches (see DRIVER). A
+ *    deliverable that exits on import fails, by any exit code.
  *  - It is withheld from the model like every drafted check, and lives
  *    outside the project, so a task that walks the tree never meets it.
  */
@@ -167,9 +171,24 @@ export const SECOND_REFERENCE_SYSTEM = [
  * every input before the deliverable runs; judges the deliverable only where
  * they agree; and exits 3 — the check's own failure, never the work's — when
  * a reference fails, the two mostly disagree, or run_deliverable raises.
+ *
+ * Exit 0 is earned, never inherited. The deliverable runs in a child process
+ * of the driver, never in the driver's own: a deliverable imported in-process
+ * could end that process — `os._exit(0)` on import, or `sys.exit(0)` — with
+ * status 0 before a single value was compared, and status 0 is what the check
+ * reads as "every input matched". The child only runs the deliverable and
+ * reports, per input, what it returned, on lines tagged with a per-run nonce
+ * (so nothing the deliverable prints is mistaken for a result). The driver
+ * compares those against the expected values it kept to itself, and passes
+ * only when every agreed input has a result that matches. A child that ends
+ * early, by any exit code, is a failure of the work on the first input it
+ * left unanswered — not a pass, and not the reference's own error (which
+ * would retire the check). When check.py defines `same`, the comparison has
+ * to run beside the deliverable's live value, so that one verdict is the
+ * child's.
  */
 export const DRIVER = [
-  "import importlib.util, json, os, sys, traceback",
+  "import importlib.util, json, os, pickle, secrets, subprocess, sys, traceback",
   "HERE = os.path.dirname(os.path.abspath(__file__))",
   "def load(name):",
   "    spec = importlib.util.spec_from_file_location(name, os.path.join(HERE, name + '.py'))",
@@ -179,6 +198,27 @@ export const DRIVER = [
   "    except Exception: return repr(v)",
   "def own(msg):",
   "    sys.stdout.flush(); sys.stderr.write('REFERENCE ERROR: ' + msg + '\\n'); sys.exit(3)",
+  "def deliverable():",
+  "    # The child: runs the deliverable on each input and reports; never compares unless check.py's same() must.",
+  "    tag = sys.stdin.readline().strip()",
+  "    job = pickle.loads(bytes.fromhex(sys.stdin.readline().strip()))",
+  "    out = os.fdopen(os.dup(1), 'w')",
+  "    def report(n, r):",
+  "        r['n'] = n; out.write('\\n' + tag + ' ' + json.dumps(r) + '\\n'); out.flush()",
+  "    a = load('check')",
+  "    inputs = job['inputs'] if job['inputs'] is not None else [list(a.INPUTS)[i] for i in job['idx']]",
+  "    same = getattr(a, 'same', None)",
+  "    for n, x in enumerate(inputs):",
+  "        try: got = a.run_deliverable(x)",
+  "        except SystemExit as e: report(n, {'exited': repr(e.code)}); return",
+  "        except BaseException: traceback.print_exc(); report(n, {'raised': True}); return",
+  "        r = {'key': key(got), 'repr': repr(got)[:4000]}",
+  "        if same is not None:",
+  "            try: r['same'] = bool(same(job['expected'][n], got))",
+  "            except BaseException: traceback.print_exc(); r['same_failed'] = True",
+  "        report(n, r)",
+  "if sys.argv[1:2] == ['--deliverable']:",
+  "    deliverable(); sys.stdout.flush(); os._exit(0)",
   "try:",
   "    a = load('check'); b = load('second'); inputs = list(a.INPUTS)[:200]",
   "except SystemExit: raise",
@@ -186,24 +226,42 @@ export const DRIVER = [
   "    traceback.print_exc(); own('a reference could not be loaded')",
   "if not inputs: own('the reference defines no inputs')",
   "agreed, disagreed = [], []",
-  "for x in inputs:",
+  "for i, x in enumerate(inputs):",
   "    try: ea = a.reference(x)",
   "    except BaseException: traceback.print_exc(); own('the first reference failed on input %r' % (x,))",
   "    try: eb = b.reference(x)",
   "    except BaseException as e: eb = ('<the second reference failed>', repr(e))",
-  "    (agreed if key(ea) == key(eb) else disagreed).append((x, ea, eb))",
+  "    (agreed if key(ea) == key(eb) else disagreed).append((x, ea, eb, i))",
   "need = len(inputs) if len(inputs) < 3 else max(3, (len(inputs) + 1) // 2)",
   "if len(agreed) < need:",
-  "    x, ea, eb = disagreed[0]",
+  "    x, ea, eb, _ = disagreed[0]",
   "    own('the two independent references agree on only %d of %d inputs; first disagreement, input %r: %r vs %r' % (len(agreed), len(inputs), x, ea, eb))",
   "same = getattr(a, 'same', None)",
-  "for x, e, _ in agreed:",
-  "    try: got = a.run_deliverable(x)",
-  "    except BaseException: traceback.print_exc(); own('run_deliverable raised on input %r' % (x,))",
-  "    try: ok = same(e, got) if same else key(e) == key(got)",
-  "    except BaseException: traceback.print_exc(); own('the comparison failed on input %r' % (x,))",
+  "expected = [e for _, e, _, _ in agreed] if same else None",
+  "try: job = pickle.dumps({'inputs': [x for x, _, _, _ in agreed], 'expected': expected})",
+  "except Exception:",
+  "    try: job = pickle.dumps({'inputs': None, 'idx': [i for _, _, _, i in agreed], 'expected': expected})",
+  "    except Exception: traceback.print_exc(); own('the expected values could not be handed to the deliverable process')",
+  "tag = secrets.token_hex(16)",
+  "p = subprocess.run([sys.executable, os.path.abspath(__file__), '--deliverable'], input=(tag + '\\n' + job.hex() + '\\n').encode(), stdout=subprocess.PIPE)",
+  "got = {}",
+  "for line in p.stdout.decode('utf-8', 'replace').splitlines():",
+  "    if line.startswith(tag + ' '):",
+  "        try: r = json.loads(line[len(tag) + 1:]); got.setdefault(r['n'], r)",
+  "        except Exception: pass",
+  "    else: print(line)",
+  "sys.stdout.flush()",
+  "for n, (x, e, _, _) in enumerate(agreed):",
+  "    r = got.get(n)",
+  "    if r is None:",
+  "        print('input: %r\\nexpected: %r\\nactual:   nothing; the deliverable ended the run (exit %s) before returning a result for this input' % (x, e, p.returncode)); sys.exit(1)",
+  "    if 'exited' in r:",
+  "        print('input: %r\\nexpected: %r\\nactual:   nothing; the deliverable called sys.exit(%s) instead of returning' % (x, e, r['exited'])); sys.exit(1)",
+  "    if r.get('raised'): own('run_deliverable raised on input %r' % (x,))",
+  "    if r.get('same_failed'): own('the comparison failed on input %r' % (x,))",
+  "    ok = r.get('same') is True if same else key(e) == r.get('key')",
   "    if not ok:",
-  "        print('input: %r\\nexpected: %r\\nactual:   %r\\n(two independent references agree on the expected result)' % (x, e, got)); sys.exit(1)",
+  "        print('input: %r\\nexpected: %r\\nactual:   %s\\n(two independent references agree on the expected result)' % (x, e, r.get('repr'))); sys.exit(1)",
   "print('%d inputs match two independent references%s' % (len(agreed), '; %d where they disagreed were not judged' % len(disagreed) if disagreed else ''))",
   "",
 ].join("\n");
