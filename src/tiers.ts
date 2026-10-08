@@ -243,7 +243,11 @@ const RUNNER = /^(?:python[\d.]*|node|bash|sh|zsh|dash|ruby|perl|php|deno|bun|np
 /** Rule 5c: `<runs something> | ... | grep [-q] '<literal>'`. */
 function grepsRunOutput(run: string): boolean {
   for (const [a, b] of shellSegments(run)) {
-    const stages = pipeStages(run.slice(a, b));
+    const seg = run.slice(a, b).trim();
+    // `! prog | grep -q X`, `prog | grep -q X && exit 1`, `if prog | grep -q X; then exit 1`:
+    // the check passes when the text is ABSENT, which wrong output (nothing at all) also is.
+    if (seg.startsWith("!") || /^\s*&&\s*(?:exit\s+[1-9]|false\b)/.test(run.slice(b)) || (/^if\b/.test(seg) && /^\s*;?\s*then\s+(?:exit\s+[1-9]|false\b)/.test(run.slice(b)))) continue;
+    const stages = pipeStages(run.slice(a, b).replace(/^\s*if\s+/, ""));
     if (stages.length < 2) continue;
     const last = stages[stages.length - 1]!.trim();
     const words: string[] = last.match(/"(?:[^"\\]|\\.)*"|'[^']*'|\S+/g) ?? [];
@@ -255,7 +259,9 @@ function grepsRunOutput(run: string): boolean {
     const pat = e >= 0 ? args[e + 1] : args.find((w) => !w.startsWith("-"));
     if (!pat || pat.startsWith(">") || pat.startsWith("<")) continue;
     const body = pat.replace(/^(["'])(.*)\1$/s, "$2");
-    if (/\$[\w{(]/.test(body) || (body.match(/\w/g) ?? []).length < 2) continue;
+    // A pattern of a letter or two matches nearly any text, and `a|b` under -E passes on either outcome.
+    if (/\$[\w{(]/.test(body) || (body.match(/\w/g) ?? []).length < 4) continue;
+    if ((words[0] === "egrep" || hasFlag(flags, "E") || flags.includes("--extended-regexp")) && /(?<!\\)\|/.test(body)) continue;
     if (stages.slice(0, -1).some((s) => RUNNER.test(stageProgram(s)))) return true;
   }
   return false;
@@ -403,16 +409,22 @@ const COMPARISON = /==|!=|<=|>=|<|>|\s(?:not\s+)?in\s/y;
 /** One `and`-conjunct of an asserted condition: does it assert the work's behaviour on literal input? */
 function conjunctAsserts(raw: string, names: ReadonlySet<string>): boolean {
   let c = raw.trim();
+  let negated = false;
   for (;;) {
-    const n = c.replace(/^not\s+/, "").replace(/^\((.*)\)$/s, (all, inner: string) => (closeParen(all, 0) === all.length ? inner : all)).trim();
+    const unnot = c.replace(/^not\s+/, "");
+    if (unnot !== c) negated = !negated;
+    const n = unnot.replace(/^\((.*)\)$/s, (all, inner: string) => (closeParen(all, 0) === all.length ? inner : all)).trim();
     if (n === c) break;
     c = n;
   }
-  // `'x' in f('lit')` / `'x' not in f('lit')`: a literal in the work's answer.
-  const member = /^([rbuf]{0,2}\\?["'][^"']*\\?["']|-?\d+)\s+(?:not\s+)?in\s+(.+)$/s.exec(c);
-  if (member) return callsIn(member[2]!).some((k) => deliverableCall(k, names));
-  const none = /\s+is\s+(?:not\s+)?None\s*$/.test(c);
-  const body = c.replace(/\s+is\s+(?:not\s+)?None\s*$/, "");
+  // `'x' in f('lit')`: a literal in the work's answer. Its negation (`'x' not
+  // in f(...)`, `not 'x' in ...`) holds for an empty answer, and `is not None`
+  // for "", 0, False and []: weaker than truthiness, so neither counts.
+  const member = /^([rbuf]{0,2}\\?["'][^"']*\\?["']|-?\d+)\s+(not\s+)?in\s+(.+)$/s.exec(c);
+  if (member) return !negated && !member[2] && callsIn(member[3]!).some((k) => deliverableCall(k, names));
+  if (/\s+is\s+not\s+None\s*$/.test(c)) return false;
+  const none = !negated && /\s+is\s+None\s*$/.test(c);
+  const body = c.replace(/\s+is\s+None\s*$/, "");
   // A comparison with no literal side is rule 1's to refuse (`f(x) == g(x)`), and an ordering is a bound, not a value.
   if (!none || splitTop(body, COMPARISON).length > 1) return false;
   return callsIn(body).some((k) => deliverableCall(k, names));

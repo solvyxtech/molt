@@ -61,14 +61,12 @@ describe("the value tag", () => {
     `python3 -c "import pytest, pricing\nwith pytest.raises(KeyError):\n    pricing.price('zz', 1)"`,
     `cd $(mktemp -d) && cp ../pricing.py . && python3 -c "from pricing import price; price('widget', 1, 'UNKNOWN')" 2>&1 | grep -q 'ValueError' && exit 0 || exit 1`,
     // is None / a literal in the answer, on a call with literal input
-    `python3 -c "import pricing; assert pricing.best_coupon('item1', 1) is not None"`,
     `python3 -c "import pricing; assert pricing.best_coupon('zz', 1) is None, 'no coupon for an unknown item'"`,
     `python3 -c "import sys, pricing; sys.exit(0 if 'SAVE10' in pricing.coupons_for('mug', 2) else 1)"`,
     // a literal grepped from what running the work printed
     `echo -e '!!!\n!!!' | python3 slugify.py | grep -q 'untitled$'`,
     `python3 nextrun.py '* * * * 1' '2023-01-01 12:00' 1 | grep '2023-01-02'`,
     `node summarize.js nonexistent.json 2>&1 | grep -q 'Error reading file'`,
-    `d=$(mktemp -d) && cp -r md2html.py src Makefile "$d"/ && cd "$d" && make -s && ! make | grep -q md2html`,
     `./rotate.sh 2>&1 | grep -q 'usage'`,
     // rule 1 inside a test bracket whose $(...) holds a ; or a newline, and $'...' literals
     `[ "$(python3 -c "from pricing import best_coupon; print(best_coupon('A', 5))")" = 'SAVE10' ]`,
@@ -77,6 +75,16 @@ describe("the value tag", () => {
     `output=$(python3 wc.py f1.txt f2.txt) && [ "$output" = $'2 2 4 f1.txt\n4 5 10 total' ]`,
   ];
   const notBehaviour = [
+    // #44 review: weaker than truthiness, or text that must be absent (nothing at all passes too).
+    `python3 -c "import pricing; assert pricing.best_coupon('item1', 1) is not None"`,
+    `python3 -c "import slug; assert '!' not in slug.slugify('Hello!')"`,
+    `python3 -c "import slug; assert not '!' in slug.slugify('Hello!')"`,
+    `! python3 tool.py 2>&1 | grep -q Traceback`,
+    `python3 tool.py 2>&1 | grep -q Traceback && exit 1`,
+    `if python3 tool.py 2>&1 | grep -q Traceback; then exit 1; fi`,
+    `python3 t.py | grep -qi 'er'`,
+    `python3 t.py | grep -E 'ok|fail'`,
+    `d=$(mktemp -d) && cp -r md2html.py src Makefile "$d"/ && cd "$d" && make -s && ! make | grep -q md2html`,
     // Not widened: the work's pattern tried on the check's own strings (4 of 7 such flips were grader failures).
     `python3 -c "import re; p=open('regex.txt').read().strip(); assert re.search(p, 'GET 10.1.2.3 served 2024-05-06 ok'), p"`,
     `python3 -c "import re; p=open('regex.txt').read().strip(); assert re.search(p, 'host 192.168.01.1 seen 2024-05-06') is None, p"`,
