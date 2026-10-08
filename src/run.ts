@@ -18,6 +18,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
+import { privSep } from "./privsep.js";
 
 export type RunOptions = {
   cwd: string;
@@ -30,6 +31,21 @@ export type RunOptions = {
   shell?: string | true;
   /** Kills the command when it aborts, so a turn can be cancelled mid-command. */
   signal?: AbortSignal;
+  /**
+   * The worker asked for it: under privilege separation (src/privsep.ts) it
+   * runs as the worker user. Without privilege separation this changes nothing.
+   */
+  asWorker?: boolean;
+  /**
+   * This is a check run. Under privilege separation with a check account
+   * (`--check-user`): "copy" runs it as the check account (it is in a copy of
+   * the tree Maat made for it), "in-place" runs it as the worker (it runs in
+   * the worker's own tree: a project check, a mutation run). Either way it
+   * gets its own PID namespace and private /tmp when Maat can make them
+   * (`PrivSep.checkSpec`). Without a check account this changes nothing:
+   * checks run as Maat, as before.
+   */
+  asCheck?: "copy" | "in-place";
 };
 
 export type RunResult = {
@@ -90,17 +106,43 @@ export function draftedShell(check: { hidden?: boolean; tags?: readonly string[]
 export function runCommand(command: string, opts: RunOptions): Promise<RunResult> {
   return new Promise<RunResult>((resolve, reject) => {
     let child: ChildProcess;
+    let cleanup: (() => void) | undefined;
     try {
-      child = spawn(command, {
-        cwd: opts.cwd,
-        shell: opts.shell ?? true,
-        env: opts.env,
-        stdio: ["ignore", "pipe", "pipe"],
-        // Its own process group, so a timeout can kill everything the command
-        // started and not just the shell (see `kill`).
-        detached: process.platform !== "win32",
-      });
+      const sep = privSep();
+      const ps = opts.asWorker ? sep : undefined;
+      if (opts.asCheck && sep?.check) {
+        const made = sep.checkSpec(command, opts.shell ?? true, opts.cwd, opts.asCheck === "copy" ? "check" : "worker", opts.env ?? process.env);
+        cleanup = made.cleanup;
+        const spec = made.spec;
+        child = spawn(spec.file, spec.args, {
+          cwd: opts.cwd,
+          env: spec.env,
+          stdio: ["ignore", "pipe", "pipe"],
+          detached: true,
+          ...(spec.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
+        });
+      } else if (ps) {
+        const spec = ps.commandSpec(command, opts.shell ?? true, opts.cwd, opts.env);
+        child = spawn(spec.file, spec.args, {
+          cwd: opts.cwd,
+          env: spec.env,
+          stdio: ["ignore", "pipe", "pipe"],
+          detached: true,
+          ...(spec.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
+        });
+      } else {
+        child = spawn(command, {
+          cwd: opts.cwd,
+          shell: opts.shell ?? true,
+          env: opts.env,
+          stdio: ["ignore", "pipe", "pipe"],
+          // Its own process group, so a timeout can kill everything the command
+          // started and not just the shell (see `kill`).
+          detached: process.platform !== "win32",
+        });
+      }
     } catch (e) {
+      cleanup?.();
       reject(e as Error);
       return;
     }
@@ -181,6 +223,7 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
       if (killTimer) clearTimeout(killTimer);
       if (drainTimer) clearTimeout(drainTimer);
       opts.signal?.removeEventListener("abort", onAbort);
+      cleanup?.();
       if (heldOpen) {
         child.stdout?.destroy();
         child.stderr?.destroy();
@@ -204,6 +247,7 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
       if (killTimer) clearTimeout(killTimer);
       if (drainTimer) clearTimeout(drainTimer);
       opts.signal?.removeEventListener("abort", onAbort);
+      cleanup?.();
       reject(e);
     });
   });

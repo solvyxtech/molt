@@ -54,28 +54,31 @@ SETS = [
 
 
 # ------------------------------------------------------------------ inside the container
-def inside() -> None:
+def inside(job_path: str = "/job.json", src: str = "/src", work: str = "/work") -> None:
     sys.path.insert(0, str(HERE))
-    job = json.load(open("/job.json"))
+    job = json.load(open(job_path))
     from tasks import TASKS  # noqa: PLC0415
     from tasks2 import TASKS2  # noqa: PLC0415
 
+    import run  # noqa: PLC0415  (the grading helpers run.py grades with)
+
     by = {T.name: T for T in TASKS + TASKS2}
-    os.environ["GIT_CONFIG_COUNT"] = "1"
-    os.environ["GIT_CONFIG_KEY_0"] = "safe.directory"
-    os.environ["GIT_CONFIG_VALUE_0"] = "*"
-    dst = Path("/work") / job["name"]
+    # No safe.directory=*: the trees are agent-written, and their .git/config (core.fsmonitor,
+    # hooks, filters, diff drivers) would run as root. The grader grades a sanitized root-owned
+    # copy exactly as run.py does (run.grade_safely: config cut to the format lines, hooks and
+    # attributes removed, git started without system or global config). The checks run on a
+    # root-owned copy whose repositories are sanitized the same way (run.sanitized_copy).
+    dst = Path(work) / job["name"]
 
     def fresh() -> Path:
         shutil.rmtree(dst, ignore_errors=True)
         dst.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["cp", "-R", "--preserve=mode,timestamps", "/src", str(dst)], check=True)
-        return dst
+        return run.sanitized_copy(Path(src), dst)
 
     res: dict = {"name": job["name"], "checks": {}}
     try:
         d = fresh()
-        ok, why = by[job["task"]].grade(d)
+        ok, why = run.grade_safely(by[job["task"]], d)
         res["grade"] = [bool(ok), str(why)[:300]]
     except Exception as e:  # noqa: BLE001
         res["grade"] = [None, f"grader crashed: {e}"[:300]]

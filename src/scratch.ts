@@ -37,9 +37,9 @@
  */
 import { constants } from "node:fs";
 import { copyFile, lstat, mkdir, mkdtemp, readdir, readlink, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { STATE_DIRS } from "./statedir.js";
+import { checkTmpDir, privSep } from "./privsep.js";
 
 /** Folders that are dependencies or caches, linked into the copy rather than copied. */
 export const LINKED_DIRS = new Set([
@@ -185,7 +185,9 @@ export async function copyTreeOrWhy(
   if ((await countUpTo(root, maxFiles)) > maxFiles) return { why: `the tree has over ${maxFiles} files` };
   let tmp: string;
   try {
-    tmp = await mkdtemp(join(tmpdir(), "maat-check-"));
+    // With a check account (--check-user) the copy goes in its folder, which
+    // the worker cannot enter, and is handed to it below.
+    tmp = await mkdtemp(join(checkTmpDir(), "maat-check-"));
   } catch (e) {
     return { why: `no temporary directory (${e instanceof Error ? e.message : String(e)})` };
   }
@@ -286,6 +288,9 @@ export async function copyTreeOrWhy(
   };
   try {
     await copyDir(root, dest, true, false);
+    // The check runs as the check account and may write in its copy (a
+    // build, a cache, a commit), as it would in the project.
+    privSep()?.giveToCheck(tmp);
   } catch (e) {
     await cleanup();
     return {

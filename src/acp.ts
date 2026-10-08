@@ -78,6 +78,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
+import { privSep } from "./privsep.js";
 import { promisify } from "node:util";
 
 import { errorText } from "./format.js";
@@ -129,6 +130,15 @@ export type AcpAgentSpec = {
   readonly loginHint: string;
   /** Where the CLI keeps the credential, so health can say "logged out". */
   readonly credentialPath: string;
+  /**
+   * Environment variables that carry this agent's own login. Under privilege
+   * separation (src/privsep.ts) the worker's environment loses every
+   * credential-looking name; these, and only for this agent's process when it
+   * is the worker, pass through. Anything else (another provider's key, a
+   * token the worker's shell commands would see) stays out. An agent without
+   * one must find its login in the worker user's HOME.
+   */
+  readonly workerCredentialEnv?: readonly string[];
   /**
    * How this agent can be handed Maat's tool server.
    *
@@ -252,6 +262,8 @@ export const ACP_AGENTS: readonly AcpAgentSpec[] = [
     installHint: "npm install -g opencode-ai",
     loginHint: "opencode auth login",
     credentialPath: ".local/share/opencode/auth.json",
+    // The Zen account's key, when it arrives through the environment rather than auth.json.
+    workerCredentialEnv: ["OPENCODE_API_KEY"],
     mcpTransport: "http",
     sessionMeta: () => ({}),
   },
@@ -499,6 +511,8 @@ export class AcpConnection {
       onRequest?: ClientHandler;
       /** Anything at all arrived from the agent: the stall watchdog's clock. */
       onActivity?: () => void;
+      /** The agent is the worker: under privilege separation it runs as the worker user (src/privsep.ts). */
+      asWorker?: boolean;
     } = {},
   ) {
     const onRequest = opts.onRequest;
@@ -521,19 +535,27 @@ export class AcpConnection {
 
   async start(): Promise<void> {
     const spawnFn = this.opts.spawnFn ?? spawn;
-    const child = spawnFn(this.spec.bin, [...this.spec.args], {
-      cwd: this.opts.cwd ?? process.cwd(),
+    const cwd = this.opts.cwd ?? process.cwd();
+    // The subprocess environment REPLACES rather than merges, so the spread
+    // is load-bearing: without it a Finder-launched molt hands the CLI an
+    // empty PATH and it cannot find its own helpers.
+    // `electron/login-path.ts` has already repaired process.env.PATH by the
+    // time anything gets here.
+    const env = {
+      ...(this.spec.childEnv ? this.spec.childEnv(process.env) : process.env),
+      ...this.spec.env,
+      ...(this.spec.env ? { PWD: cwd } : {}),
+    };
+    // The worker's agent, and every tool it runs itself, as the worker user:
+    // its own reads (Grok auto-approves read_file, grep, list_dir) never
+    // reach Maat, so only the uid can bound them.
+    const ps = this.opts.asWorker ? privSep() : undefined;
+    const spec = ps?.execSpec(this.spec.bin, this.spec.args, cwd, env, this.spec.workerCredentialEnv);
+    const child = spawnFn(spec?.file ?? this.spec.bin, spec?.args ?? [...this.spec.args], {
+      cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      // The subprocess environment REPLACES rather than merges, so the spread
-      // is load-bearing: without it a Finder-launched molt hands the CLI an
-      // empty PATH and it cannot find its own helpers.
-      // `electron/login-path.ts` has already repaired process.env.PATH by the
-      // time anything gets here.
-      env: {
-        ...(this.spec.childEnv ? this.spec.childEnv(process.env) : process.env),
-        ...this.spec.env,
-        ...(this.spec.env ? { PWD: this.opts.cwd ?? process.cwd() } : {}),
-      },
+      env: spec?.env ?? env,
+      ...(spec?.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
       // Its own process group, so ending it ends what it started (src/proctree.ts).
       ...groupSpawn(),
     });
@@ -835,6 +857,8 @@ export type AcpOptions<H> = {
   abortTools?: () => void;
   /** Injected in tests, which drive a scripted agent rather than a real one. */
   spawnFn?: typeof spawn;
+  /** This agent is the worker (not a judge): run it as the worker user when privilege separation is on. */
+  asWorker?: boolean;
 };
 
 /** How long an interrupted turn waits for its aborted tool calls to end. */
@@ -954,6 +978,7 @@ export class AcpSession<H> {
     const conn = new AcpConnection(spec, {
       cwd,
       ...(this.opts.spawnFn ? { spawnFn: this.opts.spawnFn } : {}),
+      ...(this.opts.asWorker ? { asWorker: true } : {}),
       onNotify: (method, params) => this.onNotify(method, params),
       onRequest: (method, params) => this.onRequest(method, params),
       onActivity: () => this.touch(),

@@ -26,6 +26,7 @@ import { spawn } from "node:child_process";
 import { closeSync, mkdirSync, openSync } from "node:fs";
 import { join } from "node:path";
 import { stateDirName } from "./statedir.js";
+import { privSep } from "./privsep.js";
 
 export type BackgroundProcess = {
   id: number;
@@ -91,23 +92,45 @@ function killGroup(pid: number, signal: NodeJS.Signals): boolean {
  */
 export function startBackground(
   command: string,
-  opts: { cwd: string; env?: NodeJS.ProcessEnv },
+  opts: { cwd: string; env?: NodeJS.ProcessEnv; asWorker?: boolean },
 ): BackgroundProcess {
   hookExit();
   const id = nextId++;
   const bgRel = `${stateDirName(opts.cwd)}/bg`;
   const dir = join(opts.cwd, bgRel);
-  mkdirSync(dir, { recursive: true });
   const log = `${bgRel}/${id}.log`;
-  const fd = openSync(join(opts.cwd, log), "w");
-  const child = spawn(command, {
-    cwd: opts.cwd,
-    shell: true,
-    env: opts.env,
-    detached: true,
-    stdio: ["ignore", fd, fd],
-  });
-  closeSync(fd);
+  const ps = opts.asWorker ? privSep() : undefined;
+  let child;
+  if (ps) {
+    // Under privilege separation the job is the worker's, and so is its log:
+    // the worker's own shell makes the folder and opens the file, so the
+    // log is created with the worker's permissions. Maat (root) never creates
+    // or opens a path in the worker's tree.
+    const spec = ps.execSpec(
+      "/bin/sh",
+      ["-c", 'mkdir -p -- "$1" && exec >"$2" 2>&1 </dev/null && exec /bin/sh -c "$3"', "maat-bg", dir, join(opts.cwd, log), command],
+      opts.cwd,
+      opts.env,
+    );
+    child = spawn(spec.file, spec.args, {
+      cwd: opts.cwd,
+      env: spec.env,
+      detached: true,
+      stdio: "ignore",
+      ...(spec.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
+    });
+  } else {
+    mkdirSync(dir, { recursive: true });
+    const fd = openSync(join(opts.cwd, log), "w");
+    child = spawn(command, {
+      cwd: opts.cwd,
+      shell: true,
+      env: opts.env,
+      detached: true,
+      stdio: ["ignore", fd, fd],
+    });
+    closeSync(fd);
+  }
   const entry: BackgroundProcess = {
     id,
     pid: child.pid ?? -1,

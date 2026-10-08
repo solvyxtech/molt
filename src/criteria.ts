@@ -321,6 +321,8 @@ export async function preflightCriteria(
         timeoutMs: opts.timeoutMs ?? 5_000,
         maxBuffer: 1024 * 1024,
         signal: opts.signal,
+        // As the check account in its copy, or as the worker in the project (--check-user).
+        asCheck: copy ? "copy" : "in-place",
       });
       // One decision point, shared with the bar. A command that outlived the
       // timeout plainly ran, and a timeout's exit code is never one of the
