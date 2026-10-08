@@ -212,7 +212,8 @@ describe("the tier in a turn", () => {
   it("a pass that ran the work and asserted a value is verified", async () => {
     const { end, rows } = await run(VALUE);
     assert.deepEqual([end.outcome, end.tier, end.tierReason], ["verified", "verified", undefined]);
-    assert.deepEqual([rows.at(-1).tier, rows.at(-1).evidence], ["verified", "runs+exact"]);
+    // "runs+exact" only with the exact-value rule on (opt-in, MAAT_REQUIRE_EXACT=1).
+    assert.deepEqual([rows.at(-1).tier, rows.at(-1).evidence], ["verified", "runs+value"]);
   });
 
   it("a reviewer contradiction takes the word back, and the index row says so", async () => {

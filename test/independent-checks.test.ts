@@ -284,9 +284,14 @@ describe("a golden file only stands for a value when it predates the work", () =
     assert.deepEqual([end.outcome, end.tier], ["unverified", "passed-checks"]);
   });
 
-  it("the task shipped expected.txt and the worker left it alone: verified", async () => {
+  it("the task shipped expected.txt and the worker left it alone: its value counts, but a drafted check that reads only project files does not verify", async () => {
+    // golden.ts: a shipped, untouched expected.txt keeps the diff's value tag.
+    // control.ts (#41): a drafted check whose only inputs were already in the
+    // project for the worker to read can be met by copying them, so it does
+    // not carry the word on its own.
     const end = await turn({ "out.txt": "hello\n" }, { "expected.txt": "hello\n" });
-    assert.deepEqual([end.outcome, end.tier, end.claim], ["verified", "verified", "verified (independent checks: judge-j)"]);
+    assert.deepEqual([end.outcome, end.tier], ["unverified", "passed-checks"]);
+    assert.match(end.tierReason ?? "", /already in the project for the worker to read/);
   });
 
   it("the worker rewrote the shipped expected.txt: not verified", async () => {

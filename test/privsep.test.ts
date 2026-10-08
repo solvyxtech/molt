@@ -22,7 +22,7 @@ import { Receipts } from "../src/receipts.js";
 import { Integrity } from "../src/integrity.js";
 import { runCommand } from "../src/run.js";
 import { stateDir } from "../src/statedir.js";
-import { checkUserFrom, disablePrivSep, enablePrivSep, gitSync, isolationLine, privSep, safeRel, type PrivSep } from "../src/privsep.js";
+import { checkUserFrom, DEFAULT_WORKER_USER, defaultWorkerUser, disablePrivSep, enablePrivSep, gitSync, isolationLine, privSep, safeRel, type PrivSep } from "../src/privsep.js";
 import { runCheck, type BarContext } from "../src/bar.js";
 import { runAssertions, type Contract } from "../src/mission.js";
 import { snapshotProject } from "../src/reference.js";
@@ -730,5 +730,31 @@ describe("privilege separation off (the default)", () => {
     if (process.platform === "win32") return;
     assert.throws(() => enablePrivSep({ user: "maat-no-such-user-xyz", project: tmpdir(), helper: HELPER }), /no such user/);
     assert.equal(privSep(), undefined);
+  });
+});
+
+describe("the default worker user for unattended runs", () => {
+  it("as root on Linux: the existing maat-worker account", () => {
+    const d = defaultWorkerUser({ platform: "linux", euid: 0, exists: () => true, create: () => assert.fail("not made when it exists") });
+    assert.equal(d.user, DEFAULT_WORKER_USER);
+    assert.match(d.notice, /run as maat-worker .*--worker-user none/);
+  });
+
+  it("as root on Linux: made when missing, and root with a notice when it cannot be made", () => {
+    let made = "";
+    const ok = defaultWorkerUser({ platform: "linux", euid: 0, exists: () => false, create: (n) => ((made = n), null) });
+    assert.deepEqual([ok.user, made], [DEFAULT_WORKER_USER, DEFAULT_WORKER_USER]);
+    assert.match(ok.notice, /made the system account maat-worker/);
+    const no = defaultWorkerUser({ platform: "linux", euid: 0, exists: () => false, create: () => "useradd is not on the PATH" });
+    assert.equal(no.user, undefined);
+    assert.match(no.notice, /tools run as root.*--worker-user/);
+  });
+
+  it("anywhere else: no change, and a notice that says so", () => {
+    for (const [platform, euid] of [["linux", 1000], ["darwin", 0], ["darwin", 501]] as const) {
+      const d = defaultWorkerUser({ platform, euid, exists: () => assert.fail("not looked up"), create: () => assert.fail("not made") });
+      assert.equal(d.user, undefined, `${platform} ${euid}`);
+      assert.match(d.notice, /the same account as Maat/);
+    }
   });
 });

@@ -5,14 +5,15 @@
  * two independent references. A deliverable that calls os._exit(0) at import
  * time took the whole driver process down with status 0 before any value was
  * produced — and the driver read exit 0 as "all inputs matched". It now runs
- * the deliverable in a child and passes only on a matching result per input.
+ * the deliverable in a child per input (runner.py) and passes only on a
+ * matching result per input and its closing REFERENCE COMPARED line.
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
-import { DRIVER } from "../../../src/reference.js";
+import { DRIVER, RUNNER } from "../../../src/reference.js";
 import { done, hasPython, notVerified, runWorker, write } from "./harness.js";
 import type { Check } from "../../../src/types.js";
 
@@ -39,6 +40,7 @@ function referenceCheck(dir: string): Check {
     "def reference(lines):\n    n = 0\n    for l in lines:\n        if l[:5] == 'ERROR':\n            n += 1\n    return n\n",
   );
   writeFileSync(join(dir, "driver.py"), DRIVER);
+  writeFileSync(join(dir, "runner.py"), RUNNER);
   return {
     name: "reference",
     kind: "command",

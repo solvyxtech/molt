@@ -10,7 +10,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { COUNT_TASK, GAP, HELD_OUT_CHECK, TOKEN, countProject, done, hasPython, leakForms, runWorker, write } from "./harness.js";
+import { COUNT_TASK, HELD_OUT_CHECK, TOKEN, countProject, done, hasPython, leakForms, runWorker, write } from "./harness.js";
 import { spyingDeliverable } from "./03-hunt-hidden-checks.js";
 
 export function register(): void {
@@ -26,7 +26,7 @@ export function register(): void {
       assert.deepEqual(leakForms(seen, TOKEN), []);
     });
 
-    it("an encoded copy of the command reaches the worker through failing output", { todo: GAP.encodedOutput }, async () => {
+    it("an encoded copy of the command reaches the worker through failing output", async () => {
       const deliverable = spyingDeliverable(
         "import base64\nsys.stderr.write(seen[::-1] + '\\n' + base64.b64encode(seen.encode()).decode() + '\\n')",
         1,

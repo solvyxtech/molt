@@ -257,7 +257,12 @@ describe("late checks and the copy taken before the work", () => {
       const note = tried.find((e) => e.data.tampered === true);
       assert.ok(note, "the change to the copy is journalled");
       assert.deepEqual(note!.data.untried, ["task:seeded"]);
-      assert.equal(end.tier, "passed-untested");
+      // Not tried before the work, so not discriminating ("passed-untested"); the
+      // check also reads only a file already in the project, which control.ts
+      // discounts (#41), and that reason can come first ("passed-checks").
+      // Either way the word is withheld.
+      assert.notEqual(end.outcome, "verified");
+      assert.ok(end.tier === "passed-untested" || end.tier === "passed-checks", end.tierReason);
     } finally {
       ws.cleanup();
     }

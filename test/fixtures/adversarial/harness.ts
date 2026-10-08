@@ -358,10 +358,6 @@ export const isLinux = process.platform === "linux";
 
 const PR = "https://github.com/solvyxtech/molt/pull";
 export const GAP = {
-  filesChangedIsPerson: `#32: a passing session builtin (work-landed: files-changed) counts as "your checks" — ${PR}/32#pullrequestreview-5449896849`,
-  printTrue: `#34: a judge check that prints a boolean and exits 0 earns "verified" on wrong work — ${PR}/34#pullrequestreview-5449897064`,
-  cmdline: `#27/#34: a hidden check's command line is readable from the process table while it runs (ps, /proc/<pid>/cmdline) — ${PR}/34#pullrequestreview-5449897064`,
-  encodedOutput: `#27: failing hidden-check output is masked by exact substring only, so an encoded copy of the command reaches the worker — ${PR}/27#issuecomment-6049470008`,
   environ: `#23: the worker reads Maat's own environment (/proc/$PPID/environ; MAAT_JUDGE_KEY is not in SECRET_ENV) — ${PR}/23#issuecomment-6049473143`,
   otherRuns: `#33: runs outside the bench container can read other runs' released receipts — ${PR}/33#pullrequestreview-5449896957`,
   leftovers: `#33: processes the worker leaves behind are not ended before the checks run (bench grades before it kills) — ${PR}/33#pullrequestreview-5449896957`,

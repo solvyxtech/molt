@@ -162,7 +162,9 @@ describe("the gates", () => {
     const ctx = { workDir: t.work, preWorkDir: t.pre, mutants: [] };
     const q = "For input.txt the total is 7.";
     assert.equal((await auditGates({ name: "a", run: `[ "$(head -1 input.txt)" = "3" ]`, quote: q }, ctx)).rule, "P1-passes-before-work");
-    assert.equal((await auditGates({ name: "a2", run: `[ "$(cat input.txt | wc -l | tr -d ' ')" = "3" ]`, quote: q }, ctx)).rule, "V-property-only", "a count is a property");
+    // With the exact-value rule on (opt-in, MAAT_REQUIRE_EXACT=1) a count is a property; off, it is tried before the work.
+    assert.equal((await auditGates({ name: "a2", run: `[ "$(cat input.txt | wc -l | tr -d ' ')" = "3" ]`, quote: q }, { ...ctx, requireExact: true })).rule, "V-property-only", "a count is a property");
+    assert.equal((await auditGates({ name: "a3", run: `[ "$(cat input.txt | wc -l | tr -d ' ')" = "3" ]`, quote: q }, { ...ctx, requireExact: false })).rule, "P1-passes-before-work");
     assert.equal((await auditGates({ name: "b", run: `[ "$(node sum.js input.txt)" = "7" ] || echo fail`, quote: q }, ctx)).rule, "L16-cannot-fail");
     assert.equal((await auditGates({ name: "c", run: `node sum.js input.txt > out.txt && grep -qx 7 out.txt`, quote: q }, ctx)).rule, "L15-mutates");
     assert.equal((await auditGates({ name: "d", run: `node sum.js input.txt`, quote: q }, ctx)).rule, "V-no-value");

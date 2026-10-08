@@ -55,7 +55,7 @@ import { stateDir } from "./statedir.js";
 import { draftReference, snapshotProject } from "./reference.js";
 import { env } from "./env.js";
 import { fileURLToPath } from "node:url";
-import { checkUserFrom, disablePrivSep, enablePrivSep, setIsolationLine, workerUserFrom, type PrivSep } from "./privsep.js";
+import { checkUserFrom, defaultWorkerUser, disablePrivSep, enablePrivSep, setIsolationLine, workerUserFrom, type PrivSep } from "./privsep.js";
 import { preWorkCopy } from "./scratch.js";
 
 /**
@@ -265,7 +265,9 @@ options
                      root or with passwordless sudo to <u>). Maat's records go
                      to a private state dir (MAAT_STATE_DIR) and are copied
                      into .maat/ when the job ends. For containers and
-                     unattended runs. (MAAT_WORKER_USER)
+                     unattended runs. Unset, an unattended run as root on
+                     Linux uses maat-worker (made if missing); "none" keeps
+                     the tools as Maat's own user. (MAAT_WORKER_USER)
   --check-user <u>   with --worker-user: task checks (hidden, drafted, mission)
                      run as user <u> in their copy of the tree, with only PATH,
                      a fresh HOME, LANG and TERM, and (root with CAP_SYS_ADMIN)
@@ -2325,9 +2327,18 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
 
   // Privilege separation, when asked for: before any record is opened, so
   // every one of them is made in the private state dir (src/privsep.ts).
-  const worker = workerUserFrom(args.workerUser);
+  const named = workerUserFrom(args.workerUser);
   const checker = checkUserFrom(args.checkUser);
   const separates = args.cmd === "run" || args.cmd === "ask" || (args.cmd === "mission" && (args.task ?? "").split(" ")[0] === "run");
+  // `none` keeps the worker's tools as Maat's own user. Unnamed, an unattended
+  // run as root on Linux separates by default (privsep.ts defaultWorkerUser);
+  // anywhere else nothing changes, and the notice says which account it is.
+  let worker = named === "none" ? undefined : named;
+  if (!named && separates && !checker && !args.workerStrict) {
+    const d = defaultWorkerUser();
+    process.stderr.write(`maat: ${d.notice}\n`);
+    worker = d.user;
+  }
   if (!worker && separates && (checker || args.workerStrict)) {
     process.stderr.write(`maat: ${args.workerStrict ? "--worker-strict" : "--check-user"} needs --worker-user (MAAT_WORKER_USER)\n`);
     return 2;

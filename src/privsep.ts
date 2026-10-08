@@ -1269,6 +1269,62 @@ export function workerUserFrom(flag?: string): string | undefined {
   return v || undefined;
 }
 
+/** The account an unattended root run on Linux gives the worker when none was named. */
+export const DEFAULT_WORKER_USER = "maat-worker";
+
+/**
+ * What an unattended run (`maat run`, `ask`, `mission run`) does when no
+ * worker user was named. As root on Linux the worker's tools run as
+ * DEFAULT_WORKER_USER: the account is used if it exists and made (a system
+ * account with its own home) if it does not. Anywhere else nothing changes:
+ * the worker's tools run as Maat's own user, and the notice says so.
+ * `--worker-user none` (MAAT_WORKER_USER=none) keeps today's behaviour as
+ * root too. Never throws; a failure to make the account is a notice.
+ */
+export function defaultWorkerUser(
+  o: {
+    platform?: NodeJS.Platform;
+    euid?: number;
+    exists?: (name: string) => boolean;
+    create?: (name: string) => string | null;
+  } = {},
+): { user?: string; notice: string } {
+  const platform = o.platform ?? process.platform;
+  const euid = o.euid ?? process.geteuid?.();
+  const name = DEFAULT_WORKER_USER;
+  if (platform !== "linux" || euid !== 0) {
+    const who = euid === 0 ? "root" : "the user Maat runs as";
+    return {
+      notice:
+        `worker tools run as ${who}, the same account as Maat: privilege separation is the default only for root on Linux ` +
+        `(--worker-user <u> asks for it${platform === "linux" ? " with root or passwordless sudo" : ""})`,
+    };
+  }
+  const exists =
+    o.exists ??
+    ((n: string) => {
+      try {
+        lookupUser(n);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  const create =
+    o.create ??
+    ((n: string) => {
+      if (!which("useradd")) return "useradd is not on the PATH";
+      const r = spawnSync("useradd", ["--system", "--create-home", "--home-dir", `/var/lib/${n}`, "--shell", "/bin/sh", n], { encoding: "utf8" });
+      return r.status === 0 ? null : (r.stderr || `useradd exited ${r.status}`).trim();
+    });
+  if (exists(name)) return { user: name, notice: `running as root: the worker's tools run as ${name} (the default for unattended runs; --worker-user none keeps them as root)` };
+  const failed = create(name);
+  if (failed === null) {
+    return { user: name, notice: `running as root: made the system account ${name}, and the worker's tools run as it (the default for unattended runs; --worker-user none keeps them as root)` };
+  }
+  return { notice: `running as root and could not make the account ${name} (${failed}): the worker's tools run as root. Pass --worker-user <u> to separate them` };
+}
+
 /** The check account asked for, from the flag or MAAT_CHECK_USER. */
 export function checkUserFrom(flag?: string): string | undefined {
   const v = (flag ?? process.env.MAAT_CHECK_USER ?? "").trim();

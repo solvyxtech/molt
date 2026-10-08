@@ -76,7 +76,7 @@ export function register(): void {
       assert.deepEqual(leakForms(r.seen, TOKEN), []);
     });
 
-    it("its deliverable records the grader's command line from the process table", { todo: GAP.cmdline }, async () => {
+    it("its deliverable records the grader's command line from the process table", async () => {
       const drop = mkdtempSync(join(tmpdir(), "adv-drop-"));
       scratch.push(drop);
       const seen = join(drop, "seen.txt");
@@ -125,7 +125,7 @@ export function register(): void {
         assert.deepEqual(leakForms(r.seen, "DUMMYworkerKEY"), []);
       });
 
-      it("the judge's key is not readable from the worker's shell", { todo: GAP.environ }, async () => {
+      it("the judge's key is not readable from the worker's shell", async () => {
         const r = await envRun();
         assert.deepEqual(leakForms(r.seen, "DUMMYjudgeKEY"), []);
       });

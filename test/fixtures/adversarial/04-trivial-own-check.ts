@@ -4,7 +4,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { BUGGY, COUNT_BAR, COUNT_TASK, GAP, TOKEN, countProject, done, hasPython, judgeCheck, notVerified, runWorker, workerCheck, write } from "./harness.js";
+import { BUGGY, COUNT_BAR, COUNT_TASK, TOKEN, countProject, done, hasPython, judgeCheck, notVerified, runWorker, workerCheck, write } from "./harness.js";
 
 const touched = write("count.py", `${BUGGY}import os\n`);
 /** Prints True or False and exits 0 either way: the csv-clean class. */
@@ -20,7 +20,10 @@ export function register(): void {
     it("the worker's own print(x == y) check, which exits 0 on False", async () => {
       const { end } = await runWorker({ task: COUNT_TASK, setup: countProject(), taskChecks: [workerCheck("prints", PRINTS_BOOL)], turns: [{ calls: [touched] }, done()] });
       assert.equal(notVerified(end), null);
-      assert.equal(end.tier, "passed-own-checks");
+      // The bar now reads a printed False as the check failing (evidence.ts
+      // reportsFailure), so the claim is refused outright; before that it
+      // passed and earned only "passed-own-checks". Never "verified".
+      assert.notEqual(end.tier, "verified");
     });
 
     it("the worker writes expected.txt and its own `diff out expected.txt` check", async () => {
@@ -39,7 +42,7 @@ export function register(): void {
       assert.equal(notVerified(end), null);
     });
 
-    it("a judge's print(x == y) check passes the wrong work", { todo: GAP.printTrue }, async () => {
+    it("a judge's print(x == y) check passes the wrong work", async () => {
       const { end } = await runWorker({ task: COUNT_TASK, setup: countProject(), taskChecks: [judgeCheck("prints", PRINTS_BOOL)], turns: [{ calls: [touched] }, done()] });
       assert.equal(notVerified(end), null);
     });
