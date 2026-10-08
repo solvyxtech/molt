@@ -73,11 +73,12 @@ url=${url//127.0.0.1/host.docker.internal}; url=${url//localhost/host.docker.int
 # Maat on a pipe (MAAT_KEYS_FD), so it is in no environment at all.
 envf=$(mktemp); chmod 600 "$envf"; trap 'rm -f "$envf"' EXIT
 printf 'OPENROUTER_API_KEY=%s\n' "$key" > "$envf"
-# Anthropic API lanes (BENCH_URL=https://api.anthropic.com/v1): the key comes from the
-# Keychain item maat-bench-anthropic (paste it with container/set-anthropic-key.sh),
-# never from the command line.
+# The api2 lane (a second provider's API as the worker or the judge; BENCH_URL or an ARMS
+# judge URL on that provider's host): the key comes from the Keychain item maat-bench-api2
+# (paste it with container/set-api2-key.sh), never from the command line. It is handed to
+# Maat under the provider's own variable name, which is what Maat reads.
 if [[ "$url" == *api.anthropic.com* || "${ARMS:-}" == *api.anthropic.com* ]]; then
-  akey=$(security find-generic-password -s maat-bench-anthropic -w 2>/dev/null) || { echo "no Keychain item maat-bench-anthropic: run bench/local/container/set-anthropic-key.sh" >&2; exit 1; }
+  akey=$(security find-generic-password -s maat-bench-api2 -w 2>/dev/null) || { echo "no Keychain item maat-bench-api2: run bench/local/container/set-api2-key.sh" >&2; exit 1; }
   printf 'ANTHROPIC_API_KEY=%s\n' "$akey" >> "$envf"
 fi
 # The graders and reference solutions are mounted where only root can reach (/root is 700),
