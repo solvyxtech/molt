@@ -17,9 +17,11 @@ import { isOpencode, opencodeAsk } from "./opencode.js";
 import { removedSubscriptionProblem } from "./endpoint.js";
 import { errorText } from "./format.js";
 import { authHeaders, isSelfHosted, selfHostedThinking, openRouterProvider } from "./providers.js";
-import { LONG_RATE_LIMIT_MS, longQuotaText, providerErrorText, rateLimitResetAt, readStream, transientProviderError, untilText, type ProviderError } from "./stream.js";
+import { LONG_RATE_LIMIT_MS, longQuotaText, providerErrorText, rateLimitResetAt, readStream, transientProviderError, untilText, type ProviderError, type Usage } from "./stream.js";
 import { askError, askTimeoutMs, localSpeed, probeSignal } from "./watchdog.js";
 import { takeTurn } from "./localgate.js";
+import type { AskMeter } from "./judge-meter.js";
+import { estTokens } from "./types.js";
 
 /**
  * Pauses before asking again when the provider said it is overloaded or
@@ -64,6 +66,13 @@ export type AskOptions = {
    * three before the first step. Never recorded for a self-hosted server.
    */
   latency?: { record(w: { firstProgressMs: number | undefined; maxGapMs: number }): void };
+  /**
+   * Where each answered ask reports what it used (src/judge-meter.ts): input,
+   * output, cache read and write tokens, and the provider's own dollar figure
+   * when it sends one. Every ask that returns an answer is recorded, retries
+   * included; an ask the provider refused is not, since nothing was billed.
+   */
+  meter?: AskMeter;
 };
 
 export type Asked = { ok: true; text: string; cutOff: boolean } | { ok: false; error: string; transient?: true };
@@ -201,7 +210,10 @@ async function askOnce(opts: AskOptions, maxTokens: number): Promise<Asked> {
       prompt: opts.prompt,
       ...(opts.cliRun ? { run: opts.cliRun } : {}),
     });
-    if (asked.ok) return { ok: true, text: asked.text, cutOff: false };
+    if (asked.ok) {
+      meterEstimate(opts, asked.text);
+      return { ok: true, text: asked.text, cutOff: false };
+    }
     return { ok: false, error: longQuotaText(asked.error) ?? asked.error, ...(asked.transient ? { transient: true as const } : {}) };
   }
 
@@ -216,7 +228,10 @@ async function askOnce(opts: AskOptions, maxTokens: number): Promise<Asked> {
       cwd: opts.cwd,
       ...(opts.acpSpawn ? { spawnFn: opts.acpSpawn } : {}),
     });
-    if (asked.ok) return { ok: true, text: asked.text, cutOff: false };
+    if (asked.ok) {
+      meterEstimate(opts, asked.text);
+      return { ok: true, text: asked.text, cutOff: false };
+    }
     return { ok: false, error: longQuotaText(asked.error) ?? asked.error };
   }
 
@@ -276,10 +291,12 @@ async function askOnce(opts: AskOptions, maxTokens: number): Promise<Asked> {
     type Reply = {
       choices?: { message?: { content?: string | null }; finish_reason?: string | null }[];
       error?: ProviderError;
+      usage?: Usage;
     };
     let content: string;
     let finish: string | null | undefined;
     let error: ProviderError | undefined;
+    let used: Usage | undefined;
     // A server that was sent `stream: true` and answers with plain JSON (a
     // proxy that buffers, or an error body) is read as JSON, as it always was.
     if (stream && res.body && /text\/event-stream/i.test(res.headers.get("content-type") ?? "")) {
@@ -287,12 +304,25 @@ async function askOnce(opts: AskOptions, maxTokens: number): Promise<Asked> {
       content = done.message.content ?? "";
       finish = done.finishReason;
       error = done.error;
+      if (done.promptTokens !== undefined || done.completionTokens !== undefined) {
+        used = {
+          ...(done.promptTokens !== undefined ? { prompt_tokens: done.promptTokens } : {}),
+          ...(done.completionTokens !== undefined ? { completion_tokens: done.completionTokens } : {}),
+          ...(done.cachedTokens !== undefined ? { cache_read_input_tokens: done.cachedTokens } : {}),
+          ...(done.cacheWriteTokens !== undefined ? { cache_creation_input_tokens: done.cacheWriteTokens } : {}),
+          ...(done.costUsd !== undefined ? { cost: done.costUsd } : {}),
+        };
+      }
     } else {
       const json = (await res.json()) as Reply;
       content = json.choices?.[0]?.message?.content ?? "";
       finish = json.choices?.[0]?.finish_reason;
       error = json.error && typeof json.error === "object" ? json.error : undefined;
+      used = json.usage && typeof json.usage === "object" ? json.usage : undefined;
     }
+    // Before the error check: a provider can bill a request whose reply then
+    // carries an error, and a usage block is the provider saying it did.
+    if (!error || used) meterUsage(opts, used, content);
     if (error) {
       const resetAt = rateLimitResetAt({ error });
       if (resetAt !== undefined && resetAt - Date.now() > LONG_RATE_LIMIT_MS) {
@@ -313,6 +343,51 @@ async function askOnce(opts: AskOptions, maxTokens: number): Promise<Asked> {
   } finally {
     release();
   }
+}
+
+/** A finite, non-negative count, or undefined. */
+function count(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+}
+
+/**
+ * Report one answered HTTP ask to the meter: the provider's usage block when
+ * it sent one, Maat's estimate (marked) when it did not.
+ */
+function meterUsage(opts: AskOptions, u: Usage | undefined, reply: string): void {
+  if (!opts.meter) return;
+  const prompt = count(u?.prompt_tokens);
+  const completion = count(u?.completion_tokens);
+  if (prompt === undefined && completion === undefined) {
+    meterEstimate(opts, reply);
+    return;
+  }
+  const read = count(u?.prompt_tokens_details?.cached_tokens) ?? count(u?.cache_read_input_tokens);
+  const write = count(u?.cache_creation_input_tokens);
+  const billed = count(u?.cost);
+  opts.meter.record({
+    baseUrl: opts.baseUrl,
+    model: opts.model,
+    ...(opts.what ? { what: opts.what } : {}),
+    promptTokens: prompt ?? estTokens(opts.system + opts.prompt),
+    completionTokens: completion ?? estTokens(reply),
+    ...(read !== undefined ? { cacheReadTokens: read } : {}),
+    ...(write !== undefined ? { cacheWriteTokens: write } : {}),
+    ...(billed !== undefined ? { billedUsd: billed } : {}),
+    estimated: prompt === undefined || completion === undefined,
+  });
+}
+
+/** An answered ask whose transport reports no usage (ACP, a CLI, a bare reply): estimated. */
+function meterEstimate(opts: AskOptions, reply: string): void {
+  opts.meter?.record({
+    baseUrl: opts.baseUrl,
+    model: opts.model,
+    ...(opts.what ? { what: opts.what } : {}),
+    promptTokens: estTokens(opts.system + opts.prompt),
+    completionTokens: estTokens(reply),
+    estimated: true,
+  });
 }
 
 /**

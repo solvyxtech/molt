@@ -16,6 +16,7 @@ import { resolve } from "node:path";
 import { Archive } from "./archive.js";
 import { isAutonomy, type Autonomy } from "./autonomy.js";
 import { fmtCost, fmtDuration } from "./banner.js";
+import { judgeSpendLine } from "./format.js";
 import { stepDid } from "./format.js";
 import { BarError, hasBar, loadBar, selectChecks, writeDefaultBar } from "./bar.js";
 import { Engine, type FileAccess } from "./engine.js";
@@ -148,7 +149,8 @@ options
   --verbose          show every call, argument, and result (press v in the TUI)
   --provider <name>  label shown in the status line
   --cwd <dir>        project directory (default: current)
-  --budget <n>       hard token ceiling for the session
+  --budget <n>       hard token ceiling for the session: the worker's tokens plus
+                     the judge's (drafting, review, audit), counted together
   --review [n]       after a verified claim, n independent reviews (default 3) read
                      the task and the receipt; a majority-backed violation quoted
                      from the task labels the work "passed its checks,
@@ -925,6 +927,7 @@ function engineFor(args: Args, session = false, extra: { files?: FileAccess } = 
  * nothing, no cost is shown at all.
  */
 async function priceEngine(engine: Engine, args: Args): Promise<void> {
+  await priceJudge(engine, args);
   if (!needsPriceLookup(args.model, engine.pricing(), storedEndpoint())) return;
   const p = await fetchPricing(args.url, args.model, keyForUrl(args.url, args.key));
   if (!p) {
@@ -936,6 +939,31 @@ async function priceEngine(engine: Engine, args: Args): Promise<void> {
   }
   engine.setPricing({ in: p.in, out: p.out, cached: p.cached, source: p.source });
   savePricing(args.model, p);
+}
+
+/**
+ * Give the judge's meter a price for each model asked around the work that is
+ * not the worker's own: the judge (MAAT_JUDGE_MODEL) and the arbiter. Keyed on
+ * that model's id, from the same lookup the worker uses (fetchPricing). A
+ * model that publishes nothing stays unpriced: its tokens are reported with
+ * "$ unknown", never $0. The worker's own model needs nothing here; the meter
+ * prices it with the worker's prices, hand-set ones included.
+ */
+async function priceJudge(engine: Engine, args: Args): Promise<void> {
+  const key = keyForUrl(args.url, args.key);
+  const judge = judgeTarget({ baseUrl: args.url, apiKey: key, model: args.model });
+  const arb = engine.cfg.dispute;
+  const others = [
+    judge,
+    ...(arb?.model ? [{ baseUrl: arb.baseUrl || args.url, apiKey: arb.apiKey ?? key, model: arb.model }] : []),
+  ].filter((t) => !(t.model === args.model && t.baseUrl === args.url));
+  await Promise.all(
+    others.map(async (t) => {
+      if (planFor(t.baseUrl) || engine.judgeMeter.hasPricing(t.baseUrl, t.model)) return;
+      const p = await fetchPricing(t.baseUrl, t.model, t.apiKey).catch(() => null);
+      engine.judgeMeter.setPricing(t.baseUrl, t.model, p);
+    }),
+  );
 }
 
 /**
@@ -1344,6 +1372,8 @@ async function autoDraftFrom(
       ...(preWork ? { preWorkDir: preWork.dir, preWorkIntact: preWork.intact } : {}),
       reasoningEffort: judgeEffort(args.reasoningChecks ?? args.reasoning),
       latency: engine.askLatency,
+      // The drafter and the critic are the judge: metered as the judge.
+      meter: engine.judgeMeter,
       deadlineAt,
       // What is ready when a time budget stops the wait (RunOptions.criteriaSoFar).
       onProgress: (d) => {
@@ -1390,7 +1420,7 @@ async function autoDraftFrom(
  * there is no python3, the project is too large to copy, or no reference
  * applies.
  */
-function startReference(args: Args, deadlineAt?: number): Promise<{ check: Check; note: Record<string, unknown> } | null> | undefined {
+function startReference(args: Args, deadlineAt?: number, engine?: Engine): Promise<{ check: Check; note: Record<string, unknown> } | null> | undefined {
   const here = commandsHere(args.cwd);
   if (!here.present.includes("python3")) {
     process.stderr.write("maat: no reference check — python3 is not installed here\n");
@@ -1410,6 +1440,8 @@ function startReference(args: Args, deadlineAt?: number): Promise<{ check: Check
     cwd: args.cwd,
     reasoningEffort: args.reasoningChecks ?? args.reasoning,
     ...(deadlineAt !== undefined ? { deadlineAt } : {}),
+    // Asked around the work, like the drafter: on the judge's meter.
+    ...(engine ? { meter: engine.judgeMeter } : {}),
   }).then((r) => {
     if (!r.ok) {
       process.stderr.write(`maat: no reference check — ${r.why}\n`);
@@ -1557,6 +1589,8 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
             (sp.costUsd === undefined ? "" : ` · ${sp.estimated ? "~" : ""}${fmtCost(sp.costUsd)}`) +
             "\n",
         );
+        // The judge's share of the job, on its own line (judge-meter.ts).
+        if (ev.judge) process.stdout.write(`  ${judgeSpendLine(ev.judge)}\n`);
         break;
       }
       case "request":
@@ -1661,7 +1695,7 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         return soFar.draft?.checks.length ? sealDraft(soFar.draft, args) : Promise.resolve({ taskChecks: [], taskNotes: [] });
       }
     : undefined;
-  const referenceCheck = args.reference && !ask ? startReference(args, runDeadlineAt) : undefined;
+  const referenceCheck = args.reference && !ask ? startReference(args, runDeadlineAt, engine) : undefined;
   let undetermined = false;
   /** The turn's own verdict, from job_end. */
   let outcome: string | undefined;
@@ -1699,6 +1733,17 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
           : ` · ${b.costEstimated ? "~" : ""}${fmtCost(b.costUsd)}`) +
         "\n",
     );
+  }
+  // The judge's spend, apart from the worker's line above, and the two added
+  // up when both are priced. An unpriced judge says so; it is never $0.
+  if (b.judge) {
+    process.stdout.write(`${judgeSpendLine(b.judge)}\n`);
+    if (b.costUsd !== undefined && b.judge.costUsd !== undefined) {
+      process.stdout.write(
+        `total ${b.costEstimated || b.judge.estimated ? "~" : ""}${fmtCost(b.costUsd + b.judge.costUsd)} ` +
+          `(worker ${fmtCost(b.costUsd)} + judge ${fmtCost(b.judge.costUsd)})\n`,
+      );
+    }
   }
 
   // An unverified answer is not a success. Neither is no answer at all.

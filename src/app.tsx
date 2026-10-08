@@ -11,7 +11,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { Box, Static, Text, render, useApp, useInput, useStdout } from "ink";
 import type { RenderOptions } from "ink";
 import { Banner, fmtCost, fmtDuration, fmtTokens } from "./banner.js";
-import { stepDid } from "./format.js";
+import { judgeSpendLine, stepDid } from "./format.js";
 import {
   COMMANDS,
   COMMAND_COL,
@@ -984,7 +984,9 @@ export function App({
           );
           note(
             `▪ job ${ev.job} ${ev.outcome} · ${ev.steps} step(s) · ` +
-              `${spendText(ev.spend)} · ${fmtDuration(ev.durationMs)}`,
+              `${spendText(ev.spend)} · ${fmtDuration(ev.durationMs)}` +
+              // The judge's share, apart from the worker's (judge-meter.ts).
+              (ev.judge ? ` · ${judgeSpendLine(ev.judge)}` : ""),
           );
           break;
         case "request":

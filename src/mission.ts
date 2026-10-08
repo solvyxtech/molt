@@ -499,6 +499,8 @@ export type Handoff = {
   failed: string[];
   receipt?: string;
   spend?: Spend;
+  /** The judge's spend on this attempt, apart from the worker's (judge-meter.ts). */
+  judge?: import("./judge-meter.js").JudgeSpend;
   durationMs: number;
   at: string;
 };
@@ -640,6 +642,7 @@ export async function runMission(opts: MissionRunOptions): Promise<MissionSummar
     let failed: string[] = [];
     let receipt: string | undefined;
     let spend: Spend | undefined;
+    let judge: Handoff["judge"];
     let durationMs = 0;
     const t0 = Date.now();
     try {
@@ -664,6 +667,7 @@ export async function runMission(opts: MissionRunOptions): Promise<MissionSummar
           case "job_end":
             outcome = e.outcome;
             spend = e.spend;
+            judge = e.judge;
             durationMs = e.durationMs;
             break;
           default:
@@ -684,6 +688,7 @@ export async function runMission(opts: MissionRunOptions): Promise<MissionSummar
       failed,
       ...(receipt ? { receipt } : {}),
       ...(spend ? { spend } : {}),
+      ...(judge ? { judge } : {}),
       durationMs,
       at: now(),
     };

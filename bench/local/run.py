@@ -627,7 +627,7 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
     write_private(log, out)
     # Maat's own notices (criteria not drafted, dropped checks, refusals) go to stderr.
     write_private(log.with_suffix(".err"), err or "")
-    steps = 0; per = []; outcome = None; spend = {}; review = None; disagree = []; extra = {}
+    steps = 0; per = []; outcome = None; spend = {}; judge = None; review = None; disagree = []; extra = {}
     for line in out.splitlines():
         if not line.startswith("{"):
             continue
@@ -641,6 +641,9 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
         elif ev.get("kind") == "job_end":
             outcome = claim_of(ev)
             spend = ev.get("spend") or {}
+            # The judge's asks (drafting, critic, review, audit), metered apart from
+            # the worker's. Absent on builds before judge metering, or when no judge ran.
+            judge = ev.get("judge")
             review = ev.get("review")
             disagree = ev.get("checksDisagree") or []
             # Only what job_end carried; absent keys stay absent (older builds).
@@ -651,7 +654,9 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
     return {
         "provider_capped": capped,
         "secs": round(secs), "turns": steps, "calls": sum(per), "multi": sum(1 for x in per if x > 1),
-        "tokens_in": spend.get("promptTokens"), "cost_usd": spend.get("costUsd"), "claim": outcome, "timed_out": timed_out,
+        "tokens_in": spend.get("promptTokens"), "cost_usd": spend.get("costUsd"),
+        **judge_columns(judge),
+        "claim": outcome, "timed_out": timed_out,
         "said_done": (outcome or "").startswith("verified"),
         # The reviewer's label: a verified claim it did not confirm.
         "review": review,
@@ -659,6 +664,24 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
         "checks_disagree": disagree,
         "said_done_reviewed": (outcome or "").startswith("verified") and not (review and not review.get("confirmed")),
         **extra,
+    }
+
+
+def judge_columns(judge: dict | None) -> dict:
+    """The judge's tokens and $, next to the worker's `tokens_in` / `cost_usd`.
+
+    Only when the run output carried them (job_end.judge, Maat's judge meter): None
+    otherwise, so an older build is never read as a free judge. `judge_cost_usd` is
+    None when the judge's model had no price ("$ unknown"), never 0."""
+    if not isinstance(judge, dict):
+        return {}
+    return {
+        "judge_calls": judge.get("calls"),
+        "judge_tokens_in": judge.get("promptTokens"),
+        "judge_tokens_out": judge.get("completionTokens"),
+        "judge_cache_read": judge.get("cacheReadTokens"),
+        "judge_cache_write": judge.get("cacheWriteTokens"),
+        "judge_cost_usd": judge.get("costUsd"),
     }
 
 
@@ -678,24 +701,55 @@ def alarm_limits() -> dict:
     }
 
 
+def _sum_known(*xs):
+    """The sum of the values that are known, or None when none is."""
+    known = [x for x in xs if x is not None]
+    return sum(known) if known else None
+
+
+def run_cost(row: dict) -> float | None:
+    """A run's whole cost: the worker's plus the judge's (judge_columns). None when
+    neither is known; an unpriced judge adds nothing it cannot price."""
+    return _sum_known(row.get("cost_usd"), row.get("judge_cost_usd"))
+
+
+def run_tokens(row: dict) -> int | None:
+    """A run's prompt tokens, the worker's plus the judge's."""
+    return _sum_known(row.get("tokens_in"), row.get("judge_tokens_in"))
+
+
 def cost_alarm(row: dict, prior_costs: list[float]) -> dict | None:
-    """Why this run trips the alarm, or None. `prior_costs` are the lane's earlier runs
-    (this run excluded): the median is over runs that reported a cost. A run with no
-    cost (an unpriced model) is judged on its prompt tokens only."""
+    """Why this run trips the alarm, or None. `prior_costs` are the lane's earlier runs'
+    total costs (this run excluded): the median is over runs that reported a cost. A
+    run with no cost (an unpriced model) is judged on its prompt tokens only.
+
+    Cost and tokens are the worker's plus the judge's: a runaway judge trips it too.
+    When the run had a judge, the detail says how the total splits."""
     lim = alarm_limits()
     med = statistics.median(prior_costs) if prior_costs else None
     limit_usd = max(lim["x"] * med, lim["usd"]) if med is not None else lim["usd"]
-    cost, toks = row.get("cost_usd"), row.get("tokens_in")
+    cost, toks = run_cost(row), run_tokens(row)
+    judged = row.get("judge_calls") is not None
+
+    def usd(x):
+        return "$ unknown" if x is None else f"${x:.4f}"
+
     why = []
     if cost is not None and cost > limit_usd:
-        why.append(f"cost ${cost:.4f} > ${limit_usd:.4f} (max({lim['x']:g}x lane median "
+        split = f" (worker {usd(row.get('cost_usd'))} + judge {usd(row.get('judge_cost_usd'))})" if judged else ""
+        why.append(f"cost ${cost:.4f}{split} > ${limit_usd:.4f} (max({lim['x']:g}x lane median "
                    f"{'n/a' if med is None else f'${med:.4f}'}, ${lim['usd']:g}))")
     if toks is not None and toks > lim["tokens"]:
-        why.append(f"prompt tokens {toks:,} > {lim['tokens']:,}")
+        split = (f" (worker {row.get('tokens_in') or 0:,} + judge {row.get('judge_tokens_in') or 0:,})"
+                 if judged else "")
+        why.append(f"prompt tokens {toks:,}{split} > {lim['tokens']:,}")
     if not why:
         return None
-    return {"detail": "; ".join(why), "cost_usd": cost, "tokens_in": toks, "lane_median_usd": med,
-            "limit_usd": round(limit_usd, 6), "limit_tokens": lim["tokens"]}
+    return {"detail": "; ".join(why), "cost_usd": cost, "tokens_in": toks,
+            **({"worker_cost_usd": row.get("cost_usd"), "judge_cost_usd": row.get("judge_cost_usd"),
+                "worker_tokens_in": row.get("tokens_in"), "judge_tokens_in": row.get("judge_tokens_in")}
+               if judged else {}),
+            "lane_median_usd": med, "limit_usd": round(limit_usd, 6), "limit_tokens": lim["tokens"]}
 
 
 def claims_done(text: str) -> bool:
@@ -855,8 +909,8 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
         if r.get("stopped"):  # a STOPPED marker, not a run
             continue
         done.add((r["task"], r["agent"], r["rep"], r.get("arm")))
-        if r.get("cost_usd") is not None:
-            lane_costs.setdefault(r.get("arm"), []).append(r["cost_usd"])
+        if run_cost(r) is not None:
+            lane_costs.setdefault(r.get("arm"), []).append(run_cost(r))
     global SCRUBBER
     SCRUBBER = make_scrubber()
     for rep in range(repeats):
@@ -914,8 +968,8 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
                     alarm = cost_alarm(r, costs)
                     if alarm:
                         stop_lane(out, tag, EXPORT / f"{tag}.log", alarm, arm, lid)
-                    if r.get("cost_usd") is not None:
-                        costs.append(r["cost_usd"])
+                    if run_cost(r) is not None:
+                        costs.append(run_cost(r))
 
 
 def stop_lane(out: Path, tag: str, log: Path, alarm: dict, arm: str | None, lid: str | None = None) -> None:
