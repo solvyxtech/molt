@@ -184,6 +184,14 @@ describe("superseded results (MAAT_LEAN_SUPERSEDE)", () => {
     assert.ok(!wire.includes("3 failed") && wire.includes("3 passed") && wire.includes(ELIDED_PREFIX));
   });
 
+  it("a rerun with different options (a longer timeout_s) is a different call: the timeout note stays", () => {
+    const t = new Transcript("S");
+    t.push({ role: "user", content: "task" });
+    step(t, [["bash", { command: "make" }, "a", body("timeout after 120s; call again with timeout_s")]]);
+    step(t, [["bash", { command: "make", timeout_s: 600 }, "b", body("built")]]);
+    assert.equal(t.elideSupersededReads({ lean: true }).elided, 0);
+  });
+
   it("a rerun that came back the same keeps the earlier output it points at", () => {
     const t = new Transcript("S");
     t.push({ role: "user", content: "task" });

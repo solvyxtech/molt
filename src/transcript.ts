@@ -655,14 +655,19 @@ export class Transcript {
         }
         if (opts.lean && call.function.name === "bash" && typeof args.command === "string" && call.id) {
           const cmd = args.command.replace(/\s+/g, " ").trim();
+          // The same call: the same command with the same options. A rerun
+          // with a longer timeout_s, or in the background, is a different call,
+          // and the earlier result (a timeout and how to avoid it) is the
+          // reason for it.
+          const key = JSON.stringify({ ...args, command: cmd });
           const now = resultOf.get(call.id) ?? "";
           // A rerun that came back the same is already sent as a pointer to
           // the earlier copy, which must then stay. One that came back
           // different makes the earlier output history.
-          const prior = lastRun.get(cmd);
+          const prior = lastRun.get(key);
           if (prior !== undefined && !now.startsWith("[molt: this is the same ") && now !== resultOf.get(prior))
             mark(i, prior, `rerun at step ${i}`);
-          if (!now.startsWith("[molt: this is the same ")) lastRun.set(cmd, call.id);
+          if (!now.startsWith("[molt: this is the same ")) lastRun.set(key, call.id);
           // A plain read of one file through bash is a read of that file: a
           // later write makes it stale exactly as it does a read_file.
           const read = SIMPLE_READ.exec(cmd);
