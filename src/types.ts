@@ -420,7 +420,8 @@ export type BarResult = {
 export type LedgerEntry = {
   path: string;
   /**
-   * Assertions this write deleted from a test file.
+   * Assertions this write deleted (or rewrote) in a test file, and skips it
+   * added there (`specWeakened`, files.ts).
    *
    * Read by `spec-intact`. Present only when a test file lost an assertion,
    * which is rare and always worth a person's attention: it is the difference
