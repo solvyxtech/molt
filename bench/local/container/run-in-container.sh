@@ -63,7 +63,7 @@ printf 'OPENROUTER_API_KEY=%s\n' "$key" > "$envf"
 # Anthropic API lanes (BENCH_URL=https://api.anthropic.com/v1): the key comes from the
 # Keychain item maat-bench-anthropic (paste it with container/set-anthropic-key.sh),
 # never from the command line.
-if [[ "$url" == *api.anthropic.com* ]]; then
+if [[ "$url" == *api.anthropic.com* || "${ARMS:-}" == *api.anthropic.com* ]]; then
   akey=$(security find-generic-password -s maat-bench-anthropic -w 2>/dev/null) || { echo "no Keychain item maat-bench-anthropic: run bench/local/container/set-anthropic-key.sh" >&2; exit 1; }
   printf 'ANTHROPIC_API_KEY=%s\n' "$akey" >> "$envf"
 fi
