@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -88,6 +89,110 @@ def kill_tree(proc: subprocess.Popen) -> None:
         subprocess.run(["pkill", "-KILL", "-u", AGENT_USER], check=False)
 
 
+def kill_agent_procs() -> None:
+    """In a container, end every process of the agent user. Before grading, so nothing the worker
+    left running (a server on the port the grader wants, a loop rewriting outputs) is still there
+    while the work is judged; and again when the task is finished."""
+    if AGENT_USER and shutil.which("pkill"):
+        subprocess.run(["pkill", "-KILL", "-u", AGENT_USER], check=False)
+
+
+# Environment variables a grader's children never see: the worker's code runs in them.
+SECRET_ENV = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "AUTH")
+GRADE_LIMIT = int(os.environ.get("BENCH_GRADE_LIMIT", "900"))  # seconds, the whole grade of one task
+
+
+def grade(T, d: Path) -> tuple[bool, str]:
+    """
+    T.grade(d), and with BENCH_AGENT_USER set, as that user.
+
+    Graders run the worker's code: `python3 server.py`, `python3 migrate.py`, `python3 -c 'import
+    the_module'`. Run as root, that code could append a passing row to the results, edit the task
+    modules the next tasks are graded by, or read reference_solutions/. So the grade runs in a
+    forked child that has dropped to the agent user (everything it runs inherits that), with the
+    secrets stripped from its environment. The child is non-dumpable after the drop, so the
+    worker's code, though it runs as the same user, cannot attach to it or read its pipe; the
+    verdict comes back to root over that pipe, and root alone writes the results. Code that kills
+    the grader, hangs past GRADE_LIMIT or answers with anything but a verdict fails the task.
+    Mac host lanes (no agent user): T.grade(d) as before.
+    """
+    if not AGENT_USER:
+        return T.grade(d)
+    import pwd
+    import select
+    import signal
+    pw = pwd.getpwnam(AGENT_USER)
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # the grader
+        code = 0
+        try:
+            os.close(r)
+            os.setgroups([])
+            os.setgid(pw.pw_gid)
+            os.setuid(pw.pw_uid)
+            try:
+                import ctypes
+                ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE 0 (also the default after setuid)
+            except Exception:
+                pass
+            for k in list(os.environ):
+                if any(s in k.upper() for s in SECRET_ENV):
+                    del os.environ[k]
+            os.environ["HOME"] = pw.pw_dir
+            os.chdir(d)
+            ok, why = T.grade(d)
+            data = json.dumps([bool(ok), str(why)])
+        except BaseException as e:  # noqa: BLE001 - every failure is a verdict
+            data = json.dumps([False, f"grader error: {e!r}"[:2000]])
+            code = 1
+        try:
+            os.write(w, data.encode())
+        finally:
+            os._exit(code)
+    os.close(w)
+    chunks: list[bytes] = []
+    deadline = time.time() + GRADE_LIMIT
+    timed_out = False
+    try:
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                timed_out = True
+                break
+            ready, _, _ = select.select([r], [], [], left)
+            if not ready:
+                continue
+            b = os.read(r, 65536)
+            if not b:
+                break
+            chunks.append(b)
+    finally:
+        os.close(r)
+        if timed_out:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        kill_agent_procs()  # whatever the worker's code started while it was being graded
+        _, status = os.waitpid(pid, 0)
+    if timed_out:
+        return False, f"grader timed out after {GRADE_LIMIT}s"
+    try:
+        ok, why = json.loads(b"".join(chunks).decode())
+        return bool(ok), str(why)
+    except (ValueError, TypeError):
+        return False, f"grader ended without a verdict (wait status {status})"
+
+
+def _copy_regular(src: str, dst: str, *, follow_symlinks: bool = True) -> str:
+    """copytree's copy_function: regular files only. A FIFO or a socket a worker left in its folder
+    (a server's .sock, or `mkfifo x` on purpose) made copytree raise, and the lane stopped."""
+    if stat.S_ISREG(os.lstat(src).st_mode):
+        return shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
+    return dst
+
+
 def hand_over(d: Path) -> None:
     if AGENT_USER:
         subprocess.run(["chown", "-R", AGENT_USER, str(d)], check=True)
@@ -128,18 +233,26 @@ def finish_task(d: Path, logs: list[Path]) -> None:
     The task is graded and its agent is gone: copy the folder and its logs to EXPORT, then remove
     the private copies. In a container, every process of the agent user is killed first: a server
     a worker left running would otherwise still be there, as that user, during the next task.
+
+    Never raises: the export is for the owner to look at, and a failure to copy it (a special
+    file, a full disk) is reported, not allowed to stop the lane or leave the private folder.
     """
-    if AGENT_USER and shutil.which("pkill"):
-        subprocess.run(["pkill", "-KILL", "-u", AGENT_USER], check=False)
-    EXPORT.mkdir(parents=True, exist_ok=True)
-    dst = EXPORT / d.name
-    if dst.resolve() != d.resolve():
-        shutil.rmtree(dst, ignore_errors=True)
-        shutil.copytree(d, dst, symlinks=True)
+    kill_agent_procs()
+    try:
+        EXPORT.mkdir(parents=True, exist_ok=True)
+        dst = EXPORT / d.name
+        if dst.resolve() != d.resolve():
+            shutil.rmtree(dst, ignore_errors=True)
+            shutil.copytree(d, dst, symlinks=True, copy_function=_copy_regular)
+    except (OSError, shutil.Error) as e:
+        print(f"export of {d.name} incomplete: {e}", file=sys.stderr, flush=True)
     for f in logs:
-        if f.exists() and (EXPORT / f.name).resolve() != f.resolve():
-            shutil.copy2(f, EXPORT / f.name)
-            f.unlink()
+        try:
+            if f.exists() and (EXPORT / f.name).resolve() != f.resolve():
+                shutil.copy2(f, EXPORT / f.name)
+                f.unlink()
+        except OSError as e:
+            print(f"export of {f.name} failed: {e}", file=sys.stderr, flush=True)
     shutil.rmtree(d.parent, ignore_errors=True)
 
 
@@ -291,6 +404,10 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
         want = {x.strip() for x in os.environ["BENCH_TASKS"].split(",") if x.strip()}
         tasks = [T for T in tasks if T.name in want]
     arms = parse_arms(os.environ.get("ARMS"))
+    if not AGENT_USER:
+        print("WARNING: no BENCH_AGENT_USER: the worker runs as this user, so it can read the graders, "
+              "the export and earlier tasks' logs, and graders run its code with this user's rights. "
+              "Use the container lanes for numbers that matter.", file=sys.stderr, flush=True)
     out = Path(os.environ.get("RESULTS_DIR", HERE)) / os.environ.get("RESULTS", f"results-{which}-x{repeats}.jsonl")
     out.parent.mkdir(parents=True, exist_ok=True)
     done = set()
@@ -327,18 +444,23 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
                         # Not recorded, so a resume runs this task again.
                         print(f"STOPPED: the provider's daily limit / quota is reached ({tag} not recorded)", flush=True)
                         return
+                    # Nothing the worker started is still running while it is graded.
+                    kill_agent_procs()
                     try:
-                        ok, why = T.grade(d)
-                    finally:
+                        ok, why = grade(T, d)
+                    except BaseException:
                         finish_task(d, [log, log.with_suffix(".err")])
+                        raise
                     final = ""
                     r.update(task=T.name, agent=a, rep=rep, passed=ok, why=why, final=final[:300])
                     if arm:
                         r["arm"] = arm
                     if os.environ.get("MAAT_BUILD"):
                         r["build"] = os.environ["MAAT_BUILD"]  # sha8 of the packed Maat the container ran
+                    # The result is written before the export, so nothing in the export can lose it.
                     with out.open("a") as f:
                         f.write(json.dumps(r) + "\n")
+                    finish_task(d, [log, log.with_suffix(".err")])
                     print(json.dumps({k: r[k] for k in ("task", "agent", "arm", "rep", "passed", "said_done", "turns", "secs") if k in r}), flush=True)
 
 

@@ -109,6 +109,71 @@ class Layout(unittest.TestCase):
         shutil.rmtree(tmp)
 
 
+class SpecialFilesAndOrder(unittest.TestCase):
+    def test_a_fifo_or_socket_in_the_task_folder_does_not_stop_the_lane(self):
+        import socket
+        tmp = Path(tempfile.mkdtemp())
+        h = Harness(tmp / "work", tmp / "export", tmp / "results")
+        socks = []
+        try:
+            def fake(d: Path, prompt: str, log: Path) -> dict:
+                os.mkfifo(d / "pipe")
+                s = socket.socket(socket.AF_UNIX)
+                # AF_UNIX paths are short; bind from inside the folder.
+                cwd = os.getcwd()
+                os.chdir(d)
+                try:
+                    s.bind("srv.sock")
+                finally:
+                    os.chdir(cwd)
+                socks.append(s)
+                (d / "out.txt").write_text("x\n")
+                log.write_text('{"kind":"job_end"}\n')
+                return {"secs": 0, "turns": 0, "claim": "verified", "said_done": True}
+
+            run.run_molt = fake
+            run.main("molt", 1, "iso-a,iso-b")
+        finally:
+            h.restore()
+            for s in socks:
+                s.close()
+        rows = [json.loads(x) for x in (tmp / "results" / "iso.jsonl").read_text().splitlines()]
+        self.assertEqual([r["task"] for r in rows], ["iso-a", "iso-b"], "both tasks ran and were recorded")
+        self.assertEqual([r["passed"] for r in rows], [True, True])
+        for t in ("iso-a-molt-0", "iso-b-molt-0"):
+            self.assertTrue((tmp / "export" / t / "out.txt").exists(), "the regular files were exported")
+            self.assertFalse((tmp / "export" / t / "pipe").exists(), "the FIFO was skipped")
+            self.assertFalse((tmp / "export" / t / "srv.sock").exists(), "the socket was skipped")
+        self.assertEqual(sorted(os.listdir(tmp / "work")), [".logs"], "no private folder left behind")
+        shutil.rmtree(tmp)
+
+    def test_agent_processes_are_killed_before_grading_and_the_result_is_written_before_the_export(self):
+        tmp = Path(tempfile.mkdtemp())
+        h = Harness(tmp / "work", tmp / "export", tmp / "results")
+        events: list[str] = []
+        saved = (run.kill_agent_procs, run.finish_task)
+        results = tmp / "results" / "iso.jsonl"
+        try:
+            def fake(d: Path, prompt: str, log: Path) -> dict:
+                events.append("agent")
+                (d / "out.txt").write_text("x\n")
+                return {"secs": 0, "turns": 0, "claim": "verified", "said_done": True}
+
+            real_finish = run.finish_task
+            run.run_molt = fake
+            run.kill_agent_procs = lambda: events.append("kill")
+            run.finish_task = lambda d, logs: (events.append("export:" + str(len(results.read_text().splitlines()) if results.exists() else 0)), real_finish(d, logs))
+            grade_a = run.TASKS[0].grade
+            run.TASKS[0].grade = staticmethod(lambda d: (events.append("grade"), grade_a(d))[1])
+            run.main("molt", 1, "iso-a")
+        finally:
+            run.kill_agent_procs, run.finish_task = saved
+            h.restore()
+        self.assertEqual(events[:3], ["agent", "kill", "grade"], events)
+        self.assertIn("export:1", events, "the row was on disk before the export ran")
+        shutil.rmtree(tmp)
+
+
 def have_agent_user() -> bool:
     if os.geteuid() != 0 or not shutil.which("runuser"):
         return False
@@ -179,6 +244,55 @@ class AsTheAgentUser(unittest.TestCase):
         # Exported for the owner all the same.
         self.assertTrue((export / "iso-a-molt-0" / "out.txt").exists())
         self.assertIn("iso-a log", (export / "iso-a-molt-0.log").read_text())
+
+
+@unittest.skipUnless(have_agent_user(), "needs root and the agent user: run isolation-in-container.sh")
+class GradedAsTheAgentUser(unittest.TestCase):
+    def test_the_workers_code_runs_unprivileged_during_grading_and_cannot_reach_the_results(self):
+        user = os.environ.get("BENCH_AGENT_USER") or "agent"
+        uid = pwd.getpwnam(user).pw_uid
+        os.chmod("/root", 0o700)
+        work = Path(tempfile.mkdtemp(dir="/var/tmp")) / "bench-work"
+        os.chmod(work.parent, 0o755)
+        export = Path(tempfile.mkdtemp(dir="/root")) / "bench-export"
+        results = Path(tempfile.mkdtemp(dir="/root"))
+        h = Harness(work, export, results, agent=user)
+        os.environ["FAKE_API_KEY"] = "sk-must-not-leak"
+        seen: dict = {}
+        try:
+            def fake(d: Path, prompt: str, log: Path) -> dict:
+                # A hostile "solution": run by the grader, it tries to forge a result and read secrets.
+                (d / "server.py").write_text(
+                    "import os, glob\n"
+                    "out = {'uid': os.getuid(), 'key': os.environ.get('FAKE_API_KEY')}\n"
+                    f"try:\n    open('{results}/iso.jsonl', 'a').write('forged\\n'); out['forged'] = True\n"
+                    "except OSError:\n    out['forged'] = False\n"
+                    "print(repr(out))\n"
+                )
+                (d / "out.txt").write_text("x\n")
+                os.chown(d / "server.py", uid, -1)
+                return {"secs": 0, "turns": 0, "claim": "verified", "said_done": True}
+
+            def grade(d: Path):
+                seen["grader_uid"] = os.getuid()
+                p = subprocess.run(["python3", "server.py"], cwd=d, capture_output=True, text=True)
+                seen["worker"] = p.stdout.strip()
+                return True, "graded"
+
+            run.run_molt = fake
+            run.TASKS[0].grade = staticmethod(grade)
+            run.main("molt", 1, "iso-a")
+            # The grader ran in a child: what it saw comes back only through its verdict, so ask again directly.
+            ok, why = run.grade(type("T", (), {"grade": staticmethod(lambda d: (True, repr((os.getuid(), subprocess.run(["python3", "-c", "import os;print(os.getuid(), os.environ.get('FAKE_API_KEY'))"], capture_output=True, text=True).stdout.strip()))))}), Path("/tmp"))
+        finally:
+            h.restore()
+            os.environ.pop("FAKE_API_KEY", None)
+        rows = (results / "iso.jsonl").read_text().splitlines()
+        self.assertEqual(len(rows), 1, rows)
+        self.assertNotIn("forged", "\n".join(rows))
+        self.assertTrue(json.loads(rows[0])["passed"])
+        self.assertTrue(ok)
+        self.assertEqual(why, repr((uid, f"{uid} None")), "the grader and what it runs are the agent user, without the secrets")
 
 
 if __name__ == "__main__":
