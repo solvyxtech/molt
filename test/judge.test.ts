@@ -58,3 +58,14 @@ describe("Grok Build as the judge of an HTTP worker", () => {
     assert.deepEqual(r, { ok: true, text: '{"criteria":[]}', cutOff: false });
   });
 });
+
+describe("a judge on Anthropic's API", () => {
+  it("takes ANTHROPIC_API_KEY when the worker is elsewhere", () => {
+    const t = judgeTarget(
+      { baseUrl: "https://openrouter.ai/api/v1", apiKey: "or-key", model: "deepseek/deepseek-v4-pro" },
+      { MAAT_JUDGE_MODEL: "claude-haiku-5-5", MAAT_JUDGE_URL: "https://api.anthropic.com/v1", ANTHROPIC_API_KEY: "sk-ant-x" },
+    );
+    assert.equal(t.apiKey, "sk-ant-x");
+    assert.equal(t.model, "claude-haiku-5-5");
+  });
+});
