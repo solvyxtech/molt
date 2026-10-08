@@ -54,6 +54,9 @@ function trees(): { pre: string; work: string; cleanup: () => void } {
   // Ignores --help and prints the answer: its output must never reach the view.
   writeFileSync(join(work, "show.js"), `console.log(${JSON.stringify(SECRET)});\n`);
   writeFileSync(join(work, "out.txt"), `7 ${SECRET}\n`);
+  // Ignore --help too, and print an answer with the word "usage" in it, or a usage line beside the answer.
+  writeFileSync(join(work, "disk.js"), `console.log("disk usage report"); console.log("total: 1234");\n`);
+  writeFileSync(join(work, "sneaky.js"), `console.log("usage: node sneaky.js"); console.log("answer: 5678");\n`);
   return { pre, work, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
@@ -66,13 +69,16 @@ describe("the interface view", () => {
 
   it("names the new files, shows signatures and usage, and none of the outputs", async () => {
     const v = await interfaceView({ preWorkDir: t.pre, workDir: t.work });
-    assert.deepEqual(changedFiles(t.pre, t.work).map((c) => `${c.path}:${c.status}`), ["out.txt:new", "show.js:new", "sum.js:new"]);
-    assert.match(v.text, /Files the work added or changed: out\.txt \(new\), show\.js \(new\), sum\.js \(new\)/);
+    assert.deepEqual(changedFiles(t.pre, t.work).map((c) => `${c.path}:${c.status}`), ["disk.js:new", "out.txt:new", "show.js:new", "sneaky.js:new", "sum.js:new"]);
+    assert.match(v.text, /Files the work added or changed: disk\.js \(new\), out\.txt \(new\), show\.js \(new\), sneaky\.js \(new\), sum\.js \(new\)/);
     assert.match(v.text, /function total\(lines\)/);
     assert.match(v.text, /run as: node sum\.js\n  `--help` prints:\n    usage: node sum\.js FILE/);
     assert.match(v.text, /run as: node show\.js  \(no usage text\)/, "an answer printed in reply to --help is not usage");
     assert.match(v.text, /out\.txt: text \(contents not shown\)/);
-    assert.match(v.text, /Project files \(top level\): input\.txt out\.txt show\.js sum\.js/);
+    assert.match(v.text, /Project files \(top level\): disk\.js input\.txt out\.txt show\.js sneaky\.js sum\.js/);
+    // An answer that mentions "usage", or a usage line printed beside the answer whatever the flags, is not usage text.
+    assert.ok(!v.text.includes("1234"), "a disk usage report is an answer");
+    assert.ok(!v.text.includes("5678"), "output that is the same with and without --help is an answer");
     assert.ok(!v.text.includes(SECRET), "no output, file content or constant of the work reaches the judge");
     assert.ok(!v.text.includes("t += Number"), "no function body");
   });
@@ -83,6 +89,7 @@ describe("the interface view", () => {
       "class Row",
       "p.add_argument('--port', type=int)",
     ]);
+    assert.deepEqual(signatures("b.py", "p.add_argument('--n', type=int, default=42, help='the answer is 42')\n"), ["p.add_argument('--n', type=int, default=…, help=…)"]);
   });
 });
 
@@ -186,7 +193,7 @@ describe("the audit in a turn", () => {
     ],
   });
 
-  async function turn(postWorkAudit: boolean, judgeModel: string | null = "judge-x") {
+  async function turn(postWorkAudit: boolean, judgeModel: string | null = "judge-x", extra: Check[] = []) {
     const ws = workspace();
     const was = process.env.MAAT_JUDGE_MODEL;
     if (judgeModel) process.env.MAAT_JUDGE_MODEL = judgeModel;
@@ -209,7 +216,7 @@ describe("the audit in a turn", () => {
         receipts: new Receipts(ws.dir), stream: false, autonomy: "high", journal,
         ...(postWorkAudit ? { postWorkAudit: true } : {}),
       });
-      const events = await drain(engine.run(TASK, allowAll, { taskChecks: [own], taskNotes: [] }));
+      const events = await drain(engine.run(TASK, allowAll, { taskChecks: [own, ...extra], taskNotes: [] }));
       const end = events.find((e) => e.kind === "job_end");
       assert.ok(end && end.kind === "job_end");
       const rows = readFileSync(join(ws.dir, ".maat", "receipts", "index.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
@@ -236,6 +243,23 @@ describe("the audit in a turn", () => {
     assert.ok(judgePrompts[0]!.includes("sum.js (new)"), "and the interface");
     assert.ok(!judgePrompts[0]!.includes(SECRET), "never the worker's claim or the work's contents");
     assert.ok(!judgePrompts[0]!.includes("Done."), "never the transcript");
+  });
+
+  it("never overrules a failing check someone other than the worker sealed", async () => {
+    // A judge sealed `= 8` (wrong here, but it is the judge's word against the
+    // work); the audit's own check passes. The failing independent check stands.
+    const judged: Check = { name: "judged", kind: "command", run: `[ "$(node sum.js input.txt)" = "8" ]`, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true, author: { kind: "judge", model: "judge-j" } } as Check;
+    const { end, judgePrompts } = await turn(true, "judge-x", [judged]);
+    assert.notEqual(end.outcome, "verified");
+    assert.notEqual(end.tier, "verified-audit");
+    assert.equal(end.audit, undefined);
+    assert.equal(judgePrompts.length, 0, "the audit is not asked for");
+  });
+
+  it("a failing check only the worker drafted still lets the audit run", async () => {
+    const mine: Check = { name: "mine", kind: "command", run: `[ "$(node sum.js input.txt)" = "8" ]`, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true, author: { kind: "worker", model: "m" } } as Check;
+    const { end } = await turn(true, "judge-x", [mine]);
+    assert.deepEqual([end.outcome, end.tier], ["verified", "verified-audit"]);
   });
 
   it("with the flag off nothing changes: no audit, no judge request, the tier is the sealed checks'", async () => {

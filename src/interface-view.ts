@@ -125,7 +125,8 @@ export function signatures(path: string, text: string, max = 25): string[] {
     const t = l.trim();
     if (ext === ".py" || (!CODE.has(ext) && /^#!.*python/.test(lines[0] ?? ""))) {
       if (/^(async\s+)?def\s+\w+\s*\(/.test(t) || /^class\s+\w+/.test(t)) add(l.replace(/:\s*(#.*)?$/, ""));
-      else if (/\badd_argument\s*\(/.test(t) || /\badd_parser\s*\(/.test(t)) add(l);
+      // The flags only: a `default=` or `help=` value is text the work chose, and can carry an answer.
+      else if (/\badd_argument\s*\(/.test(t) || /\badd_parser\s*\(/.test(t)) add(stripArgValues(l));
     } else if ([".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"].includes(ext)) {
       if (/^(export\s+)?(default\s+)?(async\s+)?function\b/.test(t) || /^(export\s+)?(default\s+)?class\s+\w+/.test(t)) add(l.replace(/\{\s*$/, ""));
       else if (/^export\s+(const|let|var)\s+\w+\s*=\s*(async\s*)?(\([^)]*\)|\w+)\s*=>/.test(t)) add(l.replace(/=>.*$/, "=>"));
@@ -139,14 +140,26 @@ export function signatures(path: string, text: string, max = 25): string[] {
       if (/^[\w:<>*&\s]+\s+\**\w+\s*\([^;]*\)\s*\{?\s*$/.test(t) && !/^(if|for|while|switch|return)\b/.test(t)) add(l.replace(/\{\s*$/, ""));
     }
     // Usage text is the interface, whatever the language (a shell script's `echo "usage: ..."`).
-    if (/\busage\s*:/i.test(t) && !keep.includes(l.trimEnd().slice(0, 160))) add(l);
+    // Only the usage text itself, up to the end of its string: the rest of the line is code the work wrote.
+    const u = /\busage\s*:[^"'`\n]*/i.exec(t);
+    if (u && !keep.includes(u[0].trimEnd().slice(0, 160))) add(u[0]);
   }
   return keep;
 }
 
-/** Text that reads as a program's usage message rather than its answer. */
+/** An argparse-style call with its `default=` and `help=` values cut out. */
+export function stripArgValues(line: string): string {
+  return line.replace(/\b(default|help|metavar|const)\s*=\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^,)]*)/g, "$1=…");
+}
+
+/**
+ * Text that reads as a program's usage message rather than its answer: a line
+ * that starts with `usage:`, or an argparse/getopt section heading at the
+ * start of a line. The word "usage" anywhere else (a disk or CPU usage
+ * report) is an answer, not a usage message.
+ */
 export function looksLikeUsage(text: string): boolean {
-  return /\busage\b/i.test(text) || /^\s*(options|arguments|positional arguments)\s*:/im.test(text);
+  return /^\s*usage\s*:/im.test(text) || /^\s*(options|optional arguments|arguments|positional arguments)\s*:/im.test(text);
 }
 
 export const HELP_TIMEOUT_MS = 3_000;
@@ -229,7 +242,13 @@ export async function interfaceView(input: InterfaceViewInput): Promise<Interfac
           try {
             const r = await runCommand(`${h.cmd} --help`, { cwd: copy.dir, timeoutMs: HELP_TIMEOUT_MS, maxBuffer: 64 * 1024, signal: input.signal, killGroupOnExit: true });
             const out = copy.unmap(`${r.stdout}\n${r.stderr}`).trim();
-            if (!r.timedOut && looksLikeUsage(out)) said = out.slice(0, HELP_MAX_CHARS);
+            if (!r.timedOut && looksLikeUsage(out)) {
+              // A script that ignores --help prints what it prints anyway: its
+              // answer. Usage text is what differs from a plain run.
+              const plain = await runCommand(h.cmd, { cwd: copy.dir, timeoutMs: HELP_TIMEOUT_MS, maxBuffer: 64 * 1024, signal: input.signal, killGroupOnExit: true });
+              const bare = copy.unmap(`${plain.stdout}\n${plain.stderr}`).trim();
+              if (bare !== out) said = out.slice(0, HELP_MAX_CHARS);
+            }
           } catch {
             /* could not spawn: no usage text */
           }

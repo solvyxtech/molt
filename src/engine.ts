@@ -4154,6 +4154,18 @@ export class Engine {
     return m;
   }
 
+  /** Failing checks written by someone independent of the worker (judge, reference, person): their names. */
+  private independentFailing(failing: readonly CheckResult[]): string[] {
+    const authors = this.sealedAuthors();
+    const workers = this.workerNames();
+    return failing
+      .filter((r) => {
+        const a = authors.get(r.name);
+        return a !== undefined && independentOf(a, workers);
+      })
+      .map((r) => r.name);
+  }
+
   /** The worker under every name it ran as: the configured id and the one the backend reported. */
   private workerNames(): string[] {
     return [...new Set([this.cfg.model, this.modelOfRecord()].filter((m): m is string => typeof m === "string" && m.trim().length > 0))];
@@ -5088,7 +5100,11 @@ export class Engine {
       // person's or the project's check refused ("not proven"), or an error.
       outcome === "unverified" &&
       // A reviewer that found the claim contradicts the task is not overruled here.
-      contradictions(review) === 0;
+      contradictions(review) === 0 &&
+      // Nor is a sealed check someone other than the worker wrote (a judge, a
+      // reference) that still fails on this work: an audit check on another
+      // property passing beside it is no answer to that failure.
+      this.independentFailing(failing).length === 0;
     if (auditable) {
       audit = yield* this.runPostWorkAudit(userText);
       if (audit?.accepted.length) {
