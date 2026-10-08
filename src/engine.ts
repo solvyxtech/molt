@@ -133,7 +133,7 @@ import {
   type Spend,
 } from "./types.js";
 import { stateDir, stateDirName } from "./statedir.js";
-import { bashReach, noProgressCallsFromEnv, outsideTask, taskPathsIn, treeStamp } from "./scope.js";
+import { bashReach, noProgressCallsFromEnv, outsideTask, ProgressMeter, taskPathsIn, treeStamp } from "./scope.js";
 import { env } from "./env.js";
 import { Judgments, caseReason, reasonText } from "./judgment.js";
 
@@ -5933,15 +5933,22 @@ export class Engine {
      */
     let deadlineInterrupted = false;
     /**
-     * The no-progress guard, unattended only (src/scope.ts). Tool calls since
-     * a file in the project last changed; at `idleLimit` the model is told
-     * once to finish or stop, at twice that the turn ends and the work on
-     * disk is judged the way the deadline judges it. 2026-10-07: a worker
-     * made 90-125 calls a task reading other tasks' logs and Maat's records,
-     * changing nothing, until the clock ran out.
+     * The no-progress guard, unattended only (src/scope.ts). Tool calls in a
+     * row that advanced nothing: no file in the project changed, and each
+     * call returned only what it had returned before (ProgressMeter). Reading
+     * something new, running a command for the first time, or getting a
+     * different answer from one is progress, wherever the work happens. At
+     * `idleLimit` the model is told once to finish or stop, at twice that the
+     * turn ends and the work on disk is judged the way the deadline judges
+     * it. 2026-10-07: a worker made 90-125 calls a task reading other tasks'
+     * logs and Maat's records until the clock ran out. HTTP backends only:
+     * an ACP backend (grok-build://, OpenCode) runs its tools inside one step.
      */
     const idleLimit = this.cfg.unattended ? (this.cfg.noProgressCalls ?? noProgressCallsFromEnv()) : 0;
     let idleStamp = idleLimit > 0 ? treeStamp(this.cwd) : null;
+    const progress = new ProgressMeter();
+    /** Per call this step: whether it advanced anything (see ProgressMeter). */
+    const advancedThisStep: boolean[] = [];
     let idleCalls = 0;
     let idleNudged = false;
     let idleStop = false;
@@ -5979,7 +5986,7 @@ export class Engine {
         yield {
           kind: "info",
           text:
-            `no progress: ${idleCalls} tool calls in a row changed no file in the project, after ` +
+            `no progress: ${idleCalls} tool calls in a row changed no file and returned nothing new, after ` +
             `being told to finish or stop — no more tool calls. The sealed checks judge the work as it stands.`,
         };
         const judged = yield* judgeOnDisk("no-progress", "");
@@ -7171,8 +7178,20 @@ export class Engine {
           }
         }
         if (pendingCriteria && planned.some((p) => changesSomething(p.name, p.rawArgs))) yield* settleCriteria(false);
+        advancedThisStep.length = 0;
         for (const p of planned) {
           const outcome = yield* this.invokeTool(p, { step, userText, confirm, log, shown, answered });
+          if (idleLimit > 0) {
+            let parsed: Record<string, unknown> | undefined;
+            try {
+              const v = JSON.parse(p.rawArgs || "{}") as unknown;
+              if (v && typeof v === "object" && !Array.isArray(v)) parsed = v as Record<string, unknown>;
+            } catch {
+              /* malformed: its answer is Maat's complaint, which is never progress */
+            }
+            const key = parsed ? callKey(outcome.name, parsed) : `${outcome.name}(${p.rawArgs})`;
+            advancedThisStep.push(!outcome.repeated && progress.advanced(key, outcome.result));
+          }
           called.push(outcome.name);
           if (outcome.repeated) repeated += 1;
           if (outcome.auto) autoRan += 1;
@@ -7188,26 +7207,34 @@ export class Engine {
 
         if (idleLimit > 0) {
           const stamp = treeStamp(this.cwd);
-          if (stamp === null || idleStamp === null) {
-            // Not measurable (the walk was cut short): never counted as idle.
-            idleStamp = stamp;
-          } else if (stamp !== idleStamp) {
-            idleStamp = stamp;
+          const changed = stamp === null || idleStamp === null || stamp !== idleStamp;
+          idleStamp = stamp;
+          if (changed) {
+            // A file in the project changed, or the tree could not be measured
+            // (never counted as idle).
             idleCalls = 0;
             idleNudged = false;
           } else {
-            idleCalls += called.length;
+            // In order: the run of non-advancing calls is what is counted, and
+            // one call that advanced anything starts it again.
+            for (const a of advancedThisStep) {
+              if (a) {
+                idleCalls = 0;
+                idleNudged = false;
+              } else idleCalls += 1;
+            }
             if (!idleNudged && idleCalls >= idleLimit) {
               idleNudged = true;
               log?.append("no_progress", { step, calls: idleCalls, limit: idleLimit, action: "nudged" });
-              yield { kind: "info", text: `no progress: ${idleCalls} tool calls in a row changed no file in the project — told the model to finish or stop` };
+              yield { kind: "info", text: `no progress: ${idleCalls} tool calls in a row changed no file and returned nothing new — told the model to finish or stop` };
               this.transcript.push({
                 role: "user",
                 content:
-                  `[molt: your last ${idleCalls} tool calls changed no file in the project. Reading ` +
-                  `more will not finish the task. If you know what to change, change it now and ` +
-                  `say done. If you cannot finish, say plainly what is blocking you and stop. If ` +
-                  `${idleLimit} more calls change nothing, the turn ends and the work is judged as it stands.]`,
+                  `[molt: your last ${idleCalls} tool calls changed no file and returned nothing they ` +
+                  `had not returned before. Repeating them will not finish the task. If you know what ` +
+                  `to change, change it now and say done. If you cannot finish, say plainly what is ` +
+                  `blocking you and stop. If ${idleLimit} more calls advance nothing, the turn ends ` +
+                  `and the work is judged as it stands.]`,
                 molt: { nudge: true },
               });
             } else if (idleNudged && idleCalls >= 2 * idleLimit) {

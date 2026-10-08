@@ -19,8 +19,13 @@
  *  - bash is not blocked (a shell can reach anything; a regex over a command
  *    line is not a wall), but a command that names `.maat/` or a path outside
  *    the project is journalled (`bashReach`).
- *  - The no-progress guard (engine.ts) counts tool calls that changed no file
- *    in the project, measured by `treeStamp`.
+ *  - The no-progress guard (engine.ts) counts tool calls in a row that did
+ *    not advance anything (`ProgressMeter`): no file in the project changed
+ *    (`treeStamp`), and the call returned nothing it had not returned before.
+ *    Reading a file not read before, a command not run before, or a command
+ *    whose output differs from every earlier run of it is progress, wherever
+ *    it works: a build into dist/, a venv, a config under /etc. What stops a
+ *    run is the same call coming back with the same answer, over and over.
  */
 import { createHash } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
@@ -94,14 +99,17 @@ export function outsideTask(
       message:
         `refused: ${shown} is outside this task. While this job runs, ${opts.tool} reads only the ` +
         `project (${cwd}) and paths the task names. Nothing outside it bears on the task or on how ` +
-        `the work will be judged; work on the task's own files.`,
+        `the work will be judged; work on the task's own files. (A scratch file you made outside ` +
+        `the project with bash can still be read with bash.)`,
     };
   }
   const rel = relative(root, target).split(sep).join("/");
-  const state = STATE_DIRS.find((d) => rel === d || rel.startsWith(`${d}/`));
+  // On a case-insensitive disk (macOS, Windows) `.MAAT/log` is `.maat/log`.
+  const fold = process.platform === "darwin" || process.platform === "win32" ? rel.toLowerCase() : rel;
+  const state = STATE_DIRS.find((d) => fold === d.toLowerCase() || fold.startsWith(`${d.toLowerCase()}/`));
   if (!state) return null;
   // What Maat itself points the model at: a long output it spilled, a background job's log.
-  if (opts.tool === "read_file" && /^[^/]+\/(out|bg)\/[^/]+$/.test(rel)) return null;
+  if (opts.tool === "read_file" && /^[^/]+\/(out|bg)\/[^/]+$/.test(fold)) return null;
   return {
     kind: "state",
     message:
@@ -164,4 +172,42 @@ export function treeStamp(root: string): string | null {
     h.update(`f\0${e.path}\0${e.bytes ?? 0}\0${mtime}\0`);
   }
   return h.digest("hex");
+}
+
+/**
+ * Output that differs between two runs of the same command for no reason that
+ * matters: durations, clock times, process ids in a "[1] 12345" job line. Left
+ * in, every timed test run would count as new output forever.
+ */
+function settled(result: string): string {
+  return result
+    .replace(/\b\d{4}-\d\d-\d\d[T ]\d\d:\d\d(?::\d\d(?:[.,]\d+)?)?(?:Z|[+-]\d\d:?\d\d)?/g, "<time>")
+    .replace(/\b\d\d:\d\d:\d\d(?:[.,]\d+)?\b/g, "<time>")
+    .replace(/\b\d+(?:\.\d+)?\s?(?:ms|µs|us|ns|s|sec|secs|seconds?|m|min|minutes?)\b/g, "<dur>")
+    .replace(/^\[\d+\]\s+\d+$/gm, "<job>");
+}
+
+/**
+ * Whether each tool call advanced the work, for the no-progress guard.
+ *
+ * A call advances when its (call, result) pair is new for this turn: a file
+ * read for the first time, a command run for the first time, or a command or
+ * read whose result differs from every earlier time it was made. The same
+ * call with the same answer again is not progress, however it is spelled.
+ * Maat's own answers (`[molt: ...]` pointers and complaints) and refusals of
+ * paths outside the task are never progress: nothing was read or run.
+ * Writes are measured separately, by the tree stamp, and by their result.
+ */
+export class ProgressMeter {
+  private seen = new Set<string>();
+
+  /** `key` is the call in canonical form (tool and arguments); `result` what it returned. */
+  advanced(key: string, result: string): boolean {
+    const r = result.trimStart();
+    if (r.startsWith("[molt:") || r.startsWith("refused:")) return false;
+    const pair = createHash("sha256").update(key).update("\0").update(settled(result)).digest("hex");
+    if (this.seen.has(pair)) return false;
+    this.seen.add(pair);
+    return true;
+  }
 }
