@@ -36,6 +36,7 @@ import { copyTree } from "./scratch.js";
 import { diagnoseFailure } from "./bar.js";
 import { normalizeRequirements } from "./signout.js";
 import { evidenceTags } from "./tiers.js";
+import type { CheckAuthor } from "./types.js";
 
 /**
  * `surface`: the critic read it as only looking (a file exists, a word
@@ -116,7 +117,15 @@ export function sanitizeCriteria(raw: unknown): Draft {
  */
 export function taskChecksFrom(
   raw: unknown,
-  opts: { hidden?: boolean } = {},
+  opts: {
+    hidden?: boolean;
+    /**
+     * Who wrote these checks. Defaults to a person when they are not hidden
+     * (a person approved them in the window or wrote them on the command
+     * line); hidden checks without one count as the worker's (tiers.ts).
+     */
+    author?: CheckAuthor;
+  } = {},
 ): {
   taskChecks: {
     name: string;
@@ -126,6 +135,7 @@ export function taskChecksFrom(
     expectExit: number;
     tags: string[];
     hidden?: boolean;
+    author?: CheckAuthor;
   }[];
   taskNotes: string[];
   requirements?: string[];
@@ -141,6 +151,7 @@ export function taskChecksFrom(
       // surface from the critic, value from the command itself (evidence.ts).
       tags: evidenceTags(c.run, c.surface),
       ...(opts.hidden ? { hidden: true } : {}),
+      ...(opts.author ? { author: { ...opts.author } } : opts.hidden ? {} : { author: { kind: "person" as const } }),
     })),
     taskNotes: drafted.notes,
     ...(drafted.requirements ? { requirements: drafted.requirements } : {}),

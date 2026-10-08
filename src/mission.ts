@@ -350,6 +350,8 @@ export function assertionChecks(contract: Contract, ids: readonly string[]): Che
       tags: ["mission"],
       // The worker is told what must be true, not how it will be checked.
       hidden: true,
+      // A model may propose the contract; a person edits it and `mission run` seals what is on disk.
+      author: { kind: "person" },
     });
   }
   return out;

@@ -60,7 +60,44 @@ def no_verdict(row: dict) -> bool:
     return (not c) or c.startswith(("error", "stopped")) or bool(row.get("timed_out"))
 
 
-TIERS = ("verified", "passed-checks")
+TIERS = ("verified", "passed-checks", "passed-own-checks")
+
+
+def claim_basis(claim) -> str | None:
+    """
+    Who stood behind a claim, read from run.py's `claim` text, old or new.
+
+      "verified (independent checks: m)"            -> "independent"
+      "verified (your checks)"                      -> "person"
+      "passed own checks (m), not verified"         -> "own"
+      "verified (self-checked)"  (builds before 2026-10-07: the checks were
+                                  drafted, by the worker or a judge; the
+                                  text cannot say which)  -> "self-checked"
+      "verified"                 (old: no drafted-only flag; authorship
+                                  was never recorded)  -> "unrecorded"
+      anything else                                  -> None
+    """
+    if not isinstance(claim, str):
+        return None
+    if claim.startswith("verified (independent checks"):
+        return "independent"
+    if claim.startswith("verified (your checks)"):
+        return "person"
+    if claim.startswith("passed own checks"):
+        return "own"
+    if claim.startswith("verified (self-checked)"):
+        return "self-checked"
+    if claim.startswith("verified"):
+        return "unrecorded"
+    return None
+
+
+def claim_judge(claim) -> list[str]:
+    """The judge model(s) named by "verified (independent checks: a, b)"; [] otherwise."""
+    if not isinstance(claim, str) or not claim.startswith("verified (independent checks:"):
+        return []
+    inner = claim[len("verified (independent checks:"):].rsplit(")", 1)[0]
+    return [m.strip() for m in inner.split(",") if m.strip()]
 
 
 def tier_breakdown(rows: list[dict]) -> dict[str, tuple[int, int]]:

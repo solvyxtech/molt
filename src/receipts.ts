@@ -11,7 +11,8 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, write
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { MIN_SECRET_CHARS, redact } from "./redact.js";
-import type { BarResult } from "./types.js";
+import type { BarResult, CheckAuthor } from "./types.js";
+import { authorWords, claimLabel, resultAuthorWords } from "./tiers.js";
 import { stateDir } from "./statedir.js";
 import { WITHHELD, maskDeep, maskText } from "./withhold.js";
 import type { Objection } from "./review.js";
@@ -87,8 +88,10 @@ export type ReceiptRecord = {
    * (`amendTier`), so the index row is the last word and the receipt file,
    * hash-bound when it was written, is never rewritten.
    */
-  tier?: "verified" | "passed-checks";
+  tier?: "verified" | "passed-checks" | "passed-own-checks";
   tierReason?: string;
+  /** The claim in words (src/tiers.ts claimLabel), e.g. "verified (independent checks: m)". */
+  claim?: string;
   /** The strongest evidence class among the passing checks. */
   evidence?: string;
   /**
@@ -377,7 +380,13 @@ export class Receipts {
     /** True when that figure rests on molt's own token estimate. */
     costEstimated?: boolean;
     /** The tier the passing checks earned, before any independent review (src/tiers.ts). */
-    tier?: { tier: "verified" | "passed-checks"; reason?: string; evidence: string };
+    tier?: { tier: "verified" | "passed-checks" | "passed-own-checks"; reason?: string; evidence: string; basis?: "person" | "independent" | "own"; by?: string[]; worker?: string };
+    /**
+     * Who wrote each check, by check name, recorded at seal time: the worker
+     * model, a separate judge, a person, or the reference writer. A check not
+     * named here is printed as unrecorded.
+     */
+    authors?: Record<string, CheckAuthor>;
     /** True for a question: the bar ran advisory and could not refuse. */
     ask?: boolean;
     /** The model was stopped (clock, provider) and the tree was judged as it stood. */
@@ -447,7 +456,10 @@ export class Receipts {
     if (args.verdict === "accepted" && !args.ask && args.tier) {
       verdictLine += args.tier.tier === "verified"
         ? `\n\nEvidence: ${args.tier.evidence}. A passing check of this class earns the word "verified".`
-        : `\n\nPassed its checks, not verified: ${args.tier.reason}. The strongest passing check is ${args.tier.evidence}.`;
+        : args.tier.tier === "passed-own-checks"
+          ? `\n\nPassed own checks, not verified: ${args.tier.reason}. A model never judges its own work; a check from a person or another model is needed for "verified".`
+          : `\n\nPassed its checks, not verified: ${args.tier.reason}. The strongest passing check is ${args.tier.evidence}.`;
+      verdictLine += `\n\nClaim: ${args.tier.tier === "passed-checks" ? "passed its checks, not verified" : claimLabel("verified", args.tier)}.`;
     }
     if (args.revealed?.length) {
       verdictLine += `\n\nThe command of ${args.revealed.map((n) => `\`${n}\``).join(", ")} was shown to the model after it failed the same way twice; the work was judged against a check the model had read.`;
@@ -469,7 +481,11 @@ export class Receipts {
       );
       if (task.checks.length) {
         asked.push("**Machine-checked.** These ran with the bar and could refuse the claim:", "");
-        for (const c of task.checks) asked.push(`- \`${c}\``);
+        for (const c of task.checks) {
+          const name = c.slice(0, c.indexOf(": ") >= 0 ? c.indexOf(": ") : c.length);
+          const a = args.authors?.[name] ?? args.authors?.[`task:${name}`];
+          asked.push(`- \`${c}\` — written by ${authorWords(a)}`);
+        }
         asked.push("");
       }
       if (task.notes.length) {
@@ -608,6 +624,7 @@ export class Receipts {
         "",
         `check: ${r.name}`,
         `kind: ${r.kind}`,
+        `written by: ${resultAuthorWords(r, args.authors?.[r.name])}`,
         `command: ${r.detail}`,
         ...(r.ranInPlace ? [`ran in place: no throwaway copy of the tree — ${r.ranInPlace}`] : []),
         `exit: ${r.exitCode ?? "n/a"}`,
@@ -703,7 +720,12 @@ export class Receipts {
       ...(args.revealed?.length ? { revealed: [...args.revealed] } : {}),
       ...(args.endedBy ? { endedBy: args.endedBy } : {}),
       ...(args.verdict === "accepted" && !args.ask && args.tier
-        ? { tier: args.tier.tier, evidence: args.tier.evidence, ...(args.tier.reason ? { tierReason: args.tier.reason } : {}) }
+        ? {
+            tier: args.tier.tier,
+            evidence: args.tier.evidence,
+            ...(args.tier.reason ? { tierReason: args.tier.reason } : {}),
+            ...(args.tier.tier !== "passed-checks" ? { claim: claimLabel("verified", args.tier) } : {}),
+          }
         : {}),
       // Only when the caller said what changed. A row with no count is
       // unknown, and unknown is not zero — it is counted as a change, which is
@@ -730,7 +752,7 @@ export class Receipts {
    * is hash-bound and stays byte for byte as written. A row that is not
    * there, or an index that cannot be read, is left alone.
    */
-  amendTier(file: string, tier: { tier: "verified" | "passed-checks"; reason?: string }): boolean {
+  amendTier(file: string, tier: { tier: "verified" | "passed-checks" | "passed-own-checks"; reason?: string; claim?: string }): boolean {
     try {
       if (!existsSync(this.indexPath)) return false;
       let hit = false;
@@ -742,8 +764,13 @@ export class Receipts {
             const r = JSON.parse(l) as ReceiptRecord;
             if (r.file !== file) return l;
             hit = true;
-            const { tierReason: _drop, ...rest } = r;
-            return JSON.stringify({ ...rest, tier: tier.tier, ...(tier.reason ? { tierReason: redact(tier.reason, this.secrets) } : {}) });
+            const { tierReason: _drop, claim: _was, ...rest } = r;
+            return JSON.stringify({
+              ...rest,
+              tier: tier.tier,
+              ...(tier.reason ? { tierReason: redact(tier.reason, this.secrets) } : {}),
+              ...(tier.claim ? { claim: tier.claim } : {}),
+            });
           } catch {
             return l;
           }

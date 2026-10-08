@@ -24,7 +24,8 @@ import { describeStart, listBackground, startBackground, stopBackground } from "
 import { objectionLine, readsTheWork, reviewClaim, type ExecutableReview, type ObjectionRun, type Review } from "./review.js";
 import { credentialFreeEnv } from "./credenv.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
-import { tierOf } from "./tiers.js";
+import { authorKey, authorWords, claimLabel, tierOf, withAuthor } from "./tiers.js";
+import { recordGoldens, valueUnproven } from "./golden.js";
 import { arbitrate, parseDisputes, type Ruling } from "./dispute.js";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
@@ -121,6 +122,7 @@ import {
   estTokens,
   type Bar,
   type Check,
+  type CheckAuthor,
   type CheckResult,
   type BarResult,
   type Bom,
@@ -2279,6 +2281,13 @@ export class Engine {
    * `pass (nothing to establish)` for it rather than presenting it as proof.
    */
   private passedBeforeWork: ReadonlySet<string> = new Set();
+  /**
+   * The expected-looking operands of `diff`/`cmp` task checks, with their
+   * content as the turn found them (src/golden.ts). Recorded at the seal,
+   * before the first step; a golden file not in here, or changed since,
+   * proves no value.
+   */
+  private goldensBefore: Map<string, string | null> = new Map();
   /** True only while `proveNow` runs: a bar with no turn behind it. */
   private standalone = false;
   private barHash: string | null;
@@ -3871,6 +3880,43 @@ export class Engine {
     return this.cfg.reviewAdvisory === true ? { reviewAdvisory: true, guards: this.passedBeforeWork } : {};
   }
 
+  /** Who wrote each sealed check, keyed by the name it runs under in the bar (and its bare name). */
+  private sealedAuthors(): Map<string, CheckAuthor> {
+    const m = new Map<string, CheckAuthor>();
+    for (const c of this.sealedChecks) {
+      const a = withAuthor(c, this.cfg.model).author!;
+      m.set(c.name, a);
+      if (!c.name.startsWith("task:")) m.set(`task:${c.name}`, a);
+    }
+    return m;
+  }
+
+  /** The worker under every name it ran as: the configured id and the one the backend reported. */
+  private workerNames(): string[] {
+    return [...new Set([this.cfg.model, this.modelOfRecord()].filter((m): m is string => typeof m === "string" && m.trim().length > 0))];
+  }
+
+  /** Everything tierOf weighs beside the results: advisory mode, the worker, who wrote each check, and which golden files predate the work. */
+  private tierContext(): {
+    reviewAdvisory?: true;
+    guards?: ReadonlySet<string>;
+    worker: string[];
+    authors: Map<string, CheckAuthor>;
+    valueUnproven: Set<string>;
+  } {
+    return {
+      ...this.advisoryTier(),
+      worker: this.workerNames(),
+      authors: this.sealedAuthors(),
+      valueUnproven: valueUnproven(this.sealedChecks.map((c) => ({ name: c.name, run: c.kind === "command" ? c.run : undefined, tags: c.tags })), this.cwd, this.goldensBefore),
+    };
+  }
+
+  /** The receipt's authorship map: sealed checks by bar name, as recorded. */
+  private receiptAuthors(): Record<string, CheckAuthor> {
+    return Object.fromEntries(this.sealedAuthors());
+  }
+
   /** See `passedBeforeWork`. Only a passing command criterion is relabelled. */
   private markGuards(result: BarResult): BarResult {
     if (this.passedBeforeWork.size === 0) return result;
@@ -4689,22 +4735,41 @@ export class Engine {
     // right 7/7 where everything else carrying the word was right 28/50. What
     // passed without earning it is reported as what it is. After the judgment
     // case above, which is opened on what the reviewers said.
-    let tier: "verified" | "passed-checks" | undefined;
+    let tier: "verified" | "passed-checks" | "passed-own-checks" | undefined;
     let tierReason: string | undefined;
+    let claim: string | undefined;
     if (outcome === "verified" && lastProof) {
       // Review was asked for and did not run (skipped near the deadline, or a
       // nudge cleared it and no re-review followed): no "verified". On v11, 6
       // of the 7 "verified" claims were unreviewed this way and 4 were wrong.
       const unreviewed = this.cfg.review !== undefined && !review;
-      const t = tierOf({ results: lastProof.results, review, unreviewed, ...this.advisoryTier() });
+      const t = tierOf({ results: lastProof.results, review, unreviewed, ...this.tierContext() });
       tier = t.tier;
       if (t.tier === "passed-checks") {
         outcome = "unverified";
         tierReason = t.reason;
         yield { kind: "info", text: `passed its checks (not verified: ${t.reason}).` };
+      } else if (t.tier === "passed-own-checks") {
+        // The model that did the work wrote every check that could have
+        // proved it: a model never both finds and judges. Not verified, and
+        // the exit code is unverified's.
+        outcome = "unverified";
+        tierReason = t.reason;
+        claim = claimLabel(outcome, t);
+        yield { kind: "info", text: `${claim}: ${t.reason}. Use --judge <another model>, or approve the checks yourself, for "verified".` };
+      } else {
+        claim = claimLabel(outcome, t);
       }
-      if (receiptPath) this.cfg.receipts?.amendTier(basename(receiptPath), t);
-      this.cfg.journal?.append("note", { text: `tier: ${t.tier}`, evidence: t.evidence, ...(t.reason ? { reason: t.reason } : {}), ...(t.reviewNote ? { review: t.reviewNote } : {}) });
+      if (receiptPath) this.cfg.receipts?.amendTier(basename(receiptPath), { ...t, ...(claim ? { claim } : {}) });
+      this.cfg.journal?.append("note", {
+        text: `tier: ${t.tier}`,
+        evidence: t.evidence,
+        ...(t.basis ? { basis: t.basis } : {}),
+        ...(t.by?.length ? { by: t.by } : {}),
+        ...(claim ? { claim } : {}),
+        ...(t.reason ? { reason: t.reason } : {}),
+        ...(t.reviewNote ? { review: t.reviewNote } : {}),
+      });
     }
     yield {
       kind: "job_end",
@@ -4714,6 +4779,8 @@ export class Engine {
       durationMs: Date.now() - startedAt,
       outcome,
       ...(tier ? { tier, ...(tierReason ? { tierReason } : {}) } : {}),
+      ...(claim ? { claim } : {}),
+      ...(this.sealedChecks.length ? { checkAuthors: Object.fromEntries(this.sealedChecks.map((c) => [c.name.startsWith("task:") ? c.name : `task:${c.name}`, authorKey(withAuthor(c, this.cfg.model).author!)])) } : {}),
       ...(selfChecked ? { selfChecked: true } : {}),
       ...(this.reviewSkipped ? { unreviewed: true } : {}),
       ...(this.turnEndedBy ? { endedBy: this.turnEndedBy, ...(this.turnEndedBy === "deadline" ? { deadline: true } : {}) } : {}),
@@ -5445,6 +5512,7 @@ export class Engine {
     let requirements = normalizeRequirements(opts.requirements);
     let signedOut = false;
     this.passedBeforeWork = new Set();
+    this.goldensBefore = new Map();
     const log = this.cfg.journal;
     /**
      * This turn's criteria, copied and sealed before anything runs.
@@ -5481,7 +5549,9 @@ export class Engine {
     const self = this;
     /** Freeze, seal, journal and try the criteria — all before any change. */
     async function* sealCriteria(checks: Check[], notes: string[]): AsyncGenerator<EngineEvent> {
-    taskChecks = checks.map((c) => Object.freeze({ ...c }));
+    // Who wrote each check is fixed here, with the checks: a check nobody
+    // vouched for is the worker's (src/tiers.ts withAuthor).
+    taskChecks = checks.map((c) => Object.freeze(withAuthor({ ...c }, self.cfg.model)));
     taskNotes = [...notes];
     Object.freeze(taskChecks);
     Object.freeze(taskNotes);
@@ -5496,6 +5566,7 @@ export class Engine {
         text: `task criteria sealed: ${taskChecks.length} check(s), ${taskNotes.length} note(s)`,
         seal: taskSeal,
         checks: taskChecks.map((c) => c.name),
+        authors: Object.fromEntries(taskChecks.map((c) => [c.name, authorWords(c.author)])),
         notes: taskNotes,
       });
       yield {
@@ -5508,6 +5579,8 @@ export class Engine {
       // meant to fail before the work; it is not meant to be unrunnable, and
       // the difference is cheap to establish here and expensive to discover
       // at the end of a turn.
+      // What each expected-looking file held before the work (src/golden.ts).
+      self.goldensBefore = recordGoldens(taskChecks.map((c) => ({ run: c.kind === "command" ? c.run : undefined })), self.cwd);
       if (taskChecks.length) {
         // Through `running`, so ctrl+C at the very start of a turn kills the
         // preflight rather than waiting it out.
@@ -5742,7 +5815,9 @@ export class Engine {
       }
       referencePending = undefined;
       if (!got) return;
-      const check = Object.freeze({ ...got.check, name: got.check.name.startsWith("task:") ? got.check.name : `task:${got.check.name}` });
+      const check = Object.freeze(
+        withAuthor({ ...got.check, name: got.check.name.startsWith("task:") ? got.check.name : `task:${got.check.name}` }, self.cfg.model),
+      );
       if (taskChecks.some((c) => c.name === check.name)) return;
       taskChecks = Object.freeze([...taskChecks, check]) as Check[];
       self.sealedChecks = taskChecks;
@@ -5817,7 +5892,7 @@ export class Engine {
       }
       const have = new Set(taskChecks.map((c) => c.name));
       const added = (got?.taskChecks ?? [])
-        .map((c) => Object.freeze({ ...c, name: c.name.startsWith("task:") ? c.name : `task:${c.name}` }))
+        .map((c) => Object.freeze(withAuthor({ ...c, name: c.name.startsWith("task:") ? c.name : `task:${c.name}` }, self.cfg.model)))
         .filter((c) => !have.has(c.name));
       if (!added.length) {
         log?.append("note", { kind: "late-checks", text: "the drafter finished with no checks to join", inputsSha: draftInputs });
@@ -5975,7 +6050,8 @@ export class Engine {
                   notes: [...taskNotes],
                 }
               : undefined,
-          ...(verdict === "accepted" ? { tier: tierOf({ results: result.results, ...self.advisoryTier() }) } : {}),
+          ...(verdict === "accepted" ? { tier: tierOf({ results: result.results, ...self.tierContext() }) } : {}),
+          authors: self.receiptAuthors(),
           });
           log?.append("receipt", { verdict, file: receipt.path, attempt: proofAttempts, endedBy: why });
           self.bindReceipt(receipt.path, verdict);
@@ -7889,7 +7965,8 @@ export class Engine {
               }
             : undefined,
           ...(this.turnRevealed.length ? { revealed: [...this.turnRevealed] } : {}),
-          ...(verdict === "accepted" ? { tier: tierOf({ results: result.results, ...this.advisoryTier() }) } : {}),
+          ...(verdict === "accepted" ? { tier: tierOf({ results: result.results, ...this.tierContext() }) } : {}),
+          authors: this.receiptAuthors(),
         });
         log?.append("receipt", { verdict, file: receipt.path, attempt: proofAttempts });
         this.bindReceipt(receipt.path, verdict);

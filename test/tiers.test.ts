@@ -76,20 +76,22 @@ describe("the value tag", () => {
 });
 
 describe("tierOf", () => {
-  const ok = (tags: string[], hidden = true) => ({ ok: true, hidden: hidden || undefined, tags });
+  const ok = (tags: string[], hidden = true) => ({ name: "c", ok: true, hidden: hidden || undefined, kind: "command" as const, tags });
+  // Drafted by a separate judge model: the authorship rule is pinned in independent-checks.test.ts.
+  const J = { worker: "worker-m", authors: new Map([["c", { kind: "judge" as const, model: "judge-j" }]]) };
   it("needs a passing check that runs the work and asserts a value", () => {
-    assert.equal(tierOf({ results: [ok(["task", "value"])] }).tier, "verified");
-    assert.equal(tierOf({ results: [ok(["task"]), ok(["task", "value"])] }).tier, "verified");
-    assert.equal(tierOf({ results: [ok(["task"])] }).tier, "passed-checks");
-    assert.equal(tierOf({ results: [ok(["task", "surface", "value"])] }).tier, "passed-checks", "a check that only looks cannot carry it");
-    assert.equal(tierOf({ results: [{ ok: false, hidden: true, tags: ["task", "value"] }] }).tier, "passed-checks", "a failing check is no evidence");
+    assert.equal(tierOf({ ...J, results: [ok(["task", "value"])] }).tier, "verified");
+    assert.equal(tierOf({ ...J, results: [ok(["task"]), ok(["task", "value"])] }).tier, "verified");
+    assert.equal(tierOf({ ...J, results: [ok(["task"])] }).tier, "passed-checks");
+    assert.equal(tierOf({ ...J, results: [ok(["task", "surface", "value"])] }).tier, "passed-checks", "a check that only looks cannot carry it");
+    assert.equal(tierOf({ ...J, results: [{ ok: false, hidden: true, tags: ["task", "value"] }] }).tier, "passed-checks", "a failing check is no evidence");
   });
   it("lets a person's passing check verify, and a contradiction undo any of it", () => {
-    assert.equal(tierOf({ results: [ok([], false)] }).tier, "verified");
-    const r = tierOf({ results: [ok(["task", "value"])], review: { votes: "1/3", violations: [] } });
+    assert.equal(tierOf({ ...J, results: [{ ...ok([], false), name: "project" }] }).tier, "verified");
+    const r = tierOf({ ...J, results: [ok(["task", "value"])], review: { votes: "1/3", violations: [] } });
     assert.equal(r.tier, "passed-checks");
     assert.match(r.reason!, /1\/3/);
-    assert.equal(tierOf({ results: [ok(["task", "value"])], review: { votes: "0/3", violations: [] } }).tier, "verified");
+    assert.equal(tierOf({ ...J, results: [ok(["task", "value"])], review: { votes: "0/3", violations: [] } }).tier, "verified");
   });
   it("says it in one phrase", () => {
     assert.equal(passedChecksWords("no check asserted an expected value"), "passed its checks (not verified: no check asserted an expected value)");
@@ -99,7 +101,11 @@ describe("tierOf", () => {
 describe("the tier in a turn", () => {
   const TASK = "Write out.txt containing exactly the word hello.";
   const make = (tags: string[], run: string, hidden = true): Check =>
-    ({ name: "made", kind: "command", run, timeoutMs: 5_000, expectExit: 0, tags, ...(hidden ? { hidden: true } : {}) }) as Check;
+    ({
+      name: "made", kind: "command", run, timeoutMs: 5_000, expectExit: 0, tags,
+      // Hidden ones as a separate judge model (not the worker "m") drafted them.
+      ...(hidden ? { hidden: true, author: { kind: "judge", model: "judge-j" } } : {}),
+    }) as Check;
   const SURFACE = make(["task", "surface"], "test -f out.txt");
   const RUNS = make(["task"], "test -s out.txt");
   const VALUE = make(["task", "value"], `grep -qx hello out.txt`);

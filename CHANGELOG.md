@@ -17,6 +17,42 @@
 
 ### Changed
 
+- **"Verified" needs a check the worker model did not write.** Each task
+  check now records who wrote it (the worker, a separate judge, a person, the
+  reference writer). A run is `verified` only when a passing check that ran
+  the work and asserted a value came from another model (`--judge`,
+  `MAAT_JUDGE_*`, compared by provider-normalised id), or a person wrote or
+  approved a passing command check (done.yml, a mission, criteria approved in
+  the window, `--criterion`). Otherwise the tier is the new
+  **`passed-own-checks`**: outcome `unverified`, **exit code 3**.
+  **This changes headless `--criteria auto` without `--judge` (or with a judge
+  that is the worker model under another name): it used to exit 0 and now
+  exits 3.** CI jobs and bench scripts that read exit 0 as success should
+  pass `--judge <another model>` or approve the checks.
+- **Builtins never make a run verified.** `work-landed`, `record-intact`,
+  `claims-grounded`, `work-accounted`, `spec-intact` and every other builtin
+  or `session` check say the turn was well-formed, not that the task is
+  right. A bar of builtins alone now ends `passed-checks` (unverified, exit 3)
+  where it used to end `verified`, and receipts say these checks are Maat's,
+  not "a person (your check)".
+- **An expected file counts only if it predates the work.** `diff out.txt
+  expected.txt` (or a golden/want/baseline/answer file) asserts a value only
+  when that file was in the project before the first step and is unchanged
+  at the claim. A worker that writes both files no longer earns "verified".
+- **The reference check runs the deliverable out of process.** Maat's driver
+  used to import an import-style deliverable into its own process, so a
+  module that called `os._exit(0)` ended the check with exit 0 before any
+  comparison, and it passed. Each input now runs in a fresh child; a child
+  that ends without a result is a mismatch, `reference()` is removed from the
+  module the work's code can reach, and expected values never leave the
+  driver's memory. A pass also needs the driver's final `REFERENCE COMPARED
+  n/n` line: an exit 0 without it is a failure.
+- **Claims say who stood behind them** on the terminal, the window, job_end's
+  `claim`, the receipt index and the receipt: `verified (independent checks:
+  <judge>)`, `verified (your checks)`, `passed own checks (<worker>), not
+  verified`. With `--review-advisory`, a review that contradicted the task or
+  did not run appends `, unconfirmed` / `, unreviewed`.
+
 - **OpenCode runs OpenCode Zen models only.** The OpenCode backend (worker and
   judge) accepts `opencode/<model>` (e.g. `opencode/big-pickle`) and refuses
   any other provider at parse time and at run time; the CLI is handed a config

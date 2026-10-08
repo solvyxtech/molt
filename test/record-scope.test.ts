@@ -56,7 +56,9 @@ describe("a completion claim is judged on the turn that made it", () => {
       maxProofAttempts: 1,
     });
     const first = await drain(engine.run("add a file", allowAll));
-    assert.equal((first.at(-1) as { outcome: string }).outcome, "verified");
+    // The bar passed; a builtin alone never makes it "verified" (src/tiers.ts personCheck).
+    const firstEnd = first.at(-1) as { outcome: string; tier?: string };
+    assert.deepEqual([firstEnd.outcome, firstEnd.tier], ["unverified", "passed-checks"]);
 
     const second = await drain(engine.run("refactor the auth module", allowAll));
     const end = second.at(-1) as { kind: string; outcome: string };

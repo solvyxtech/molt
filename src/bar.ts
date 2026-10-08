@@ -10,6 +10,7 @@
  */
 import { DISPUTE_HINT } from "./dispute.js";
 import { judgePass } from "./evidence.js";
+import { REFERENCE_SENTINEL, referenceComparedAll } from "./reference.js";
 import { testsRealFor } from "./tests-real.js";
 import { runCommand, draftedShell } from "./run.js";
 import { parseLcov, coverageFor, coverageCouldSpeak, unprovenIn, type Unproven } from "./coverage.js";
@@ -2229,6 +2230,15 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
       passed = false;
       if (judged.broken) diagnosis = { didNotRun: true, hint: judged.why };
       output = `[molt] ${judged.why}\n\n${output}`;
+    }
+    // The reference driver (src/reference.ts) ends by saying it compared
+    // every input it judged. An exit 0 without that line is something ending
+    // the driver early (the work's code, once, with os._exit(0)), not a pass.
+    if (passed && check.tags.includes("reference") && !referenceComparedAll(output)) {
+      passed = false;
+      output =
+        "[molt] the reference check exited 0 without reporting that it compared every input " +
+        `(no \`${REFERENCE_SENTINEL} n/n\` line), so nothing was shown to match\n\n${output}`;
     }
   }
   return {

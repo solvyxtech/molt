@@ -233,6 +233,26 @@ def provider_capped(out: str, steps: int) -> bool:
     )
 
 
+def claim_of(ev: dict) -> str | None:
+    """
+    The `claim` field for one job_end event.
+
+    Builds from 2026-10-07 on carry job_end's own `claim`, which says who stood
+    behind the word: "verified (independent checks: <judge>)", "verified (your
+    checks)", or "passed own checks (<worker>), not verified" (never counted as
+    verified: it does not start with "verified"). Older builds, and outcomes
+    that are not a tier, carry the outcome as before, with " (self-checked)"
+    when every check was drafted (whoever drafted it).
+    """
+    c = ev.get("claim")
+    if isinstance(c, str) and c:
+        return c
+    o = ev.get("outcome")
+    if not isinstance(o, str):
+        return None
+    return o + (" (self-checked)" if ev.get("selfChecked") else "")
+
+
 def run_molt(d: Path, prompt: str, log: Path) -> dict:
     key = openrouter_key() if "openrouter.ai" in URL else "local"
     env = os.environ | {"MOLT_API_KEY": key, "MOLT_JUDGMENT": "0"}  # nobody rules on a benchmark run
@@ -277,12 +297,12 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
             steps += 1
             per.append(len(ev.get("tools") or []))
         elif ev.get("kind") == "job_end":
-            outcome = ev.get("outcome") + (" (self-checked)" if ev.get("selfChecked") else "")
+            outcome = claim_of(ev)
             spend = ev.get("spend") or {}
             review = ev.get("review")
             disagree = ev.get("checksDisagree") or []
             # Only what job_end carried; absent keys stay absent (older builds).
-            extra = {k: ev[k] for k in ("revealed", "deadline", "endedBy", "retired", "build", "tier", "tierReason", "providerStall") if k in ev}
+            extra = {k: ev[k] for k in ("revealed", "deadline", "endedBy", "retired", "build", "tier", "tierReason", "providerStall", "checkAuthors") if k in ev}
     # The provider's daily cap, not the work: every later task would fail the
     # same way (2026-10-05: eleven tasks per arm "failed" in 140 s, 0 turns).
     capped = provider_capped(out, steps)

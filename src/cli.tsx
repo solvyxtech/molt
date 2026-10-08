@@ -27,7 +27,7 @@ import { buildRepoMap, DEFAULT_MAP_TOKENS } from "./repomap.js";
 import { buildBrief, DEFAULT_BRIEF_TOKENS } from "./brief.js";
 import { draftMission, missionStatus, runMission, writePlan, type MissionSummary } from "./mission.js";
 import { parseDuration } from "./session-commands.js";
-import { passedChecksWords } from "./tiers.js";
+import { jobEndWords } from "./tiers.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
 import { commandsHere, draftCriteriaCritiqued, drafterInputsHash, drafterSnapshot, preflightCriteria, taskChecksFrom, type Draft, type DrafterInputs } from "./criteria.js";
 import { listProject, removeNew } from "./leftovers.js";
@@ -49,7 +49,7 @@ import {
   type StoredEndpoint,
 } from "./providers.js";
 import { Receipts } from "./receipts.js";
-import type { BarResult, Check, EngineEvent } from "./types.js";
+import type { BarResult, Check, CheckAuthor, EngineEvent } from "./types.js";
 import { stateDir } from "./statedir.js";
 import { draftReference, snapshotProject } from "./reference.js";
 import { env } from "./env.js";
@@ -190,6 +190,9 @@ options
                      A separate judge does not share the worker's misreadings;
                      it raised verified-on-correct-work on every worker tested
                      with no wrong verifieds. Same as MAAT_JUDGE_MODEL.
+                     Without one (or with the worker's own model), drafted
+                     checks are the worker's and the most a run earns is
+                     "passed own checks", never "verified".
   --judge-url <url>  where the judge runs, e.g. grok-build://subscription,
                      opencode://zen (OpenCode Zen models only, e.g.
                      opencode/big-pickle), or an OpenAI-style URL.
@@ -1375,7 +1378,11 @@ function startReference(args: Args, deadlineAt?: number): Promise<{ check: Check
 async function sealDraft(draft: Draft, args: Args, late = false): Promise<ReturnType<typeof taskChecksFrom>> {
   // Hidden: the model wrote these, and a model shown its own exam makes the
   // work equal the check. It gets the names, and the output on failure.
-  const sealed = taskChecksFrom(draft, { hidden: true });
+  // Who wrote them, recorded with the seal: the judge when one is set, else the
+  // worker itself. Whether that judge is really another model is tierOf's call.
+  const drafter = judgeTarget({ baseUrl: args.url, apiKey: args.key, model: args.model }).model;
+  const author: CheckAuthor = process.env.MAAT_JUDGE_MODEL?.trim() ? { kind: "judge", model: drafter } : { kind: "worker", model: args.model };
+  const sealed = taskChecksFrom(draft, { hidden: true, author });
   // Headless, the checks' own side effects are cleaned up (src/leftovers.ts).
   // A draft that joins at a claim (RunOptions.pendingCriteria, cut with no
   // checks ready) lands after the work began: trying it in the live folder
@@ -1489,22 +1496,7 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         // the same books.
         const sp = ev.spend;
         const cached = sp.cachedTokens > 0 ? ` (${sp.cachedTokens} cached)` : "";
-        const said =
-          ev.tier === "passed-checks"
-            ? passedChecksWords(ev.tierReason)
-            : ev.outcome === "verified" && ev.revealed?.length
-            ? "verified (checks shown after a repeat failure)"
-            : ev.outcome === "verified" && ev.review && !ev.review.confirmed
-            ? "passed its checks, unconfirmed"
-            : ev.outcome === "verified" && ev.review?.confirmed
-              ? "verified, independently reviewed"
-              : ev.outcome === "verified" && ev.unreviewed
-                ? "passed its checks, unreviewed"
-              : ev.outcome === "verified" && ev.selfChecked
-                ? "passed its own checks"
-                : ev.outcome === "unverified" && ev.checksDisagree?.length
-                  ? "unverified, its own drafted checks disagree"
-                  : ev.outcome;
+        const said = jobEndWords(ev);
         process.stdout.write(
           `· job ${said} · ${ev.steps} step(s) · ${sp.promptTokens} in${cached} · ` +
             `${sp.completionTokens} out · ${fmtDuration(ev.durationMs)}` +

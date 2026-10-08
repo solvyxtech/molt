@@ -15,6 +15,8 @@ import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
 const greet = (hidden = true): Check => ({
   name: "greeting", kind: "command", run: "grep -qx hello out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden,
+  // Drafted by a separate judge model, not the worker "m".
+  author: { kind: "judge", model: "judge-j" },
 });
 
 function end(events: Awaited<ReturnType<typeof drain>>) {
@@ -128,7 +130,7 @@ describe("a provider that gives up after work happened", () => {
 });
 
 describe("a check that exceeds its timeout", () => {
-  const hang: Check = { name: "hangs", kind: "command", run: "sleep 5", timeoutMs: 300, expectExit: 0, tags: ["task"], hidden: true };
+  const hang: Check = { name: "hangs", kind: "command", run: "sleep 5", timeoutMs: 300, expectExit: 0, tags: ["task"], hidden: true, author: { kind: "judge", model: "judge-j" } };
 
   it("is retired as a timeout, and the others judge", async () => {
     const ws = workspace();
