@@ -44,7 +44,7 @@ Build it once with `npm run build`, then add this to Zed's `settings.json`
   from the Dock does not have your shell's PATH, so a bare `node` may not be
   found.
 - `--acp` works in place of `acp`, for launchers that want a flag.
-- If the CLI package is installed (`npm run pack:cli`, `@solvyx/molt`),
+- If the CLI is installed on your PATH (`npm run pack:cli && npm i -g ./out-cli`),
   `"command": "molt", "args": ["acp"]` is the same thing.
 - `default_config_options` sets what each new thread starts with — see
   [The pickers](#the-pickers) for the ids and values. Zed only applies a
