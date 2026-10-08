@@ -31,8 +31,8 @@
  * costs one claim the word, a check counted wrongly costs the word its
  * meaning.
  */
-import { lstatSync, readdirSync, readFileSync, readlinkSync, statSync } from "node:fs";
-import { basename, delimiter, isAbsolute, relative, resolve, sep } from "node:path";
+import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { basename, delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { treeChanges, type TreeSnapshot } from "./files.js";
 import type { CheckAuthor, CheckResult } from "./types.js";
 
@@ -156,6 +156,16 @@ export function plantedBins(cwd: string, since: number): string[] {
     const p = resolve(dir, n);
     try {
       const st = lstatSync(p);
+      // A link into node_modules whose target the turn wrote: the link can be
+      // old while the program it runs is new (node_modules/jest/bin/jest.js
+      // edited in place), or the link new and its package one nobody installed.
+      if (st.isSymbolicLink()) {
+        const why = tamperedTarget(cwd, p, since);
+        if (why) {
+          out.push(`node_modules/.bin/${n} (${why})`);
+          continue;
+        }
+      }
       if (st.mtimeMs < since - 1_000 && st.ctimeMs < since - 1_000) continue;
       // A bin named after a command the system already has (node, sh,
       // python3) shadows it whatever it links to; no package needs that.
@@ -171,6 +181,44 @@ export function plantedBins(cwd: string, since: number): string[] {
     }
   }
   return out;
+}
+
+/**
+ * Why a `.bin` link's real target inside node_modules is the worker's, or null.
+ * npm installs files with a fixed old mtime, so a target modified since the
+ * turn began was written by hand. A target whose package has no package.json,
+ * or whose package.json does not declare it as a bin, was put there by hand
+ * too, when it appeared this turn.
+ */
+function tamperedTarget(cwd: string, link: string, since: number): string | null {
+  const modules = resolve(cwd, "node_modules");
+  let real: string;
+  try {
+    real = realpathSync(link);
+  } catch {
+    return null;
+  }
+  let modulesReal = modules;
+  try {
+    modulesReal = realpathSync(modules);
+  } catch {
+    /* as is */
+  }
+  const rel = relative(modulesReal, real);
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return null;
+  const st = statSync(real);
+  if (st.mtimeMs >= since - 1_000) return `${rel} was modified this turn`;
+  if (st.ctimeMs < since - 1_000) return null;
+  const parts = rel.split(sep);
+  const pkgDir = join(modulesReal, ...(parts[0]!.startsWith("@") ? parts.slice(0, 2) : parts.slice(0, 1)));
+  try {
+    const pkg = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8")) as { name?: string; bin?: string | Record<string, string> };
+    const bins = typeof pkg.bin === "string" ? [pkg.bin] : Object.values(pkg.bin ?? {});
+    if (bins.some((b) => resolve(pkgDir, b) === real)) return null;
+    return `${rel} is not a bin its package declares`;
+  } catch {
+    return `${rel} appeared this turn in a folder with no package.json`;
+  }
 }
 
 /** True when `name` is a command on PATH outside the project. */

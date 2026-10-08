@@ -85,10 +85,21 @@ export function groundedViolations(reply: string, task: string): Violation[] {
  * what the reviewer reads.
  */
 export function receiptEvidence(receipt: string, cap = 14_000): string {
-  const checkedAt = receipt.search(/^## What was checked/m);
+  // Headings are found on "\n"-separated lines only: a JS /m regex also
+  // breaks lines at \r, \u2028 and \u2029, which the receipt quotes as part
+  // of one "> " line, so a worker's "Done.\r## Output\r" read as a heading.
+  const at = (re: RegExp, from: number): number => {
+    let pos = 0;
+    for (const line of receipt.split("\n")) {
+      if (pos >= from && re.test(line)) return pos;
+      pos += line.length + 1;
+    }
+    return -1;
+  };
+  const checkedAt = at(/^## What was checked/, 0);
   const from = checkedAt >= 0 ? checkedAt : 0;
-  const outAt = receipt.slice(from).search(/^## Output[ \t]*$/m);
-  const end = outAt >= 0 ? from + outAt : receipt.length;
+  const outAt = at(/^## Output[ \t]*$/, from);
+  const end = outAt >= 0 ? outAt : receipt.length;
   const head = receipt.slice(0, from);
   const checks = receipt.slice(from, end).slice(0, cap);
   if (head.length + checks.length <= cap) return head + checks;

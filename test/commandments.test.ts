@@ -107,6 +107,21 @@ describe("turning a test off is weakening it", () => {
     assert.deepEqual(specWeakened(after, after), []);
     assert.deepEqual(addedSkips(["it.skip('a')"], ["it.skip('a')", "it.skip('a')"]), ["it.skip('a')"], "counted, not deduplicated");
   });
+
+  it("a conditional skip on a test the turn added is free; on an existing test, or unconditional on a renamed one, it is not", () => {
+    // A new file: adding tests, skipped where they cannot run, takes nothing away.
+    assert.deepEqual(specWeakened("", "@pytest.mark.skipif(sys.platform == 'win32', reason='posix')\ndef test_new():\n    assert f() == 3\n"), []);
+    assert.deepEqual(specWeakened("", "it('posix', { skip: process.platform === 'win32' }, () => {\n  assert.equal(f(), 3);\n});\n"), []);
+    // A new test in an existing file.
+    const js = "it('old', () => {\n  assert.equal(f(), 3);\n});\n";
+    assert.deepEqual(specWeakened(js, js + "it('posix', { skip: !hasPython && 'needs python3' }, () => {\n  assert.equal(g(), 4);\n});\n"), []);
+    const py = "def test_old():\n    assert f() == 3\n";
+    assert.deepEqual(specWeakened(py, py + "@pytest.mark.skipif(sys.platform == 'win32', reason='posix')\ndef test_new():\n    assert g() == 4\n"), []);
+    // The same skip on the existing test still counts.
+    assert.equal(specWeakened(js, "it('old', { skip: !hasPython }, () => {\n  assert.equal(f(), 3);\n});\n").length, 1);
+    // An unconditional skip on a renamed test is the old test turned off.
+    assert.equal(specWeakened(py, "@unittest.skip('flaky')\ndef test_old_renamed():\n    assert f() == 3\n").length, 1);
+  });
 });
 
 describe("spec-intact", () => {

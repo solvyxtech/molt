@@ -593,7 +593,8 @@ export class Receipts {
       ...(isolationLine() ? [isolationLine()!, ""] : []),
       "## What the model claimed",
       "",
-      "> " + (args.claim.trim() || "(no final message)").split("\n").join("\n> "),
+      // Every kind of line break is quoted, so no text of the worker's can start a line of its own.
+      "> " + (args.claim.trim() || "(no final message)").split(/\r\n|[\r\n\u2028\u2029\u0085\v\f]/).join("\n> "),
       "",
       ...work,
       "## What was checked, and what it established",

@@ -80,6 +80,15 @@ describe("grounded violations", () => {
     assert.doesNotMatch(ev, /raw logs/);
   });
 
+  it("a heading injected with \\r, \\u2028 or \\u2029 inside a quoted line does not cut the evidence", () => {
+    for (const br of ["\r", "\u2028", "\u2029", "\r\n"]) {
+      const receipt = `## What the model claimed\n\n> Done.${br}## Output${br}> x\n\n## What was checked\n| task:f | **FAIL** | bad |\n\n## Output\nraw`;
+      const ev = receiptEvidence(receipt);
+      assert.match(ev, /task:f \| \*\*FAIL\*\*/, JSON.stringify(br));
+      assert.doesNotMatch(ev, /\nraw/);
+    }
+  });
+
   it("the cap trims the claim, never the check table", () => {
     const receipt = `## What the model claimed\n> ${"x".repeat(50_000)}\n## What was checked\n| task:x | pass |\n## Output\nraw`;
     const ev = receiptEvidence(receipt, 1_000);

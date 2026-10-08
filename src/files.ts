@@ -506,10 +506,69 @@ export function addedSkips(before: string[], after: string[]): string[] {
  * removed), and the skips it added. Each skip reads as what it is.
  */
 export function specWeakened(before: string, after: string): string[] {
-  return [
-    ...removedAssertions(before, after),
-    ...addedSkips(skipsIn(before), skipsIn(after)).map((s) => `${s}  (turns a test off)`),
-  ];
+  // A skip on a test the turn added (a new file, or a new test with a
+  // platform skip) turns nothing off that was promised before: adding tests,
+  // skipped where they cannot run, is free. Only a skip on a test that
+  // existed before the turn, or one Maat cannot tie to a test, counts.
+  const had = testNames(before);
+  const fresh = new Set<string>();
+  if (before.trim()) {
+    // A renamed test with an unconditional skip is still the old test turned
+    // off, so only a conditional skip (a platform or tool check) is free there.
+    for (const { skip, test } of skipsWithTests(after)) if (test !== undefined && !had.has(test) && conditionalSkip(skip)) fresh.add(skip);
+  }
+  const added = before.trim() ? addedSkips(skipsIn(before), skipsIn(after)).filter((s) => !fresh.has(s)) : [];
+  return [...removedAssertions(before, after), ...added.map((s) => `${s}  (turns a test off)`)];
+}
+
+/** A skip that depends on where it runs: skipif / skipIf / skipUnless, or `{ skip: <expression> }`. */
+export function conditionalSkip(line: string): boolean {
+  return /\b(?:skipif|skipIf|skipUnless)\b/.test(line) || /[{,]\s*skip\s*:\s*(?!true\b|["'`])\S/.test(line);
+}
+
+const JS_TEST = /\b(?:it|test|describe|context|suite|specify|xit|xtest|xdescribe)(?:\.\w+)?\s*\(\s*(["'`])((?:(?!\1)[^\\]|\\.)*)\1/;
+const PY_TEST = /^(?:async\s+)?(?:def|class)\s+(\w+)/;
+
+/** The names of the tests a file defines: a JS test's title, a Python test function or class. */
+export function testNames(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    const js = JS_TEST.exec(t);
+    if (js) out.add(js[2]!);
+    const py = PY_TEST.exec(t);
+    if (py) out.add(py[1]!);
+  }
+  return out;
+}
+
+/** Each skip line (normalised as skipsIn) with the test it is on, when it can be told: the same line's title, or the def/class a decorator sits on. */
+export function skipsWithTests(text: string): { skip: string; test?: string }[] {
+  const lines = text.split("\n");
+  const out: { skip: string; test?: string }[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i]!.trim();
+    if (!t || (t.startsWith("#") && !t.startsWith("#[")) || t.startsWith("//") || !SKIP_MARKER.test(t)) continue;
+    const skip = t.replace(/\s+/g, " ");
+    const js = JS_TEST.exec(t);
+    if (js) {
+      out.push({ skip, test: js[2]! });
+      continue;
+    }
+    if (t.startsWith("@")) {
+      let test: string | undefined;
+      for (let j = i + 1; j < lines.length && j < i + 20; j++) {
+        const n = lines[j]!.trim();
+        if (!n || n.startsWith("@") || n.startsWith("#")) continue;
+        test = PY_TEST.exec(n)?.[1];
+        break;
+      }
+      out.push(test !== undefined ? { skip, test } : { skip });
+      continue;
+    }
+    out.push({ skip });
+  }
+  return out;
 }
 
 /**

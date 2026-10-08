@@ -351,6 +351,13 @@ describe("the driver's exit 0 is earned, not inherited", { skip: !hasPython && "
     }
   });
 
+  it("a BaseException the deliverable raises fails the work, not the reference", () => {
+    for (const solution of ["class Out(BaseException):\n    pass\nraise Out()\n", "def double(n):\n    raise KeyboardInterrupt\n"]) {
+      const r = drive(solution);
+      assert.equal(r.status, 1, solution);
+    }
+  });
+
   it("an early exit with the reference's own error code does not retire the check", () => {
     assert.equal(drive("import os\nos._exit(3)\n").status, 1);
   });
