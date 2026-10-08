@@ -49,6 +49,27 @@ To see them: `npx tsc -p tsconfig.test.json && node --test dist-test/test/lean-b
 - The numbers are deterministic (scripted turns, no clock in the bodies), so
   1.5x leaves room for small prompt edits, not for noise.
 
+## Shed and elision rules the study fixed
+
+From `reports/lean-sessions-study.md`; tests in `test/lean-fixes.test.ts`.
+
+- **Shed min-free** (`SHED_MIN_FREE` = 0.25 in `src/transcript.ts`). A shed
+  cut on user turns must free at least a quarter of the history, or `planShed`
+  cuts on recent messages instead. A shed costs the whole prompt cache, and
+  Maat's own notes (acceptance criteria, bar refusals) arrive as user
+  messages, so the user-turn cut could land near the start of a long turn
+  (a real run: 60,788 -> 60,387 tokens) or return no plan at all, step after
+  step, so auto-shed never fired again.
+- **Per-call elision.** `elideSupersededReads` elides the superseded call's
+  own result, not every result of its step. A bash rerun with new output
+  supersedes the earlier output; the same command with different options
+  (`timeout_s`, background) is a different call and keeps its result. A plain
+  `cat`/`head`/`tail`/`nl`/`sed -n` of one file (no pipe, redirect or second
+  command) is a read that a later write of that file makes stale.
+
+The flag-gated experiments from the study (shed threshold, ageing) are not
+part of this.
+
 ## The bench cost alarm (`bench/local/run.py`)
 
 After each run, run.py reads the run's cost (`spend.costUsd`) and prompt

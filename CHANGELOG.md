@@ -147,6 +147,20 @@
   background logs, and paths the task names). bash is not blocked; this is a
   budget control, not isolation.
 
+### Fixed
+
+- **Two lean-session defects (lean-sessions study).** A shed cut on user
+  turns must now free at least 25% of the history, or it cuts on recent
+  messages instead: Maat's own notes (acceptance criteria, bar refusals) are
+  user messages, so a shed could cost the whole prompt cache for 0.7%
+  (60,788 -> 60,387 tokens), or come back empty on every step so auto-shed
+  never fired again that turn. Superseded tool results are now elided per
+  call, not per step: rewriting `dur.py` no longer drops `test_dur.py` read in
+  the same step. A bash rerun that came back different supersedes the earlier
+  output (a rerun with different options, such as a longer `timeout_s`, is a
+  different call), and a plain `cat`/`head`/`tail`/`nl`/`sed -n` of one file
+  counts as a read a later write makes stale. See `docs/lean.md`.
+
 ## 0.2.2 — subscription backends removed
 
 ### Removed
