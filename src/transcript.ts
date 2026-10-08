@@ -19,6 +19,7 @@
  * No filesystem access here — archiving lives in archive.ts so this whole
  * module stays pure and testable.
  */
+import { isAbsolute, posix, relative } from "node:path";
 import { parseLenient } from "./lenient-json.js";
 import { estTokens, type Bom, type Msg } from "./types.js";
 
@@ -28,6 +29,27 @@ export const ELIDED_PREFIX = "[molt: superseded tool result —";
 const SAME_CALL_PREFIX = "[molt: this is the same ";
 /** How the engine sends a read of lines the model has already been shown. */
 const SHOWN_PREFIX = "[molt: you have already been shown";
+
+/**
+ * One spelling per file, for every map that is keyed by path: `dur.py`,
+ * `./dur.py` and `sub/../dur.py` are one file, and with `root` (the
+ * workspace) so is its absolute path. A path outside `root` stays absolute.
+ * An empty path stays empty: it names no file.
+ *
+ * The engine's read-coverage map and this module's elision have to agree on
+ * it. When they did not, an edit of `./dur.py` cleared the wrong key, the
+ * transcript elided the old copy, and the re-read was answered "you have
+ * already been shown it": the model held no copy of the file it had edited.
+ */
+export function canonPath(path: string, root?: string): string {
+  if (!path) return path;
+  let p = path;
+  if (root && isAbsolute(p)) {
+    const rel = relative(root, p);
+    if (rel !== ".." && !rel.startsWith("../") && !isAbsolute(rel)) p = rel || ".";
+  }
+  return posix.normalize(p).replace(/^(?:\.\/)+/, "") || ".";
+}
 
 /**
  * A bash command that only prints one file: `cat f`, `head -n 40 f`,
@@ -611,11 +633,11 @@ export class Transcript {
           // pointer to an earlier copy is not a read: the copy it points at
           // is the one a write must invalidate.
           const read = SIMPLE_READ.exec(cmd);
-          if (read && !pointer) noteRead(read[1]!.replace(/^\.\//, ""), `bash:${cmd}`, at);
+          if (read && !pointer) noteRead(canonPath(read[1]!), `bash:${cmd}`, at);
           return;
         }
 
-        const path = String(args.path ?? "").replace(/^\.\//, "");
+        const path = canonPath(String(args.path ?? ""));
         if (!path) return;
 
         if (call.function.name === "read_file") {

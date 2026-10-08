@@ -17,7 +17,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { Engine } from "../src/engine.js";
-import { ELIDED_PREFIX, SHED_MIN_FREE, Transcript } from "../src/transcript.js";
+import { ELIDED_PREFIX, SHED_MIN_FREE, Transcript, canonPath } from "../src/transcript.js";
 import { allowAll, drain, scriptedProvider, toolCall, workspace } from "./helpers.js";
 
 describe("shed min-free (default)", () => {
@@ -290,5 +290,63 @@ describe("per-call elision (default)", () => {
     step(t, [["bash", { command: "npm run dev", background: true }, "a", body("started job 1")]]);
     step(t, [["bash", { command: "npm run dev", background: true }, "b", body("started job 2")]]);
     assert.equal(t.elideSupersededReads().elided, 0);
+  });
+});
+
+/**
+ * The engine's read-coverage map (`shown`) keyed a path as spelled. A read of
+ * `dur.py`, then an edit of `./dur.py`, cleared the `./dur.py` key and left
+ * `dur.py` marked as shown: the re-read came back as "you have already been
+ * shown … nothing has changed since", while the transcript (which strips the
+ * `./`) had already elided the old copy. The model held no copy of the file
+ * it had just edited and was told not to read it again.
+ */
+describe("shown map: one spelling per file", () => {
+  async function editThenReread(readAs: string, editAs: (dir: string) => string, rereadAs: string) {
+    const ws = workspace();
+    try {
+      writeFileSync(join(ws.dir, "dur.py"), `def parse(s):\n    return 0  # OLD_MARK\n${"# pad\n".repeat(60)}`);
+      const p = scriptedProvider([
+        { calls: [{ name: "read_file", args: { path: readAs } }] },
+        { calls: [{ name: "edit_file", args: { path: editAs(ws.dir), old_text: "return 0  # OLD_MARK", new_text: "return 5400  # NEW_MARK" } }] },
+        { calls: [{ name: "read_file", args: { path: rereadAs } }] },
+        { text: "Done." },
+      ] as never);
+      const e = new Engine({ baseUrl: "http://p.test/v1", model: "m", cwd: ws.dir, fetchFn: p.fetchFn, bar: null, stream: false, autonomy: "high", maxSteps: 0 });
+      await drain(e.run("fix dur.py", allowAll));
+      assert.match(readFileSync(join(ws.dir, "dur.py"), "utf8"), /NEW_MARK/, "the edit did not land");
+      const last = p.bodies.at(-1)!;
+      assert.doesNotMatch(last, /you have already been shown/, "the re-read after the edit was answered with a pointer");
+      assert.match(last, /NEW_MARK/, "the model has no copy of the edited file");
+    } finally {
+      ws.cleanup();
+    }
+  }
+
+  it("read dur.py, edit ./dur.py, read dur.py: the re-read returns the new contents", () =>
+    editThenReread("dur.py", () => "./dur.py", "dur.py"));
+  it("read ./dur.py, edit dur.py, read ./dur.py", () => editThenReread("./dur.py", () => "dur.py", "./dur.py"));
+  it("an absolute path inside the workspace is the same file", () =>
+    editThenReread("dur.py", (dir) => join(dir, "dur.py"), "dur.py"));
+  it("a/../dur.py is the same file", () => editThenReread("dur.py", () => "sub/../dur.py", "dur.py"));
+
+  it("canonPath: one spelling, and a path outside the workspace stays as it is", () => {
+    assert.equal(canonPath("./dur.py"), "dur.py");
+    assert.equal(canonPath("././a//b/../dur.py"), "a/dur.py");
+    assert.equal(canonPath("/ws/src/dur.py", "/ws"), "src/dur.py");
+    assert.equal(canonPath("/ws", "/ws"), ".");
+    assert.equal(canonPath("/other/dur.py", "/ws"), "/other/dur.py");
+    assert.equal(canonPath("/ws2/dur.py", "/ws"), "/ws2/dur.py");
+    assert.equal(canonPath("../dur.py"), "../dur.py");
+    assert.equal(canonPath(""), "");
+  });
+
+  it("the transcript keys elision the same way: a write to sub/../dur.py elides the read of dur.py", () => {
+    const t = new Transcript("S");
+    t.push({ role: "assistant", content: null, tool_calls: [toolCall("read_file", { path: "dur.py" }, "a")] });
+    t.push({ role: "tool", tool_call_id: "a", content: `DUR_OLD\n${"x".repeat(2000)}` });
+    t.push({ role: "assistant", content: null, tool_calls: [toolCall("edit_file", { path: "sub/../dur.py", old_text: "x", new_text: "y" }, "e")] });
+    t.push({ role: "tool", tool_call_id: "e", content: "edited" });
+    assert.equal(t.elideSupersededReads().elided, 1);
   });
 });
