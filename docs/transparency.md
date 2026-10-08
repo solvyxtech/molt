@@ -189,10 +189,17 @@ the worker's tokens plus the judge's, and the per-turn ceiling in tokens or
 dollars counts the judge's spend in that turn too: a budget is what you are
 willing to spend, and the judge's tokens are billed like any others. When a
 budget is hit with judge spend in it, the message says how much was the
-judge's. A judge with no known price adds its tokens to a token budget and
-nothing to a dollar ceiling (its spend there is unknown, and said so). The
-budget is checked before every worker step; a judge ask already under way is
-not cut off.
+judge's; when the judge's drafting used it before the worker's first step,
+the message says that too. The turn is priced in dollars when either side is
+priced: a local or subscription worker with a paid judge is still held to a
+dollar ceiling by the judge's dollars. A side with no known price adds its
+tokens to a token budget and nothing to a dollar ceiling (its spend there is
+unknown, and said so). The budget is checked before every worker step; a judge
+ask already under way is not cut off.
+
+Judge calls are priced when they are read, not when they were made: a price
+that arrives later applies to every call, and a price that is cleared stops
+applying (the journal keeps each call's figure as it stood at the time).
 
 ## Work that goes nowhere
 

@@ -16,8 +16,7 @@ import { resolve } from "node:path";
 import { Archive } from "./archive.js";
 import { isAutonomy, type Autonomy } from "./autonomy.js";
 import { fmtCost, fmtDuration } from "./banner.js";
-import { judgeSpendLine } from "./format.js";
-import { stepDid } from "./format.js";
+import { judgeSpendLine, stepDid } from "./format.js";
 import { BarError, hasBar, loadBar, selectChecks, writeDefaultBar } from "./bar.js";
 import { Engine, type FileAccess } from "./engine.js";
 import { describeDrift, driftSince } from "./git.js";
@@ -927,7 +926,12 @@ function engineFor(args: Args, session = false, extra: { files?: FileAccess } = 
  * nothing, no cost is shown at all.
  */
 async function priceEngine(engine: Engine, args: Args): Promise<void> {
-  await priceJudge(engine, args);
+  // Side by side: each lookup is bounded, and neither needs the other's answer.
+  await Promise.all([priceJudge(engine, args), priceWorker(engine, args)]);
+}
+
+/** The worker's own price lookup (see priceEngine). */
+async function priceWorker(engine: Engine, args: Args): Promise<void> {
   if (!needsPriceLookup(args.model, engine.pricing(), storedEndpoint())) return;
   const p = await fetchPricing(args.url, args.model, keyForUrl(args.url, args.key));
   if (!p) {

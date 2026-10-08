@@ -1873,6 +1873,12 @@ function fmtUsd(usd: number): string {
   return usd >= 0.1 ? `$${usd.toFixed(2)}` : usd >= 0.001 ? `$${usd.toFixed(3)}` : "<$0.001";
 }
 
+/** The sum of the values that are known, or undefined when none is. */
+function sumKnown(...xs: (number | undefined)[]): number | undefined {
+  const known = xs.filter((x): x is number => x !== undefined);
+  return known.length ? known.reduce((a, b) => a + b, 0) : undefined;
+}
+
 /** A tool argument that should be a non-empty string, or nothing. */
 function str(v: unknown): string | undefined {
   return typeof v === "string" && v.trim() !== "" ? v : undefined;
@@ -3560,15 +3566,14 @@ export class Engine {
   }
 
   /**
-   * Worker and judge USD together: what a money budget counts. Undefined when
-   * the worker has no price. A judge with no price adds nothing here (its
+   * Worker and judge USD together: what a money budget counts. Defined when
+   * either is priced, so a local or subscription worker with a paid judge is
+   * still bounded by a dollar ceiling. An unpriced side adds nothing here (its
    * tokens still count toward a token budget, and every surface says its $ is
    * unknown); a judge on a subscription plan costs no money.
    */
   totalCostUsd(): number | undefined {
-    const worker = this.costUsd();
-    if (worker === undefined) return undefined;
-    return worker + (this.judgeMeter.total().costUsd ?? 0);
+    return sumKnown(this.costUsd(), this.judgeMeter.total().costUsd);
   }
 
   /** The whole session's judge spend (judge-meter.ts). */
@@ -6579,7 +6584,10 @@ export class Engine {
 
     // Both ceilings count the judge's spend too (overBudget).
     const turnStartTokens = this.spentTokens;
-    const turnStartCost = this.totalCostUsd();
+    // Priced per side: the worker's delta when the worker is priced, plus the
+    // judge's calls this turn when they are. Either one makes the turn priced.
+    const turnStartCost = this.costUsd();
+    const turnJudgeMark = this.judgeMeter.mark();
     let warned = 0;
     // The step guard is the last way out of a turn, and it had the same fault
     // the spending ceiling had: it stopped dead. A reported run reached it with
@@ -6697,7 +6705,13 @@ export class Engine {
           text:
             `budget hit (${this.budgetTokens} tokens` +
             (this.spentTokens > this.sessionTokens ? `, ${this.spentTokens - this.sessionTokens} of them the judge's` : "") +
-            `) — loop stopped. /budget to raise.`,
+            `) — loop stopped. /budget to raise.` +
+            // Hit before the worker took a step, with the judge asked for this
+            // turn already (its drafting): say what used it up.
+            (step === 0 && this.judgeMeter.mark() > this.judgeReported
+              ? ` The judge drafting this turn's checks used the budget before the worker's first step; ` +
+                `raise --budget to leave room for both.`
+              : ""),
           ceiling: "budget",
         };
         yield* this.salvage(`You have reached the token budget for this session.`, fetchFn, log);
@@ -6709,8 +6723,10 @@ export class Engine {
       // refuses to spend rather than what it noticed spending.
       // Money where a price is known, tokens only where it is not.
       const spentThisTurn = this.spentTokens - turnStartTokens;
-      const usdThisTurn =
-        turnStartCost === undefined ? undefined : (this.totalCostUsd() ?? 0) - turnStartCost;
+      const usdThisTurn = sumKnown(
+        turnStartCost === undefined ? undefined : (this.costUsd() ?? 0) - turnStartCost,
+        this.judgeMeter.since(turnJudgeMark).costUsd,
+      );
       // Zero unless someone set one. The self-hosted exception that used to
       // live here — no default ceiling on hardware you own — is gone with the
       // default itself: there is nothing left to make an exception to.

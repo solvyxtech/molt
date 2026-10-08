@@ -713,6 +713,19 @@ def run_cost(row: dict) -> float | None:
     return _sum_known(row.get("cost_usd"), row.get("judge_cost_usd"))
 
 
+def median_cost(row: dict) -> float | None:
+    """A run's cost as the lane median counts it, or None to leave it out.
+
+    A run whose judge ran but had no price is left out: its total is the worker's
+    cost alone, a lower bound, and averaged with runs whose judge was priced it would
+    pull the median (and so the limit) down without anyone seeing why. The alarm on
+    that run itself still uses the lower bound (run_cost): under-counting there only
+    makes the alarm late, never wrong."""
+    if row.get("judge_calls") is not None and row.get("judge_cost_usd") is None:
+        return None
+    return run_cost(row)
+
+
 def run_tokens(row: dict) -> int | None:
     """A run's prompt tokens, the worker's plus the judge's."""
     return _sum_known(row.get("tokens_in"), row.get("judge_tokens_in"))
@@ -909,8 +922,8 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
         if r.get("stopped"):  # a STOPPED marker, not a run
             continue
         done.add((r["task"], r["agent"], r["rep"], r.get("arm")))
-        if run_cost(r) is not None:
-            lane_costs.setdefault(r.get("arm"), []).append(run_cost(r))
+        if median_cost(r) is not None:
+            lane_costs.setdefault(r.get("arm"), []).append(median_cost(r))
     global SCRUBBER
     SCRUBBER = make_scrubber()
     for rep in range(repeats):
@@ -968,8 +981,8 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
                     alarm = cost_alarm(r, costs)
                     if alarm:
                         stop_lane(out, tag, EXPORT / f"{tag}.log", alarm, arm, lid)
-                    if run_cost(r) is not None:
-                        costs.append(run_cost(r))
+                    if median_cost(r) is not None:
+                        costs.append(median_cost(r))
 
 
 def stop_lane(out: Path, tag: str, log: Path, alarm: dict, arm: str | None, lid: str | None = None) -> None:

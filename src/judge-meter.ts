@@ -187,10 +187,12 @@ export class JudgeMeter implements AskMeter {
   /**
    * The judge's spend since a mark. Priced now, not when recorded, so a price
    * that arrived after the first ask (a lookup still in flight, a /price) is
-   * applied to every call, as the worker's meter does.
+   * applied to every call, and a price that was cleared is no longer applied
+   * to any: the figure stored at record time (the journal's) is dropped before
+   * re-pricing. The worker's meter does the same with its session totals.
    */
   since(mark: number): JudgeSpend {
-    const span = this.calls.slice(mark).map((c) => this.priced(c));
+    const span = this.calls.slice(mark).map(({ costUsd: _recorded, plan: _plan, ...u }) => this.priced(u));
     const models: string[] = [];
     let cost = 0;
     let unpriced = 0;

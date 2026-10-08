@@ -16,6 +16,9 @@
   columns to each row, and its cost alarm now judges worker + judge cost and
   prompt tokens (the detail shows the split), so a runaway judge stops the lane
   too. See `docs/transparency.md` and `docs/lean.md`.
+  The per-turn dollar ceiling counts a priced judge even when the worker is
+  unpriced; the lane median leaves out runs whose judge was unpriced; a budget
+  used up by drafting before the first step says so.
 
 - **`--review-executable`** (experimental, also `MAAT_REVIEW_EXECUTABLE=1`):
   every `--review` objection must carry a read-only command that demonstrates

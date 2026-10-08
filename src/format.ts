@@ -122,11 +122,12 @@ export function spendLine(sp: {
 }
 
 /**
- * A judge spend in one line, for the CLI and the receipt:
+ * A judge spend in one line, for the CLI and the receipt (`label` names whose
+ * asks they were; a worker's own planning asks use the same shape):
  * `judge 3 calls · 1200 in (400 cached) · 300 out · $0.004`, with `$ unknown`
  * when a model had no price and the plan's name when a plan paid.
  */
-export function judgeSpendLine(s: JudgeSpend, fmt: (usd: number) => string = fmtCost): string {
+export function judgeSpendLine(s: JudgeSpend, fmt: (usd: number) => string = fmtCost, label = "judge"): string {
   const cache =
     s.cacheReadTokens > 0 || s.cacheWriteTokens > 0
       ? ` (${[s.cacheReadTokens > 0 ? `${s.cacheReadTokens} cached` : "", s.cacheWriteTokens > 0 ? `${s.cacheWriteTokens} cache write` : ""].filter(Boolean).join(", ")})`
@@ -140,5 +141,5 @@ export function judgeSpendLine(s: JudgeSpend, fmt: (usd: number) => string = fmt
         : s.plan
           ? `your ${s.plan} plan, not metered`
           : "$ unknown";
-  return `judge ${s.calls} call${s.calls === 1 ? "" : "s"} · ${e}${s.promptTokens} in${cache} · ${e}${s.completionTokens} out · ${money}`;
+  return `${label} ${s.calls} call${s.calls === 1 ? "" : "s"} · ${e}${s.promptTokens} in${cache} · ${e}${s.completionTokens} out · ${money}`;
 }
