@@ -126,7 +126,7 @@ describe("the value tag", () => {
     assert.deepEqual(sealed.taskChecks.map((t) => t.tags), [
       ["task", "surface"],
       ["task", "surface", "value"],
-      ["task", "value"],
+      ["task", "value", "exact"],
       ["task"],
     ]);
   });
@@ -137,19 +137,19 @@ describe("tierOf", () => {
   // Drafted by a separate judge model: the authorship rule is pinned in independent-checks.test.ts.
   // ...and it failed on the tree before the work (the discrimination rule is pinned in discriminating-checks.test.ts).
   const J = { worker: "worker-m", authors: new Map([["c", { kind: "judge" as const, model: "judge-j" }]]), failedBefore: new Set(["c"]) };
-  it("needs a passing check that runs the work and asserts a value", () => {
-    assert.equal(tierOf({ ...J, results: [ok(["task", "value"])] }).tier, "verified");
-    assert.equal(tierOf({ ...J, results: [ok(["task"]), ok(["task", "value"])] }).tier, "verified");
+  it("needs a passing check that runs the work and asserts an exact value", () => {
+    assert.equal(tierOf({ ...J, results: [ok(["task", "value", "exact"])] }).tier, "verified");
+    assert.equal(tierOf({ ...J, results: [ok(["task"]), ok(["task", "value", "exact"])] }).tier, "verified");
     assert.equal(tierOf({ ...J, results: [ok(["task"])] }).tier, "passed-checks");
     assert.equal(tierOf({ ...J, results: [ok(["task", "surface", "value"])] }).tier, "passed-checks", "a check that only looks cannot carry it");
-    assert.equal(tierOf({ ...J, results: [{ ok: false, hidden: true, tags: ["task", "value"] }] }).tier, "passed-checks", "a failing check is no evidence");
+    assert.equal(tierOf({ ...J, results: [{ ok: false, hidden: true, tags: ["task", "value", "exact"] }] }).tier, "passed-checks", "a failing check is no evidence");
   });
   it("lets a person's passing check verify, and a contradiction undo any of it", () => {
     assert.equal(tierOf({ ...J, results: [{ ...ok([], false), name: "project" }] }).tier, "verified");
-    const r = tierOf({ ...J, results: [ok(["task", "value"])], review: { votes: "1/3", violations: [] } });
+    const r = tierOf({ ...J, results: [ok(["task", "value", "exact"])], review: { votes: "1/3", violations: [] } });
     assert.equal(r.tier, "passed-checks");
     assert.match(r.reason!, /1\/3/);
-    assert.equal(tierOf({ ...J, results: [ok(["task", "value"])], review: { votes: "0/3", violations: [] } }).tier, "verified");
+    assert.equal(tierOf({ ...J, results: [ok(["task", "value", "exact"])], review: { votes: "0/3", violations: [] } }).tier, "verified");
   });
   it("says it in one phrase", () => {
     assert.equal(passedChecksWords("no check asserted an expected value"), "passed its checks (not verified: no check asserted an expected value)");
@@ -166,7 +166,7 @@ describe("the tier in a turn", () => {
     }) as Check;
   const SURFACE = make(["task", "surface"], "test -f out.txt");
   const RUNS = make(["task"], "test -s out.txt");
-  const VALUE = make(["task", "value"], `grep -qx hello out.txt`);
+  const VALUE = make(["task", "value", "exact"], `grep -qx hello out.txt`);
   const work: ScriptedTurn[] = [
     { calls: [{ name: "write_file", args: { path: "out.txt", content: "hello\n" } }] },
     { text: "Done." },
@@ -212,7 +212,7 @@ describe("the tier in a turn", () => {
   it("a pass that ran the work and asserted a value is verified", async () => {
     const { end, rows } = await run(VALUE);
     assert.deepEqual([end.outcome, end.tier, end.tierReason], ["verified", "verified", undefined]);
-    assert.deepEqual([rows.at(-1).tier, rows.at(-1).evidence], ["verified", "runs+value"]);
+    assert.deepEqual([rows.at(-1).tier, rows.at(-1).evidence], ["verified", "runs+exact"]);
   });
 
   it("a reviewer contradiction takes the word back, and the index row says so", async () => {

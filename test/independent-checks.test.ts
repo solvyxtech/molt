@@ -59,7 +59,7 @@ describe("independentOf", () => {
 });
 
 describe("tierOf: who wrote the checks", () => {
-  const value = (name: string) => ({ name, ok: true, hidden: true as const, kind: "command" as const, tags: ["task", "value"] });
+  const value = (name: string) => ({ name, ok: true, hidden: true as const, kind: "command" as const, tags: ["task", "value", "exact"] });
   const by = (a: CheckAuthor, name = "task:v") => new Map([[name, a]]);
   // Every check here failed before the work: the discrimination rule has its own tests.
   const failedBefore = new Set(["task:v", "task:own", "task:judged"]);
@@ -183,7 +183,7 @@ describe("authorship at the seal, in a turn", () => {
     { text: "Done." },
   ];
   const value = (extra: Partial<Check> = {}): Check =>
-    ({ name: "made", kind: "command", run: "grep -qx hello out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, ...extra }) as Check;
+    ({ name: "made", kind: "command", run: "grep -qx hello out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true, ...extra }) as Check;
 
   async function run(checks: Check[], opts: { initBar?: boolean } = {}) {
     const ws = workspace();
@@ -259,7 +259,7 @@ describe("a golden file only stands for a value when it predates the work", () =
   const TASK = "Write out.txt with the line hello.";
   const diffCheck: Check = {
     name: "matches", kind: "command", run: "diff out.txt expected.txt", timeoutMs: 5_000, expectExit: 0,
-    tags: ["task", "value"], hidden: true, author: { kind: "judge", model: "judge-j" },
+    tags: ["task", "value", "exact"], hidden: true, author: { kind: "judge", model: "judge-j" },
   } as Check;
   async function turn(writes: Record<string, string>, before: Record<string, string> = {}) {
     const ws = workspace();
