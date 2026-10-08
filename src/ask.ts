@@ -95,6 +95,33 @@ function outOfTime(opts: AskOptions): Asked {
 /** Endpoint+model pairs that refused `temperature`; asked without it from then on. */
 const noTemperature = new Set<string>();
 
+/** Forget which endpoints refused `temperature` (tests). */
+export function resetAskMemo(): void {
+  noTemperature.clear();
+}
+
+/** A 400 body that refuses the `temperature` setting itself. */
+export function refusesTemperature(body: string): boolean {
+  const msg = errorMessageOf(body);
+  return /temperature/i.test(msg) && /deprecated|not supported|unsupported|does not support|doesn't support|not allowed|only supports|cannot be set|is not available/i.test(msg);
+}
+
+/**
+ * What a 400 says, for the error text: the provider's own `error.message` when
+ * the body is JSON, else its first 300 characters. Not the whole body: some
+ * gateways echo the request, and the request holds the hidden checks.
+ */
+export function errorMessageOf(body: string): string {
+  try {
+    const o = JSON.parse(body) as { error?: { message?: unknown } | string; message?: unknown };
+    const m = typeof o.error === "string" ? o.error : typeof o.error?.message === "string" ? o.error.message : typeof o.message === "string" ? o.message : undefined;
+    if (m !== undefined) return m.slice(0, 300);
+  } catch {
+    /* not JSON */
+  }
+  return body.slice(0, 300);
+}
+
 export async function askModel(opts: AskOptions): Promise<Asked> {
   const pauses = opts.overloadBackoffMs ?? ASK_OVERLOAD_BACKOFF_MS;
   if ((leftMs(opts.deadlineAt) ?? 1) <= 0) return outOfTime(opts);
@@ -217,18 +244,23 @@ async function askOnce(opts: AskOptions, maxTokens: number): Promise<Asked> {
     });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
-      // Some current models refuse a sampling setting outright (Claude Haiku 5.5:
-      // "`temperature` is deprecated for this model"). Remember it and ask again
-      // without, rather than leaving every judge call on that model refused.
-      if (res.status === 400 && /temperature/i.test(body) && !noTemperature.has(`${base} ${opts.model}`)) {
+      // Some models refuse a sampling setting outright ("`temperature` is
+      // deprecated for this model"). Remember it and ask again without,
+      // rather than leaving every judge call on that model refused. Only a
+      // refusal of the setting: a validation error that merely echoes the
+      // request (and so the word) is not one.
+      if (res.status === 400 && refusesTemperature(body) && !noTemperature.has(`${base} ${opts.model}`)) {
         noTemperature.add(`${base} ${opts.model}`);
+        // Give the turn back first: a self-hosted server allows one request
+        // at a time (localgate.ts), and the retry would wait on this one.
+        release();
         return askOnce(opts, maxTokens);
       }
-      const resetAt = rateLimitResetAt(body);
+      const resetAt = res.status === 429 ? rateLimitResetAt(body) : undefined;
       if (resetAt !== undefined && resetAt - Date.now() > LONG_RATE_LIMIT_MS) {
         return { ok: false, error: `the provider's rate limit is reached ${untilText(resetAt)}${opts.what ? ` (${opts.what})` : ""}` };
       }
-      return { ok: false, error: `HTTP ${res.status}${opts.what ? ` ${opts.what}` : ""}${res.status === 400 && body ? `: ${body.slice(0, 300)}` : ""}`, ...(res.status === 429 || res.status === 503 ? { transient: true } : {}) };
+      return { ok: false, error: `HTTP ${res.status}${opts.what ? ` ${opts.what}` : ""}${res.status === 400 && body ? `: ${errorMessageOf(body)}` : ""}`, ...(res.status === 429 || res.status === 503 ? { transient: true } : {}) };
     }
     type Reply = {
       choices?: { message?: { content?: string | null }; finish_reason?: string | null }[];
