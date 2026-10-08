@@ -321,6 +321,9 @@ export async function preflightCriteria(
         timeoutMs: opts.timeoutMs ?? 5_000,
         maxBuffer: 1024 * 1024,
         signal: opts.signal,
+        // Drafted-check trials run the hidden command before the work; keep it
+        // out of argv so the trial does not leak it either (src/run.ts).
+        hideCommand: !!opts.stray,
       });
       // One decision point, shared with the bar. A command that outlived the
       // timeout plainly ran, and a timeout's exit code is never one of the

@@ -911,6 +911,7 @@ async function mutationCheck(
   sample: number,
   timeoutMs: number,
   allowEmpty = false,
+  hideCommand = false,
 ): Promise<{ ok: boolean; output: string; established?: boolean }> {
   // Source code only, and not the tests themselves. A live run mutated
   // package.json — `&&` to `||` inside a JSON string — and reported the
@@ -1006,7 +1007,7 @@ async function mutationCheck(
     };
   }
   if (!prior) {
-    const baseline = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal });
+    const baseline = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal, hideCommand });
     if (baseline.code !== 0) {
       return {
         ok: false,
@@ -1039,6 +1040,7 @@ async function mutationCheck(
         cwd: ctx.cwd,
         timeoutMs,
         signal: ctx.signal,
+        hideCommand,
       });
       // A mutation the command still passes is a line nothing checks — unless
       // it was a boundary nudge and negating the same condition is caught.
@@ -1052,7 +1054,7 @@ async function mutationCheck(
         let negKilled = false;
         if (neg && negText !== null && negText !== file.text) {
           writeFileSync(file.abs, negText, "utf8");
-          const rn = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal });
+          const rn = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal, hideCommand });
           negKilled = rn.code !== 0;
         }
         if (negKilled) boundaryOnly.push(`${m.path}:${m.line} (${m.operator}) — ${m.before.trim()}`);
@@ -2151,6 +2153,7 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
             check.sample ?? 4,
             check.timeoutMs ?? 600_000,
             check.empty === "allow",
+            check.hidden === true,
           )
         : runBuiltin(
             check.builtin,
@@ -2196,6 +2199,8 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
       timeoutMs: check.timeoutMs,
       maxBuffer: 8 * 1024 * 1024,
       signal: ctx.signal,
+      // A hidden check's command is a secret; keep it out of argv (src/run.ts).
+      hideCommand: check.hidden === true,
     });
     output = copy ? copy.unmap(`${r.stdout}${r.stderr}`) : `${r.stdout}${r.stderr}`;
     exitCode = r.code ?? 1;

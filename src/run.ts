@@ -30,6 +30,22 @@ export type RunOptions = {
   shell?: string | true;
   /** Kills the command when it aborts, so a turn can be cancelled mid-command. */
   signal?: AbortSignal;
+  /**
+   * Keep the command out of the process's argv (`/proc/<pid>/cmdline`, `ps`).
+   *
+   * A hidden check's command is a secret the worker must not learn. Spawned
+   * the ordinary way it is an argument to the shell, so it shows up in the
+   * command line of a process any user on the box can read — and a check that
+   * runs the worker's own deliverable hands that deliverable a process it can
+   * read the command out of (even inside a per-check PID namespace, a child
+   * can read its parent's cmdline). With this on, the shell is invoked with a
+   * tiny fixed wrapper and the real command is streamed in on an inherited
+   * file descriptor (fd 3) instead, so it never appears in any argv. stdin is
+   * left untouched (the check keeps whatever stdin it had), which is why fd 3
+   * is used rather than `sh -s` on stdin. Linux/macOS only; on Windows (no
+   * `/proc`, no cheap fd passing) the command is spawned the ordinary way.
+   */
+  hideCommand?: boolean;
 };
 
 export type RunResult = {
@@ -90,16 +106,41 @@ export function draftedShell(check: { hidden?: boolean; tags?: readonly string[]
 export function runCommand(command: string, opts: RunOptions): Promise<RunResult> {
   return new Promise<RunResult>((resolve, reject) => {
     let child: ChildProcess;
+    const hide = opts.hideCommand === true && process.platform !== "win32";
     try {
-      child = spawn(command, {
-        cwd: opts.cwd,
-        shell: opts.shell ?? true,
-        env: opts.env,
-        stdio: ["ignore", "pipe", "pipe"],
-        // Its own process group, so a timeout can kill everything the command
-        // started and not just the shell (see `kill`).
-        detached: process.platform !== "win32",
-      });
+      if (hide) {
+        // The command is streamed in on fd 3 and the shell reads it from
+        // there (`eval "$(cat <&3)"`), so the only thing in argv is that fixed
+        // wrapper — never the hidden command (see `hideCommand`). `eval` of
+        // the whole text runs it exactly as `-c` would; `$0` is the shell, as
+        // with `-c`. stdin stays what it was (ignored here), so a check that
+        // reads stdin is unaffected.
+        const shellPath = opts.shell === undefined || opts.shell === true ? "/bin/sh" : opts.shell;
+        child = spawn(shellPath, ["-c", 'eval "$(cat <&3)"'], {
+          cwd: opts.cwd,
+          env: opts.env,
+          stdio: ["ignore", "pipe", "pipe", "pipe"],
+          detached: process.platform !== "win32",
+        });
+        const sink = child.stdio[3] as NodeJS.WritableStream | null | undefined;
+        if (!sink || typeof sink.write !== "function") {
+          throw new Error("could not pass the command on fd 3");
+        }
+        // A check that exits before reading its whole script closes the pipe;
+        // the EPIPE that follows is expected, not a failure of the run.
+        sink.on("error", () => {});
+        sink.end(command);
+      } else {
+        child = spawn(command, {
+          cwd: opts.cwd,
+          shell: opts.shell ?? true,
+          env: opts.env,
+          stdio: ["ignore", "pipe", "pipe"],
+          // Its own process group, so a timeout can kill everything the command
+          // started and not just the shell (see `kill`).
+          detached: process.platform !== "win32",
+        });
+      }
     } catch (e) {
       reject(e as Error);
       return;

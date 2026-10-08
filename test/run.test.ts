@@ -502,3 +502,47 @@ describe("a connection that drops mid-turn", () => {
     assert.ok(f.calls() > 1, "did not retry at all");
   });
 });
+
+/**
+ * A hidden check's command must never reach any process's argv, because
+ * `/proc/<pid>/cmdline` is world-readable and a check that runs the worker's
+ * own deliverable gives that deliverable a process whose command line it can
+ * read. `hideCommand` streams the command in on fd 3 instead, so the only
+ * thing in argv is the fixed wrapper.
+ */
+describe("hideCommand keeps the command out of /proc/<pid>/cmdline", () => {
+  const onLinux = process.platform === "linux";
+
+  // A command carrying a token no other process would have. It executes
+  // (prints a computed value, so "ran" cannot be confused with the token) and
+  // reports the command line of itself and of a child it spawns.
+  const token = `HIDDEN_CHECK_TOKEN_${Math.random().toString(36).slice(2)}`;
+  const probe = (tok: string) =>
+    `: ${tok}\n` +
+    `printf 'RAN=%s\\n' "$((6 * 7))"\n` +
+    `printf 'SELF=%s\\n' "$(tr '\\0' ' ' < /proc/$$/cmdline)"\n` +
+    `sh -c "printf 'PARENT=%s\\n' \\"$(tr '\\0' ' ' < /proc/\\$PPID/cmdline)\\""\n`;
+
+  it("hidden: the token runs but is absent from every cmdline it can see", { skip: onLinux ? false : "needs /proc (Linux)" }, async () => {
+    const r = await runCommand(probe(token), { cwd: ws(), timeoutMs: 10_000, hideCommand: true });
+    assert.match(r.stdout, /RAN=42/, `the hidden command did not run:\n${r.stdout}\n${r.stderr}`);
+    const lines = r.stdout.split("\n").filter((l) => l.startsWith("SELF=") || l.startsWith("PARENT="));
+    assert.ok(lines.length >= 2, `did not read its cmdline:\n${r.stdout}`);
+    for (const l of lines) assert.ok(!l.includes(token), `the hidden command leaked into a process argv: ${l}`);
+    assert.ok(!r.stdout.replace(/RAN=42/, "").includes(token), `the token appeared somewhere unexpected:\n${r.stdout}`);
+  });
+
+  it("without hideCommand the token IS in the cmdline (the test is meaningful)", { skip: onLinux ? false : "needs /proc (Linux)" }, async () => {
+    const r = await runCommand(probe(token), { cwd: ws(), timeoutMs: 10_000 });
+    assert.match(r.stdout, /RAN=42/);
+    assert.ok(r.stdout.includes(`SELF=`), `did not read its own cmdline:\n${r.stdout}`);
+    const self = r.stdout.split("\n").find((l) => l.startsWith("SELF=")) ?? "";
+    assert.ok(self.includes(token), `expected the ordinary spawn to put the command in argv, but it did not: ${self}`);
+  });
+
+  it("propagates the exit code and leaves stdin untouched", { skip: onLinux ? false : "needs /proc (Linux)" }, async () => {
+    const r = await runCommand(`read x <&0; printf 'STDIN=[%s]\\n' "$x"; exit 7`, { cwd: ws(), timeoutMs: 10_000, hideCommand: true });
+    assert.equal(r.code, 7, "the exit code did not propagate through the fd-3 wrapper");
+    assert.match(r.stdout, /STDIN=\[\]/, "stdin was not left empty for the check");
+  });
+});
