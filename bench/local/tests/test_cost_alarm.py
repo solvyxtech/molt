@@ -129,3 +129,67 @@ def test_resume_skips_the_marker_and_keeps_the_median(monkeypatch, tmp_path):
     # Earlier run's $0.10 is the median: limit max(0.50, 0.10), so $0.40 passes.
     run.main("molt", 1, None)
     assert json.loads(out.read_text().splitlines()[-1])["task"] == "t0"
+
+
+def test_a_runaway_judge_trips_the_alarm_and_the_detail_shows_the_split():
+    # The worker alone is well under the floor; the judge pushes the run over it.
+    row = {"cost_usd": 0.03, "tokens_in": 40_000, "judge_calls": 9, "judge_cost_usd": 0.25, "judge_tokens_in": 300_000}
+    a = run.cost_alarm(row, [])
+    assert a, "worker + judge is what the alarm judges"
+    assert "cost $0.2800 (worker $0.0300 + judge $0.2500) > $0.1000" in a["detail"]
+    assert a["cost_usd"] == pytest.approx(0.28)
+    assert a["worker_cost_usd"] == 0.03 and a["judge_cost_usd"] == 0.25
+    assert a["tokens_in"] == 340_000 and a["judge_tokens_in"] == 300_000
+
+
+def test_judge_tokens_count_toward_the_token_alarm():
+    row = {"cost_usd": None, "tokens_in": 900_000, "judge_calls": 5, "judge_cost_usd": None, "judge_tokens_in": 700_000}
+    a = run.cost_alarm(row, [])
+    assert a and "prompt tokens 1,600,000 (worker 900,000 + judge 700,000) > 1,500,000" in a["detail"]
+
+
+def test_an_unpriced_judge_is_said_as_unknown_in_the_split():
+    row = {"cost_usd": 0.12, "judge_calls": 2, "judge_cost_usd": None, "judge_tokens_in": 1_000}
+    a = run.cost_alarm(row, [])
+    assert a and "cost $0.1200 (worker $0.1200 + judge $ unknown)" in a["detail"]
+
+
+def test_a_run_with_no_judge_reads_as_before():
+    a = run.cost_alarm({"cost_usd": 0.11, "tokens_in": 1000}, [])
+    assert a and "(worker" not in a["detail"] and "judge_cost_usd" not in a
+
+
+def test_the_lane_median_is_over_worker_plus_judge(monkeypatch, tmp_path):
+    out = _lane(monkeypatch, tmp_path, [(0.02, 50_000), (0.03, 60_000), (0.02, 50_000)])
+    judge = iter([0.08, 0.07, 0.30])
+    inner = run.run_molt
+
+    def with_judge(d, prompt, log):
+        r = inner(d, prompt, log)
+        return {**r, "judge_calls": 4, "judge_cost_usd": next(judge), "judge_tokens_in": 10_000}
+
+    monkeypatch.setattr(run, "run_molt", with_judge)
+    # Totals 0.10, 0.10, 0.32: median 0.10 -> limit max(0.50, 0.10); 0.32 passes.
+    run.main("molt", 1, None)
+    rows = [json.loads(x) for x in out.read_text().splitlines()]
+    assert len(rows) == 3 and not any(r.get("stopped") for r in rows)
+    assert [r["judge_cost_usd"] for r in rows] == [0.08, 0.07, 0.30]
+
+
+def test_a_lane_stops_on_a_runaway_judge(monkeypatch, tmp_path):
+    out = _lane(monkeypatch, tmp_path, [(0.02, 50_000), (0.02, 50_000), (0.02, 50_000), (0.02, 50_000)])
+    judge = iter([0.01, 0.01, 0.90, 0.01])
+    inner = run.run_molt
+
+    def with_judge(d, prompt, log):
+        r = inner(d, prompt, log)
+        return {**r, "judge_calls": 4, "judge_cost_usd": next(judge), "judge_tokens_in": 10_000}
+
+    monkeypatch.setattr(run, "run_molt", with_judge)
+    with pytest.raises(SystemExit) as e:
+        run.main("molt", 1, None)
+    assert e.value.code == run.COST_ALARM_EXIT
+    stop = [json.loads(x) for x in out.read_text().splitlines()][-1]
+    assert stop["stopped"] is True and stop["run"] == "t2-molt-0"
+    assert stop["worker_cost_usd"] == 0.02 and stop["judge_cost_usd"] == 0.90
+    assert "(worker $0.0200 + judge $0.9000)" in stop["detail"]

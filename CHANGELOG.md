@@ -13,7 +13,9 @@
   worker + judge total in the CLI, and `judge` on the receipt (row updated at
   the job's end). `--budget` and the per-turn ceilings now count worker and
   judge spend together. `bench/local/run.py` adds `judge_*` token and cost
-  columns to each row. See `docs/transparency.md`.
+  columns to each row, and its cost alarm now judges worker + judge cost and
+  prompt tokens (the detail shows the split), so a runaway judge stops the lane
+  too. See `docs/transparency.md` and `docs/lean.md`.
 
 - **`--review-executable`** (experimental, also `MAAT_REVIEW_EXECUTABLE=1`):
   every `--review` objection must carry a read-only command that demonstrates
