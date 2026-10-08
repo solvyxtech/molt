@@ -32,7 +32,8 @@ import { askModel, type AskOptions } from "./ask.js";
 import { runCommand, draftedShell, bashPath } from "./run.js";
 import { cannotFail, lintAll, readTree, type LintCtx, type Tree } from "./checklint.js";
 import { checkMutates } from "./checkwrites.js";
-import { copyTree } from "./scratch.js";
+import { copyTree, replacePathPrefix } from "./scratch.js";
+import { absolutePathArgs } from "./shellwords.js";
 import { diagnoseFailure } from "./bar.js";
 import { reportsFailure } from "./evidence.js";
 import { normalizeRequirements } from "./signout.js";
@@ -43,8 +44,13 @@ import type { CheckAuthor } from "./types.js";
  * `surface`: the critic read it as only looking (a file exists, a word
  * appears, it compiles) rather than running the deliverable. Kept, but such a
  * check alone cannot carry a "verified" once the ones that ran it are retired.
+ *
+ * `guard`: a check that passed on the tree before the work (P1). It cannot
+ * show the task was done, so it never counts toward "verified"; it is sealed
+ * anyway, as a refuse-only guard, because what it asserts (no conflict
+ * markers, a clean tree, the suite still passing) must still hold after.
  */
-export type DraftedCheck = { name: string; run: string; surface?: true };
+export type DraftedCheck = { name: string; run: string; surface?: true; guard?: true };
 export type Draft = {
   checks: DraftedCheck[];
   notes: string[];
@@ -58,6 +64,8 @@ export type Draft = {
 
 /** Same bounds the drafter uses — applied again at `session:run`. */
 export const CRITERIA_MAX_CHECKS = 4;
+/** Refuse-only guards sealed beside the checks, at most (they are not counted in CRITERIA_MAX_CHECKS). */
+export const CRITERIA_MAX_GUARDS = 4;
 export const CRITERIA_MAX_NOTES = 3;
 export const CRITERIA_MAX_NAME = 40;
 /**
@@ -95,13 +103,18 @@ export function sanitizeCriteria(raw: unknown): Draft {
             // check does not use up a slot: see CRITERIA_MAX_RUN.
             (c as DraftedCheck).run.trim().length <= CRITERIA_MAX_RUN,
         )
-        .slice(0, CRITERIA_MAX_CHECKS)
         .map((c) => ({
           name: c.name.trim().slice(0, CRITERIA_MAX_NAME),
           run: c.run.trim(),
           ...(c.surface === true ? { surface: true as const } : {}),
+          ...(c.guard === true ? { guard: true as const } : {}),
         }))
     : [];
+  // Guards have their own cap: they can only refuse, so they never crowd out a check that can verify.
+  const capped = [
+    ...checks.filter((c) => !c.guard).slice(0, CRITERIA_MAX_CHECKS),
+    ...checks.filter((c) => c.guard).slice(0, CRITERIA_MAX_GUARDS),
+  ];
   const notes: string[] = Array.isArray(o.notes)
     ? o.notes
         .filter((n): n is string => typeof n === "string" && n.trim().length > 0)
@@ -109,7 +122,7 @@ export function sanitizeCriteria(raw: unknown): Draft {
         .map((n) => n.trim().slice(0, CRITERIA_MAX_NOTE))
     : [];
   const requirements = normalizeRequirements(Array.isArray(o.requirements) ? o.requirements : undefined);
-  return { checks, notes, ...(requirements.length ? { requirements } : {}) };
+  return { checks: capped, notes, ...(requirements.length ? { requirements } : {}) };
 }
 
 /**
@@ -149,8 +162,9 @@ export function taskChecksFrom(
       run: c.run,
       timeoutMs: 120_000,
       expectExit: 0,
-      // surface from the critic, value from the command itself (evidence.ts).
-      tags: evidenceTags(c.run, c.surface),
+      // surface from the critic, value from the command itself (evidence.ts);
+      // a guard is marked so tierOf never counts it toward "verified".
+      tags: [...evidenceTags(c.run, c.surface), ...(c.guard ? ["guard"] : [])],
       ...(opts.hidden ? { hidden: true } : {}),
       ...(opts.author ? { author: { ...opts.author } } : opts.hidden ? {} : { author: { kind: "person" as const } }),
     })),
@@ -264,10 +278,15 @@ function under(p: string, root: string): boolean {
  *
  * Seen in real runs: `python3 /wc.py` and `/home/user/data.csv` in checks
  * drafted without any view of the project. They fail for ever, whatever the
- * work does, and refuse correct work. Paths with a trailing slash are skipped
- * (`awk '/x/'`, `sed 's/a/b/'` delimiters), as is anything glued to a word,
- * `$VAR`, `./`, or `://` — those are relative paths, expansions and URLs —
- * and so are closing tags (`</h1>`) and cron steps. A deliberately missing path
+ * work does, and refuse correct work.
+ *
+ * Only what a program will open is read (src/shellwords.ts absolutePathArgs):
+ * operands, redirect targets, assignments, and the string literals of an
+ * inline program that are a path on their own. A sed or awk program, a grep
+ * pattern, a jq filter, printf's data and a value glued onto `$d` or
+ * `sys.argv[1] +` are not paths: on 2026-10-07 a regex over the raw command
+ * dropped three good differential checks for the `/g` of `sed -E 's/ +/ /g'`.
+ * A path with a trailing slash is skipped, and a deliberately missing path
  * (`/nonexistent`) tests error handling and is allowed.
  */
 export function strayPath(run: string, opts: { cwd: string; task?: string }): string | null {
@@ -278,8 +297,10 @@ export function strayPath(run: string, opts: { cwd: string; task?: string }): st
     /* a cwd that is not there: compare as given */
   }
   const roots = [opts.cwd, real, ...TEMP_PATHS, tmpdir(), ...SYSTEM_PATHS];
-  for (const m of run.matchAll(/(?<![\w.$}):/~<*+\]\\-])(\/[\w.@+-][^\s"'`;|&<>()*?\[\]{}$,=\\]*)/g)) {
-    const p = m[1]!;
+  for (const arg of absolutePathArgs(run)) {
+    // A glob or a variable tail is cut off: `/srv/out/*.txt` is about /srv/out.
+    const p = arg.replace(/[*?[{$,].*$/s, "");
+    if (!/^\/[\w.@+-]/.test(p)) continue;
     if (p.endsWith("/")) continue;
     // A path built to not exist is an error-handling test, not an invention.
     if (/nonexist|no[-_]such|does[-_]?not[-_]?exist|missing/i.test(p)) continue;
@@ -288,6 +309,30 @@ export function strayPath(run: string, opts: { cwd: string; task?: string }): st
     return p;
   }
   return null;
+}
+
+/**
+ * The project file a shell could not run because it is not there yet, or
+ * null. Only a path the shell was asked to open (`./rotate.sh`, `bin/tool`,
+ * `bash backup.sh`) and that is absent from the tree counts: a bare command
+ * name the shell looked up on PATH (`pytest: command not found`) is a tool
+ * the machine lacks, and stays broken.
+ */
+export function missingDeliverable(stderr: string, cwd: string): string | null {
+  const said =
+    /^(?:\S*sh|bash|dash|zsh)(?::\s*line \d+)?:\s*(?:\d+:\s*)?([^\s:]+): (?:No such file or directory|not found)\s*$/m.exec(stderr) ??
+    /^\S*sh: \d+: (?:cannot open|Can't open) ([^\s:]+)/m.exec(stderr);
+  if (!said) return null;
+  const p = said[1]!;
+  if (isAbsolute(p) || p.startsWith("~")) return null;
+  // PATH lookups name no directory; bash's "No such file" for `bash x.sh` names a file.
+  if (!p.includes("/") && !/No such file or directory|cannot open|Can't open/.test(said[0])) return null;
+  try {
+    statSync(join(cwd, p));
+    return null;
+  } catch {
+    return p;
+  }
 }
 
 export async function preflightCriteria(
@@ -325,9 +370,24 @@ export async function preflightCriteria(
      * run. The task text is where a path the person stated is allowed from.
      */
     stray?: { task: string };
+    /**
+     * The project's own absolute path, when `cwd` is a copy of it (the
+     * pre-work copy the screen tries on). A check that names the project
+     * (`cd /app && …`) is tried on the copy it runs in, not on the live
+     * folder the worker may already be changing. Defaults to `cwd`.
+     */
+    root?: string;
   },
 ): Promise<BrokenCriterion[]> {
   const broken: BrokenCriterion[] = [];
+  const roots = (() => {
+    const r = opts.root ?? opts.cwd;
+    try {
+      return [...new Set([r, realpathSync(r), opts.cwd, realpathSync(opts.cwd)])];
+    } catch {
+      return [...new Set([r, opts.cwd])];
+    }
+  })();
   for (const c of checks) {
     if (c.kind && c.kind !== "command") continue;
     if (!c.run) continue;
@@ -340,9 +400,14 @@ export async function preflightCriteria(
     // that checks out a branch or deletes a file would change the folder the
     // work starts from.
     const copy = process.env.MAAT_CHECK_COPY === "0" ? null : await copyTree(opts.cwd);
+    // Where the check will really run: the copy, under the project's layout,
+    // `.git` included. A check that names the project by its absolute path is
+    // pointed at the copy too, as the bar points it (src/bar.ts).
+    const where = copy?.dir ?? opts.cwd;
+    const run = roots.reduce((t, r) => replacePathPrefix(t, r, where), c.run);
     try {
-      const r = await runCommand(c.run, {
-        cwd: copy?.dir ?? opts.cwd,
+      const r = await runCommand(run, {
+        cwd: where,
         // Under the shell the bar will run this check with (src/run.ts
         // draftedShell): bash for a drafted check, sh otherwise. Tried under
         // one shell and judged under another, a bashism (`[[ ]]`, `==` in
@@ -363,7 +428,14 @@ export async function preflightCriteria(
       // satisfy a command that cannot be satisfied.
       const unparsed = SHELL_PARSE_ERROR.test(r.stderr);
       const selfError = r.code !== (c.expectExit ?? 0) ? checkSelfError(`${r.stdout}\n${r.stderr}`) : null;
-      if (d.didNotRun) broken.push({ name: c.name, run: c.run, why: d.hint ?? "did not run" });
+      const absent = d.didNotRun ? missingDeliverable(r.stderr, where) : null;
+      if (absent) {
+        // `./rotate.sh` before rotate.sh exists: the shell's "not found" is
+        // the deliverable missing, which is what a check is meant to find
+        // before the work. On 2026-10-07 six checks of a script the task
+        // asked for were dropped as "the command was not found".
+        opts.failed?.push(c.name);
+      } else if (d.didNotRun) broken.push({ name: c.name, run: c.run, why: d.hint ?? "did not run" });
       else if (unparsed) {
         broken.push({ name: c.name, run: c.run, why: `the shell could not parse it: ${firstLine(copy ? copy.unmap(r.stderr) : r.stderr)}` });
       } else if (selfError) broken.push({ name: c.name, run: c.run, why: selfError });
@@ -970,10 +1042,64 @@ export async function draftCriteriaCritiqued(
       { ...opts, snapshot, askCwd: opts.askCwd ?? ownDir, onProgress: opts.onProgress && ((d) => opts.onProgress!(withReqs(d))) },
       sink,
     );
-    return r.ok ? { ...r, draft: withReqs(r.draft), ...(sink.lint.length ? { lint: sink.lint } : {}) } : r;
+    if (!r.ok) return r;
+    const kept = guardsFrom(sink.lint, r.draft.checks);
+    const draft = kept.length ? { ...r.draft, checks: [...r.draft.checks, ...kept] } : r.draft;
+    const critique = kept.length ? [...r.critique, `kept as refuse-only guards (they passed before the work, so they can refuse the claim but never verify it): ${kept.map((g) => g.name).join(", ")}`] : r.critique;
+    return { ...r, draft: withReqs(draft), critique, ...(sink.lint.length ? { lint: sink.lint } : {}) };
   } finally {
     if (ownDir) rmSync(ownDir, { recursive: true, force: true });
   }
+}
+
+/**
+ * Does this check pin a value the project's own program prints for the
+ * project's own data, today? Such a check passing before the work says the
+ * literal is the CURRENT output, and the task is usually to change it: as a
+ * guard it would refuse the correct fix. Replayed over the P1 drops of the
+ * 2026-10-07 lanes (bench/local/drop_audit.py), 13 of the 19 that failed on a
+ * finished tree the grader accepted were of this shape
+ * (`node summarize.js transactions.json | jq -e '.zoe == "-3.50"'`,
+ * `sqlite3 app.db 'PRAGMA user_version' | grep -q '^1$'`, `test -f cache.py`
+ * in a revert), against 7 of 147 that held. A literal 0 or an empty answer
+ * ("no duplicates", "nothing changed") is an invariant, not a pin, and an
+ * input the check makes itself (echo, printf, a heredoc, mktemp) is not the
+ * project's data.
+ */
+export function pinsCurrentValue(run: string): boolean {
+  const literal =
+    /==\s*(?:["'][^"']+["']|-?[1-9][\d.]*|-?0\.\d|\[)/.test(run) ||
+    /\bgrep\s+(?:-\w+\s+)*-\w*[qx]\w*\s+['"]\^(?!0\$)[^'"|]+\$['"]/.test(run) ||
+    /(?:\[|\btest)\s+"?\$\(.*\)"?\s*=\s*["'][^$]/.test(run) ||
+    /\btest\s+-[fe]\s+[\w./-]+\s*(?:&&\s*echo\b.*)?$/.test(run.trim());
+  const ownInput = /\b(?:echo|printf)\b[^|]*\|\s*\S|<<|mktemp|\/dev\/null/.test(run);
+  return literal && !ownInput;
+}
+
+/**
+ * The checks the pre-work screen dropped for passing before the work (P1),
+ * kept as refuse-only guards: sealed, run at the bar, able to refuse, never
+ * counted toward "verified" (tags `guard`, src/tiers.ts). On 2026-10-07 the
+ * fix-git judge's `! grep -qE '^(<<<<<<<|>>>>>>>)' about.md index.md` and
+ * "on master with a clean tree" were dropped this way: right for the word
+ * "verified", but a merge that leaves conflict markers should still be
+ * refused. Not kept: a check that pins today's output (pinsCurrentValue), one
+ * that duplicates a sealed check, and any beyond CRITERIA_MAX_GUARDS.
+ */
+export function guardsFrom(dropped: readonly LintDrop[], sealed: readonly DraftedCheck[]): DraftedCheck[] {
+  const runs = new Set(sealed.map((c) => c.run));
+  const names = new Set(sealed.map((c) => c.name));
+  const out: DraftedCheck[] = [];
+  for (const d of dropped) {
+    if (d.rule !== "P1-passes-before-work" || runs.has(d.run) || pinsCurrentValue(d.run)) continue;
+    runs.add(d.run);
+    let name = d.name;
+    for (let k = 2; names.has(name); k++) name = `${d.name}-${k}`;
+    names.add(name);
+    out.push({ name: name.slice(0, CRITERIA_MAX_NAME), run: d.run, guard: true });
+    if (out.length >= CRITERIA_MAX_GUARDS) break;
+  }
+  return out;
 }
 
 /** Why a drafted check that passes on the pre-work copy is sent back: the drafter reads this. */
@@ -1058,7 +1184,7 @@ async function critiqued(
       await preflightCriteria(
         // As they will be sealed: hidden task checks, so under the bar's shell.
         l.ok.map((c) => ({ name: c.name, kind: "command", run: c.run, hidden: true, tags: ["task"] })),
-        { cwd: opts.preWorkDir, passed, printedFail },
+        { cwd: opts.preWorkDir, passed, printedFail, ...(opts.cwd ? { root: opts.cwd } : {}) },
       );
     } catch {
       return l;

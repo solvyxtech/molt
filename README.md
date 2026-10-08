@@ -413,7 +413,9 @@ to them. Passing checks the worker model drafted for itself are never
 the best a run earns is `passed own checks (<model>), not verified`, exit 3.
 Drafted checks are tried on a copy of the project before the work: one that
 already passes there, or cannot fail by construction, is sent back to the
-drafter once and dropped if the redraft is no better. `--require-discriminating`
+drafter once and dropped if the redraft is no better; one that already
+passed is still sealed as a refuse-only guard, which can fail the claim but
+never makes it verified. `--require-discriminating`
 goes further: "verified" then needs an independent value check that failed
 before the work, and anything less is `passed checks that did not test this
 work, not verified` (exit 3).
