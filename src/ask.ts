@@ -92,6 +92,9 @@ function outOfTime(opts: AskOptions): Asked {
   return { ok: false, error: `the time budget ran out${opts.what ? ` before ${opts.what}` : ""}` };
 }
 
+/** Endpoint+model pairs that refused `temperature`; asked without it from then on. */
+const noTemperature = new Set<string>();
+
 export async function askModel(opts: AskOptions): Promise<Asked> {
   const pauses = opts.overloadBackoffMs ?? ASK_OVERLOAD_BACKOFF_MS;
   if ((leftMs(opts.deadlineAt) ?? 1) <= 0) return outOfTime(opts);
@@ -202,7 +205,7 @@ async function askOnce(opts: AskOptions, maxTokens: number): Promise<Asked> {
           { role: "user", content: opts.prompt },
         ],
         max_tokens: maxTokens,
-        temperature: 0,
+        ...(noTemperature.has(`${base} ${opts.model}`) ? {} : { temperature: 0 }),
         ...(opts.reasoningEffort ? { reasoning: { effort: opts.reasoningEffort } } : {}),
         ...selfHostedThinking(base, opts.reasoningEffort),
         ...openRouterProvider(base, opts.model),
@@ -210,12 +213,19 @@ async function askOnce(opts: AskOptions, maxTokens: number): Promise<Asked> {
       }),
     });
     if (!res.ok) {
-      const body = res.status === 429 ? await res.text().catch(() => "") : "";
+      const body = await res.text().catch(() => "");
+      // Some current models refuse a sampling setting outright (Claude Haiku 5.5:
+      // "`temperature` is deprecated for this model"). Remember it and ask again
+      // without, rather than leaving every judge call on that model refused.
+      if (res.status === 400 && /temperature/i.test(body) && !noTemperature.has(`${base} ${opts.model}`)) {
+        noTemperature.add(`${base} ${opts.model}`);
+        return askOnce(opts, maxTokens);
+      }
       const resetAt = rateLimitResetAt(body);
       if (resetAt !== undefined && resetAt - Date.now() > LONG_RATE_LIMIT_MS) {
         return { ok: false, error: `the provider's rate limit is reached ${untilText(resetAt)}${opts.what ? ` (${opts.what})` : ""}` };
       }
-      return { ok: false, error: `HTTP ${res.status}${opts.what ? ` ${opts.what}` : ""}`, ...(res.status === 429 || res.status === 503 ? { transient: true } : {}) };
+      return { ok: false, error: `HTTP ${res.status}${opts.what ? ` ${opts.what}` : ""}${res.status === 400 && body ? `: ${body.slice(0, 300)}` : ""}`, ...(res.status === 429 || res.status === 503 ? { transient: true } : {}) };
     }
     type Reply = {
       choices?: { message?: { content?: string | null }; finish_reason?: string | null }[];
