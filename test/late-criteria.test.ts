@@ -34,17 +34,54 @@ function setup(dir: string, id: string) {
 }
 const notes = (j: Journal, kind: string) => Journal.read(j.path).filter((e) => e.kind === "note" && e.data.kind === kind);
 
+/**
+ * A draft that finishes once the engine has cut its wait with none ready.
+ *
+ * These cases used to finish the draft on a wall-clock timer (300-400 ms)
+ * started before `engine.run`, against a 100 ms cut. Under 150 CPU burners
+ * (2026-10-08) the engine's start-up outran the timer: the journal showed the
+ * draft sealed 7-38 ms into the turn, ready at the cut, so the product rightly
+ * sealed it there, and "none was ready" failed 12 runs in 20. Finishing on the
+ * cut's own announcement puts the draft after the cut under any load. The
+ * fallback only bounds an engine that never cuts; that still fails.
+ */
+function draftAfterCut(checks: Check[]) {
+  let cut!: () => void;
+  let fallback: ReturnType<typeof setTimeout> | undefined;
+  const pendingCriteria = new Promise<void>((r) => {
+    cut = r;
+    fallback = setTimeout(r, 10_000);
+  }).then(() => {
+    clearTimeout(fallback);
+    return { taskChecks: checks, taskNotes: [] as string[] };
+  });
+  const watch = (e: EngineEvent) => {
+    if (e.kind === "info" && /none was ready; not sealing an empty set/.test(e.text)) cut();
+  };
+  return { pendingCriteria, watch };
+}
+async function drainWatching(run: AsyncGenerator<EngineEvent>, watch: (e: EngineEvent) => void): Promise<EngineEvent[]> {
+  const ev: EngineEvent[] = [];
+  for await (const e of run) {
+    ev.push(e);
+    watch(e);
+  }
+  return ev;
+}
+
 describe("zero checks at the time budget's cut", () => {
   it("are not sealed empty: the draft joins at the first claim and judges it, the input hash journalled twice", async () => {
     const ws = workspace();
     try {
       const { engine, journal } = setup(ws.dir, "late-1");
-      const ev = await drain(
+      const draft = draftAfterCut([mk("greeting", "grep -qx hello out.txt")]);
+      const ev = await drainWatching(
         engine.run(TASK, allowAll, {
-          pendingCriteria: later({ taskChecks: [mk("greeting", "grep -qx hello out.txt")], taskNotes: [] }, 400),
+          pendingCriteria: draft.pendingCriteria,
           criteriaSoFar: nothing,
           criteriaWaitMs: 100,
         }),
+        draft.watch,
       );
       assert.ok(ev.some((e) => e.kind === "info" && /none was ready; not sealing an empty set/.test(e.text)));
       assert.ok(ev.some((e) => e.kind === "info" && /joined this turn's checks/.test(e.text)));
@@ -67,13 +104,16 @@ describe("zero checks at the time budget's cut", () => {
     const ws = workspace();
     try {
       const { engine } = setup(ws.dir, "late-2");
-      const ev = await drain(
+      const draft = draftAfterCut([mk("farewell", "grep -qx goodbye out.txt")]);
+      const ev = await drainWatching(
         engine.run(TASK, allowAll, {
-          pendingCriteria: later({ taskChecks: [mk("farewell", "grep -qx goodbye out.txt")], taskNotes: [] }, 300),
+          pendingCriteria: draft.pendingCriteria,
           criteriaSoFar: nothing,
           criteriaWaitMs: 100,
         }),
+        draft.watch,
       );
+      assert.ok(ev.some((e) => e.kind === "info" && /joined this turn's checks/.test(e.text)), "the late check joined");
       const end = ev.find((e) => e.kind === "job_end");
       assert.ok(end && end.kind === "job_end" && end.outcome !== "verified");
       assert.ok(ev.some((e) => e.kind === "proof_start"));
@@ -89,7 +129,9 @@ describe("zero checks at the time budget's cut", () => {
       const started = Date.now();
       const ev = await drain(
         engine.run(TASK, allowAll, {
-          pendingCriteria: later({ taskChecks: [mk("greeting", "grep -q hello out.txt")], taskNotes: [] }, 2_500),
+          // Never arrives: a 2.5 s timer started before the run could beat a
+          // start-up slowed by load, and then it was not late at all.
+          pendingCriteria: new Promise<{ taskChecks: Check[]; taskNotes: string[] }>(() => {}),
           criteriaSoFar: nothing,
           criteriaWaitMs: 100,
           lateCriteriaWaitMs: 50,
@@ -133,15 +175,22 @@ describe("a claim waits for late drafts until the time budget's margin", () => {
   const realTimeout = setTimeout;
   const slow = (name: string, run: string): Check => ({ ...mk(name, run), timeoutMs: 10_000_000 });
   /** Run a turn on a virtual clock: one simulated second per real 2 ms. */
-  async function onVirtualClock(start: (at: <T>(v: T, ms: number) => Promise<T>) => AsyncGenerator<EngineEvent>): Promise<{ ev: EngineEvent[]; simMs: number }> {
+  async function onVirtualClock(
+    start: (at: <T>(v: T, ms: number) => Promise<T>) => AsyncGenerator<EngineEvent>,
+  ): Promise<{ ev: EngineEvent[]; simMs: number; t0: number; turnStart: number }> {
     mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
     const t0 = Date.now();
     try {
       const ev: EngineEvent[] = [];
+      let turnStart = NaN;
       let done = false;
       let err: unknown;
       const run = (async () => {
-        for await (const e of start((v, ms) => new Promise((r) => setTimeout(() => r(v), ms)))) ev.push(e);
+        for await (const e of start((v, ms) => new Promise((r) => setTimeout(() => r(v), ms)))) {
+          ev.push(e);
+          // The turn's own start on the simulated clock, which its deadline counts from.
+          if (e.kind === "job_end") turnStart = Date.now() - e.durationMs;
+        }
       })().then(
         () => { done = true; },
         (e: unknown) => { err = e; done = true; },
@@ -152,7 +201,7 @@ describe("a claim waits for late drafts until the time budget's margin", () => {
       }
       await run;
       if (err) throw err;
-      return { ev, simMs: Date.now() - t0 };
+      return { ev, simMs: Date.now() - t0, t0, turnStart };
     } finally {
       mock.timers.reset();
     }
@@ -179,7 +228,7 @@ describe("a claim waits for late drafts until the time budget's margin", () => {
     const ws = workspace();
     try {
       const { engine, journal } = setup(ws.dir, "late-wait-1");
-      const { ev, simMs } = await onVirtualClock((at) =>
+      const { ev, simMs, t0 } = await onVirtualClock((at) =>
         engine.run(TASK, allowAll, {
           pendingCriteria: at({ taskChecks: [slow("greeting", "grep -qx hello out.txt")], taskNotes: [] }, 200_000),
           criteriaSoFar: nothing,
@@ -187,7 +236,11 @@ describe("a claim waits for late drafts until the time budget's margin", () => {
           draftInputs: sealed,
         }),
       );
-      assert.ok(infos(ev).some((t) => /^waited (19\d|20\d)s for the drafted checks \(waited to the time budget's margin.*1 arrived and joined/.test(t)), infos(ev).join("\n"));
+      // How long the claim waited depends on when it began, and the simulated
+      // clock runs on while the engine's real work does: under load the claim
+      // began 11 s in and "waited 189s" failed a 19x-20x s pattern. What the
+      // product owes is to be still waiting when the draft lands at 200 s.
+      assert.ok(infos(ev).some((t) => /^waited \d+s for the drafted checks \(waited to the time budget's margin.*1 arrived and joined/.test(t)), infos(ev).join("\n"));
       const proof = ev.find((e) => e.kind === "proof_result");
       assert.ok(proof && proof.kind === "proof_result" && proof.result.results.some((r: { name: string }) => r.name === "task:greeting"));
       assert.equal(outcome(ev), "verified");
@@ -195,7 +248,10 @@ describe("a claim waits for late drafts until the time budget's margin", () => {
       const join = notes(journal, "late-checks");
       assert.equal(join.length, 1);
       assert.equal(join[0]!.data.arrived, true);
-      assert.ok(Number(join[0]!.data.waitedMs) >= 195_000);
+      // Joined once it landed (the note follows the join's own pre-work try,
+      // real work on a simulated clock), and well before the 510 s margin.
+      const joinedAt = Date.parse(String(join[0]!.iso)) - t0;
+      assert.ok(joinedAt >= 200_000 && joinedAt < 510_000, `joined ${joinedAt} ms in, for a draft that landed at 200 s`);
       assert.equal(notes(journal, "draft-inputs")[0]!.data.inputsSha, "frozen-inputs");
       assert.equal(join[0]!.data.inputsSha, "frozen-inputs");
     } finally {
@@ -227,7 +283,7 @@ describe("a claim waits for late drafts until the time budget's margin", () => {
     const ws = workspace();
     try {
       const { engine, journal } = setup(ws.dir, "late-wait-3");
-      const { ev, simMs } = await onVirtualClock(() =>
+      const { ev, simMs, turnStart } = await onVirtualClock(() =>
         engine.run(TASK, allowAll, {
           pendingCriteria: new Promise(() => {}),
           criteriaSoFar: nothing,
@@ -237,9 +293,12 @@ describe("a claim waits for late drafts until the time budget's margin", () => {
       );
       const said = infos(ev).find((t) => /did not arrive/.test(t));
       assert.ok(said, infos(ev).join("\n"));
-      // 600 s budget, 90 s margin: about 510 s waited, then judged in what is left.
-      const waited = Number(/^waited (\d+)s/.exec(said!)?.[1]);
-      assert.ok(waited >= 500 && waited <= 512, said);
+      // 600 s budget, 90 s margin: the wait ends 510 s after the turn began,
+      // then the claim is judged in what is left. Counted from the turn's
+      // start, not from the claim, which load can push tens of seconds in.
+      const gaveUp = notes(journal, "late-checks")[0]!;
+      const endedAt = Date.parse(String(gaveUp.iso)) - turnStart;
+      assert.ok(endedAt >= 510_000 && endedAt <= 513_000, `${said} (gave up ${endedAt} ms into the turn)`);
       assert.match(said!, /judged without them/);
       assert.notEqual(outcome(ev), "verified");
       assert.ok(ev.some((e) => e.kind === "job_end"));
