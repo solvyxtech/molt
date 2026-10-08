@@ -53,7 +53,7 @@ import type { BarResult, Check, CheckAuthor, EngineEvent } from "./types.js";
 import { stateDir } from "./statedir.js";
 import { draftReference, snapshotProject } from "./reference.js";
 import { env } from "./env.js";
-import { copyTree } from "./scratch.js";
+import { preWorkCopy } from "./scratch.js";
 
 /**
  * The version, from the manifest that npm actually publishes.
@@ -1240,9 +1240,12 @@ async function autoDraft(
   // show this task was done, so it is sent back to the drafter once and
   // dropped if it still passes (criteria.ts screen). Null when the project is
   // too big to copy: the checks are then not tried here.
-  const preWork = args.cwd ? await copyTree(args.cwd) : null;
+  // Fingerprinted: the drafting can outlive the start of the work (a late
+  // draft), and the worker runs as this uid, so every try checks the copy is
+  // still as taken (src/scratch.ts preWorkCopy).
+  const preWork = args.cwd ? await preWorkCopy(args.cwd) : null;
   try {
-    return await autoDraftFrom(engine, args, snapshot, preWork?.dir, soFar, inputs, deadlineAt);
+    return await autoDraftFrom(engine, args, snapshot, preWork ? { dir: preWork.dir, intact: preWork.intact } : undefined, soFar, inputs, deadlineAt);
   } finally {
     await preWork?.cleanup();
   }
@@ -1252,7 +1255,7 @@ async function autoDraftFrom(
   engine: Engine,
   args: Args,
   snapshot: DrafterInputs,
-  preWorkDir: string | undefined,
+  preWork: { dir: string; intact: () => Promise<boolean> } | undefined,
   soFar?: { draft?: Draft; sealed?: boolean; late?: boolean },
   inputs?: { snapshot: DrafterInputs; used: string[] },
   deadlineAt?: number,
@@ -1274,7 +1277,7 @@ async function autoDraftFrom(
       barChecks: (engine.cfg.bar?.checks ?? []).map((c) => c.name),
       ...judgeTarget({ baseUrl: args.url, apiKey: args.key, model: args.model }),
       cwd: args.cwd,
-      ...(preWorkDir ? { preWorkDir } : {}),
+      ...(preWork ? { preWorkDir: preWork.dir, preWorkIntact: preWork.intact } : {}),
       reasoningEffort: judgeEffort(args.reasoningChecks ?? args.reasoning),
       latency: engine.askLatency,
       deadlineAt,

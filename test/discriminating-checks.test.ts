@@ -15,13 +15,15 @@
  * "passed-untested", outcome unverified, exit code 3.
  */
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { parseArgs } from "../src/cli.js";
+import { diagnoseFailure } from "../src/bar.js";
 import { Engine } from "../src/engine.js";
 import { Journal } from "../src/journal.js";
 import { Receipts } from "../src/receipts.js";
+import { preWorkCopy } from "../src/scratch.js";
 import { claimLabel, noteCoverage, tierOf, UNTESTED_CLAIM } from "../src/tiers.js";
 import type { Check, CheckAuthor } from "../src/types.js";
 import { allowAll, drain, scriptedProvider, workspace, type ScriptedTurn } from "./helpers.js";
@@ -152,12 +154,30 @@ describe("the rule in a turn", () => {
     assert.deepEqual(tried[0]!.data.failed, ["task:greeting"]);
   });
 
-  it("a check that could not run before the work has no pre-work try: not verified", async () => {
-    // `sh tool.sh` before tool.sh exists exits 127: the try found it broken, not failing.
-    const { end, receipt } = await turn([check("tool", "sh tool.sh")]);
-    assert.deepEqual([end.outcome, end.tier], ["unverified", "passed-untested"]);
-    assert.match(end.tierReason!, /`task:tool` was not tried before the work began/);
-    assert.match(receipt, /before the work: not tried/);
+  it("a check that could not run before the work has no pre-work try: not verified, on every platform", async () => {
+    // Before tool.sh exists, `bash tool.sh` exits 127, and `sh tool.sh` exits 127
+    // where sh is bash (macOS) and 2 where it is dash (Debian, Ubuntu): both are
+    // read as broken, not failing, so neither counts as tried.
+    for (const run of ["bash tool.sh", "sh tool.sh"]) {
+      const { end, receipt } = await turn([check("tool", run)]);
+      assert.deepEqual([end.outcome, end.tier], ["unverified", "passed-untested"], run);
+      assert.match(end.tierReason!, /`task:tool` was not tried before the work began/);
+      assert.match(receipt, /before the work: not tried/);
+    }
+  });
+
+  it("dash's missing-script exit reads as bash's", () => {
+    assert.equal(diagnoseFailure(2, "", "sh: 0: cannot open tool.sh: No such file\n").didNotRun, true);
+    assert.equal(diagnoseFailure(127, "", "bash: tool.sh: No such file or directory\n").didNotRun, true);
+    assert.equal(diagnoseFailure(2, "", "python3: can't open file 'x.py': [Errno 2] No such file or directory\n").didNotRun, false, "an interpreter's own missing file is the work missing");
+  });
+
+  it("a drafted check is tried before the work under the shell the bar runs it with", async () => {
+    // `==` inside `[ ]` and `echo -e` are bash; under dash the first errs and the
+    // second prints "-e x". Tried under sh it "failed before the work" on Linux
+    // and passed at the bar under bash: a guard counted as discriminating.
+    const { tried } = await turn([check("bashism", `[ "$(echo -e x)" == "x" ]`)], [], false);
+    assert.deepEqual(tried[0]!.data.passed, ["task:bashism"]);
   });
 });
 
@@ -167,3 +187,93 @@ describe("parseArgs --require-discriminating", () => {
     assert.equal(parseArgs(["--require-discriminating"]).requireDiscriminating, true);
   });
 });
+
+describe("late checks and the copy taken before the work", () => {
+  const later = <T>(v: T, ms: number) => new Promise<T>((r) => setTimeout(() => r(v), ms));
+  const nothing = async () => ({ taskChecks: [] as Check[], taskNotes: [] as string[] });
+  const mk = (name: string, run: string): Check => ({ name, kind: "command", run, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: JUDGE }) as Check;
+
+  const TASK = "Write out.txt containing exactly the word hello.";
+  async function lateTurn(dir: string, calls: { name: string; args: Record<string, unknown> }[], checks: Check[]) {
+    const provider = scriptedProvider([{ calls }, { text: "Done." }]);
+    const journal = new Journal(dir, "late-copy");
+    const engine = new Engine({
+      baseUrl: "http://provider.test/v1", model: "m", cwd: dir, fetchFn: provider.fetchFn, bar: null, stream: false, autonomy: "high", journal,
+      requireDiscriminating: true,
+    });
+    engine.setTurnDeadline(600_000);
+    const events = await drain(engine.run(TASK, allowAll, { pendingCriteria: later({ taskChecks: checks, taskNotes: [] }, 300), criteriaSoFar: nothing, criteriaWaitMs: 100 }));
+    const end = events.find((e) => e.kind === "job_end");
+    assert.ok(end && end.kind === "job_end");
+    return { end, tried: Journal.read(journal.path).filter((e) => e.kind === "note" && e.data.kind === "pre-work-try"), copies: Journal.read(journal.path).filter((e) => e.kind === "note" && e.data.kind === "pre-work-copy") };
+  }
+
+  it("is tried on the copy when the copy is untouched: the check failed before the work and discriminates", async () => {
+    const ws = workspace();
+    try {
+      const { end, tried, copies } = await lateTurn(ws.dir, [{ name: "write_file", args: { path: "out.txt", content: "hello\n" } }], [mk("greeting", "grep -qx hello out.txt")]);
+      assert.equal(copies.length, 1, "the copy is journalled with its timing");
+      assert.equal(typeof copies[0]!.data.ms, "number");
+      assert.deepEqual(tried.at(-1)!.data.failed, ["task:greeting"]);
+      assert.equal(end.outcome, "verified");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("a copy the worker changed during the work is not the tree before it: late checks count as not tried", async () => {
+    const ws = workspace();
+    const seed = `seed-${process.pid}-${Date.now()}.txt`;
+    writeFileSync(join(ws.dir, seed), "pristine\n");
+    try {
+      // The worker, as Maat's own uid, finds the copy under the temp folder and edits it.
+      const tamper = `for f in "\${TMPDIR:-/tmp}"/maat-check-*/*/${seed}; do echo hello > "$f"; done; cp ${seed} /dev/null`;
+      const { end, tried } = await lateTurn(
+        ws.dir,
+        [{ name: "bash", args: { command: tamper } }, { name: "write_file", args: { path: "out.txt", content: "hello\n" } }],
+        [mk("seeded", `grep -qx hello ${seed} || grep -qx hello out.txt`)],
+      );
+      const note = tried.find((e) => e.data.tampered === true);
+      assert.ok(note, "the change to the copy is journalled");
+      assert.deepEqual(note!.data.untried, ["task:seeded"]);
+      assert.equal(end.tier, "passed-untested");
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("a late check that names the project's absolute path is not tried on the copy", async () => {
+    const ws = workspace();
+    try {
+      const { tried } = await lateTurn(ws.dir, [{ name: "write_file", args: { path: "out.txt", content: "hello\n" } }], [mk("abs", `grep -qx hello ${join(ws.dir, "out.txt")}`)]);
+      assert.ok(tried.some((e) => Array.isArray(e.data.untried) && (e.data.untried as string[]).includes("task:abs")));
+    } finally {
+      ws.cleanup();
+    }
+  });
+});
+
+describe("preWorkCopy", () => {
+  it("knows when the copy changed", async () => {
+    const ws = workspace();
+    try {
+      writeFileSync(join(ws.dir, "a.txt"), "a\n");
+      const c = await preWorkCopy(ws.dir);
+      assert.ok(c);
+      try {
+        assert.equal(await c.intact(), true);
+        writeFileSync(join(c.dir, "a.txt"), "b\n");
+        assert.equal(await c.intact(), false, "same size, different content");
+        writeFileSync(join(c.dir, "a.txt"), "a\n");
+        assert.equal(await c.intact(), true);
+        writeFileSync(join(c.dir, "new.txt"), "");
+        assert.equal(await c.intact(), false, "a file added");
+      } finally {
+        await c.cleanup();
+      }
+    } finally {
+      ws.cleanup();
+    }
+  });
+});
+
