@@ -149,6 +149,15 @@
 
 ### Fixed
 
+- **A re-read after an edit returns the file, whatever the path's spelling.**
+  The engine recorded which lines of a file the model had been shown under the
+  path as spelled, so `read_file dur.py`, then `edit_file ./dur.py`, then
+  `read_file dur.py` was answered "you have already been shown … nothing has
+  changed since", while the transcript had already elided the old copy: the
+  model held no copy of the file it had just edited. The engine and the
+  transcript now key files through one normaliser (`canonPath`), which also
+  treats `sub/../dur.py` and an absolute path inside the workspace as the same
+  file.
 - **Anthropic prices are per model version, checked 2026-10-08.** The table
   priced by family: Opus 5.5 was billed at $5 / $25 per MTok instead of
   $4 / $20, Sonnet 5 and 5.5 at $3 / $15 instead of $2 / $10, Opus 4 / 4.1 at

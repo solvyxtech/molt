@@ -118,7 +118,7 @@ import { takeTurn } from "./localgate.js";
 import { parseLenient } from "./lenient-json.js";
 import { LONG_RATE_LIMIT_MS, longQuotaText, rateLimitResetAt, untilText, providerErrorText, normalizeMessage, readStream, transientProviderError, type ProviderError, type StreamAccumulator, type Usage } from "./stream.js";
 import { Fragments, SafeStream } from "./live.js";
-import { Transcript, excerpt, toolDetail } from "./transcript.js";
+import { Transcript, canonPath, excerpt, toolDetail } from "./transcript.js";
 import { acpAgentFor, acpHealth, acpModels, AcpSession, backendStallMs, isAcp } from "./acp.js";
 import { type BackendSession, type ToolRunner } from "./backend.js";
 import { endpointProblem, removedSubscriptionProblem } from "./endpoint.js";
@@ -5759,7 +5759,10 @@ export class Engine {
         const path = String(args.path ?? "");
         const from = num(args.offset, 0);
         const to = actualReadEnd(result, from, path);
-        const covered = ctx.shown.get(path) ?? [];
+        // Keyed by the file, not the spelling: an edit of `./dur.py` has to
+        // clear what a read of `dur.py` recorded.
+        const file = canonPath(path, this.cwd);
+        const covered = ctx.shown.get(file) ?? [];
         // How much of this window is genuinely new. Containment alone is
         // too strict: a read that overlaps an earlier one by 99% and
         // runs three lines past it is not contained, and a model
@@ -5783,7 +5786,7 @@ export class Engine {
           repeatedHere = true;
         } else {
           covered.push({ from, to });
-          ctx.shown.set(path, covered);
+          ctx.shown.set(file, covered);
         }
       }
 
@@ -5828,7 +5831,7 @@ export class Engine {
       sha256: createHash("sha256").update(result, "utf8").digest("hex").slice(0, 16),
     });
     if ((name === "write_file" || name === "edit_file") && allowed) {
-      ctx.shown.delete(String(args.path ?? ""));
+      ctx.shown.delete(canonPath(String(args.path ?? ""), this.cwd));
       this.pinTask(ctx.userText);
     }
     this.did.push(
