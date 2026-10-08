@@ -863,10 +863,10 @@ describe("the default worker user, end to end (Linux, root)", { skip: linuxRoot 
     const r = await run({ MAAT_ASSUME_CONTAINER: "0", CI: "true", MAAT_DEFAULT_WORKER_USER: "maat-nosuch-acct" });
     try {
       assert.match(r.err, /only inside a container/, r.err);
-      const rdir = join(r.dir, ".maat", "receipts");
-      const md = readdirSync(rdir).filter((f) => f.endsWith(".md"));
-      assert.ok(md.length > 0, `no receipt:\n${r.err}`);
-      assert.match(readFileSync(join(rdir, md[0]!), "utf8"), /isolation: none \(separation is the default here but could not be set up/);
+      // The journal carries the isolation line from the start of the run (receipts carry it too, when a turn writes one).
+      const logs = join(r.dir, ".maat", "log");
+      const text = readdirSync(logs).map((f) => readFileSync(join(logs, f), "utf8")).join("\n");
+      assert.match(text, /isolation: none \(separation is the default here but could not be set up/, `${r.err}\n${text.slice(0, 500)}`);
     } finally {
       r.cleanup();
     }
