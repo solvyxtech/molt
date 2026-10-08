@@ -51,6 +51,14 @@ export type MsgMeta = {
    * that, every time.
    */
   pinned?: true;
+  /**
+   * What goes on the wire in place of `content`, once the message has aged
+   * (lean-sessions prototype, MAAT_LEAN_AGE). The content itself, the record
+   * and the exuviae keep the full text; only the resend is shortened.
+   */
+  wire?: string;
+  /** Tool-call arguments sent in place of the originals once aged, by call id. */
+  agedArgs?: Record<string, string>;
 };
 
 export type Bom = {

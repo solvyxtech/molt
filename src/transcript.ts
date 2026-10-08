@@ -63,6 +63,76 @@ export type ShedPlan = {
   afterTokens: number;
 };
 
+/**
+ * What a message costs on the wire, in molt's token units: its aged stand-in
+ * when it has one (see `planAging`), its content otherwise.
+ */
+export function sentTokens(m: Msg): number {
+  const calls = m.tool_calls?.map((c) =>
+    c.id && m.molt?.agedArgs?.[c.id] !== undefined ? { ...c, function: { ...c.function, arguments: m.molt.agedArgs[c.id]! } } : c,
+  );
+  return estTokens(m.molt?.wire ?? m.content ?? "") + estTokens(JSON.stringify(calls ?? ""));
+}
+
+/**
+ * Ageing older tool results (lean-sessions prototype, MAAT_LEAN_AGE).
+ *
+ * The newest `keep` tool results go on the wire whole. Older ones longer than
+ * `minChars` go as their first `head` and last `tail` characters and a pointer
+ * to the full text, which the engine writes under `.maat/out/` first. With
+ * `args`, older tool-call arguments longer than `argMinChars` are shortened
+ * the same way. Nothing is ever aged unless at least `batchChars` would come
+ * off: each ageing rewrites messages in the middle of the conversation, so
+ * everything after the first of them is a cache miss on the next request, and
+ * batching keeps that to one miss per `batchChars` saved instead of one per
+ * step.
+ */
+export type AgingOpts = {
+  keep: number;
+  minChars: number;
+  batchChars: number;
+  head: number;
+  tail: number;
+  args: boolean;
+  argMinChars: number;
+  /**
+   * Age only once the history is over this many tokens (molt's units), and
+   * then everything eligible at once: a soft shed, timed like a shed, that
+   * keeps every call and the ends of every result. 0: age whenever a batch
+   * is ready.
+   */
+  atTokens: number;
+};
+
+export type AgingPlan = {
+  results: { index: number; callId: string; full: string }[];
+  calls: { index: number; callId: string; full: string }[];
+  /** Chars that stop being resent. */
+  saving: number;
+  /** Soft shed only: ageing alone cannot buy the headroom, so shed after it. */
+  thenShed?: boolean;
+};
+
+/** An aged string: head, a marker saying what is missing and where it is, tail. */
+export function ageText(text: string, head: number, tail: number, pointer: string | null, what = "result"): string {
+  const cut = text.length - head - tail;
+  return (
+    `${text.slice(0, head)}\n[molt: ${cut} characters of this older ${what} are not resent` +
+    (pointer ? `; the full text is in ${pointer} — read_file it, with an offset, for the part you need` : "") +
+    `.]\n${text.slice(text.length - tail)}`
+  );
+}
+
+/**
+ * A bash command that only prints one file: `cat f`, `head -n 40 f`,
+ * `sed -n '1,80p' f`, `nl f`, `tail f`. Anything with a pipe, a redirect or a
+ * second command is not a plain read and is left alone.
+ */
+const SIMPLE_READ = /^(?:cat|nl(?: -\S+)*|head(?: -\S+(?: \d+)?)*|tail(?: -\S+(?: \d+)?)*|sed -n ['"]?[\d,$p]+['"]?)\s+([^\s|;&<>$`*?]+)$/;
+
+/** Results that are already a pointer or a notice: nothing to age. */
+const NOT_AGEABLE = [ELIDED_PREFIX, "[molt: this is the same ", "[molt: you have already been shown"];
+
 export class Transcript {
   private system: Msg;
   private working: Msg[] = [];
@@ -78,6 +148,16 @@ export class Transcript {
    * The record and captures keep the full text.
    */
   private malformedCalls = new Set<string>();
+  /**
+   * The least share of the history a shed cut on user turns must free, or it
+   * cuts on recent messages instead (lean-sessions prototype,
+   * MAAT_LEAN_SHED_MINFREE). 0 is off. Maat's own notes (the acceptance
+   * criteria, a bar refusal) arrive as user messages, so a long single-request
+   * turn can have three "exchanges" with nearly all its history before the
+   * second: a real run shed 6 messages, 60,788 -> 60,387 tokens, lost its
+   * whole prompt cache for 0.7%, and shed again one step later.
+   */
+  shedMinFree = 0;
 
   constructor(systemPrompt: string) {
     this.system = { role: "system", content: systemPrompt };
@@ -171,11 +251,25 @@ export class Transcript {
     // llama.cpp Qwen failed with a 500. Leading system messages are joined
     // in order; a system message anywhere later goes as a user message.
     const out: Omit<Msg, "molt">[] = [];
-    for (const { molt: _molt, ...m } of this.all()) {
+    for (const { molt, ...raw } of this.all()) {
+      // An aged message goes as its stand-in (planAging); `repair` false is a
+      // record of what was said, which keeps the full text.
+      const aged = repair && molt?.wire !== undefined;
+      const m = aged ? { ...raw, content: molt!.wire! } : raw;
+      const agedArgs = repair ? molt?.agedArgs : undefined;
       if (m.role !== "system")
         out.push(
           repair && Array.isArray(m.tool_calls)
-            ? { ...m, tool_calls: m.tool_calls.map((c) => (c.id && this.malformedCalls.has(c.id) ? excerptCall(c) : wireCall(c))) }
+            ? {
+                ...m,
+                tool_calls: m.tool_calls.map((c) =>
+                  c.id && this.malformedCalls.has(c.id)
+                    ? excerptCall(c)
+                    : c.id && agedArgs?.[c.id] !== undefined
+                      ? { ...c, function: { ...c.function, arguments: agedArgs[c.id]! } }
+                      : wireCall(c),
+                ),
+              }
             : m,
         );
       else if (out.length === 0) out.push({ ...m });
@@ -210,10 +304,7 @@ export class Transcript {
   }
 
   bom(toolSchemaJson: string, session: { prompt: number; completion: number }): Bom {
-    const historyTokens = this.working.reduce(
-      (n, m) => n + estTokens(m.content ?? "") + estTokens(JSON.stringify(m.tool_calls ?? "")),
-      0,
-    );
+    const historyTokens = this.working.reduce((n, m) => n + sentTokens(m), 0);
     // The standing note is part of every request, so it is part of the fixed
     // cost of one — counted with the system prompt rather than hidden.
     const systemTokens = estTokens(this.system.content ?? "") + estTokens(this.task ?? "");
@@ -230,10 +321,73 @@ export class Transcript {
   }
 
   historyTokens(): number {
-    return this.working.reduce(
-      (n, m) => n + estTokens(m.content ?? "") + estTokens(JSON.stringify(m.tool_calls ?? "")),
-      0,
-    );
+    return this.working.reduce((n, m) => n + sentTokens(m), 0);
+  }
+
+  /**
+   * Plan an ageing pass (see AgingOpts). Null when it would save less than a
+   * batch. Pure: commitAging applies it.
+   */
+  planAging(o: AgingOpts): AgingPlan | null {
+    const history = this.historyTokens();
+    if (o.atTokens > 0 && history <= o.atTokens) return null;
+    const toolIdx = this.working.map((m, i) => (m.role === "tool" ? i : -1)).filter((i) => i >= 0);
+    if (toolIdx.length <= o.keep) return null;
+    let plan = this.agingFrom(toolIdx[toolIdx.length - o.keep]!, o);
+    if (o.atTokens > 0) {
+      // A soft shed buys headroom, like a shed: keep fewer whole results until
+      // the history would be back under half the threshold, and if even two
+      // are too many (the stand-ins themselves have grown), say so: the caller
+      // sheds for real.
+      for (let keep = o.keep - 1; keep >= 2 && history - plan.saving / 4 > o.atTokens / 2; keep--) {
+        plan = this.agingFrom(toolIdx[toolIdx.length - keep]!, o);
+      }
+      if (history - plan.saving / 4 > o.atTokens / 2) plan.thenShed = true;
+      return plan.saving > 0 || plan.thenShed ? plan : null;
+    }
+    if (plan.saving < o.batchChars) return null;
+    return plan;
+  }
+
+  /** Everything ageable before message `boundary`. */
+  private agingFrom(boundary: number, o: AgingOpts): AgingPlan {
+    const stub = ageText("", o.head, o.tail, ".maat/out/aged-call_0000000000.txt").length;
+    const plan: AgingPlan = { results: [], calls: [], saving: 0 };
+    for (let i = 0; i < boundary; i++) {
+      const m = this.working[i]!;
+      if (m.role === "tool" && m.tool_call_id && typeof m.content === "string" && m.molt?.wire === undefined) {
+        const t = m.content;
+        if (t.length > Math.max(o.minChars, o.head + o.tail + stub) && !NOT_AGEABLE.some((p) => t.startsWith(p))) {
+          plan.results.push({ index: i, callId: m.tool_call_id, full: t });
+          plan.saving += t.length - (o.head + o.tail + stub);
+        }
+      }
+      if (o.args && m.role === "assistant") {
+        for (const c of m.tool_calls ?? []) {
+          if (!c.id || m.molt?.agedArgs?.[c.id] !== undefined || this.malformedCalls.has(c.id)) continue;
+          const a = c.function.arguments ?? "";
+          if (a.length > o.argMinChars) {
+            plan.calls.push({ index: i, callId: c.id, full: a });
+            plan.saving += Math.max(0, a.length - agedArgs(a, o, null).length);
+          }
+        }
+      }
+    }
+    return plan;
+  }
+
+  /** Apply an ageing plan; `pointer` names where each full text was kept (null: nowhere). */
+  commitAging(plan: AgingPlan, o: AgingOpts, pointer: (callId: string, kind: "result" | "call") => string | null): void {
+    for (const r of plan.results) {
+      const m = this.working[r.index];
+      if (!m || m.tool_call_id !== r.callId) continue;
+      m.molt = { ...m.molt, wire: ageText(r.full, o.head, o.tail, pointer(r.callId, "result")) };
+    }
+    for (const c of plan.calls) {
+      const m = this.working[c.index];
+      if (!m) continue;
+      m.molt = { ...m.molt, agedArgs: { ...m.molt?.agedArgs, [c.callId]: agedArgs(c.full, o, pointer(c.callId, "call")) } };
+    }
   }
 
   /**
@@ -266,6 +420,13 @@ export class Transcript {
     let cutAt: number;
     if (userIdxs.length > keepExchanges) {
       cutAt = userIdxs[userIdxs.length - keepExchanges];
+      if (this.shedMinFree > 0) {
+        const freed = this.working.slice(0, cutAt).reduce((n, m) => n + sentTokens(m), 0);
+        if (freed < this.shedMinFree * this.historyTokens()) {
+          const fallback = this.findSafeCut(this.working.length - Math.max(2, keepRecent));
+          if (fallback !== null && fallback > cutAt) cutAt = fallback;
+        }
+      }
     } else {
       // A single request can produce dozens of tool calls with no user turn
       // to cut on — which is exactly when context runs out. Fall back to
@@ -295,10 +456,7 @@ export class Transcript {
       content: digest,
       molt: { digest: true },
     };
-    const afterTokens = [digestMsg, ...kept].reduce(
-      (n, m) => n + estTokens(m.content ?? "") + estTokens(JSON.stringify(m.tool_calls ?? "")),
-      0,
-    );
+    const afterTokens = [digestMsg, ...kept].reduce((n, m) => n + sentTokens(m), 0);
 
     // Shedding must only ever shrink. On tiny sessions the digest can cost
     // more than the messages it replaces.
@@ -411,6 +569,8 @@ export class Transcript {
     for (let i = 0; i < this.working.length; i++) {
       const m = this.working[i];
       if (m.role !== "tool" || typeof m.content !== "string") continue;
+      // Already aged: what goes on the wire is the short stand-in.
+      if (m.molt?.wire !== undefined) continue;
       const before = estTokens(m.content);
       if (before <= maxTokens) continue;
 
@@ -447,9 +607,28 @@ export class Transcript {
    * elided, which is what a self-hosted endpoint sees.
    */
   elideSupersededReads(
-    opts: { protectCache?: boolean } = {},
+    opts: { protectCache?: boolean; lean?: boolean } = {},
   ): { elided: number; tokensSaved: number; deferred: number } {
     const supersededBy = new Map<number, string>();
+    /**
+     * With `lean` (MAAT_LEAN_SUPERSEDE), what is superseded is a call, not the
+     * message it was in. Keyed by message, a write to one file elided every
+     * result of the step that read it — a step that read dur.py and
+     * test_dur.py together lost test_dur.py when dur.py was rewritten, and
+     * the marker told the model the current copy was further down, which it
+     * was not.
+     */
+    const supersededCall = new Map<string, string>();
+    /** The result each call id came back with, for the bash rerun rule. */
+    const resultOf = new Map<string, string>();
+    if (opts.lean)
+      for (const m of this.working) if (m.role === "tool" && m.tool_call_id) resultOf.set(m.tool_call_id, m.content ?? "");
+    /** The last live run of each bash command, by its whitespace-normalised text. */
+    const lastRun = new Map<string, string>();
+    const mark = (i: number, id: string | undefined, why: string) => {
+      if (opts.lean && id) supersededCall.set(id, why);
+      else supersededBy.set(i, why);
+    };
     /**
      * Reads still worth keeping, keyed by the exact window they returned.
      *
@@ -461,7 +640,7 @@ export class Transcript {
      * it back to read the same file again, forever. Two features that were
      * each correct alone.
      */
-    const lastRead = new Map<string, number>();
+    const lastRead = new Map<string, { i: number; id?: string }>();
     /** Every live read of a path, so a write can invalidate all of them. */
     const readsOf = new Map<string, string[]>();
 
@@ -474,7 +653,30 @@ export class Transcript {
         } catch {
           continue;
         }
-        const path = String(args.path ?? "");
+        if (opts.lean && call.function.name === "bash" && typeof args.command === "string" && call.id) {
+          const cmd = args.command.replace(/\s+/g, " ").trim();
+          const now = resultOf.get(call.id) ?? "";
+          // A rerun that came back the same is already sent as a pointer to
+          // the earlier copy, which must then stay. One that came back
+          // different makes the earlier output history.
+          const prior = lastRun.get(cmd);
+          if (prior !== undefined && !now.startsWith("[molt: this is the same ") && now !== resultOf.get(prior))
+            mark(i, prior, `rerun at step ${i}`);
+          if (!now.startsWith("[molt: this is the same ")) lastRun.set(cmd, call.id);
+          // A plain read of one file through bash is a read of that file: a
+          // later write makes it stale exactly as it does a read_file.
+          const read = SIMPLE_READ.exec(cmd);
+          if (read) {
+            const window = `bash:${cmd}`;
+            const p = read[1]!.replace(/^\.\//, "");
+            lastRead.set(window, { i, id: call.id });
+            const windows = readsOf.get(p) ?? [];
+            if (!windows.includes(window)) windows.push(window);
+            readsOf.set(p, windows);
+          }
+          continue;
+        }
+        const path = String(args.path ?? "").replace(opts.lean ? /^\.\// : /$^/, "");
         if (!path) continue;
 
         if (call.function.name === "read_file") {
@@ -482,8 +684,8 @@ export class Transcript {
           // different part of the file and stands on its own.
           const window = `${path}@${Number(args.offset ?? 0)}+${String(args.limit ?? "all")}`;
           const prior = lastRead.get(window);
-          if (prior !== undefined) supersededBy.set(prior, `re-read at step ${i}`);
-          lastRead.set(window, i);
+          if (prior !== undefined) mark(prior.i, prior.id, `re-read at step ${i}`);
+          lastRead.set(window, { i, id: call.id });
           const windows = readsOf.get(path) ?? [];
           if (!windows.includes(window)) windows.push(window);
           readsOf.set(path, windows);
@@ -493,7 +695,7 @@ export class Transcript {
           // what is on disk.
           for (const window of readsOf.get(path) ?? []) {
             const prior = lastRead.get(window);
-            if (prior !== undefined) supersededBy.set(prior, `changed at step ${i}`);
+            if (prior !== undefined) mark(prior.i, prior.id, `changed at step ${i}`);
             lastRead.delete(window);
           }
           readsOf.delete(path);
@@ -501,15 +703,28 @@ export class Transcript {
       }
     }
 
+    if (opts.lean) {
+      // Per call: map each superseded call id to its result's position.
+      for (const [id, reason] of supersededCall) {
+        const j = this.working.findIndex((m) => m.role === "tool" && m.tool_call_id === id);
+        if (j >= 0) supersededBy.set(-(j + 1), reason);
+      }
+    }
+
     let elided = 0;
     let tokensSaved = 0;
     let deferred = 0;
     for (const [callIdx, reason] of supersededBy) {
-      // The tool result follows its assistant turn.
-      for (let j = callIdx + 1; j < this.working.length; j++) {
+      // The tool result follows its assistant turn. A negative key is one
+      // exact result (the lean per-call rule): -(index + 1).
+      const exact = callIdx < 0 ? -callIdx - 1 : -1;
+      for (let j = exact >= 0 ? exact : callIdx + 1; j < this.working.length; j++) {
         const m = this.working[j];
         if (m.role !== "tool") break;
+        if (exact >= 0 && j !== exact) break;
         if (!m.content || m.content.startsWith(ELIDED_PREFIX)) continue;
+        // Already aged: what goes on the wire is the short stand-in.
+        if (m.molt?.wire !== undefined) continue;
         const before = estTokens(m.content);
         // Wording matters here. "Full contents remain in the archived record"
         // reads, to a model, as an invitation to go and get them — which it
@@ -699,4 +914,29 @@ function wireCall<T extends { function?: { arguments?: unknown } }>(c: T): T {
   if (typeof a !== "string") return c;
   const fixed = wireArgs(a);
   return fixed === a ? c : { ...c, function: { ...c.function!, arguments: fixed } };
+}
+
+/**
+ * Aged tool-call arguments: the same keys, with each string value longer than
+ * a fifth of `argMinChars` shortened to its ends and a marker, so the call
+ * still reads as the call it was. Always a JSON object, like wireArgs.
+ */
+function agedArgs(text: string, o: AgingOpts, pointer: string | null): string {
+  let v: unknown;
+  try {
+    v = JSON.parse(wireArgs(text));
+  } catch {
+    return text;
+  }
+  if (!v || typeof v !== "object" || Array.isArray(v)) return text;
+  const cap = Math.max(200, Math.floor(o.argMinChars / 5));
+  const out: Record<string, unknown> = {};
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    out[k] =
+      typeof val === "string" && val.length > cap + 120
+        ? ageText(val, Math.floor(cap * 0.7), Math.floor(cap * 0.3), pointer, "call's argument")
+        : val;
+  }
+  const s = JSON.stringify(out);
+  return s.length < text.length ? s : text;
 }

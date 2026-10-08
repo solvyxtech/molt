@@ -133,6 +133,7 @@ import {
 } from "./types.js";
 import { stateDir, stateDirName } from "./statedir.js";
 import { env } from "./env.js";
+import { leanAging, leanShedAt, leanShedMinFree, leanSupersede } from "./lean.js";
 import { Judgments, caseReason, reasonText } from "./judgment.js";
 
 /** A reading of the session meter, for measuring one job against. */
@@ -2718,7 +2719,7 @@ export class Engine {
 
   /** The history size a shed is triggered at, in molt's own token units. 0 is off. */
   get autoShedAtTokens(): number {
-    return this.cfg.autoShedAtTokens ?? DEFAULT_AUTO_SHED_TOKENS;
+    return this.cfg.autoShedAtTokens ?? leanShedAt() ?? DEFAULT_AUTO_SHED_TOKENS;
   }
 
   setAutoShed(tokens: number): void {
@@ -3012,9 +3013,9 @@ export class Engine {
    * else molt writes, and return the path the model should read. Null if it
    * could not be written — the preview still stands on its own.
    */
-  private spill(text: string, callId: string): string | null {
+  private spill(text: string, callId: string, prefix = ""): string | null {
     try {
-      const rel = `${stateDirName(this.cwd)}/out/${callId.replace(/[^\w-]/g, "_")}.txt`;
+      const rel = `${stateDirName(this.cwd)}/out/${prefix}${callId.replace(/[^\w-]/g, "_")}.txt`;
       mkdirSync(stateDir(this.cwd, "out"), { recursive: true });
       writeFileSync(join(this.cwd, rel), this.maskWithheld(redact(text, this.secrets())), "utf8");
       return rel;
@@ -6131,6 +6132,7 @@ export class Engine {
         // as it always did.
         const pruned = this.transcript.elideSupersededReads({
           protectCache: this.sessionCached > 0,
+          lean: leanSupersede(),
         });
         if (pruned.elided > 0) {
           log?.append("elide", {
@@ -6147,7 +6149,40 @@ export class Engine {
         }
       }
 
-      const auto = this.subprocess ? 0 : this.cfg.autoShedAtTokens ?? DEFAULT_AUTO_SHED_TOKENS;
+      // Ageing (lean-sessions prototype, MAAT_LEAN_AGE): older tool results go
+      // on the wire as their ends and a pointer to the full text, in batches.
+      const aging = this.subprocess ? null : leanAging();
+      if (aging) {
+        const plan = this.transcript.planAging(aging);
+        if (plan) {
+          const kept = new Map<string, string | null>();
+          for (const r of plan.results) kept.set(`r:${r.callId}`, this.spill(r.full, r.callId, "aged-"));
+          for (const c of plan.calls) kept.set(`c:${c.callId}`, this.spill(c.full, c.callId, "aged-call-"));
+          this.transcript.commitAging(plan, aging, (id, kind) => kept.get(`${kind === "call" ? "c" : "r"}:${id}`) ?? null);
+          // What molt believed it had "already shown" is no longer on the
+          // wire in full: a re-read must be served, not refused (as after a shed).
+          shown.clear();
+          answered.clear();
+          log?.append("note", {
+            kind: "age",
+            text: "aged older tool results",
+            results: plan.results.length,
+            calls: plan.calls.length,
+            chars: plan.saving,
+          });
+          if (plan.thenShed) {
+            const shed = this.shed();
+            if (shed) yield { kind: "shed", ...shed };
+          }
+          yield {
+            kind: "info",
+            text: `aged ${plan.results.length} older tool result(s)${plan.calls.length ? ` and ${plan.calls.length} call(s)` : ""} · ~${Math.round(plan.saving / 4)} tokens no longer resent; the full text is in ${stateDirName(this.cwd)}/out/`,
+          };
+        }
+      }
+
+      this.transcript.shedMinFree = leanShedMinFree();
+      const auto = this.subprocess ? 0 : this.cfg.autoShedAtTokens ?? leanShedAt() ?? DEFAULT_AUTO_SHED_TOKENS;
       if (auto > 0 && this.transcript.historyTokens() > auto) {
         const shed = this.shed();
         if (shed) {
