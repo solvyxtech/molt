@@ -9,7 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ASK_MAX_TOKENS, ASK_RETRY_FACTOR, askModel, jsonIn, notJson } from "../src/ask.js";
+import { ASK_MAX_TOKENS, ASK_RETRY_FACTOR, ASK_RETRY_MAX_TOKENS, askModel, jsonIn, notJson } from "../src/ask.js";
 
 type Reply = { content: string | null; finish?: string; status?: number };
 
@@ -74,6 +74,23 @@ describe("askModel", () => {
     const p = replying([{ content: '{"a":', finish: "length" }, { content: '{"a":[1,', finish: "length" }]);
     const r = await ask(p.fetchFn);
     assert.deepEqual(r, { ok: true, text: '{"a":[1,', cutOff: true });
+    assert.equal(p.ceilings.length, 2);
+  });
+
+  it("caps the retry's ceiling, and does not retry a caller already at the cap", async () => {
+    const p = replying([{ content: '{"a":', finish: "length" }, { content: '{"a":1}' }]);
+    await ask(p.fetchFn, { maxTokens: 6_000 });
+    assert.deepEqual(p.ceilings, [6_000, ASK_RETRY_MAX_TOKENS]);
+    const q = replying([{ content: '{"a":', finish: "length" }]);
+    const r = await ask(q.fetchFn, { maxTokens: 16_000 });
+    assert.deepEqual(q.ceilings, [16_000]);
+    assert.deepEqual(r, { ok: true, text: '{"a":', cutOff: true });
+  });
+
+  it("keeps the first cut-off reply when the retry fails outright", async () => {
+    const p = replying([{ content: '{"a":', finish: "length" }, { content: null, status: 400 }]);
+    const r = await ask(p.fetchFn);
+    assert.deepEqual(r, { ok: true, text: '{"a":', cutOff: true });
     assert.equal(p.ceilings.length, 2);
   });
 

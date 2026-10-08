@@ -81,6 +81,8 @@ export const ASK_MAX_TOKENS = 2_000;
 
 /** How much larger the retry is when a reply came back empty at the ceiling. */
 export const ASK_RETRY_FACTOR = 4;
+/** The most a cut-off retry asks for, whatever the first ceiling was. */
+export const ASK_RETRY_MAX_TOKENS = ASK_MAX_TOKENS * ASK_RETRY_FACTOR * 2;
 
 /** Milliseconds left before `deadlineAt`, or undefined when there is none. */
 function leftMs(deadlineAt: number | undefined): number | undefined {
@@ -147,8 +149,17 @@ async function askSized(opts: AskOptions): Promise<Asked> {
   // edge-case checks is longer than the ceiling allowed for, and half a JSON
   // reply proposes nothing (2026-10-07: 3 of 20 runs drafted no checks).
   if (first.ok && first.cutOff && (leftMs(opts.deadlineAt) ?? 1) > 0) {
-    const bigger = (opts.maxTokens ?? ASK_MAX_TOKENS) * ASK_RETRY_FACTOR;
+    const asked = opts.maxTokens ?? ASK_MAX_TOKENS;
+    // Never past ASK_RETRY_MAX_TOKENS: a caller that already asks for a large
+    // ceiling (a reference check's 16k) would ask for 64k, which many
+    // providers refuse with a 400, and which holds a self-hosted server's
+    // only slot for hours.
+    const bigger = Math.min(asked * ASK_RETRY_FACTOR, Math.max(asked, ASK_RETRY_MAX_TOKENS));
+    if (bigger <= asked) return first;
     const second = await askOnce(opts, bigger);
+    // A retry that failed outright says less than the first reply did: keep
+    // the clear "cut off at the token limit" result for the caller.
+    if (!second.ok && first.text.trim() !== "") return first;
     if (second.ok && second.cutOff && second.text.trim() === "") {
       return {
         ok: false,

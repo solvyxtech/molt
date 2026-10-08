@@ -656,10 +656,54 @@ export function assertsValue(run: string, goldenPredates?: (operand: string) => 
  * `literalOnly` turns forms 5 and 6 off: the rule as first measured, for
  * bench/local/exact_replay.py.
  */
+/**
+ * Python asserts that hold whatever the work does: `assert (x == 1, 'msg')`
+ * (a non-empty tuple is always true), `assert x == 1 or True`, `assert x == 1
+ * if False else True`, and any assert under `python -O` / PYTHONOPTIMIZE,
+ * which strips it.
+ */
+export function pythonAssertNeverFails(cmd: string): string | null {
+  if (!/\bpython[\d.]*\b/.test(cmd) || !/\bassert\b/.test(cmd)) return null;
+  if (/\bpython[\d.]*\s+(?:-\w+\s+)*-\w*O/.test(cmd) || /\bPYTHONOPTIMIZE=(?!0\b|""|''|\s)/.test(cmd)) {
+    return "python runs with -O (or PYTHONOPTIMIZE), which strips every assert, so it exits 0 whatever happened";
+  }
+  for (const m of cmd.matchAll(/\bassert\s*\(/g)) {
+    const open = (m.index ?? 0) + m[0].length - 1;
+    let depth = 0;
+    let q: string | undefined;
+    let found = false;
+    for (let i = open; i < cmd.length; i++) {
+      const ch = cmd[i]!;
+      if (q) {
+        if (ch === "\\") i++;
+        else if (ch === q) q = undefined;
+        continue;
+      }
+      if (ch === "'" || ch === '"') q = ch;
+      else if ("([{".includes(ch)) depth++;
+      else if (")]}".includes(ch)) {
+        depth--;
+        if (depth === 0) {
+          const after = cmd.slice(i + 1).trimStart();
+          // `assert (cond)` alone is fine; `assert (a, b)` is a tuple.
+          if (/^(?:[;\n"']|$)/.test(after) && found) return "it asserts a tuple (`assert (x, 'msg')`), which is always true";
+          break;
+        }
+      } else if (ch === "," && depth === 1) found = true;
+    }
+  }
+  for (const m of cmd.matchAll(/\bassert\b([^;\n]*)/g)) {
+    const body = m[1]!.replace(/(["'])(?:(?!\1)[^\\]|\\.)*\1/g, "''");
+    if (/\bor\s+(?:True|1|not\s+False)\b/.test(body)) return "its assert ends in `or True`, so it holds whatever the work does";
+    if (/\bif\b.*\belse\s+(?:True|1)\b/.test(body)) return "its assert is a conditional expression with a true branch, so it holds whatever the work does";
+  }
+  return null;
+}
+
 export function assertsExact(run: string, opts: { literalOnly?: boolean } = {}): boolean {
   // A pattern the work wrote, tried on lines the check chose: the judge's own examples
   // missed the grader's near-miss (see "Not widened" under assertsValue).
-  if (cannotFail(run) || PATTERN_DELIVERABLE.test(run)) return false;
+  if (cannotFail(run) || pythonAssertNeverFails(run) || PATTERN_DELIVERABLE.test(run)) return false;
   const names = exactNames(run);
   const narrow = !opts.literalOnly;
   if (exactEquality(run, names, narrow) || exactHelper(run, names) || exactDiff(run) || exactGrepLine(run) || exactNone(run, names) || (narrow && containsValue(run))) return true;
@@ -726,7 +770,8 @@ const STATUS_SIDE = /\$\?|\breturncode\b|\bexit_?[Cc]ode\b|\.(?:status|status_co
  */
 function statusExpected(literal: string): boolean {
   const n = literal.trim().replace(/^(["'])(.*)\1$/, "$2");
-  return /^-?\d+$/.test(n) && n !== "0" && n !== "200";
+  // 1 is what any crash exits with: on its own it cannot tell the work from a stub that raises.
+  return /^-?\d+$/.test(n) && n !== "0" && n !== "1" && n !== "200";
 }
 
 /** A shell word that prints literal text: `"$(printf 'a\nb')"`, `"$(echo ok)"`, with no expansion inside. */
@@ -909,6 +954,7 @@ function exactEquality(run: string, names: ReadonlySet<string>, oracle: boolean)
         if (!statusExpected(expected) || before.endsWith("||")) continue;
       } else if (PROPERTY_SIDE.test(work)) continue;
       if (quantified(run, at)) continue;
+      if (trivialLiteral(expected)) continue;
       return true;
     }
     if (op === "=" || op === "-eq" || op === "-ne") continue;
@@ -934,10 +980,30 @@ function exactEquality(run: string, names: ReadonlySet<string>, oracle: boolean)
     if (STATUS_SIDE.test(work)) {
       if (!statusExpected(expected)) continue;
     } else if (PROPERTY_SIDE.test(work)) continue;
-    if (quantified(run, at) && !names.has(expected.trim())) continue;
+    if (quantified(run, at) && !loopNames(run, names).has(expected.trim())) continue;
+    if (trivialLiteral(expected)) continue;
     return true;
   }
   return false;
+}
+
+/**
+ * A literal any stub or crash produces: an empty container or string, a
+ * boolean, None, 0 or 1. On its own it cannot tell the work from a function
+ * that returns [] or a program that dies.
+ */
+function trivialLiteral(text: string): boolean {
+  const t = text.trim().replace(/^(["'])(\s*)\1$/, "''");
+  return /^(?:\[\s*\]|\{\s*\}|\(\s*\)|''|""|True|False|None|true|false|null|undefined|-?[01](?:\.0+)?)$/.test(t);
+}
+
+/** Loop variables over a literal table of cases (`for inp, want in CASES`): they change with the input, unlike a constant bound once (`ok = True`). */
+function loopNames(run: string, names: ReadonlySet<string>): Set<string> {
+  const out = new Set<string>();
+  for (const m of run.matchAll(/\bfor\s+\(?\s*([A-Za-z_][\w\s,]*?)\s*\)?\s+in\s+/g)) {
+    for (const v of m[1]!.split(",")) if (v.trim() && names.has(v.trim())) out.add(v.trim());
+  }
+  return out;
 }
 
 /** What builds a value by running something: then it is the work's output, not an expectation. */
@@ -1060,6 +1126,9 @@ function containsValue(run: string): boolean {
     const upstream = stages.slice(0, -1);
     if (upstream.some((x) => COUNTING_STAGE.test(x.trim()))) continue;
     if (!RUNNER.test(stageProgram(upstream[0]!))) continue;
+    // A crash's message repeats its input (`ValueError: bad date '2024-06-13'`):
+    // a value the check handed the program, or one read from its stderr, is not one it worked out.
+    if (upstream.some((x) => x.includes(body)) || /2>&1|\|&|&>/.test(run.slice(a, b))) continue;
     // The program is handed literal input: an argument or a redirect, not just run bare.
     if (!/\s(?:'[^']*'|"[^"$]*"|-?\d[\w.:-]*|<\s*\S+)/.test(upstream[0]!.replace(/^\s*\S+/, ""))) continue;
     return true;

@@ -45,6 +45,7 @@ import { join } from "node:path";
 import { maskQuotes, maskShell, swallowsExit, runnerPipedAway, topLevelCommands } from "./evidence.js";
 import { strayPath } from "./criteria.js";
 import { checkMutates } from "./checkwrites.js";
+import { pythonAssertNeverFails } from "./tiers.js";
 
 export type LintHit = { rule: string; why: string };
 
@@ -402,6 +403,8 @@ const INTERPRETER = /^(?:\w+=\S*\s+)*(?:timeout\s+\S+\s+)?(?:python3?|node|ruby|
  */
 export function cannotFail(run: string): string | null {
   const cmd = run.trim();
+  const py = pythonAssertNeverFails(cmd);
+  if (py) return py;
   const masked = maskShell(cmd);
   const sw = swallowsExit(cmd);
   if (sw) return `it ends in \`${sw}\`, so it exits 0 whatever happened`;

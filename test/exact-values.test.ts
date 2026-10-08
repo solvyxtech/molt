@@ -3,7 +3,7 @@
  * needs a passing independent check that compares the work's output with an
  * EXACT expected value (src/tiers.ts assertsExact).
  *
- * On the 2026-10-07 mmhd lane (MiniMax M3 worker, Haiku 5.5 judge) cron-next
+ * On a 2026-10-07 bench lane (a worker model checked by a judge model) cron-next
  * was labelled verified on four judge checks that all tested properties: 8
  * lines, each minute a multiple of 15, sorted, unique; "every date is the 13th
  * or a Friday"; two runs agree; "starts with 2024-06-1". The grader asked for
@@ -16,8 +16,9 @@ import { CRITERIA_MAX_EXPECT, CRITIC_SYSTEM, DRAFT_SYSTEM, DRAFT_SYSTEM_EXACT, c
 import { AUDIT_SYSTEM, AUDIT_SYSTEM_EXACT, auditGates, auditSystem, parseAuditChecks } from "../src/post-audit.js";
 import { assertsExact, assertsValue, exactRuleOn, passedChecksWords, PROPERTY_ONLY_REASON, tierOf } from "../src/tiers.js";
 import type { CheckAuthor } from "../src/types.js";
+import { cannotFail } from "../src/checklint.js";
 
-/** The four judge checks the mmhd cron-next run passed, verbatim from its receipt. */
+/** The four judge checks the cron-next run passed, verbatim from its receipt. */
 const CRON_NEXT = [
   `cd "$PWD" && a=$(python3 nextrun.py '0 12 * * 7' '2024-01-01 00:00' 5) && b=$(python3 nextrun.py '0 12 * * 0' '2024-01-01 00:00' 5) && [ -n "$a" ] && [ "$a" = "$b" ] && echo "$a" | wc -l | grep -qx ' *5'`,
   `cd "$PWD" && python3 nextrun.py '0 0 13 * 5' '2024-01-01 00:00' 6 | python3 -c "import sys,datetime as d; ls=sys.stdin.read().splitlines(); assert len(ls)==6; ds=[d.datetime.strptime(l,'%Y-%m-%d %H:%M') for l in ls]; assert all(x.day==13 or x.weekday()==4 for x in ds); assert all(a<b for a,b in zip(ds,ds[1:])); assert ds[0]>d.datetime(2024,1,1)"`,
@@ -76,6 +77,22 @@ const PROPERTY = [
   `out=$(python3 nextrun.py '*/15 * * * *' '2024-01-01 00:00' 4); ! echo "$out" | grep -qx '2024-01-01 00:00'`,
   // two literals, nothing from the work
   `[ "$(echo 7)" = "7" ]`,
+  // #46 review: a crash whose message repeats the input it was handed
+  `python3 tool.py '2024-06-13' 2>&1 | grep -q '2024-06-13'`,
+  `python3 nextrun.py '0 9 * * *' '2023-01-01 09:00' 1 | grep -q '2023-01-01 09:00'`,
+  // a named constant compared across every item is still the same constant
+  `python3 -c "import cron; out=cron.next('*/15 * * * *', 8); ok=True; assert len(out) == 8; assert all(cron.valid(t) == ok for t in out)"`,
+  // asserts that can never fail
+  `python3 -c "import tool; assert (tool.f('a') == 'x', 'msg')"`,
+  `python3 -c "import tool; assert tool.f('a') == 'x' or True"`,
+  `python3 -c "import tool; assert tool.f('a') == 'x' if False else True"`,
+  `python3 -O -c "import tool; assert tool.f('a') == 'x'"`,
+  `PYTHONOPTIMIZE=1 python3 -c "import tool; assert tool.f('a') == 'x'"`,
+  // one trivial literal: any stub returns it, any crash exits with it
+  `python3 -c "import tool; assert tool.f('a') == []"`,
+  `python3 -c "import tool; assert tool.f('a') == False"`,
+  `[ "$(python3 tool.py a)" = "" ]`,
+  `python3 tool.py bad; rc=$?; [ $rc -eq 1 ]`,
 ];
 
 describe("the exact tag", () => {
@@ -88,6 +105,16 @@ describe("the exact tag", () => {
     for (const t of sealed.taskChecks) assert.deepEqual(t.tags, ["task", "value"]);
   });
 
+  it("asserts that can never fail are refused at seal time too (L16)", () => {
+    for (const c of [
+      `python3 -c "import tool; assert (tool.f('a') == 'x', 'msg')"`,
+      `python3 -c "import tool; assert tool.f('a') == 'x' or True"`,
+      `python3 -c "import tool; assert tool.f('a') == 'x' if False else True"`,
+      `python3 -O -c "import tool; assert tool.f('a') == 'x'"`,
+    ]) assert.ok(cannotFail(c), c);
+    assert.equal(cannotFail(`python3 -c "import tool; assert (tool.f('a') == 'x'), 'msg'"`), null, "parenthesised condition, then a message");
+  });
+
   it("is only ever tagged beside value", () => {
     const sealed = taskChecksFrom({ checks: [{ name: "e", run: EXACT[2]! }], notes: [] }, { hidden: true });
     assert.deepEqual(sealed.taskChecks[0]!.tags, ["task", "value", "exact"]);
@@ -95,8 +122,8 @@ describe("the exact tag", () => {
 });
 
 describe("tierOf: property checks do not earn verified", () => {
-  const JUDGE: CheckAuthor = { kind: "judge", model: "claude-haiku-5-5" };
-  const worker = "minimax-m3";
+  const JUDGE: CheckAuthor = { kind: "judge", model: "judge-model" };
+  const worker = "worker-model";
   const sealed = (runs: string[]) =>
     taskChecksFrom({ checks: runs.map((run, i) => ({ name: `task:c${i}`, run })), notes: [] }, { hidden: true, author: JUDGE }).taskChecks;
   const tier = (runs: string[], extra: Partial<Parameters<typeof tierOf>[0]> = {}) => {
