@@ -22,8 +22,9 @@ import { runCommand } from "./run.js";
 import { describeStart, listBackground, startBackground, stopBackground } from "./background.js";
 import { reviewClaim, type Review } from "./review.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
-import { authorKey, authorWords, claimLabel, tierOf, withAuthor, type Tier } from "./tiers.js";
+import { auditClaim, authorKey, authorWords, claimLabel, contradictions, independentOf, tierOf, withAuthor, type Tier } from "./tiers.js";
 import { recordGoldens, valueUnproven } from "./golden.js";
+import { postWorkAudit, type AuditReport } from "./post-audit.js";
 import { arbitrate, parseDisputes, type Ruling } from "./dispute.js";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -1423,6 +1424,16 @@ export type EngineConfig = {
    * redraft of checks that pass before the work). `reviewAdvisory` implies it.
    */
   requireDiscriminating?: boolean;
+  /**
+   * Opt-in (`--post-work-audit`, MAAT_POST_WORK_AUDIT=1): when a claimed turn
+   * is not verified by the checks sealed before the work, an independent
+   * judge drafts checks from the task text and an interface view of the work
+   * (never its transcript, claim or outputs), and one that passes on the work,
+   * fails before it and fails on a mutant of the changed code earns
+   * "verified (post-work audit: <judge>)", tier `verified-audit`
+   * (src/post-audit.ts). Needs a judge that is not the worker model.
+   */
+  postWorkAudit?: boolean;
   /**
    * Requirement sign-out (src/signout.ts): one round per unattended turn that
    * lists each stated requirement beside the commands run for it. Off unless
@@ -3708,8 +3719,12 @@ export class Engine {
     try {
       yield* inner;
     } finally {
-      await this.preWorkTree?.cleanup();
-      this.preWorkTree = null;
+      // The post-work audit tries its checks on this copy after the turn's
+      // events are over; it is removed when the job ends (runSealed).
+      if (this.cfg.postWorkAudit !== true) {
+        await this.preWorkTree?.cleanup();
+        this.preWorkTree = null;
+      }
     }
   }
 
@@ -3782,6 +3797,90 @@ export class Engine {
       failed: failed.map(asTask),
       passed: passed.map(asTask),
     });
+  }
+
+  /**
+   * Run the post-work audit (src/post-audit.ts) on the pre-work copy kept for
+   * it. Undefined, said once, when it cannot run: no copy, or no judge that is
+   * another model than the worker (#32: a model never both finds and judges).
+   */
+  private async *runPostWorkAudit(task: string): AsyncGenerator<EngineEvent, AuditReport | undefined> {
+    const log = this.cfg.journal;
+    const judge = judgeTarget({ baseUrl: this.cfg.baseUrl, apiKey: this.cfg.apiKey, model: this.cfg.model });
+    const skip = (why: string) => {
+      log?.append("note", { kind: "post-work-audit", ran: false, text: `post-work audit skipped: ${why}` });
+      return { kind: "info" as const, text: `post-work audit skipped: ${why}.` };
+    };
+    if (!independentOf({ kind: "judge", model: judge.model }, this.workerNames())) {
+      yield skip(`the judge (${judge.model}) is the worker model; set --judge to another model`);
+      return undefined;
+    }
+    const pre = this.preWorkTree;
+    if (!pre) {
+      yield skip("no copy of the project was taken before the work (too big to copy)");
+      return undefined;
+    }
+    if (!(await pre.intact())) {
+      yield skip("the copy of the project taken before the work has changed since, so nothing tried on it decides anything");
+      return undefined;
+    }
+    yield { kind: "info", text: `post-work audit: ${judge.model} drafts checks from the task and the work's interface` };
+    const now = Date.now();
+    const turnEnd = this.deadlineAt();
+    const deadlineAt = turnEnd === undefined ? now + 180_000 : Math.min(now + 180_000, Math.max(turnEnd, now + 45_000));
+    this.running = new AbortController();
+    let report: AuditReport;
+    try {
+      report = await postWorkAudit({
+        task,
+        workDir: this.cwd,
+        preWorkDir: pre.dir,
+        preWorkIntact: pre.intact,
+        judge,
+        fetchFn: this.cfg.fetchFn,
+        acpSpawn: this.cfg.acpSpawn,
+        reasoningEffort: judgeEffort(this.cfg.reasoningEffort),
+        deadlineAt,
+        signal: this.running.signal,
+        // Masked like every hidden check while it runs, released below.
+        onCheck: (c) => this.withholdText(`audit:${c.name}`, c.run),
+      });
+    } catch (e) {
+      log?.append("note", { kind: "post-work-audit", ran: false, text: `post-work audit failed: ${errorText(e)}` });
+      yield { kind: "info", text: `post-work audit could not run: ${errorText(e)}` };
+      return undefined;
+    } finally {
+      this.running = undefined;
+      this.releaseWithheld();
+    }
+    log?.append("note", {
+      kind: "post-work-audit",
+      ran: true,
+      text: `post-work audit by ${report.judge}: ${report.drafted} drafted, ${report.dropped.length} dropped, ${report.accepted.length} cleared every gate`,
+      judge: report.judge,
+      viewSha: createHash("sha256").update(report.view).digest("hex").slice(0, 16),
+      changed: report.changed.map((c) => c.path),
+      dropped: report.dropped,
+      mutants: report.mutants,
+      checks: report.checks.map((c) => ({
+        name: `audit:${c.name}`,
+        run: c.run,
+        sha256: commandSha(c.run),
+        quote: c.quote,
+        accepted: c.accepted,
+        ...(c.rule ? { rule: c.rule, why: c.why } : {}),
+        ...(c.work ? { work: c.work } : {}),
+        ...(c.preWork ? { preWork: c.preWork } : {}),
+        ...(c.mutants ? { mutantsKilled: c.mutants.killed, mutantsTotal: c.mutants.total, mutantsCrashedOnly: c.mutants.crashedOnly } : {}),
+      })),
+      ...(report.error ? { error: report.error } : {}),
+    });
+    if (report.error) yield { kind: "info", text: `post-work audit: ${report.error}` };
+    else if (!report.accepted.length) {
+      const why = report.checks.map((c) => `${c.name}: ${c.why}`).concat(report.dropped.map((d) => `${d.name}: ${d.why}`));
+      yield { kind: "info", text: `post-work audit: no check cleared every gate${why.length ? ` (${why.join("; ")})` : " (the judge drafted none)"}` };
+    }
+    return report;
   }
 
   /** tierOf's advisory-review argument: empty unless `reviewAdvisory`. */
@@ -4435,6 +4534,8 @@ export class Engine {
     } finally {
       // A turn that threw or was abandoned still releases what it withheld.
       this.releaseWithheld();
+      await this.preWorkTree?.cleanup();
+      this.preWorkTree = null;
       this.turnActive = false;
       this.cancelRequested = false;
     }
@@ -4705,6 +4806,33 @@ export class Engine {
         ...(t.reviewNote ? { review: t.reviewNote } : {}),
       });
     }
+    // The post-work audit (opt-in): a claimed turn the sealed checks did not
+    // verify gets checks an independent judge drafts from the task and the
+    // work's interface, each gated on the work, the pre-work copy and mutants.
+    let audit: AuditReport | undefined;
+    const auditable =
+      this.cfg.postWorkAudit === true &&
+      !opts.ask &&
+      !cancelled &&
+      !this.turnEndedBy &&
+      // A claim the sealed checks did not verify: they passed without earning the
+      // word, only drafted checks refused it, or nothing checked it. Never one a
+      // person's or the project's check refused ("not proven"), or an error.
+      outcome === "unverified" &&
+      // A reviewer that found the claim contradicts the task is not overruled here.
+      contradictions(review) === 0;
+    if (auditable) {
+      audit = yield* this.runPostWorkAudit(userText);
+      if (audit?.accepted.length) {
+        outcome = "verified";
+        tier = "verified-audit";
+        tierReason = undefined;
+        claim = auditClaim(audit.judge);
+        yield { kind: "info", text: `${claim}: ${audit.accepted.map((n) => `\`audit:${n}\``).join(", ")} passed on the work, failed before it, and failed on a mutant of the changed code.` };
+        if (receiptPath) this.cfg.receipts?.amendTier(basename(receiptPath), { tier: "verified-audit", claim });
+        this.cfg.journal?.append("note", { text: "tier: verified-audit", claim, by: [audit.judge], accepted: audit.accepted.map((n) => `audit:${n}`) });
+      }
+    }
     yield {
       kind: "job_end",
       job,
@@ -4714,6 +4842,7 @@ export class Engine {
       outcome,
       ...(tier ? { tier, ...(tierReason ? { tierReason } : {}) } : {}),
       ...(claim ? { claim } : {}),
+      ...(audit ? { audit: { judge: audit.judge, drafted: audit.drafted, grounded: audit.drafted - audit.dropped.length, accepted: audit.accepted.map((n) => `audit:${n}`), ...(audit.error ? { error: audit.error } : {}) } } : {}),
       ...(this.sealedChecks.length ? { checkAuthors: Object.fromEntries(this.sealedChecks.map((c) => [c.name.startsWith("task:") ? c.name : `task:${c.name}`, authorKey(withAuthor(c, this.cfg.model).author!)])) } : {}),
       ...(selfChecked ? { selfChecked: true } : {}),
       ...(this.reviewSkipped ? { unreviewed: true } : {}),
@@ -5453,7 +5582,7 @@ export class Engine {
     // taken: mark the pending draft handled now (it is awaited, and its
     // failure reported, further down) so that is not an unhandled rejection.
     opts.pendingCriteria?.catch(() => {});
-    if ((opts.pendingCriteria || opts.referenceCheck) && !opts.ask) {
+    if ((opts.pendingCriteria || opts.referenceCheck || this.cfg.postWorkAudit === true) && !opts.ask) {
       const t0 = Date.now();
       this.preWorkTree = await preWorkCopy(this.cwd);
       // Journalled either way, so a replay can tell a late check that was

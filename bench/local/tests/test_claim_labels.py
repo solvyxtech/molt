@@ -63,3 +63,17 @@ def test_passed_untested_is_its_own_tier_and_never_verified():
     assert not stats.is_verified(UNTESTED)
     assert stats.claim_basis(UNTESTED) == "untested"
     assert run.claim_of({"outcome": "unverified", "tier": "passed-untested", "claim": UNTESTED}) == UNTESTED
+
+
+AUDIT = "verified (post-work audit: qwen3-coder-30b-a3b)"
+
+
+def test_post_work_audit_label_parses():
+    ev = {"kind": "job_end", "outcome": "verified", "tier": "verified-audit", "claim": AUDIT,
+          "audit": {"judge": "qwen3-coder-30b-a3b", "drafted": 3, "grounded": 2, "accepted": ["audit:sum"]}}
+    assert run.claim_of(ev) == AUDIT
+    assert stats.is_verified(AUDIT)
+    assert stats.claim_basis(AUDIT) == "audit"
+    assert stats.claim_judge(AUDIT) == ["qwen3-coder-30b-a3b"]
+    assert "verified-audit" in stats.TIERS
+    assert stats.tier_breakdown([{"tier": "verified-audit", "passed": True}]) == {"verified-audit": (1, 1)}
