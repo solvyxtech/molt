@@ -18,6 +18,7 @@ import datetime as dt
 import hashlib
 import io
 import json
+import math
 import os
 import random
 import re
@@ -32,7 +33,8 @@ from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tasks2 import IGNORED, all_files, py_check, run, scratch_copy, sh  # noqa: E402,F401
+from tasks2 import IGNORED, all_files, ok_val, run, scratch_copy, sh, shown  # noqa: E402,F401
+from grading import JS_EMIT, child_values, jsonish, py_values  # noqa: E402,F401
 
 VCS_ENV = {
     "GIT_AUTHOR_NAME": "Dev", "GIT_AUTHOR_EMAIL": "dev@example.com",
@@ -56,6 +58,11 @@ def vcs(d: Path, *args, date: str | None = None):
         env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = date
     r = runb(["git", *args], cwd=d, env=env)
     return r.stdout.decode(errors="replace")
+
+
+def _text(p: Path) -> str:
+    """A file's text, "" when it is missing or not a regular file (a grader must not raise on it)."""
+    return p.read_text(errors="replace") if p.is_file() else ""
 
 
 def write(d: Path, rel: str, text):
@@ -674,38 +681,70 @@ def _rand_orders(seed, n):
     return out
 
 
+# The worker's modules only compute; the old render, the expected tax and money strings and the
+# source check all stay in the grader's process (INVOICE_ORIG is run there, never next to them).
 INVOICE_HARNESS = r'''
-import importlib.util, json, sys
-def load(name, path):
-    spec = importlib.util.spec_from_file_location(name, path); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); return m
+import json, sys
 sys.path.insert(0, ".")
-old = load("_orig_invoice", "_orig_invoice.py")
 import invoice, tax, format as fmt
 orders = json.load(open("_orders.json"))
-def call(f, o):
-    try: return ("ok", f(o))
-    except Exception as e: return ("err", type(e).__name__, str(e))
-for i, o in enumerate(orders):
-    a, b = call(old.render, o), call(invoice.render, o)
-    if a != b:
-        print(f"order {i} ({o['region']}, coupon={o.get('coupon')!r}): old {a!r:.120} new {b!r:.120}"); sys.exit()
-for base, region in [(10000, "US-CA"), (1, "US-CA"), (-1234, "DE"), (-1, "FR"), (0, "US-OR"), (99999, "US-NY"), (6, "US-CA"), (-6, "US-CA"), (13, "FR"), (-13, "FR"), (150, "DE"), (200, "US-CA"), (-150, "DE"), (250, "FR")]:
-    want = (base * old.REGIONS[region] + 5000) // 10000
-    got = tax.compute_tax(base, region)
-    if got != want or type(got) is not int:
-        print(f"compute_tax({base}, {region!r}) = {got!r}, want {want}"); sys.exit()
-try:
-    tax.compute_tax(100, "XX"); print("compute_tax accepted an unknown region"); sys.exit()
-except ValueError as e:
-    if str(e) != "unknown region: XX": print(f"wrong message {e}"); sys.exit()
-for c, region, want in [(123456, "US-CA", "$1,234.56"), (-5, "US-NY", "-$0.05"), (123456789, "DE", "1.234.567,89 \u20ac"), (-100, "FR", "-1,00 \u20ac"), (0, "US-OR", "$0.00"), (7, "FR", "0,07 \u20ac")]:
-    got = fmt.money(c, region)
-    if got != want: print(f"money({c}, {region!r}) = {got!r}, want {want!r}"); sys.exit()
-src = open("invoice.py").read()
-for bad in ("1900", "725", "\u20ac", "REGIONS", "divmod"):
-    if bad in src: print(f"invoice.py still contains {bad!r}: the logic was not moved"); sys.exit()
-print("OK")
+V = {"render": [call(invoice.render, o)[:3] for o in orders]}
+V["tax"] = []
+for base, region in TAX_CASES:
+    r = call(tax.compute_tax, base, region)
+    V["tax"].append([r[:3], type(r[1]).__name__ if r[0] == "ok" else None])
+V["tax_xx"] = call(tax.compute_tax, 100, "XX")
+V["money"] = [call(fmt.money, c, region)[:3] for c, region, _ in MONEY_CASES]
+emit(V)
 '''
+INVOICE_TAX_CASES = [(10000, "US-CA"), (1, "US-CA"), (-1234, "DE"), (-1, "FR"), (0, "US-OR"), (99999, "US-NY"), (6, "US-CA"), (-6, "US-CA"),
+                     (13, "FR"), (-13, "FR"), (150, "DE"), (200, "US-CA"), (-150, "DE"), (250, "FR")]
+INVOICE_MONEY_CASES = [(123456, "US-CA", "$1,234.56"), (-5, "US-NY", "-$0.05"), (123456789, "DE", "1.234.567,89 \u20ac"),
+                       (-100, "FR", "-1,00 \u20ac"), (0, "US-OR", "$0.00"), (7, "FR", "0,07 \u20ac")]
+
+
+def _invoice_verdict(w: Path, V: dict, orders: list) -> tuple[bool, str]:
+    old: dict = {}
+    exec(compile(INVOICE_ORIG, "orig", "exec"), old)
+
+    def call(f, *a):
+        try:
+            return ["ok", f(*a)]
+        except Exception as e:  # noqa: BLE001
+            return ["err", type(e).__name__, str(e)[:300]]
+
+    got = V.get("render") or []
+    if len(got) != len(orders):
+        return False, "render was not run on every order"
+    for i, (o, b) in enumerate(zip(orders, got)):
+        a = jsonish(call(old["render"], o))
+        if a != b:
+            return False, f"order {i} ({o['region']}, coupon={o.get('coupon')!r}): old {tuple(a)!r:.120} new {tuple(b) if isinstance(b, list) else b!r:.120}"
+    tx = V.get("tax") or []
+    if len(tx) != len(INVOICE_TAX_CASES):
+        return False, "compute_tax was not run on every case"
+    for (base, region), (r, typ) in zip(INVOICE_TAX_CASES, tx):
+        want = (base * old["REGIONS"][region] + 5000) // 10000
+        if r[:1] != ["ok"] or r[1] != want or typ != "int":
+            return False, f"compute_tax({base}, {region!r}) = {r[1] if r[:1] == ['ok'] else tuple(r)!r}, want {want}"
+    xx = V.get("tax_xx") or []
+    if xx[:1] == ["ok"]:
+        return False, "compute_tax accepted an unknown region"
+    if not (len(xx) >= 4 and xx[3]):  # not a ValueError
+        return False, f"compute_tax raised {xx[1:2]} for an unknown region, want ValueError"
+    if xx[2] != "unknown region: XX":
+        return False, f"wrong message {xx[2]}"
+    mo = V.get("money") or []
+    if len(mo) != len(INVOICE_MONEY_CASES):
+        return False, "money was not run on every case"
+    for (c, region, want), r in zip(INVOICE_MONEY_CASES, mo):
+        if r != ["ok", want]:
+            return False, f"money({c}, {region!r}) = {r[1] if r[:1] == ['ok'] else tuple(r)!r}, want {want!r}"
+    src = (w / "invoice.py").read_text(errors="replace")
+    for bad in ("1900", "725", "\u20ac", "REGIONS", "divmod"):
+        if bad in src:
+            return False, f"invoice.py still contains {bad!r}: the logic was not moved"
+    return True, "all checks"
 
 
 class RefactorInvoice:
@@ -741,9 +780,13 @@ class RefactorInvoice:
             for f in ("tax.py", "format.py", "invoice.py"):
                 if not (w / f).exists():
                     return False, f"no {f}"
-            write(w, "_orig_invoice.py", INVOICE_ORIG)
-            write(w, "_orders.json", json.dumps(_rand_orders(5, 500), ensure_ascii=False))
-            return py_check(w, INVOICE_HARNESS)
+            orders = _rand_orders(5, 500)
+            write(w, "_orders.json", json.dumps(orders, ensure_ascii=False))
+            cases = f"TAX_CASES = {INVOICE_TAX_CASES!r}\nMONEY_CASES = {[(c, r, None) for c, r, _ in INVOICE_MONEY_CASES]!r}\n"
+            V, diag = py_values(w, cases + INVOICE_HARNESS)
+            if not isinstance(V, dict):
+                return False, diag
+            return _invoice_verdict(w, V, orders)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -966,8 +1009,8 @@ class GitFindCulprit:
             first_bad = None
             for r in revs:
                 x = Path(tempfile.mkdtemp(prefix="co-", dir=tmp))
-                subprocess.run(f"git archive {r} | tar -x -C {x}", shell=True, cwd=tmp, capture_output=True)
-                if subprocess.run(["sh", "check.sh"], cwd=x, capture_output=True).returncode != 0:
+                subprocess.run(f"git archive {r} | tar -x -C {x}", shell=True, cwd=tmp, capture_output=True, timeout=60)
+                if subprocess.run(["sh", "check.sh"], cwd=x, capture_output=True, timeout=30).returncode != 0:
                     first_bad = r
                     break
             if vcs(d, "rev-list", "--reverse", "master").split() != revs:
@@ -2001,30 +2044,47 @@ class VendorUnits:
                     return False, "vendor/ was changed"
             finally:
                 shutil.rmtree(ref, ignore_errors=True)
+            json.dump({"a": "2m", "b": "1h 1s"}, open(w / "cfg2.json", "w"))
             code = (
-                "import json, math, sys\n"
                 "from app.retry import delay_seconds\n"
                 "from app.schedule import load_schedule\n"
-                f"GOOD = {VendorUnits.GOOD!r}\nBAD = {VendorUnits.BAD!r}\n"
-                "for spec, want in GOOD:\n"
-                "    try: got = delay_seconds(spec)\n"
-                "    except Exception as e: print(f'{spec!r}: raised {e!r}'); sys.exit()\n"
-                "    if not math.isclose(got, want, rel_tol=1e-9, abs_tol=1e-9) or (float(want).is_integer() and not isinstance(got, int)):\n"
-                "        print(f'{spec!r}: got {got!r} want {want!r}'); sys.exit()\n"
-                "for spec in BAD:\n"
-                "    try: got = delay_seconds(spec)\n"
-                "    except ValueError: continue\n"
-                "    except Exception as e: print(f'{spec!r}: raised {type(e).__name__}, want ValueError'); sys.exit()\n"
-                "    print(f'{spec!r}: accepted as {got!r}'); sys.exit()\n"
-                "json.dump({'a': '2m', 'b': '1h 1s'}, open('cfg2.json', 'w'))\n"
-                "if load_schedule('cfg2.json') != {'a': 120, 'b': 3601}: print('load_schedule wrong:', load_schedule('cfg2.json')); sys.exit()\n"
-                "if load_schedule('config.json') != {'backoff': 300, 'timeout': 90, 'cooldown': 5400, 'report': 5400}: print('config.json schedule wrong:', load_schedule('config.json')); sys.exit()\n"
-                "print('OK')\n"
+                f"GOOD = {[g for g, _ in VendorUnits.GOOD]!r}\nBAD = {VendorUnits.BAD!r}\n"
+                "V = {'good': [], 'bad': [call(delay_seconds, x) for x in BAD]}\n"
+                "for x in GOOD:\n"
+                "    r = call(delay_seconds, x)\n"
+                "    V['good'].append([r, type(r[1]).__name__ if r[0] == 'ok' else None])\n"
+                "V['cfg2'] = call(load_schedule, 'cfg2.json')\nV['config'] = call(load_schedule, 'config.json')\n"
+                "emit(V)\n"
             )
-            ok, why = py_check(w, code)
-            return ok, why
+            V, diag = py_values(w, code)
+            if not isinstance(V, dict):
+                return False, diag
+            return VendorUnits.verdict(V)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    @staticmethod
+    def verdict(V: dict) -> tuple[bool, str]:
+        good = V.get("good") or []
+        if len(good) != len(VendorUnits.GOOD) or len(V.get("bad") or []) != len(VendorUnits.BAD):
+            return False, "delay_seconds was not run on every spec"
+        for (spec, want), (r, typ) in zip(VendorUnits.GOOD, good):
+            if r[0] != "ok":
+                return False, f"{spec!r}: raised {r[1]}({r[2]!r})"
+            got = r[1]
+            if typ not in ("int", "float") or not math.isclose(got, want, rel_tol=1e-9, abs_tol=1e-9) or (float(want).is_integer() and typ != "int"):
+                return False, f"{spec!r}: got {got!r} want {want!r}"
+        for spec, r in zip(VendorUnits.BAD, V["bad"]):
+            if r[0] == "err" and r[3]:
+                continue
+            if r[0] == "err":
+                return False, f"{spec!r}: raised {r[1]}, want ValueError"
+            return False, f"{spec!r}: accepted as {r[1]!r}"
+        if V.get("cfg2") != ["ok", {"a": 120, "b": 3601}]:
+            return False, f"load_schedule wrong: {shown(V.get('cfg2'))}"
+        if V.get("config") != ["ok", {"backoff": 300, "timeout": 90, "cooldown": 5400, "report": 5400}]:
+            return False, f"config.json schedule wrong: {shown(V.get('config'))}"
+        return True, "all checks"
 
 
 # ================================================================ 19. rename-api-signature
@@ -2197,6 +2257,8 @@ class RenameApi:
         for rel, txt in SHOP_FILES.items():
             write(d, rel, txt)
 
+    # The worker's package only computes; what each call returned is compared with the expected
+    # values here, out of its process.
     HARNESS = r'''
 import inspect, runpy, sys
 sys.path.insert(0, ".")
@@ -2204,47 +2266,69 @@ from shop import db, views, billing, notify, registry, cli
 conn = db.connect()
 conn.execute("INSERT INTO users VALUES (1, 'Ada', 'ada@x.org')")
 conn.execute("INSERT INTO users VALUES (2, 'Ben', '')")
-if hasattr(db, "get_user"): print("shop.db still has get_user"); sys.exit()
-sig = inspect.signature(db.fetch_user)
-ps = list(sig.parameters.values())
-if [p.name for p in ps] != ["uid", "db"] or ps[0].kind not in (ps[0].POSITIONAL_OR_KEYWORD, ps[0].POSITIONAL_ONLY) or ps[1].kind != ps[1].KEYWORD_ONLY:
-    print(f"fetch_user signature is {sig}"); sys.exit()
-if db.fetch_user(1, db=conn) != {"id": 1, "name": "Ada", "email": "ada@x.org"} or db.fetch_user(9, db=conn) is not None:
-    print("fetch_user returns the wrong thing"); sys.exit()
+V = {"has_get_user": hasattr(db, "get_user")}
 try:
-    db.fetch_user(conn, 1); print("fetch_user(conn, 1) should not be accepted"); sys.exit()
-except TypeError:
-    pass
-if db.get_user_by_name(conn, "Ben")["id"] != 2 or list(inspect.signature(db.get_user_by_name).parameters) != ["db", "name"]:
-    print("get_user_by_name changed"); sys.exit()
-checks = [
-    ("views.profile", lambda: views.profile(conn, 1) == "Ada <ada@x.org>"),
-    ("views.profiles", lambda: views.profiles(conn, [1, 2, 3]) == ["Ada <ada@x.org>", "Ben <>"]),
-    ("views.make_loader", lambda: views.make_loader(conn)(2)["name"] == "Ben"),
-    ("billing.invoice_owner", lambda: billing.invoice_owner(conn, {"user_id": 1}) == "Ada"),
-    ("billing.total_for", lambda: billing.total_for(conn, [{"user_id": 1, "cents": 5}, {"user_id": 7, "cents": 9}]) == 5),
-    ("notify.welcome", lambda: notify.welcome(conn, 1) == "Welcome, Ada!" and notify.welcome(conn, 8) == "Welcome!"),
-    ("notify.by_keyword", lambda: notify.by_keyword(conn, 2)["name"] == "Ben"),
-    ("registry user_loader", lambda: registry.load("user_loader")(1, db=conn)["email"] == "ada@x.org"),
-    ("registry name_loader", lambda: registry.load("name_loader")(conn, "Ada")["id"] == 1),
-    ("cli show", lambda: cli.main(["show", "1"], conn) == 0),
-    ("scripts/audit.py", lambda: runpy.run_path("scripts/audit.py")["audit"](conn, [1, 2, 3]) == [2, 3]),
+    V["sig"] = [[p.name, p.kind.name] for p in inspect.signature(db.fetch_user).parameters.values()]
+except Exception as e:
+    V["sig"] = repr(e)
+V["fetch1"] = call(lambda: db.fetch_user(1, db=conn))[:3]
+V["fetch9"] = call(lambda: db.fetch_user(9, db=conn))[:3]
+V["fetch_pos"] = call(lambda: db.fetch_user(conn, 1))
+V["by_name"] = call(lambda: db.get_user_by_name(conn, "Ben")["id"])[:3]
+V["by_name_sig"] = call(lambda: list(inspect.signature(db.get_user_by_name).parameters))[:3]
+V["checks"] = [
+    call(lambda: views.profile(conn, 1))[:3],
+    call(lambda: views.profiles(conn, [1, 2, 3]))[:3],
+    call(lambda: views.make_loader(conn)(2)["name"])[:3],
+    call(lambda: billing.invoice_owner(conn, {"user_id": 1}))[:3],
+    call(lambda: billing.total_for(conn, [{"user_id": 1, "cents": 5}, {"user_id": 7, "cents": 9}]))[:3],
+    call(lambda: [notify.welcome(conn, 1), notify.welcome(conn, 8)])[:3],
+    call(lambda: notify.by_keyword(conn, 2)["name"])[:3],
+    call(lambda: registry.load("user_loader")(1, db=conn)["email"])[:3],
+    call(lambda: registry.load("name_loader")(conn, "Ada")["id"])[:3],
+    call(lambda: cli.main(["show", "1"], conn))[:3],
+    call(lambda: runpy.run_path("scripts/audit.py")["audit"](conn, [1, 2, 3]))[:3],
 ]
-for name, fn in checks:
-    try:
-        ok = fn()
-    except Exception as e:
-        print(f"{name}: raised {type(e).__name__}: {e}"); sys.exit()
-    if not ok:
-        print(f"{name}: wrong result"); sys.exit()
-print("OK")
+emit(V)
 '''
+    CHECKS = [("views.profile", "Ada <ada@x.org>"), ("views.profiles", ["Ada <ada@x.org>", "Ben <>"]), ("views.make_loader", "Ben"),
+              ("billing.invoice_owner", "Ada"), ("billing.total_for", 5), ("notify.welcome", ["Welcome, Ada!", "Welcome!"]),
+              ("notify.by_keyword", "Ben"), ("registry user_loader", "ada@x.org"), ("registry name_loader", 1), ("cli show", 0),
+              ("scripts/audit.py", [2, 3])]
+
+    @staticmethod
+    def verdict(V: dict) -> tuple[bool, str]:
+        if V.get("has_get_user") is not False:
+            return False, "shop.db still has get_user"
+        sig = V.get("sig")
+        if not (isinstance(sig, list) and [p[0] for p in sig] == ["uid", "db"]
+                and sig[0][1] in ("POSITIONAL_OR_KEYWORD", "POSITIONAL_ONLY") and sig[1][1] == "KEYWORD_ONLY"):
+            return False, f"fetch_user signature is {sig}"
+        if V.get("fetch1") != ["ok", {"id": 1, "name": "Ada", "email": "ada@x.org"}] or V.get("fetch9") != ["ok", None]:
+            return False, "fetch_user returns the wrong thing"
+        fp = V.get("fetch_pos") or []
+        if not (fp[:1] == ["err"] and len(fp) >= 5 and fp[4]):
+            if fp[:1] == ["err"]:
+                return False, f"fetch_user(conn, 1) raised {fp[1]}, want TypeError"
+            return False, "fetch_user(conn, 1) should not be accepted"
+        if V.get("by_name") != ["ok", 2] or V.get("by_name_sig") != ["ok", ["db", "name"]]:
+            return False, "get_user_by_name changed"
+        got = V.get("checks") or []
+        if len(got) != len(RenameApi.CHECKS):
+            return False, "not every call site was run"
+        for (name, want), r in zip(RenameApi.CHECKS, got):
+            if r[:1] == ["err"]:
+                return False, f"{name}: raised {r[1]}: {r[2]}"[:240]
+            if r[1:2] != [want]:
+                return False, f"{name}: wrong result"
+        return True, "all checks"
 
     @staticmethod
     def grade(d: Path):
         tmp, w = scratch_copy(d)
         try:
-            if (d / "CHANGELOG.md").read_text() != SHOP_FILES["CHANGELOG.md"]:
+            cl = d / "CHANGELOG.md"
+            if not cl.is_file() or cl.read_text(errors="replace") != SHOP_FILES["CHANGELOG.md"]:
                 return False, "CHANGELOG.md was modified"
             for rel in sorted(all_files(w)):
                 if rel == "CHANGELOG.md" or not rel.endswith((".py", ".md", ".json", ".txt", ".toml", ".cfg", ".sh")):
@@ -2252,13 +2336,16 @@ print("OK")
                 txt = (w / rel).read_text(errors="replace")
                 if re.search(r"\bget_user\b", txt):
                     return False, f"{rel} still mentions get_user"
-            if "fetch_user" not in (w / "docs/API.md").read_text() or "fetch_user" not in (w / "README.md").read_text():
+            if "fetch_user" not in _text(w / "docs/API.md") or "fetch_user" not in _text(w / "README.md"):
                 return False, "docs do not mention fetch_user"
-            if '"fetch_user"' not in (w / "shop/plugins.json").read_text():
+            if '"fetch_user"' not in _text(w / "shop/plugins.json"):
                 return False, "shop/plugins.json does not name fetch_user"
-            if "get_user_by_name" not in (w / "shop/db.py").read_text():
+            if "get_user_by_name" not in _text(w / "shop/db.py"):
                 return False, "get_user_by_name is gone"
-            ok, why = py_check(w, RenameApi.HARNESS)
+            V, diag = py_values(w, RenameApi.HARNESS)
+            if not isinstance(V, dict):
+                return False, diag
+            ok, why = RenameApi.verdict(V)
             if not ok:
                 return False, why
             r = runb(["python3", "-m", "unittest", "discover", "-s", "tests", "-t", "."], cwd=w, timeout=60)
@@ -2550,91 +2637,100 @@ class LedgerBalance:
 
 
 # ================================================================ 22. async-pool-node
+# The hidden tests only OBSERVE: each one records what mapLimit did (results, start order, peak
+# concurrency, how the promise settled) and the record goes back as one JSON value on the values
+# channel. Every assertion is made in AsyncPoolNode.verdict, out of the worker's process: the old
+# harness printed "OK" last and a `process.on('exit')` hook in pool.js could print it too.
 POOL_TESTS = r'''
 "use strict";
-const assert = require("assert");
 let mapLimit;
-try { ({ mapLimit } = require("./pool.js")); } catch (e) { console.log("cannot load pool.js: " + e.message); process.exit(); }
-if (typeof mapLimit !== "function") { console.log("pool.js must export mapLimit"); process.exit(); }
+try { ({ mapLimit } = require("./pool.js")); } catch (e) { emit({ load: "cannot load pool.js: " + e.message }); }
+if (typeof mapLimit !== "function") emit({ load: "pool.js must export mapLimit" });
 let unhandled = 0;
 process.on("unhandledRejection", () => { unhandled++; });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const enc = (v) => (v === undefined ? { $undefined: true } : Array.isArray(v) ? v.map(enc) : v);
+// assert.rejects took a promise, or a thenable with then and catch; anything else failed the test.
+const isPromise = (p) => p instanceof Promise || (!!p && typeof p.then === "function" && typeof p.catch === "function");
+const settle = (p) => Promise.resolve(p).then(
+  (v) => ({ ok: true, value: enc(v), promise: isPromise(p) }),
+  (e) => ({ ok: false, str: String(e), range: e instanceof RangeError, type: e instanceof TypeError, promise: isPromise(p) }));
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
 
-test("results keep input order and index is passed", async () => {
+test("order", async () => {
   const items = [...Array(20).keys()];
-  const res = await mapLimit(items, 3, async (x, i) => { await sleep((x * 7) % 11); return x * 2 + i; });
-  assert.deepStrictEqual(res, items.map((x, i) => x * 2 + i));
+  return { res: enc(await mapLimit(items, 3, async (x, i) => { await sleep((x * 7) % 11); return x * 2 + i; })) };
 });
-test("never more than `limit` in flight, and uses all of them", async () => {
+test("limit", async () => {
   let running = 0, max = 0;
   await mapLimit([...Array(15).keys()], 4, async (x) => { running++; max = Math.max(max, running); await sleep(5 + (x % 3)); running--; });
-  assert.strictEqual(max, 4);
+  return { max };
 });
-test("limit larger than the item count", async () => {
+test("big_limit", async () => {
   let running = 0, max = 0;
   const res = await mapLimit([1, 2, 3], 10, async (x) => { running++; max = Math.max(max, running); await sleep(5); running--; return x; });
-  assert.deepStrictEqual(res, [1, 2, 3]); assert.strictEqual(max, 3);
+  return { res: enc(res), max };
 });
-test("empty input", async () => { assert.deepStrictEqual(await mapLimit([], 2, async () => 1), []); });
-test("plain (non-promise) return values and falsy results", async () => {
-  assert.deepStrictEqual(await mapLimit([1, 2, 3], 2, (x) => (x === 2 ? 0 : x)), [1, 0, 3]);
-  assert.deepStrictEqual(await mapLimit([1, 2], 1, (x) => (x === 1 ? undefined : null)), [undefined, null]);
-});
-test("a free slot is refilled at once (no batches)", async () => {
+test("empty", async () => ({ res: enc(await mapLimit([], 2, async () => 1)) }));
+test("plain", async () => ({
+  a: enc(await mapLimit([1, 2, 3], 2, (x) => (x === 2 ? 0 : x))),
+  b: enc(await mapLimit([1, 2], 1, (x) => (x === 1 ? undefined : null))),
+}));
+test("refill", async () => {
   const start = [];
   const t0 = Date.now();
   await mapLimit([80, 10, 10, 10], 2, async (ms, i) => { start[i] = Date.now() - t0; await sleep(ms); });
-  assert.ok(start[2] < 50, "item 2 started at " + start[2] + "ms, should be ~10ms");
-  assert.ok(start[3] < 60, "item 3 started at " + start[3] + "ms, should be ~20ms");
+  return { start: enc(start) };
 });
-test("limit 1 runs strictly one after another, in order", async () => {
+test("serial", async () => {
   const order = [];
   await mapLimit([3, 1, 2], 1, async (x) => { order.push("s" + x); await sleep(x); order.push("e" + x); });
-  assert.deepStrictEqual(order, ["s3", "e3", "s1", "e1", "s2", "e2"]);
+  return { order };
 });
-test("first rejection rejects the result; nothing new is started afterwards", async () => {
+test("first_rejection", async () => {
   const started = [];
   const p = mapLimit([0, 1, 2, 3, 4, 5], 2, async (i) => { started.push(i); if (i === 0) { await sleep(5); throw new Error("boom0"); } await sleep(30); return i; });
-  await assert.rejects(p, /boom0/);
+  const out = await settle(p);
   await sleep(100);
-  assert.deepStrictEqual(started, [0, 1]);
+  return { out, started: [...started] };
 });
-test("a synchronous throw becomes a rejection, not an exception", async () => {
-  let p;
+test("sync_throw", async () => {
+  let p, threw = null;
   try { p = mapLimit([0, 1, 2], 2, (i) => { if (i === 1) throw new TypeError("sync"); return sleep(5); }); }
-  catch (e) { assert.fail("mapLimit threw synchronously: " + e.message); }
-  await assert.rejects(p, TypeError);
+  catch (e) { threw = String(e && e.message); }
+  return { threw, out: threw === null ? await settle(p) : null };
 });
-test("later failures after the first do not become unhandled rejections", async () => {
+test("later_failures", async () => {
   const before = unhandled;
   const p = mapLimit([0, 1, 2], 3, async (i) => { await sleep(5 + i * 10); throw new Error("e" + i); });
-  await assert.rejects(p, /e0/);
+  const out = await settle(p);
   await sleep(80);
-  assert.strictEqual(unhandled, before, "unhandled rejections leaked");
+  return { out, leaked: unhandled - before };
 });
-test("invalid limits reject with RangeError and run nothing", async () => {
+test("bad_limits", async () => {
+  const outs = [];
   for (const bad of [0, -1, 1.5, NaN, "2", Infinity, undefined, null]) {
-    let called = 0, p;
-    try { p = mapLimit([1, 2], bad, async () => { called++; }); } catch (e) { assert.fail("threw synchronously for " + String(bad)); }
-    await assert.rejects(p, (e) => e instanceof RangeError, "limit " + String(bad));
-    assert.strictEqual(called, 0);
+    let called = 0, p, threw = null;
+    try { p = mapLimit([1, 2], bad, async () => { called++; }); } catch (e) { threw = String(e && e.message); }
+    const out = threw === null ? await settle(p) : null;
+    outs.push({ limit: String(bad), threw, out, called });
   }
+  return { outs };
 });
-test("many items, many rounds", async () => {
+test("many", async () => {
   const items = [...Array(500).keys()];
-  const res = await mapLimit(items, 7, async (x) => { if (x % 50 === 0) await sleep(1); return x * x; });
-  assert.deepStrictEqual(res, items.map((x) => x * x));
+  return { res: enc(await mapLimit(items, 7, async (x) => { if (x % 50 === 0) await sleep(1); return x * x; })) };
 });
 
 (async () => {
+  const V = { tests: {} };
   for (const [name, fn] of tests) {
-    try { await fn(); } catch (e) { console.log(name + ": " + String(e.message || e).split("\n")[0].slice(0, 160)); process.exit(); }
+    try { V.tests[name] = await fn(); } catch (e) { V.tests[name] = { error: String((e && e.message) || e).split("\n")[0].slice(0, 160) }; }
   }
   await sleep(20);
-  if (unhandled) { console.log("unhandled rejections: " + unhandled); process.exit(); }
-  console.log("OK");
+  V.unhandled = unhandled;
+  emit(V);
 })();
 '''
 
@@ -2663,18 +2759,65 @@ class AsyncPoolNode:
             return False, "no pool.js"
         tmp, w = scratch_copy(d)
         try:
-            (w / "pool_test_hidden.js").write_text(POOL_TESTS.replace('require("./pool.js")', 'require("./pool.js")'))
-            try:
-                r = runb(["node", "pool_test_hidden.js"], cwd=w, timeout=60)
-            except subprocess.TimeoutExpired:
-                return False, "tests hung"
-            out = (r.stdout.decode().strip().splitlines() or [""])[-1]
-            if out == "OK" and r.returncode == 0:
-                return True, "all pool tests"
-            return False, (out or r.stderr.decode()[-200:] or f"exit {r.returncode}")[:240]
+            (w / "pool_test_hidden.js").write_text(JS_EMIT + POOL_TESTS)
+            V, diag = child_values(["node", "pool_test_hidden.js"], w, timeout=60)
+            if V is None:
+                return False, ("tests hung" if diag.startswith("timed out") else diag)[:240]
+            return AsyncPoolNode.verdict(V)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+
+def _pool_verdict(V) -> tuple[bool, str]:
+    """The hidden pool tests' assertions, on what the tests observed (POOL_TESTS)."""
+    if not isinstance(V, dict):
+        return False, "no observations"
+    if V.get("load"):
+        return False, str(V["load"])[:240]
+    T = V.get("tests") or {}
+    U = {"$undefined": True}
+
+    def rej(o, pattern=None, flag=None):
+        return (isinstance(o, dict) and o.get("ok") is False and o.get("promise") is True
+                and (pattern is None or re.search(pattern, str(o.get("str", ""))) is not None)
+                and (flag is None or o.get(flag) is True))
+
+    checks = [
+        ("results keep input order and index is passed", lambda t: t["res"] == [x * 2 + i for i, x in enumerate(range(20))]),
+        ("never more than `limit` in flight, and uses all of them", lambda t: t["max"] == 4),
+        ("limit larger than the item count", lambda t: t["res"] == [1, 2, 3] and t["max"] == 3),
+        ("empty input", lambda t: t["res"] == []),
+        ("plain (non-promise) return values and falsy results", lambda t: t["a"] == [1, 0, 3] and t["b"] == [U, None]),
+        ("a free slot is refilled at once (no batches)", lambda t: isinstance(t["start"][2], (int, float)) and t["start"][2] < 50
+         and isinstance(t["start"][3], (int, float)) and t["start"][3] < 60),
+        ("limit 1 runs strictly one after another, in order", lambda t: t["order"] == ["s3", "e3", "s1", "e1", "s2", "e2"]),
+        ("first rejection rejects the result; nothing new is started afterwards", lambda t: rej(t["out"], "boom0") and t["started"] == [0, 1]),
+        ("a synchronous throw becomes a rejection, not an exception", lambda t: t["threw"] is None and rej(t["out"], flag="type")),
+        ("later failures after the first do not become unhandled rejections", lambda t: rej(t["out"], "e0") and t["leaked"] == 0),
+        ("invalid limits reject with RangeError and run nothing", lambda t: len(t["outs"]) == 8
+         and all(o["threw"] is None and rej(o["out"], flag="range") and o["called"] == 0 for o in t["outs"])),
+        ("many items, many rounds", lambda t: t["res"] == [x * x for x in range(500)]),
+    ]
+    keys = ["order", "limit", "big_limit", "empty", "plain", "refill", "serial", "first_rejection", "sync_throw", "later_failures",
+            "bad_limits", "many"]
+    for key, (name, ok) in zip(keys, checks):
+        t = T.get(key)
+        if not isinstance(t, dict):
+            return False, f"{name}: not run"
+        if "error" in t:
+            return False, f"{name}: {t['error']}"[:240]
+        try:
+            good = ok(t)
+        except (KeyError, IndexError, TypeError):
+            good = False
+        if not good:
+            return False, f"{name}: {json.dumps(t)[:160]}"
+    if V.get("unhandled"):
+        return False, f"unhandled rejections: {V['unhandled']}"
+    return True, "all pool tests"
+
+
+AsyncPoolNode.verdict = staticmethod(_pool_verdict)
 
 TASKS3 = [DedupeContacts, MoneySplit, FixDailyBuckets, SemverSort, JsonDiff, RefactorInvoice, SqlGaps, GitSplitHistory,
           GitFindCulprit, BackupScript, MakeIncremental, CsvToJsonNode, IniToJson, PerfAsofJoin, SlugifyBatch, TextWrap,

@@ -63,7 +63,7 @@ export type ReceiptRecord = {
    */
   ask?: boolean;
   /** Set when the model was stopped and the tree judged as it stood. */
-  endedBy?: "deadline" | "provider";
+  endedBy?: "deadline" | "provider" | "no-progress";
   /** True when the cost rests on molt's own token estimate anywhere in the session. */
   costEstimated?: boolean;
   /**
@@ -390,7 +390,7 @@ export class Receipts {
     /** True for a question: the bar ran advisory and could not refuse. */
     ask?: boolean;
     /** The model was stopped (clock, provider) and the tree was judged as it stood. */
-    endedBy?: "deadline" | "provider";
+    endedBy?: "deadline" | "provider" | "no-progress";
     /**
      * Every file the turn changed, with the hashes that prove it — and which
      * lines it wrote, so the receipt can show the work rather than describe it.
@@ -551,7 +551,9 @@ export class Receipts {
         ? [
             args.endedBy === "deadline"
               ? "The turn's time budget ran out before the model said it was done; the sealed checks ran on the tree as it stood."
-              : "The provider failed after work had been done; the sealed checks ran on the tree as it stood.",
+              : args.endedBy === "no-progress"
+                ? "ended: no progress — the model kept calling tools without changing any file in the project, past a nudge to finish or stop; the sealed checks ran on the tree as it stood."
+                : "The provider failed after work had been done; the sealed checks ran on the tree as it stood.",
             "",
           ]
         : []),

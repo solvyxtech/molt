@@ -61,6 +61,21 @@
 - **`opencode://zen`** is the OpenCode endpoint (short name `opencode`). The old
   `opencode://subscription` still works for this release, with a deprecation
   notice.
+- **Unattended runs stop when they stop advancing** (`MAAT_NO_PROGRESS_CALLS`,
+  default 30, `0` turns it off; on for every unattended run on an HTTP
+  backend, not on ACP backends yet). A call advances when it changes a file
+  in the project, reads something not read before, runs a command not run
+  before, or gets output from a command that differs from every earlier run
+  of it (timings aside), wherever the work happens: a build into `dist/`, a
+  venv, a config under `/etc`. After N calls in a row that advance nothing the
+  model is told once to finish or stop; after N more the turn ends, the work
+  on disk is judged, and the receipt says `ended: no progress` (never
+  verified: the model did not say it was done).
+- **While an unattended job with hidden checks runs, the file tools stay in
+  the task.** `read_file`, `list_dir`, `grep` and `inspect` refuse paths
+  outside the project and under `.maat/` (except spilled output and
+  background logs, and paths the task names). bash is not blocked; this is a
+  budget control, not isolation.
 
 ## 0.2.2 — subscription backends removed
 

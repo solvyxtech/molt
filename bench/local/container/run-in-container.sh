@@ -4,9 +4,10 @@
 # Make the tarball with: npm run pack:cli && npm pack ./out-cli
 # The image is maat-bench:<sha8 of the tarball>, built once and reused, so every run
 # records exactly which Maat it tested. Env passed through: REFERENCE BENCH_MODEL
-# BENCH_URL BENCH_LIMIT RESULTS (file name). Results land in
-# ~/.cache/maat-bench/container-results/; each task's folder and Maat's log are kept
-# in ~/.cache/maat-bench/container-work/<name>/ (the only host path it can write).
+# BENCH_URL BENCH_LIMIT RESULTS (file name; run.py refuses a file holding another lane's rows). Results land in
+# ~/.cache/maat-bench/container-results/; each task's folder and Maat's log are copied,
+# once the task is graded, to ~/.cache/maat-bench/container-work/<name>/ (the only host
+# path it can write; the agent never sees it, see "Task isolation" below).
 # SUBSCRIPTION=grok: use the owner's Grok Build login (BENCH_URL=grok-build://subscription
 # BENCH_MODEL=grok-4.7). Image is maat-bench-grok:<sha> (Dockerfile.grok: official grok
 # installer, linux, pinned). ~/.grok/auth.json is mounted read-only OUTSIDE the container's
@@ -25,7 +26,7 @@
 # worker's tools run as `agent` (--worker-user agent); task checks run as `checker`
 # (--check-user checker), which can read the reference check and `agent` cannot. Maat's records sit in /var/lib/maat (700,
 # root) until each job ends; the judge's logins are in /root (700); finished task folders and
-# logs in /work are locked to root. BENCH_PIDNS=1 (default) also gives the container
+# logs are exported under /root (see "Task isolation" below). BENCH_PIDNS=1 (default) also gives the container
 # CAP_SYS_ADMIN so Maat can put the worker's commands in their own PID namespace with a private
 # /proc (the worker then sees none of Maat's processes; it gets no capability itself).
 # BENCH_PIDNS=0: no extra capability, and the worker can read the process list.
@@ -68,15 +69,28 @@ url=${url//127.0.0.1/host.docker.internal}; url=${url//localhost/host.docker.int
 # run ends: on the command line (-e KEY=...) it showed in every `ps` listing.
 envf=$(mktemp); chmod 600 "$envf"; trap 'rm -f "$envf"' EXIT
 printf 'OPENROUTER_API_KEY=%s\n' "$key" > "$envf"
+# Anthropic API lanes (BENCH_URL=https://api.anthropic.com/v1): the key comes from the
+# Keychain item maat-bench-anthropic (paste it with container/set-anthropic-key.sh),
+# never from the command line.
+if [[ "$url" == *api.anthropic.com* || "${ARMS:-}" == *api.anthropic.com* ]]; then
+  akey=$(security find-generic-password -s maat-bench-anthropic -w 2>/dev/null) || { echo "no Keychain item maat-bench-anthropic: run bench/local/container/set-anthropic-key.sh" >&2; exit 1; }
+  printf 'ANTHROPIC_API_KEY=%s\n' "$akey" >> "$envf"
+fi
 # The graders and reference solutions are mounted where only root can reach (/root is 700),
 # copied to a root-only /opt/bench, and run.py runs from there as root; it runs the agent
 # as the unprivileged `agent` user (BENCH_AGENT_USER) and grades as root afterwards.
-# Tasks run in a container-local /var/lib/bench-work (711: the worker reaches its own task folder
-# by name but cannot list the others) and are copied to /work when run.py ends. /work is a host
-# bind mount, where chown is ignored and modes are not enforced, so nothing locked there would
-# stay locked from a later task's worker.
+#
+# Task isolation, in every mode (plain, SUBSCRIPTION=grok, OPENCODE=1). A host bind mount
+# ignores chown and does not enforce modes for other users (OrbStack, Docker Desktop), so the
+# agent can read anything mounted where it can reach it: on 2026-10-07 a worker spent its whole
+# budget reading the other tasks' folders and logs in a shared /work. So nothing from the host
+# is mounted where the agent can reach it. The work folder and the results are mounted under
+# /root (700, container-local, enforced). Each task runs in a private folder under the
+# container-local /var/lib/bench-work (711, random per-task parent, removed after the task);
+# Maat's logs are written to a root-only folder there; folder and logs are copied to the export
+# only once the task is graded and every process of the agent user is gone (run.py finish_task).
 privsep=${BENCH_PRIVSEP:-1}
-credmount=; startcmd='export MOLT_DIST_ABS=$(npm root -g)/@solvyx/molt/dist BENCH_WORK=/var/lib/bench-work BENCH_EXPORT=/work; mkdir -p /work $BENCH_WORK && chmod 711 $BENCH_WORK && rm -rf /opt/bench && cp -a /root/bench-src /opt/bench && chmod -R go-rwx /opt/bench && cd /opt/bench && python3 run.py "$@"'
+credmount=; startcmd='export MOLT_DIST_ABS=$(npm root -g)/@solvyx/molt/dist BENCH_WORK=/var/lib/bench-work BENCH_EXPORT=/root/bench-export RESULTS_DIR=/root/bench-results; chmod 700 /root && mkdir -p $BENCH_WORK && chmod 711 $BENCH_WORK && rm -rf /opt/bench && cp -a /root/bench-src /opt/bench && chmod -R go-rwx /opt/bench && cd /opt/bench && python3 run.py "$@"'
 if [ "$SUBSCRIPTION" = grok ]; then
   credmount="-v $HOME/.grok/auth.json:/root/grok-cred/auth.json:ro"
   # The worker's grok runs as `agent`, so its credential copy lives in ITS home, owned by it,
@@ -105,9 +119,12 @@ fi
 caps=
 [ "$privsep" = 0 ] || [ "${BENCH_PIDNS:-1}" = 0 ] || caps=--cap-add=SYS_ADMIN
 echo "maat $img → $out/${RESULTS:-results.jsonl}"
-docker run --rm --name "maat-bench-$name" ${=caps} \
-  -v "$local_dir":/root/bench-src:ro -v "$out":/results -v "$work":/work ${=credmount} \
+# Pinned CPU and memory (BENCH_CPUS, BENCH_MEMORY): perf graders have wall-clock limits, and lanes
+# often run side by side on the Mac. Recorded in every row's lane.
+cpus=${BENCH_CPUS:-2}; mem=${BENCH_MEMORY:-4g}
+docker run --rm --name "maat-bench-$name" --cpus "$cpus" --memory "$mem" ${=caps} \
+  -v "$local_dir":/root/bench-src:ro -v "$out":/root/bench-results -v "$work":/root/bench-export ${=credmount} \
   --env-file "$envf" -e REFERENCE="${REFERENCE:-0}" -e BENCH_MODEL="${BENCH_MODEL:-}" \
   -e ARMS="${ARMS:-}" -e BENCH_TASKS="${BENCH_TASKS:-}" -e BENCH_URL="$url" -e BENCH_LIMIT="${BENCH_LIMIT:-600}" -e BENCH_REASONING="${BENCH_REASONING:-}" -e BENCH_GATE="${BENCH_GATE:-}" -e RESULTS="${RESULTS:-results.jsonl}" \
-  -e MAAT_BUILD="$sha" -e PYTHONDONTWRITEBYTECODE=1 -e BENCH_PRIVSEP="$privsep" \
+  -e MAAT_BUILD="$sha" -e PYTHONDONTWRITEBYTECODE=1 -e BENCH_CPUS="$cpus" -e BENCH_MEMORY="$mem" -e BENCH_PRIVSEP="$privsep" \
   "$img" sh -c "$startcmd" run "$@"

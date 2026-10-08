@@ -20,4 +20,6 @@ ENV BENCH_AGENT_USER=agent BENCH_CHECK_USER=checker
 WORKDIR /opt
 # Maat itself is installed per build by run-in-container.sh (FROM maat-bench + npm i -g the packed tarball).
 
-ENV BENCH_WORK=/work RESULTS_DIR=/results
+# run-in-container.sh overrides these: tasks run in a container-local /var/lib/bench-work and the
+# host folders are mounted under /root, where the agent user cannot reach them.
+ENV BENCH_WORK=/var/lib/bench-work BENCH_EXPORT=/root/bench-export RESULTS_DIR=/root/bench-results
