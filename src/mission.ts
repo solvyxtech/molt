@@ -456,6 +456,7 @@ export async function runAssertions(
         timeoutMs: a.timeoutMs ?? DEFAULT_ASSERTION_TIMEOUT_MS,
         maxBuffer: 256 * 1024,
         signal,
+        hideCommand: true,
       });
       const d = diagnoseFailure(r.code ?? 0, r.stdout, r.stderr);
       out.push({

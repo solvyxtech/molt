@@ -1006,7 +1006,7 @@ async function mutationCheck(
     };
   }
   if (!prior) {
-    const baseline = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal });
+    const baseline = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal, hideCommand: true });
     if (baseline.code !== 0) {
       return {
         ok: false,
@@ -1039,6 +1039,7 @@ async function mutationCheck(
         cwd: ctx.cwd,
         timeoutMs,
         signal: ctx.signal,
+        hideCommand: true,
       });
       // A mutation the command still passes is a line nothing checks — unless
       // it was a boundary nudge and negating the same condition is caught.
@@ -1052,7 +1053,7 @@ async function mutationCheck(
         let negKilled = false;
         if (neg && negText !== null && negText !== file.text) {
           writeFileSync(file.abs, negText, "utf8");
-          const rn = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal });
+          const rn = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal, hideCommand: true });
           negKilled = rn.code !== 0;
         }
         if (negKilled) boundaryOnly.push(`${m.path}:${m.line} (${m.operator}) — ${m.before.trim()}`);
@@ -2193,6 +2194,9 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
     const r = await runCommand(check.run, {
       cwd: copy?.dir ?? ctx.cwd,
       shell: draftedShell(check),
+      // Never in argv: a hidden check's text there is readable by every
+      // process of this user, the deliverable it runs included (src/run.ts).
+      hideCommand: true,
       timeoutMs: check.timeoutMs,
       maxBuffer: 8 * 1024 * 1024,
       signal: ctx.signal,

@@ -318,6 +318,9 @@ export async function preflightCriteria(
         cwd: copy?.dir ?? opts.cwd,
         // Drafted checks (stray set) run under the shell the bar will use.
         shell: draftedShell({ hidden: !!opts.stray, tags: ["task"] }),
+        // A trial run of a check still being drafted runs while the worker
+        // works: its text stays out of argv (src/run.ts).
+        hideCommand: true,
         timeoutMs: opts.timeoutMs ?? 5_000,
         maxBuffer: 1024 * 1024,
         signal: opts.signal,
