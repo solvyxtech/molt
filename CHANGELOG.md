@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added
+
+- **Lean-budget guards.** `test/lean-budget.test.ts` runs seven scripted
+  scenarios (small task, 400 KB read, repeated re-reads, a long session that
+  sheds, malformed calls with huge arguments on the tool and `act` paths, a
+  command printing 1 MB) with hard ceilings on the largest request, the total
+  request characters and the steps of the turn; the build before the malformed
+  excerpt fix fails it by 20-60x. `bench/local/run.py` stops the lane with a
+  `STOPPED` row (`reason: "cost alarm"`) and exit code 3 when one run costs
+  more than max(5x the lane's running median, $0.10) or sends more than 1.5M
+  prompt tokens (`BENCH_COST_ALARM_X`, `BENCH_COST_ALARM_USD`,
+  `BENCH_TOKEN_ALARM`). See `docs/lean.md`.
+
 ### Changed
 
 - **OpenCode runs OpenCode Zen models only.** The OpenCode backend (worker and
