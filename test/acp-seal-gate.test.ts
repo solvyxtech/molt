@@ -20,7 +20,7 @@ import { allowAll, drain, workspace } from "./helpers.js";
 
 const GROK = ACP_AGENTS.find((a) => a.name === "grok-build")!;
 
-const mk = (name: string, run: string): Check => ({ name, kind: "command", run, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true });
+const mk = (name: string, run: string): Check => ({ name, kind: "command", run, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true });
 
 describe("seal gate on a subprocess backend", () => {
   it("holds the first write until the checks are sealed, but lets reads through", async () => {

@@ -197,7 +197,7 @@ describe("a check that prints a boolean, at the bar", () => {
   // work (no out.csv), so the pre-work try counted it as failing there; after
   // WRONG work it printed False and exited 0, and the run read "verified".
   const run = `python3 -c "import csv; print(list(csv.reader(open('out.csv'))) == [['a'],['b']])"`;
-  const check = { name: "rows", kind: "command", run, timeoutMs: 10_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: { kind: "judge", model: "judge-j" } } as Check;
+  const check = { name: "rows", kind: "command", run, timeoutMs: 10_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true, author: { kind: "judge", model: "judge-j" } } as Check;
   async function turn(csv: string) {
     const ws = workspace();
     try {

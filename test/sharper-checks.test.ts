@@ -67,7 +67,7 @@ describe("a disputed check, in a turn", () => {
   // An arbiter other than the worker: a same-model arbiter is skipped.
   const ARBITER = { model: "arbiter" };
   const checks: Check[] = [
-    { name: "made", kind: "command", run: "head -c 5 out.txt | grep -qx hello", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: { kind: "judge", model: "judge-j" } },
+    { name: "made", kind: "command", run: "head -c 5 out.txt | grep -qx hello", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true, author: { kind: "judge", model: "judge-j" } },
     { name: "too-strict", kind: "command", run: "grep -q 366 out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true, author: { kind: "judge", model: "judge-j" } },
   ];
 
@@ -601,7 +601,7 @@ describe("a drafted check that fails in its own code", () => {
     const ws = workspace();
     try {
       const checks: Check[] = [
-        { name: "made", kind: "command", run: "head -c 5 out.txt | grep -qx hello", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: { kind: "judge", model: "judge-j" } },
+        { name: "made", kind: "command", run: "head -c 5 out.txt | grep -qx hello", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true, author: { kind: "judge", model: "judge-j" } },
         // Fails on the missing file before the work, so preflight keeps it; its own bug shows only after.
         { name: "broken-after", kind: "command", run: "test -f out.txt && python3 -c \"print(f'x {1')\"", timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true },
       ];

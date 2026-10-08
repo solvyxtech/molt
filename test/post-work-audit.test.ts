@@ -139,7 +139,7 @@ describe("the gates", () => {
   it("a check that passes on every mutant is rejected", async () => {
     const mutants = await planAuditMutants([{ path: "sum.js", text: SUM_JS }]);
     const g = await auditGates(
-      { name: "exists", run: `test -f sum.js && [ "$(echo 7)" = "7" ]`, quote: "For input.txt the total is 7." },
+      { name: "exists", run: `[ "$(test -f sum.js && echo yes)" = "yes" ]`, quote: "For input.txt the total is 7." },
       { workDir: t.work, preWorkDir: t.pre, mutants },
     );
     assert.equal(g.accepted, false);
@@ -161,7 +161,8 @@ describe("the gates", () => {
   it("a check that passes before the work, cannot fail, writes, or asserts nothing is rejected before the mutants", async () => {
     const ctx = { workDir: t.work, preWorkDir: t.pre, mutants: [] };
     const q = "For input.txt the total is 7.";
-    assert.equal((await auditGates({ name: "a", run: `[ "$(cat input.txt | wc -l | tr -d ' ')" = "3" ]`, quote: q }, ctx)).rule, "P1-passes-before-work");
+    assert.equal((await auditGates({ name: "a", run: `[ "$(head -1 input.txt)" = "3" ]`, quote: q }, ctx)).rule, "P1-passes-before-work");
+    assert.equal((await auditGates({ name: "a2", run: `[ "$(cat input.txt | wc -l | tr -d ' ')" = "3" ]`, quote: q }, ctx)).rule, "V-property-only", "a count is a property");
     assert.equal((await auditGates({ name: "b", run: `[ "$(node sum.js input.txt)" = "7" ] || echo fail`, quote: q }, ctx)).rule, "L16-cannot-fail");
     assert.equal((await auditGates({ name: "c", run: `node sum.js input.txt > out.txt && grep -qx 7 out.txt`, quote: q }, ctx)).rule, "L15-mutates");
     assert.equal((await auditGates({ name: "d", run: `node sum.js input.txt`, quote: q }, ctx)).rule, "V-no-value");
@@ -175,7 +176,7 @@ describe("the audit in a turn", () => {
     { text: `Done. The total is 7 and the note says ${SECRET}.` },
   ];
   // The worker's own check: it passes, and earns "passed own checks", not "verified".
-  const own: Check = { name: "runs", kind: "command", run: `[ "$(node sum.js input.txt)" = "7" ]`, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: { kind: "worker", model: "m" } } as Check;
+  const own: Check = { name: "runs", kind: "command", run: `[ "$(node sum.js input.txt)" = "7" ]`, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true, author: { kind: "worker", model: "m" } } as Check;
   const JUDGE_REPLY = JSON.stringify({
     checks: [
       { name: "total", run: `[ "$(node sum.js input.txt)" = "7" ]`, quote: "For input.txt the total is 7." },

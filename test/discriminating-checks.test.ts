@@ -30,7 +30,7 @@ import type { Check, CheckAuthor } from "../src/types.js";
 import { allowAll, drain, scriptedProvider, workspace, type ScriptedTurn } from "./helpers.js";
 
 const JUDGE: CheckAuthor = { kind: "judge", model: "qwen3-coder-30b-a3b" };
-const value = (name: string) => ({ name, ok: true, hidden: true as const, tags: ["task", "value"] });
+const value = (name: string) => ({ name, ok: true, hidden: true as const, tags: ["task", "value", "exact"] });
 
 describe("tierOf: a check that did not fail before the work cannot earn verified", () => {
   const names = ["task:server-starts-and-listens", "task:get-all-items", "task:post-new-item"];
@@ -103,7 +103,7 @@ describe("the rule in a turn", () => {
     { text: "Done." },
   ];
   const check = (name: string, run: string): Check =>
-    ({ name, kind: "command", run, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: JUDGE }) as Check;
+    ({ name, kind: "command", run, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true, author: JUDGE }) as Check;
 
   async function turn(checks: Check[], notes: string[] = [], requireDiscriminating = true) {
     const ws = workspace();
@@ -212,7 +212,7 @@ describe("parseArgs --require-discriminating", () => {
 describe("late checks and the copy taken before the work", () => {
   const later = <T>(v: T, ms: number) => new Promise<T>((r) => setTimeout(() => r(v), ms));
   const nothing = async () => ({ taskChecks: [] as Check[], taskNotes: [] as string[] });
-  const mk = (name: string, run: string): Check => ({ name, kind: "command", run, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: JUDGE }) as Check;
+  const mk = (name: string, run: string): Check => ({ name, kind: "command", run, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true, author: JUDGE }) as Check;
 
   const TASK = "Write out.txt containing exactly the word hello.";
   async function lateTurn(dir: string, calls: { name: string; args: Record<string, unknown> }[], checks: Check[]) {

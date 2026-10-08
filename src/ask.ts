@@ -116,7 +116,10 @@ async function askSized(opts: AskOptions): Promise<Asked> {
   // never started the answer. Once, with room: a model that empties a four
   // times larger ceiling the same way is not going to answer, and the second
   // failure says exactly that instead of "the reply was empty".
-  if (first.ok && first.cutOff && first.text.trim() === "" && (leftMs(opts.deadlineAt) ?? 1) > 0) {
+  // Cut off with text written is retried the same way: a draft of exact,
+  // edge-case checks is longer than the ceiling allowed for, and half a JSON
+  // reply proposes nothing (2026-10-07: 3 of 20 runs drafted no checks).
+  if (first.ok && first.cutOff && (leftMs(opts.deadlineAt) ?? 1) > 0) {
     const bigger = (opts.maxTokens ?? ASK_MAX_TOKENS) * ASK_RETRY_FACTOR;
     const second = await askOnce(opts, bigger);
     if (second.ok && second.cutOff && second.text.trim() === "") {

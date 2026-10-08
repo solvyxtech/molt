@@ -41,13 +41,17 @@ import { parseLenient } from "./lenient-json.js";
 import { interfaceView, isCode, type Changed } from "./interface-view.js";
 import { bashPath, runCommand } from "./run.js";
 import { copyTree } from "./scratch.js";
-import { assertsValue } from "./tiers.js";
+import { assertsExact, assertsValue, exactRuleOn } from "./tiers.js";
 
 export const AUDIT_MAX_CHECKS = 4;
 export const AUDIT_MIN_QUOTE = 8;
 export const AUDIT_MAX_MUTANTS = 5;
 export const AUDIT_CHECK_TIMEOUT_MS = 10_000;
 
+/**
+ * The auditor's instructions without the exact-value rule (#46), the default:
+ * checks compare what the work produces with an expected value from the task.
+ */
 export const AUDIT_SYSTEM = [
   "You audit finished work on one coding task. You did not do the work and you will not see what",
   "it printed or wrote. You get the task text and the INTERFACE of the finished work: which files",
@@ -79,7 +83,55 @@ export const AUDIT_SYSTEM = [
   '{"checks":[{"name":"kebab-name","run":"shell command","quote":"verbatim task words"}]}',
 ].join("\n");
 
-export type AuditCheck = { name: string; run: string; quote: string };
+/**
+ * With the exact-value rule (MAAT_REQUIRE_EXACT=1): every requirement gets an
+ * exact check, derived values say how in `expect`, and the audit drops a
+ * property-only check (V-property-only).
+ */
+export const AUDIT_SYSTEM_EXACT = [
+  "You audit finished work on one coding task. You did not do the work and you will not see what",
+  "it printed or wrote. You get the task text and the INTERFACE of the finished work: which files",
+  "it added or changed, their signatures, how to run them, and the project listing.",
+  "",
+  "Write 2 to 4 shell checks. Each runs the deliverable (a script, a function, a query) on an input",
+  "and compares what it produces with the EXACT expected output, exiting non-zero on a mismatch:",
+  "equality with a literal, a diff against a heredoc, or grep -x of a whole expected line. A count,",
+  "an order, a format, a prefix or two runs agreeing is a property wrong output also has: such a",
+  "check is dropped. Each requirement the task states gets at least one exact check. Almost",
+  "every task states something checkable: an output for a given input, a format, a count, a rule",
+  "(\"blank lines are ignored\", \"sorted by total, highest first\"), a file it must write.",
+  "Return an empty list only when the task states nothing a command could test.",
+  "",
+  "The expected value must come from the task text: either stated outright, or the result of",
+  "applying a rule the task states to a small input your check builds itself (write it under",
+  "$(mktemp -d)). Pick inputs at the edges: a boundary, empty input, a value just outside a rule",
+  "(1.2.3.4.5 for an IP rule), a start that is not on a step, and each side of an either/or rule.",
+  "For each check give `quote`: the task words that state that value or rule,",
+  "copied character for character from the task text (a short span is best, 5 to 20 words).",
+  "A quote that is not word for word in the task, even a close paraphrase, drops the check. Never",
+  "use a value you would only know by running the work or by guessing. When the value is derived,",
+  "give the steps in `expect` (\"*/15 from 00:07: 00:15, 00:30, 00:45\").",
+  "",
+  "Rules: one line each, under 500 characters, run under bash from the project root on a",
+  "throwaway copy. A check that only prints is useless: end every check in a comparison, e.g.",
+  "  [ \"$(python3 tool.py 3 4)\" = \"7\" ]",
+  "  python3 -c \"import json; d=json.load(open('out.json')); assert d['total'] == 12, d\"",
+  "  python3 tool.py 'x y' | diff - <(printf 'x-y\\n')",
+  "A wrong result must make the check exit non-zero: no `|| true`, no `|| echo`, no",
+  "printing PASS/FAIL with exit 0. Do not write into the project; scratch files go under",
+  "$(mktemp -d). Use the file names, flags and signatures shown; do not invent others.",
+  "",
+  "Reply with JSON only:",
+  '{"checks":[{"name":"kebab-name","run":"shell command","quote":"verbatim task words","expect":"how the expected output follows"}]}',
+].join("\n");
+
+/** The auditor's instructions as the exact-value rule is set (tiers.ts exactRuleOn). */
+export function auditSystem(exact = exactRuleOn()): string {
+  return exact ? AUDIT_SYSTEM_EXACT : AUDIT_SYSTEM;
+}
+
+/** `expect`: how the expected output follows from the quote, when it is derived rather than stated. */
+export type AuditCheck = { name: string; run: string; quote: string; expect?: string };
 export type AuditDrop = { name: string; run: string; why: string };
 
 /** The judge's reply as checks, with every ungrounded or malformed one dropped and said. */
@@ -116,6 +168,7 @@ export function parseAuditChecks(reply: string, task: string): { kept: AuditChec
     let name = String(o.name ?? "").trim().replace(/\s+/g, "-").slice(0, CRITERIA_MAX_NAME) || `audit-${kept.length + dropped.length + 1}`;
     const run = String(o.run ?? "").trim();
     const quote = String(o.quote ?? "").trim();
+    const expect = typeof o.expect === "string" ? o.expect.trim().slice(0, 300) : "";
     while (seen.has(name)) name = `${name}-2`;
     seen.add(name);
     if (!run) dropped.push({ name, run, why: "no command" });
@@ -124,7 +177,7 @@ export function parseAuditChecks(reply: string, task: string): { kept: AuditChec
     else if (quote.replace(/\s+/g, " ").length < AUDIT_MIN_QUOTE || !quotedIn(quote, task))
       dropped.push({ name, run, why: `its quote is not in the task text: "${quote.slice(0, 80)}"` });
     else if (kept.length >= AUDIT_MAX_CHECKS) dropped.push({ name, run, why: `over ${AUDIT_MAX_CHECKS} checks` });
-    else kept.push({ name, run, quote });
+    else kept.push({ name, run, quote, ...(expect ? { expect } : {}) });
   }
   return { kept, dropped };
 }
@@ -503,7 +556,7 @@ export type GateResult = {
 /** Gates (d), (a), (b), (c), in that order: cheapest first, and each run only if the last was cleared. */
 export async function auditGates(
   c: AuditCheck,
-  ctx: { workDir: string; preWorkDir: string; mutants: readonly Mutant[]; timeoutMs?: number; signal?: AbortSignal; preWorkIntact?: () => Promise<boolean> },
+  ctx: { workDir: string; preWorkDir: string; mutants: readonly Mutant[]; timeoutMs?: number; signal?: AbortSignal; preWorkIntact?: () => Promise<boolean>; requireExact?: boolean },
 ): Promise<GateResult> {
   const base = { name: c.name, run: c.run, quote: c.quote };
   const no = (rule: string, why: string, extra: Partial<GateResult> = {}): GateResult => ({ ...base, accepted: false, rule, why, ...extra });
@@ -512,6 +565,7 @@ export async function auditGates(
   const never = cannotFail(c.run);
   if (never) return no("L16-cannot-fail", never);
   if (!assertsValue(c.run)) return no("V-no-value", "it does not assert an expected value");
+  if ((ctx.requireExact ?? exactRuleOn()) && !assertsExact(c.run)) return no("V-property-only", "it tests a property of the output (a count, an order, a format, membership, two runs agreeing), not an exact expected value");
   const work = await runOnCopy(ctx.workDir, c.run, { timeoutMs: ctx.timeoutMs, signal: ctx.signal });
   if (work.printedFail) return no("L16-printed-fail", "it printed FAIL and still exited 0 on the work", { work: work.status });
   if (work.status !== "pass") return no("A-fails-on-work", `it does not pass on the work (${work.status}): ${work.output.split("\n").slice(-1)[0]?.slice(0, 160) ?? ""}`, { work: work.status });
@@ -595,7 +649,7 @@ export async function postWorkAudit(opts: {
     for (let i = 0; i < 2 && !parsed; i++) {
       const asked = await askModel({
         ...opts.judge,
-        system: AUDIT_SYSTEM,
+        system: auditSystem(),
         prompt: i === 0 ? prompt : `${prompt}\n\nYour last reply could not be parsed as JSON. Reply with the JSON object only.`,
         cwd: askDir,
         what: "drafting post-work audit checks",

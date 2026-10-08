@@ -37,7 +37,7 @@ import { absolutePathArgs } from "./shellwords.js";
 import { diagnoseFailure } from "./bar.js";
 import { reportsFailure } from "./evidence.js";
 import { normalizeRequirements } from "./signout.js";
-import { evidenceTags } from "./tiers.js";
+import { evidenceTags, exactRuleOn } from "./tiers.js";
 import type { CheckAuthor } from "./types.js";
 
 /**
@@ -50,7 +50,12 @@ import type { CheckAuthor } from "./types.js";
  * anyway, as a refuse-only guard, because what it asserts (no conflict
  * markers, a clean tree, the suite still passing) must still hold after.
  */
-export type DraftedCheck = { name: string; run: string; surface?: true; guard?: true };
+/**
+ * A drafted check. `expect` is where its expected output comes from: the task
+ * words that state it, or the steps that derive it from a rule the task states.
+ * Shown to the critic; it never runs.
+ */
+export type DraftedCheck = { name: string; run: string; surface?: true; guard?: true; expect?: string };
 export type Draft = {
   checks: DraftedCheck[];
   notes: string[];
@@ -79,6 +84,8 @@ export const CRITERIA_MAX_NAME = 40;
  */
 export const CRITERIA_MAX_RUN = 1_000;
 export const CRITERIA_MAX_NOTE = 200;
+/** The longest `expect` (where a check's expected output comes from) kept on a drafted check. */
+export const CRITERIA_MAX_EXPECT = 300;
 
 /**
  * Shape a renderer-supplied payload into checks the engine may run.
@@ -108,6 +115,7 @@ export function sanitizeCriteria(raw: unknown): Draft {
           run: c.run.trim(),
           ...(c.surface === true ? { surface: true as const } : {}),
           ...(c.guard === true ? { guard: true as const } : {}),
+          ...(typeof c.expect === "string" && c.expect.trim() ? { expect: c.expect.trim().slice(0, CRITERIA_MAX_EXPECT) } : {}),
         }))
     : [];
   // Guards have their own cap: they can only refuse, so they never crowd out a check that can verify.
@@ -577,59 +585,106 @@ export function drafterInputsHash(d: DrafterInputs): string {
   return h.digest("hex").slice(0, 16);
 }
 
-const SYSTEM = [
-  "You draft acceptance criteria for one coding task. You are not doing the task",
-  "and you will not judge whether it was done — a person approves what you write",
-  "and it is sealed before the work starts.",
-  "",
-  "Return JSON only, matching:",
-  '  {"checks":[{"name":"kebab-name","run":"shell command"}],"notes":["sentence"]}',
-  "",
-  "checks are commands that MUST already work in this project. Prefer the scripts",
-  "listed below verbatim, optionally narrowed (npm test -- <pattern>). Never invent",
-  "a script that does not exist: a criterion that fails because the command is",
-  "missing teaches people to ignore criteria. A plain shell check is also fine —",
-  "test -f for a file the task must produce, grep -q for content it must hold, a",
-  "curl against a port it must serve, an interpreter one-liner — using only",
-  "tools that exist here. Prefer a check that FAILS now and passes once the task is",
-  "done: a check that already passes only guards against a regression and cannot",
-  "show the task was done. One line each and well under 500 characters: if a",
-  "check needs a program, have it run a small script file that the task will add.",
-  "Never invent a number, limit, path or format the task does not state: a check",
-  "stricter than the task fails correct work, and a check that guesses is not a check.",
-  "But every one the task DOES state is a check: each path, exact value, threshold,",
-  "count, format, and anything it says must not change or must be the only thing",
-  "present. A task that says accuracy above 0.62 gets a check of accuracy above 0.62.",
-  "At least one check must run the thing and test its result; a check that only",
-  "asks whether a file exists, a name appears, or output parses shows nothing.",
-  "When the right answer cannot be known before the work (a fitted value, a model's",
-  "accuracy on held-out data, the fastest query), check the closest thing the task",
-  "provides instead: the stated threshold on the data that IS here (accuracy >= 0.62",
-  "on the provided test split), the fit's error against the measured points, the new",
-  "query's time against the original's. Never hard-code an answer you had to guess.",
-  "Never write an expected value you worked out yourself — a date, a total, a count,",
-  "an output line the task does not state. Your own arithmetic is where checks go",
-  "wrong. Expected values come only from the task text; otherwise test what the task",
-  "states as a property: the stated number of lines, each strictly after the start,",
-  "the stated format, totals that add up, the same answer from two equivalent inputs.",
-  "Checks must leave nothing behind: build and write into $(mktemp -d), never into",
-  "a directory the task names.",
-  "When the work reads input, at least one check should also feed it an input the",
-  "check writes itself (printf into $(mktemp -d)) whose answer the task's rules",
-  "decide, not only the example files already in the project: whoever does the work",
-  "can read those, and an answer special-cased for them passes a check that uses",
-  "nothing else. Such a check does not count toward \"verified\".",
-  "Every path is relative to the working directory shown below. Never write an",
-  "absolute path outside it (no /wc.py, no /home/..) except $(mktemp -d) and system",
-  "tools; a check with one is dropped. Read expected values from the input files.",
-  "",
-  "notes are for anything a command cannot decide — how something looks, reads, or",
-  "feels. They are recorded on the receipt as stated intent and never reported as",
-  "verified. Do not write a note that pretends to be a check.",
-  "",
-  "Two or three checks and at most two notes. Fewer is better. If the task needs",
-  "no criterion beyond the project's own bar, return empty lists.",
-].join("\n");
+/**
+ * The drafter's instructions. With the exact-value rule (#46, opt-in:
+ * MAAT_REQUIRE_EXACT=1, tiers.ts exactRuleOn) every functional requirement
+ * gets a check that compares the output with an exact expected value, and
+ * each check says in `expect` where that value comes from. Without it, the
+ * drafter is told to test stated properties and never to work a value out
+ * itself (the behaviour before 2026-10-07's #46).
+ */
+export function draftSystem(exact = exactRuleOn()): string {
+  return [
+    "You draft acceptance criteria for one coding task. You are not doing the task",
+    "and you will not judge whether it was done — a person approves what you write",
+    "and it is sealed before the work starts.",
+    "",
+    "Return JSON only, matching:",
+    ...(exact
+      ? [
+    '  {"checks":[{"name":"kebab-name","run":"shell command","expect":"where the expected output comes from"}],"notes":["sentence"]}',
+        ]
+      : [
+    '  {"checks":[{"name":"kebab-name","run":"shell command"}],"notes":["sentence"]}',
+        ]),
+    "",
+    "checks are commands that MUST already work in this project. Prefer the scripts",
+    "listed below verbatim, optionally narrowed (npm test -- <pattern>). Never invent",
+    "a script that does not exist: a criterion that fails because the command is",
+    "missing teaches people to ignore criteria. A plain shell check is also fine —",
+    "test -f for a file the task must produce, grep -q for content it must hold, a",
+    "curl against a port it must serve, an interpreter one-liner — using only",
+    "tools that exist here. Prefer a check that FAILS now and passes once the task is",
+    "done: a check that already passes only guards against a regression and cannot",
+    "show the task was done. One line each and well under 500 characters: if a",
+    "check needs a program, have it run a small script file that the task will add.",
+    "Never invent a number, limit, path or format the task does not state: a check",
+    "stricter than the task fails correct work, and a check that guesses is not a check.",
+    "But every one the task DOES state is a check: each path, exact value, threshold,",
+    "count, format, and anything it says must not change or must be the only thing",
+    "present. A task that says accuracy above 0.62 gets a check of accuracy above 0.62.",
+    "At least one check must run the thing and test its result; a check that only",
+    "asks whether a file exists, a name appears, or output parses shows nothing.",
+    ...(exact
+      ? [
+    "For each thing the task says the work must do, at least one check runs it on a",
+    "concrete input and compares what it produces with the EXACT expected output:",
+    "[ \"$(python3 tool.py 3 4)\" = \"7\" ], assert f('a b') == 'a-b', a diff against a",
+    "heredoc, or grep -qx of a whole expected line. Work the expected output out from",
+    "the task text only: a value it states, or one you get by applying a rule it states",
+    "to an input your check picks, step by step. Put where it comes from in the check's",
+    "\"expect\": the task words quoted, or the derivation (\"*/15 from 00:07: 00:15,",
+    "00:30, 00:45\"). A property (the line count, sorted, each minute a multiple of 15,",
+    "a prefix, two runs agreeing) holds for wrong output too: it may come with an exact",
+    "check, never instead of one. Pick inputs at the edges: a boundary, empty input, a",
+    "value just outside a rule (1.2.3.4.5 for an IP rule), a start that is not on a step,",
+    "and each side of an either/or rule.",
+        ]
+      : []),
+    "When the right answer cannot be known before the work (a fitted value, a model's",
+    "accuracy on held-out data, the fastest query), check the closest thing the task",
+    "provides instead: the stated threshold on the data that IS here (accuracy >= 0.62",
+    ...(exact
+      ? ["on the provided test split). Never hard-code an answer you had to guess."]
+      : [
+    "on the provided test split), the fit's error against the measured points, the new",
+    "query's time against the original's. Never hard-code an answer you had to guess.",
+    "Never write an expected value you worked out yourself — a date, a total, a count,",
+    "an output line the task does not state. Your own arithmetic is where checks go",
+    "wrong. Expected values come only from the task text; otherwise test what the task",
+    "states as a property: the stated number of lines, each strictly after the start,",
+    "the stated format, totals that add up, the same answer from two equivalent inputs.",
+        ]),
+    "Checks must leave nothing behind: build and write into $(mktemp -d), never into",
+    "a directory the task names.",
+    "When the work reads input, at least one check should also feed it an input the",
+    "check writes itself (printf into $(mktemp -d)) whose answer the task's rules",
+    "decide, not only the example files already in the project: whoever does the work",
+    "can read those, and an answer special-cased for them passes a check that uses",
+    "nothing else. Such a check does not count toward \"verified\".",
+    "Every path is relative to the working directory shown below. Never write an",
+    "absolute path outside it (no /wc.py, no /home/..) except $(mktemp -d) and system",
+    "tools; a check with one is dropped. Read expected values from the input files.",
+    "",
+    "notes are for anything a command cannot decide — how something looks, reads, or",
+    "feels. They are recorded on the receipt as stated intent and never reported as",
+    "verified. Do not write a note that pretends to be a check.",
+    "",
+    ...(exact
+      ? [
+    "Two to four checks and at most two notes. If the task needs",
+        ]
+      : [
+    "Two or three checks and at most two notes. Fewer is better. If the task needs",
+        ]),
+    "no criterion beyond the project's own bar, return empty lists.",
+  ].join("\n");
+}
+
+/** The drafter's instructions as the exact-value rule is set now (MAAT_REQUIRE_EXACT). */
+export const DRAFT_SYSTEM = draftSystem(false);
+/** The drafter's instructions with the exact-value rule on. */
+export const DRAFT_SYSTEM_EXACT = draftSystem(true);
 
 /** Double every backslash that does not start a valid JSON escape; valid pairs are kept whole. */
 export function repairEscapes(json: string): string {
@@ -833,7 +888,7 @@ export async function draftCriteria(opts: {
     baseUrl: opts.baseUrl,
     apiKey: opts.apiKey,
     model: opts.model,
-    system: SYSTEM,
+    system: draftSystem(),
     prompt: prompted,
     cwd: askCwd,
     what: "drafting criteria",
@@ -854,7 +909,7 @@ export async function draftCriteria(opts: {
     baseUrl: opts.baseUrl,
     apiKey: opts.apiKey,
     model: opts.model,
-    system: SYSTEM,
+    system: draftSystem(),
     prompt: `${prompted}\n\nYour last reply could not be parsed as JSON. Reply with the JSON object only.`,
     cwd: askCwd,
     what: "drafting criteria",
@@ -879,7 +934,7 @@ export async function draftCriteria(opts: {
       baseUrl: opts.baseUrl,
       apiKey: opts.apiKey,
       model: opts.model,
-      system: SYSTEM,
+      system: draftSystem(),
       prompt: context,
       cwd: askCwd,
       what: "drafting criteria",
@@ -932,7 +987,8 @@ export const CRITIC_SYSTEM = [
   "              only have guessed (a model name, a count, a result the work must find out).",
   '  "surface"  — it only looks: a file exists, a word appears in source, it compiles, --help works.',
   '  "runs"     — it runs the deliverable on an input and checks what it produces.',
-  "For invents and guesses, quote the task words the check gets wrong, verbatim.",
+  "For invents and guesses, quote the task words the check gets wrong, verbatim. A value",
+  "derived step by step from a rule the task states, shown in the check's expect, is not a guess.",
   "",
   "Then list hard requirements no check would catch if the work got them wrong. A hard",
   "requirement is a concrete fact a shell command could test on this machine, right now:",
@@ -950,6 +1006,12 @@ export const CRITIC_SYSTEM = [
   '{"checks":[{"name":"...","verdict":"invents|guesses|surface|runs","quote":"verbatim task words, or empty"}],',
   ' "uncovered":["verbatim task words"], "requirements":["verbatim task words"]}',
 ].join("\n");
+
+/** What the critic reads: the task, the project view, and each check with where its expected output comes from. */
+export function criticPrompt(task: string, view: string | undefined, checks: readonly DraftedCheck[]): string {
+  const line = (c: DraftedCheck) => `- ${c.name}: ${c.run}${c.expect ? `\n  expect: ${c.expect}` : ""}`;
+  return `TASK TEXT:\n${task}\n\n${view ? `${view}\n\n` : ""}CHECKS:\n${checks.map(line).join("\n")}`;
+}
 
 export type Critique = {
   kept: DraftedCheck[];
@@ -1268,7 +1330,7 @@ async function critiqued(
       apiKey: opts.apiKey,
       model: opts.model,
       system: CRITIC_SYSTEM,
-      prompt: `TASK TEXT:\n${opts.task}\n\n${view ? `${view}\n\n` : ""}CHECKS:\n${d.checks.map((c) => `- ${c.name}: ${c.run}`).join("\n")}`,
+      prompt: criticPrompt(opts.task, view, d.checks),
       cwd: opts.askCwd ?? opts.cwd,
       what: "reviewing the drafted checks",
       fetchFn: opts.fetchFn,

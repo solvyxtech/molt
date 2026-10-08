@@ -20,7 +20,7 @@ const check = (name: string, run: string, hidden: boolean): Check => ({
   run,
   timeoutMs: 5_000,
   expectExit: 0,
-  tags: ["task", "value"],
+  tags: ["task", "value", "exact"],
   ...(hidden ? { hidden: true, author: { kind: "judge", model: "judge-j" } } : {}),
 });
 

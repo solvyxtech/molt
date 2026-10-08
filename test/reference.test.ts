@@ -245,7 +245,7 @@ describe("a reference check, in a turn", () => {
 
   it("is retired, not obeyed, when its own code fails at the claim; the other checks judge", async () => {
     const raises = "    if __import__('os').path.exists('double.py'):\n        raise KeyError('oops')\n    return 'missing'";
-    const made: Check = { name: "made", kind: "command", run: "[ \"$(python3 double.py)\" = \"1\" ]", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: { kind: "judge", model: "judge-j" } };
+    const made: Check = { name: "made", kind: "command", run: "[ \"$(python3 double.py)\" = \"1\" ]", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true, author: { kind: "judge", model: "judge-j" } };
     const { events, outcome } = await turn("print(1)\n", { first: fenced(moduleA("str(2 * n)", raises)), extra: [made] });
     assert.ok(events.some((e) => e.kind === "info" && /failed in its own code, not on the work/.test(e.text)));
     assert.equal(outcome, "verified", "judged by the check that remained");
