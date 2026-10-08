@@ -29,6 +29,12 @@ export type Msg = {
 };
 
 export type MsgMeta = {
+  /**
+   * Ids of this assistant message's tool calls that Maat refused as malformed.
+   * Their arguments go back to the provider as an excerpt (transcript.ts). Kept
+   * on the message so a restored transcript keeps sending the excerpt.
+   */
+  refusedCalls?: string[];
   /** True for a mechanically-generated digest of shed context. */
   digest?: true;
   /** True for context deliberately re-attached from the archive. */
@@ -673,7 +679,7 @@ export type EngineEvent =
        * happened. The outcome is what the sealed bar said of the tree as it
        * stood, never a default.
        */
-      endedBy?: "deadline" | "provider" | "no-progress";
+      endedBy?: "deadline" | "provider" | "no-progress" | "malformed";
       /** The turn's wall-clock budget ended it (endedBy "deadline"). */
       deadline?: boolean;
       /**
