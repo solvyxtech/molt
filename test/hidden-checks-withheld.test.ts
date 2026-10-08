@@ -32,7 +32,7 @@ const TASK = "Write out.txt containing the greeting the release notes ask for.";
 const SECRET_A = "grep -q 'zebra-quantum-42' out.txt";
 const SECRET_B = "test \"$(wc -l < out.txt)\" -ge 1 && grep -c 'zebra' out.txt";
 const checks = (hidden: boolean): Check[] => [
-  { name: "task:has-greeting", kind: "command", run: SECRET_A, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden },
+  { name: "task:has-greeting", kind: "command", run: SECRET_A, timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden, author: { kind: "judge", model: "judge-j" } },
   { name: "task:non-empty", kind: "command", run: SECRET_B, timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden },
 ];
 
@@ -331,7 +331,7 @@ describe("checks cannot change the work", () => {
     try {
       const before = treeHash(ws.dir);
       const listed = treeListing(ws.dir);
-      const check: Check = { name: "task:merged", kind: "command", run: MUTATOR, timeoutMs: 20_000, expectExit: 0, tags: ["task"], hidden: true };
+      const check: Check = { name: "task:merged", kind: "command", run: MUTATOR, timeoutMs: 20_000, expectExit: 0, tags: ["task"], hidden: true, author: { kind: "judge", model: "judge-j" } };
       const ctx = { cwd: ws.dir, record: [], ledger: [], archivedBatches: 0 } as unknown as BarContext;
       const r = await runCheck(check, ctx);
       assert.equal(r.ok, true, r.output);

@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { Engine } from "../src/engine.js";
-import { draftReference, fencedPython, parseReferenceReply, REFERENCE_MAX_SNAPSHOT_FILES, snapshotProject } from "../src/reference.js";
+import { draftReference, fencedPython, parseReferenceReply, referenceComparedAll, REFERENCE_MAX_SNAPSHOT_FILES, snapshotProject } from "../src/reference.js";
 import type { Check } from "../src/types.js";
 import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
@@ -87,6 +87,16 @@ describe("snapshotProject", () => {
   });
 });
 
+describe("referenceComparedAll", () => {
+  it("needs the driver's last line to say every judged input was compared", () => {
+    assert.ok(referenceComparedAll("5 inputs match two independent references\nREFERENCE COMPARED 5/5\n"));
+    assert.ok(!referenceComparedAll(""), "an exit 0 with no output is not a pass");
+    assert.ok(!referenceComparedAll("REFERENCE COMPARED 3/5"));
+    assert.ok(!referenceComparedAll("REFERENCE COMPARED 0/0"));
+    assert.ok(!referenceComparedAll("REFERENCE COMPARED 5/5\nREFERENCE COMPARED 2/5"), "the last one counts");
+  });
+});
+
 describe("parsing the writers' replies", () => {
   it("reads the module from its own fenced block, braces and all", () => {
     const program = 'd = {"a": 1}\nprint("x\\ny")';
@@ -105,7 +115,7 @@ describe("draftReference", () => {
       const r = await draftReference({ ...ask, task: "write double.py", snapshot, fetchFn: p.fetchFn });
       assert.ok(r.ok, r.ok ? "" : r.why);
       assert.equal(r.check.hidden, true);
-      for (const f of ["check.py", "second.py", "driver.py"]) assert.ok(existsSync(join(snapshot.dir, f)));
+      for (const f of ["check.py", "second.py", "driver.py", "runner.py"]) assert.ok(existsSync(join(snapshot.dir, f)));
       assert.equal(existsSync(join(w.dir, "check.py")), false, "nothing is written into the project");
       // The second reviewer is told the input format and inputs — never the first's code or answers.
       assert.match(p.secondPrompts[0]!, /ONE INPUT IS: an integer n/);
@@ -178,11 +188,12 @@ describe("draftReference", () => {
 });
 
 describe("a reference check, in a turn", () => {
-  async function turn(content: string, opts: { second?: string; first?: string; waitMs?: number; extra?: Check[] } = {}) {
+  async function turn(content: string, opts: { second?: string; first?: string; waitMs?: number; extra?: Check[]; refModel?: string } = {}) {
     const w = workspace();
     const snapshot = snapshotProject(w.dir)!;
     const p = writers([opts.first ?? fenced(moduleA())], [opts.second ?? secondModule("str(n + n)")]);
-    const ref = await draftReference({ ...ask, task: "write double.py", snapshot, fetchFn: p.fetchFn });
+    // Written by a model other than the worker ("m"), unless a test says otherwise.
+    const ref = await draftReference({ ...ask, model: opts.refModel ?? "ref-model", task: "write double.py", snapshot, fetchFn: p.fetchFn });
     assert.ok(ref.ok, ref.ok ? "" : ref.why);
     const provider = scriptedProvider([
       { calls: [{ name: "write_file", args: { path: "double.py", content } }] },
@@ -202,8 +213,16 @@ describe("a reference check, in a turn", () => {
     );
     w.cleanup();
     const end = events.find((e) => e.kind === "job_end");
-    return { events, outcome: end && end.kind === "job_end" ? end.outcome : undefined };
+    return { events, outcome: end && end.kind === "job_end" ? end.outcome : undefined, end: end && end.kind === "job_end" ? end : undefined };
   }
+
+  it("records who wrote it, and a reference by the worker model is not independent", async () => {
+    const other = await turn("import sys\nprint(2 * int(sys.argv[1]))\n");
+    assert.equal(other.end?.checkAuthors?.["task:reference"], "reference ref-model");
+    assert.equal(other.end?.claim, "verified (independent checks: ref-model)");
+    const own = await turn("import sys\nprint(2 * int(sys.argv[1]))\n", { refModel: "m" });
+    assert.deepEqual([own.outcome, own.end?.tier, own.end?.claim], ["unverified", "passed-own-checks", "passed own checks (m), not verified"]);
+  });
 
   it("joins at the claim and refuses work both references disagree with, showing the input", async () => {
     const { events, outcome } = await turn("import sys\nn = int(sys.argv[1])\nprint(n + n if n < 4 else n * 3)\n");
@@ -225,7 +244,7 @@ describe("a reference check, in a turn", () => {
 
   it("is retired, not obeyed, when its own code fails at the claim; the other checks judge", async () => {
     const raises = "    if __import__('os').path.exists('double.py'):\n        raise KeyError('oops')\n    return 'missing'";
-    const made: Check = { name: "made", kind: "command", run: "[ \"$(python3 double.py)\" = \"1\" ]", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true };
+    const made: Check = { name: "made", kind: "command", run: "[ \"$(python3 double.py)\" = \"1\" ]", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value"], hidden: true, author: { kind: "judge", model: "judge-j" } };
     const { events, outcome } = await turn("print(1)\n", { first: fenced(moduleA("str(2 * n)", raises)), extra: [made] });
     assert.ok(events.some((e) => e.kind === "info" && /failed in its own code, not on the work/.test(e.text)));
     assert.equal(outcome, "verified", "judged by the check that remained");
@@ -235,6 +254,44 @@ describe("a reference check, in a turn", () => {
     const raises = "    if __import__('os').path.exists('double.py'):\n        raise KeyError('oops')\n    return 'missing'";
     const { events, outcome } = await turn("print(1)\n", { first: fenced(moduleA("str(2 * n)", raises)) });
     assert.ok(events.some((e) => e.kind === "info" && /no other check is left to judge the claim — this claim is unverified/.test(e.text)));
+    assert.notEqual(outcome, "verified");
+  });
+
+  // An import-style deliverable: run_deliverable imports the work's module.
+  const importing = [
+    "    try:",
+    "        import importlib, os, sys",
+    "        sys.path.insert(0, os.getcwd())",
+    "        return str(importlib.import_module('double').f(n))",
+    "    except Exception as e:",
+    "        return 'failed: %s' % e",
+  ].join("\n");
+
+  it("a deliverable that ends the process on import (os._exit(0)) is not a pass", async () => {
+    // The driver used to import the work's module in its own process: `os._exit(0)` at top
+    // level ended it with exit 0 before any comparison, and the check passed on wrong work.
+    const { events, outcome } = await turn("import os\nos._exit(0)\ndef f(n):\n    return n * 999\n", { first: fenced(moduleA("str(2 * n)", importing)) });
+    assert.notEqual(outcome, "verified");
+    const refused = events.find((e) => e.kind === "proof_refused" || e.kind === "proof_exhausted");
+    assert.match(JSON.stringify(refused), /the deliverable ended the process/);
+  });
+
+  it("a deliverable that calls sys.exit(0) on import, or exits during the call, is not a pass", async () => {
+    for (const content of ["import sys\nsys.exit(0)\n", "import os\ndef f(n):\n    os._exit(0)\n"]) {
+      const { outcome } = await turn(content, { first: fenced(moduleA("str(2 * n)", importing)) });
+      assert.notEqual(outcome, "verified", content);
+    }
+  });
+
+  it("an import-style deliverable that is right still verifies, judged out of process", async () => {
+    const { outcome } = await turn("def f(n):\n    return 2 * n\n", { first: fenced(moduleA("str(2 * n)", importing)) });
+    assert.equal(outcome, "verified");
+  });
+
+  it("the work's code cannot call reference() through the module it was handed", async () => {
+    // A deliverable that reaches into the check module for the expected value gets nothing.
+    const cheat = "import sys\ndef f(n):\n    m = [v for k, v in sys.modules.items() if hasattr(v, 'reference')]\n    return int(m[0].reference(n)) if m else -1\n";
+    const { outcome } = await turn(cheat, { first: fenced(moduleA("str(2 * n)", importing)) });
     assert.notEqual(outcome, "verified");
   });
 

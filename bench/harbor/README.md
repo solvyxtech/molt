@@ -8,6 +8,13 @@ the share of tasks whose tests pass. It is run through
 `molt_agent.py` is the adapter. It installs this tree's CLI into each task
 container and runs `molt run --yes --criteria auto` on the instruction.
 
+The adapter passes no `--judge`, so the checks are drafted by the worker
+model, and since 2026-10-07 a run that passes only its own checks ends
+`passed own checks (<model>), not verified` (job_end `tier:
+passed-own-checks`, exit 3), never `verified`. Set `MAAT_JUDGE_MODEL` (and
+`MAAT_JUDGE_URL` / `MAAT_JUDGE_KEY`) in the container to another model to make "verified"
+reachable. The exit code never fails a trial (see below).
+
 ## What it measures
 
 The score of **this tree**, not of a published package. The adapter installs
@@ -140,7 +147,7 @@ In this order, because each is cheaper than the next:
 2. `molt.jsonl` ends with `proof_exhausted` — molt refused its own claim
    `attempts` times. Read the last `proof_result`: the failing criterion says
    what the model thought done meant and could not reach.
-3. `job_end` says `verified` and the test still failed — the drafted
+3. `job_end` says `verified` (or `passed-own-checks`) and the test still failed — the drafted
    criteria did not capture the task. This is the interesting case: it is the
    gap between what the model checked and what the grader checked.
 4. The log stops mid-step — the harness killed molt at the task's timeout.
