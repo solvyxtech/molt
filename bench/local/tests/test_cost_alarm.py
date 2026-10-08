@@ -5,6 +5,7 @@ resent in full every step. These tests pin the thresholds and that the lane
 stops with a STOPPED row and a non-zero exit instead of running on.
 """
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -119,9 +120,11 @@ def test_an_ordinary_lane_runs_to_the_end(monkeypatch, tmp_path):
 
 def test_resume_skips_the_marker_and_keeps_the_median(monkeypatch, tmp_path):
     out = _lane(monkeypatch, tmp_path, [(0.40, 1000)])
+    # Rows of this same lane (run.py refuses a results file holding another lane's rows).
+    lid = run.lane_id(run.lane_meta(run.parse_arms(os.environ.get("ARMS"))))
     out.write_text(
-        json.dumps({"task": "t9", "agent": "molt", "rep": 0, "cost_usd": 0.10}) + "\n"
-        + json.dumps({"stopped": True, "reason": "cost alarm", "run": "t9-molt-0"}) + "\n"
+        json.dumps({"task": "t9", "agent": "molt", "rep": 0, "cost_usd": 0.10, "lane_id": lid}) + "\n"
+        + json.dumps({"stopped": True, "reason": "cost alarm", "run": "t9-molt-0", "lane_id": lid}) + "\n"
     )
     # Earlier run's $0.10 is the median: limit max(0.50, 0.10), so $0.40 passes.
     run.main("molt", 1, None)
