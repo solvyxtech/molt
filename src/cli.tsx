@@ -55,6 +55,7 @@ import { draftReference, snapshotProject } from "./reference.js";
 import { env } from "./env.js";
 import { fileURLToPath } from "node:url";
 import { checkUserFrom, disablePrivSep, enablePrivSep, setIsolationLine, workerUserFrom, type PrivSep } from "./privsep.js";
+import { preWorkCopy } from "./scratch.js";
 
 /**
  * The version, from the manifest that npm actually publishes.
@@ -174,6 +175,11 @@ options
                      says. Commands run without Maat's credentials, and with
                      no throwaway copy of the tree they are not run and do not
                      count (also MAAT_REVIEW_EXECUTABLE=1)
+  --require-discriminating
+                     "verified" needs an independent value check that failed
+                     on the tree before the work and passes now; otherwise
+                     "passed checks that did not test this work", exit 3
+                     (also MAAT_REQUIRE_DISCRIMINATING=1; off by default)
   --signout          before an unattended claim is judged, put each stated
                      requirement to the model once beside the commands it ran
                      (off by default: 60 rounds rescued no task)
@@ -311,6 +317,8 @@ type Args = {
   reviewAdvisory?: boolean;
   /** `--review-executable`: see EngineConfig.reviewExecutable. */
   reviewExecutable?: boolean;
+  /** `--require-discriminating`: see EngineConfig.requireDiscriminating. */
+  requireDiscriminating?: boolean;
   /** `--signout`: see EngineConfig.signOut. */
   signout?: boolean;
   /** `--arbiter-model` / `--dispute-votes`: see EngineConfig.dispute. */
@@ -555,6 +563,9 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         break;
       case "--review-executable":
         out.reviewExecutable = true;
+        break;
+      case "--require-discriminating":
+        out.requireDiscriminating = true;
         break;
       case "--signout":
         out.signout = true;
@@ -873,6 +884,7 @@ function engineFor(args: Args, session = false, extra: { files?: FileAccess } = 
     ...(args.revealStuck === true ? { revealOnStuck: true } : args.revealStuck === false ? { revealOnStuck: false } : {}),
     ...(args.reviewAdvisory || env("REVIEW_ADVISORY") === "1" ? { reviewAdvisory: true } : {}),
     ...(args.reviewExecutable || env("REVIEW_EXECUTABLE") === "1" ? { reviewExecutable: true } : {}),
+    ...(args.requireDiscriminating || env("REQUIRE_DISCRIMINATING") === "1" ? { requireDiscriminating: true } : {}),
     ...(args.signout ? { signOut: true } : {}),
     ...(args.arbiterModel || args.disputeVotes ? { dispute: { model: args.arbiterModel, votes: args.disputeVotes } } : {}),
     ...(args.review ? { review: { votes: args.review, reasoningEffort: args.reasoningChecks ?? args.reasoning } } : {}),
@@ -1271,6 +1283,31 @@ async function autoDraft(
   // Taken once, now, before the first step: the second try below and every
   // stage of each draft read this and never the folder the work is changing.
   const snapshot = inputs?.snapshot ?? drafterSnapshotFor(args);
+  // And a copy of the project as it is now, before the first step: each
+  // drafted check is tried on it, and one that already passes there cannot
+  // show this task was done, so it is sent back to the drafter once and
+  // dropped if it still passes (criteria.ts screen). Null when the project is
+  // too big to copy: the checks are then not tried here.
+  // Fingerprinted: the drafting can outlive the start of the work (a late
+  // draft), and the worker runs as this uid, so every try checks the copy is
+  // still as taken (src/scratch.ts preWorkCopy).
+  const preWork = args.cwd ? await preWorkCopy(args.cwd) : null;
+  try {
+    return await autoDraftFrom(engine, args, snapshot, preWork ? { dir: preWork.dir, intact: preWork.intact } : undefined, soFar, inputs, deadlineAt);
+  } finally {
+    await preWork?.cleanup();
+  }
+}
+
+async function autoDraftFrom(
+  engine: Engine,
+  args: Args,
+  snapshot: DrafterInputs,
+  preWork: { dir: string; intact: () => Promise<boolean> } | undefined,
+  soFar?: { draft?: Draft; sealed?: boolean; late?: boolean },
+  inputs?: { snapshot: DrafterInputs; used: string[] },
+  deadlineAt?: number,
+): Promise<ReturnType<typeof taskChecksFrom>> {
   const none: ReturnType<typeof taskChecksFrom> = { taskChecks: [], taskNotes: [] };
   // Under --for, no draft, critique or retry waits past the run's budget
   // (the job's own deadline, taken once by the caller: runDeadlineAt).
@@ -1288,6 +1325,7 @@ async function autoDraft(
       barChecks: (engine.cfg.bar?.checks ?? []).map((c) => c.name),
       ...judgeTarget({ baseUrl: args.url, apiKey: args.key, model: args.model }),
       cwd: args.cwd,
+      ...(preWork ? { preWorkDir: preWork.dir, preWorkIntact: preWork.intact } : {}),
       reasoningEffort: judgeEffort(args.reasoningChecks ?? args.reasoning),
       latency: engine.askLatency,
       deadlineAt,

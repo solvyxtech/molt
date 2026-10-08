@@ -30,13 +30,19 @@
  *   L15 the check changes the work: git checkout/merge/commit/…, rm,
  *       mv, sed -i, tee or a redirect into the project, a package
  *       install (src/checkwrites.ts). Always on, MAAT_CHECK_LINT or not.
+ *   L16 the check cannot fail (cannotFail): a trailing `|| echo …`,
+ *       `|| true`, `; exit 0`; `find … -exec … \;`, whose status ignores
+ *       what -exec ran; a script that prints PASS/FAIL and never exits
+ *       non-zero. Always on. On 2026-10-07 a judge's `curl … || echo
+ *       'fail'` checks passed before server.py existed and earned a wrong
+ *       "verified".
  * Left out as noisy in the replay: hand-computed numbers (L14) and paths not
  * in the tree (L10) — each fired as often on good checks as on bad ones.
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { swallowsExit, runnerPipedAway } from "./evidence.js";
+import { maskQuotes, maskShell, swallowsExit, runnerPipedAway, topLevelCommands } from "./evidence.js";
 import { strayPath } from "./criteria.js";
 import { checkMutates } from "./checkwrites.js";
 
@@ -360,7 +366,92 @@ export function lintAll(run: string, ctx: LintCtx): LintHit[] {
   // a check that does the merge passes on its own effort.
   const writes = checkMutates(cmd);
   if (writes) add("L15-mutates", writes);
+  const never = cannotFail(cmd);
+  if (never && !sw) add("L16-cannot-fail", never);
   return hits;
+}
+
+/** Something in the command that can end it non-zero whatever the last step does: `exit 1`, `set -e`. */
+const EXITS_NONZERO = /\bexit\s+[1-9]|\bset\s+-[a-z]*e|\berrexit\b/;
+/** In an inline program: something that fails the process on a false condition. */
+const PROGRAM_FAILS = /\bassert\b|sys\.exit|\bexit\s*\(|\bquit\s*\(|\braise\b|os\._exit|process\.exit|exitCode|\bthrow\b|\bdie\b|\babort\b|\bexit\s+[1-9]/;
+/** In an inline program: a comparison or a boolean-valued test. */
+const COMPARES = /==|!=|<=|>=|(?<![<-])<(?![<=])|(?<![-=])>(?![>=])|\bin\b|\bis\b|\bnot\b|startswith\(|endswith\(|isinstance\(|\ball\(|\bany\(|issubset|issuperset|\.includes\(|\.equals?\(|\.every\(|\.some\(/;
+/** An inline program that prints. */
+const PRINTS = /\bprint\s*\(|\bprint\s|console\.log|process\.stdout\.write|\bputs\b|\bsay\b|\bp\s/;
+const INTERPRETER = /^(?:\w+=\S*\s+)*(?:timeout\s+\S+\s+)?(?:python3?|node|ruby|perl|php)\b/;
+
+/**
+ * Why this command exits 0 whatever its assertion found, or null. Read off
+ * the command alone, before anything runs:
+ *  - its last top-level step is `|| echo …`/`|| printf …`, or it ends in
+ *    `|| true`, `|| :`, `|| exit 0`, `; true`, `; exit 0` (evidence.ts);
+ *  - its last step is `echo`/`printf` after `;` or a newline (`…; echo $?`,
+ *    `…; echo done`), with no `exit 1` or `set -e` anywhere: the check exits
+ *    with echo's status;
+ *  - it ends in `find … -exec … \;` (or `';'`): find's own status ignores
+ *    what -exec ran, so `-exec sh -c '… exit 1' \;` reports nothing;
+ *  - its deciding step is an inline program (`python3 -c`, `node -e`, a
+ *    heredoc) that prints a comparison or a boolean and has nothing that
+ *    exits non-zero: `print(x == y)` exits 0 whether it printed True or
+ *    False. The same for `jq` without `-e`, and `awk` with no `exit`;
+ *  - it prints a literal PASS/FAIL verdict and nothing fails the process;
+ *  - it ends in an `if … fi` with no branch that fails.
+ * A step whose output a later pipe stage reads (`… | grep -qx PASS`) is not
+ * the deciding step: the reader's status is the check's.
+ */
+export function cannotFail(run: string): string | null {
+  const cmd = run.trim();
+  const masked = maskShell(cmd);
+  const sw = swallowsExit(cmd);
+  if (sw) return `it ends in \`${sw}\`, so it exits 0 whatever happened`;
+  const echoTail = /\|\|\s*(?:echo|printf)\b[^|;&]*$/.exec(masked);
+  if (echoTail) return `it ends in \`${cmd.slice(echoTail.index).trim()}\`, so a failure prints a word and still exits 0`;
+  const find = /(?:^|[;&|(]\s*)find\s[^|;]*-exec(?:dir)?\s/.exec(masked);
+  if (find) {
+    const rest = cmd.slice(find.index);
+    const end = /(?:\;|';'|";")/.exec(rest);
+    const after = end ? maskQuotes(rest.slice(end.index + end[0].length)).trim() : "";
+    // Only when nothing after the find reads its output: `find … | grep -q .` is fine.
+    if (end && !/^\|(?!\|)/.test(after) && !/^[;&|]*\s*\S/.test(after.replace(/^&&\s*(?:echo|printf|true|:)\b.*$/, ""))) {
+      return "it ends in `find … -exec … \;`, whose exit status ignores what -exec ran, so it passes whatever the files hold";
+    }
+  }
+  const steps = topLevelCommands(cmd);
+  const last = steps.at(-1);
+  if (!last) return null;
+  const exitsNonzero = EXITS_NONZERO.test(masked);
+  if (steps.length > 1 && (last.op === ";" || last.op === "\n") && /^(?:echo|printf)\b/.test(last.text) && !exitsNonzero) {
+    return `it ends in \`${last.op === ";" ? "; " : ""}${last.text.slice(0, 40)}\`, so it exits with echo's status (0) whatever ran before`;
+  }
+  const ifAt = steps.findLastIndex((st) => /^if\b/.test(st.text));
+  const ifBlock = ifAt >= 0 ? steps.slice(ifAt).map((st) => st.text).join("; ") : "";
+  if (/\bfi\s*$/.test(masked) && ifAt >= 0 && !exitsNonzero && !/\bfalse\b|\breturn\s+[1-9]/.test(maskQuotes(ifBlock))) {
+    return "it ends in an `if … fi` with no branch that fails, so it exits 0 when the condition is false";
+  }
+  // The deciding step: the last one, or the one before an `|| exit 1` / `|| false`.
+  let decider = last;
+  if (steps.length > 1 && last.op === "||" && /^(?:exit\s+[1-9]\d*|false)\s*$/.test(last.text)) decider = steps.at(-2)!;
+  // When a later pipe stage reads the output (`… | grep -qx PASS`), that
+  // stage is the last step, and it is what is read here.
+  {
+    const d = decider.text;
+    if (INTERPRETER.test(d) && /\s-(?:c|e|E)\b|\s-\s*<<|<<|\s-\s*$/.test(d) && PRINTS.test(d) && !PROGRAM_FAILS.test(d)) {
+      if (/\b(?:True|False|true|false)\b/.test(d) || COMPARES.test(d.replace(/^\S+\s+-[a-zA-Z]\s*/, ""))) {
+        return "it prints the result of a comparison and exits 0 whether that is true or false; make it fail (assert, sys.exit(1), or compare in the shell)";
+      }
+    }
+    if (/^jq\b/.test(d) && !/\s(?:-e|--exit-status)\b|\s-[a-zA-Z]*e[a-zA-Z]*\s/.test(` ${d} `) && /==|!=|[<>]|\btest\(|\bcontains\(|\bany\b|\ball\b|\bselect\(/.test(d)) {
+      return "it runs `jq` without `-e`, which prints true or false and exits 0 either way";
+    }
+    if (/^awk\b/.test(d) && /==|!=|[<>]|~/.test(d) && !/\bexit\b/.test(d)) {
+      return "it runs `awk` with no `exit`, which exits 0 whatever its comparison found";
+    }
+    if (/\bFAIL(?:ED)?\b/.test(d) && /\bPASS(?:ED)?\b/.test(d) && !/^(?:\[|test\b)/.test(d) && !PROGRAM_FAILS.test(d) && !/\bfalse\b/.test(d) && !exitsNonzero) {
+      return "it prints PASS or FAIL but always exits 0, and only the exit status is read";
+    }
+  }
+  return null;
 }
 
 /** The first rule broken, or null. */

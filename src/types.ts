@@ -365,6 +365,13 @@ export type CheckResult = {
    */
   established?: boolean;
   /**
+   * How this sealed task check fared on the tree before the work began:
+   * "failed" (it discriminates: it cannot pass on the untouched tree),
+   * "passed" (a guard: it passes with or without the work), or "untried"
+   * (broken then, or joined after the work began). Absent for every other check.
+   */
+  beforeWork?: "failed" | "passed" | "untried";
+  /**
    * Why this check was not run at all, when it was not.
    *
    * A check dropped by `--skip`/`--only` used to vanish from the result, so
@@ -686,7 +693,7 @@ export type EngineEvent =
        * check) and no reviewer contradicted it. "passed-checks" is the outcome
        * "unverified" with `tierReason` saying why the word was not earned.
        */
-      tier?: "verified" | "passed-checks" | "passed-own-checks";
+      tier?: "verified" | "passed-checks" | "passed-own-checks" | "passed-untested";
       tierReason?: string;
       /**
        * The claim in words, the same on every surface and in the bench's

@@ -60,7 +60,7 @@ def no_verdict(row: dict) -> bool:
     return (not c) or c.startswith(("error", "stopped")) or bool(row.get("timed_out"))
 
 
-TIERS = ("verified", "passed-checks", "passed-own-checks")
+TIERS = ("verified", "passed-checks", "passed-own-checks", "passed-untested")
 
 
 def claim_basis(claim) -> str | None:
@@ -70,6 +70,7 @@ def claim_basis(claim) -> str | None:
       "verified (independent checks: m)"            -> "independent"
       "verified (your checks)"                      -> "person"
       "passed own checks (m), not verified"         -> "own"
+      "passed checks that did not test this work, not verified" -> "untested"
       "verified (self-checked)"  (builds before 2026-10-07: the checks were
                                   drafted, by the worker or a judge; the
                                   text cannot say which)  -> "self-checked"
@@ -85,6 +86,8 @@ def claim_basis(claim) -> str | None:
         return "person"
     if claim.startswith("passed own checks"):
         return "own"
+    if claim.startswith("passed checks that did not test this work"):
+        return "untested"
     if claim.startswith("verified (self-checked)"):
         return "self-checked"
     if claim.startswith("verified"):

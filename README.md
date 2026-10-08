@@ -202,7 +202,8 @@ Exit codes: `0` the bar was met · `1` it was not · `2` usage · `3` finished
 without a verdict (no bar, or `--only`/`--skip` left required checks unrun, which
 is never reported as a pass), or passed without earning "verified": every check
 that could prove the work was written by the worker model itself
-(`passed-own-checks`), or nothing but builtins passed. "Verified" needs a
+(`passed-own-checks`), with `--require-discriminating` none of them failed
+before the work (`passed-untested`), or nothing but builtins passed. "Verified" needs a
 passing check from another model (`--judge`) or a command check you wrote or
 approved; builtins never carry it.
 
@@ -410,6 +411,12 @@ the task are drafted before the work, they are sealed, and the worker is held
 to them. Passing checks the worker model drafted for itself are never
 "verified": without `--judge <another model>` (or checks a person approved)
 the best a run earns is `passed own checks (<model>), not verified`, exit 3.
+Drafted checks are tried on a copy of the project before the work: one that
+already passes there, or cannot fail by construction, is sent back to the
+drafter once and dropped if the redraft is no better. `--require-discriminating`
+goes further: "verified" then needs an independent value check that failed
+before the work, and anything less is `passed checks that did not test this
+work, not verified` (exit 3).
 
 ## Docs
 
