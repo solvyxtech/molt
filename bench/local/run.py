@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -148,7 +149,7 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
     return {
         "provider_capped": capped,
         "secs": round(secs), "turns": steps, "calls": sum(per), "multi": sum(1 for x in per if x > 1),
-        "tokens_in": spend.get("promptTokens"), "claim": outcome, "timed_out": timed_out,
+        "tokens_in": spend.get("promptTokens"), "cost_usd": spend.get("costUsd"), "claim": outcome, "timed_out": timed_out,
         "said_done": (outcome or "").startswith("verified"),
         # The reviewer's label: a verified claim it did not confirm.
         "review": review,
@@ -157,6 +158,42 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
         "said_done_reviewed": (outcome or "").startswith("verified") and not (review and not review.get("confirmed")),
         **extra,
     }
+
+
+# Per-run cost alarm (reports/loop-charter.md, non-regression rule 1): a run that
+# costs more than max(5x the lane's running median cost, $0.10), or sends more
+# than 1.5M prompt tokens, stops the lane before the bill grows. 2026-10-07: one
+# task cost 2.68M tokens / $0.82 because malformed calls were resent in full.
+COST_ALARM_EXIT = 3
+
+
+def alarm_limits() -> dict:
+    """The alarm thresholds, each overridable by env."""
+    return {
+        "x": float(os.environ.get("BENCH_COST_ALARM_X") or 5),
+        "usd": float(os.environ.get("BENCH_COST_ALARM_USD") or 0.10),
+        "tokens": int(float(os.environ.get("BENCH_TOKEN_ALARM") or 1_500_000)),
+    }
+
+
+def cost_alarm(row: dict, prior_costs: list[float]) -> dict | None:
+    """Why this run trips the alarm, or None. `prior_costs` are the lane's earlier runs
+    (this run excluded): the median is over runs that reported a cost. A run with no
+    cost (an unpriced model) is judged on its prompt tokens only."""
+    lim = alarm_limits()
+    med = statistics.median(prior_costs) if prior_costs else None
+    limit_usd = max(lim["x"] * med, lim["usd"]) if med is not None else lim["usd"]
+    cost, toks = row.get("cost_usd"), row.get("tokens_in")
+    why = []
+    if cost is not None and cost > limit_usd:
+        why.append(f"cost ${cost:.4f} > ${limit_usd:.4f} (max({lim['x']:g}x lane median "
+                   f"{'n/a' if med is None else f'${med:.4f}'}, ${lim['usd']:g}))")
+    if toks is not None and toks > lim["tokens"]:
+        why.append(f"prompt tokens {toks:,} > {lim['tokens']:,}")
+    if not why:
+        return None
+    return {"detail": "; ".join(why), "cost_usd": cost, "tokens_in": toks, "lane_median_usd": med,
+            "limit_usd": round(limit_usd, 6), "limit_tokens": lim["tokens"]}
 
 
 def claims_done(text: str) -> bool:
@@ -211,10 +248,15 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
     arms = parse_arms(os.environ.get("ARMS"))
     out = Path(os.environ.get("RESULTS_DIR", HERE)) / os.environ.get("RESULTS", f"results-{which}-x{repeats}.jsonl")
     done = set()
+    lane_costs: dict = {}  # arm -> costs of its runs so far, for the cost alarm's median
     if out.exists():  # resume: skip runs already recorded
         for line in out.read_text().splitlines():
             r = json.loads(line)
+            if r.get("stopped"):  # a STOPPED marker, not a run
+                continue
             done.add((r["task"], r["agent"], r["rep"], r.get("arm")))
+            if r.get("cost_usd") is not None:
+                lane_costs.setdefault(r.get("arm"), []).append(r["cost_usd"])
     for rep in range(repeats):
         for T in tasks:
             for arm, arm_env in arms:  # paired: arm A then arm B on this task before the next task
@@ -251,6 +293,23 @@ def main(which: str, repeats: int, task_filter: str | None) -> None:
                     with out.open("a") as f:
                         f.write(json.dumps(r) + "\n")
                     print(json.dumps({k: r[k] for k in ("task", "agent", "arm", "rep", "passed", "said_done", "turns", "secs") if k in r}), flush=True)
+                    costs = lane_costs.setdefault(arm, [])
+                    alarm = cost_alarm(r, costs)
+                    if alarm:
+                        stop_lane(out, tag, WORK / f"{tag}.log", alarm, arm)
+                    if r.get("cost_usd") is not None:
+                        costs.append(r["cost_usd"])
+
+
+def stop_lane(out: Path, tag: str, log: Path, alarm: dict, arm: str | None) -> None:
+    """Record a STOPPED row (no `passed`: not a run) and end the lane non-zero."""
+    row = {"stopped": True, "reason": "cost alarm", "run": tag, "log": str(log), **alarm}
+    if arm:
+        row["arm"] = arm
+    with out.open("a") as f:
+        f.write(json.dumps(row) + "\n")
+    print(f"STOPPED: cost alarm on {tag}: {alarm['detail']}\n  log: {log}", flush=True)
+    sys.exit(COST_ALARM_EXIT)
 
 
 

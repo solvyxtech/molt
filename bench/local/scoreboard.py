@@ -40,7 +40,9 @@ def load(path: str | Path) -> list[dict]:
     for line in Path(path).read_text().splitlines():
         line = line.strip()
         if line.startswith("{"):
-            rows.append(json.loads(line))
+            r = json.loads(line)
+            if not r.get("stopped"):  # run.py's STOPPED marker (cost alarm) is not a run
+                rows.append(r)
     return rows
 
 
