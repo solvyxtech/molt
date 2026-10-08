@@ -1550,6 +1550,8 @@ ipcMain.handle(
       // The workspace, not the app's own directory: on the ACP
       // backend this is where the CLI that answers is run.
       cwd: session.cwd,
+      // The worker's own model: worker spend on the session meter.
+      meter: session.engine.workerAskMeter,
     });
   },
 );

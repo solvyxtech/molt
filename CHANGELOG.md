@@ -4,6 +4,10 @@
 
 ### Added
 
+- **Interview and mission-planning asks are metered as worker spend.** The
+  interview's question is added to the session meter (journal: `worker_ask`);
+  `maat mission plan` prints the plan's tokens and cost at the worker's prices.
+
 - **The judge's spend is metered.** Every ask made around the work (drafting
   and its critic, the reference check, `--review`, the post-work audit, the
   arbiter) records its input, output, cache read and cache write tokens, priced

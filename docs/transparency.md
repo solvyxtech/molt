@@ -197,6 +197,11 @@ tokens to a token budget and nothing to a dollar ceiling (its spend there is
 unknown, and said so). The budget is checked before every worker step; a judge
 ask already under way is not cut off.
 
+The worker's own asks outside a turn are worker spend, not the judge's: the
+interview's question is added to the session meter like a step (and journalled
+as `worker_ask`), and `maat mission plan` prints a `worker (planning) ...` line
+with the plan's tokens and cost at the worker's prices.
+
 Judge calls are priced when they are read, not when they were made: a price
 that arrives later applies to every call, and a price that is cleared stops
 applying (the journal keeps each call's figure as it stood at the time).

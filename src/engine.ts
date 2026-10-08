@@ -25,7 +25,7 @@ import { describeStart, listBackground, startBackground, stopBackground } from "
 import { objectionLine, readsTheWork, reviewClaim, type ExecutableReview, type ObjectionRun, type Review } from "./review.js";
 import { credentialFreeEnv } from "./credenv.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
-import { JudgeMeter, judgeTokens, type JudgeSpend } from "./judge-meter.js";
+import { JudgeMeter, judgeTokens, type AskMeter, type AskUsage, type JudgeSpend } from "./judge-meter.js";
 import { auditClaim, authorKey, authorWords, claimLabel, contradictions, independentOf, tierOf, withAuthor, type Tier } from "./tiers.js";
 import { recordGoldens, valueUnproven } from "./golden.js";
 import { discountedChecks } from "./control.js";
@@ -2441,6 +2441,32 @@ export class Engine {
           }
         : null,
   }));
+  /**
+   * The worker's meter for asks on its own model outside a turn (the
+   * interview): counted into the session meter as worker spend, like a step,
+   * and journalled as `worker_ask`. Not the judge's: it is the worker's model.
+   */
+  readonly workerAskMeter: AskMeter = { record: (u) => this.recordWorkerAsk(u) };
+
+  private recordWorkerAsk(u: AskUsage): void {
+    this.sessionPrompt += u.promptTokens;
+    this.sessionCompletion += u.completionTokens;
+    this.sessionCached += u.cacheReadTokens ?? 0;
+    if (u.estimated) this.estimatedSteps += 1;
+    if (typeof u.billedUsd === "number") this.sessionBilled += u.billedUsd;
+    else this.unbilledSteps += 1;
+    this.cfg.journal?.append("worker_ask", {
+      model: u.model,
+      ...(u.what ? { what: u.what } : {}),
+      promptTokens: u.promptTokens,
+      completionTokens: u.completionTokens,
+      ...(u.cacheReadTokens !== undefined ? { cacheReadTokens: u.cacheReadTokens } : {}),
+      ...(u.cacheWriteTokens !== undefined ? { cacheWriteTokens: u.cacheWriteTokens } : {}),
+      ...(typeof u.billedUsd === "number" ? { billedUsd: u.billedUsd } : {}),
+      estimated: u.estimated,
+    });
+  }
+
   /**
    * Judge calls before this mark were reported in an earlier job_end. A job
    * reports every call since the last one, so the drafting that runs before a

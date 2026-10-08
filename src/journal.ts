@@ -92,6 +92,11 @@ export type JournalKind =
    * entries. `costUsd: null` means no price is known, never $0.
    */
   | "judge_usage"
+  /**
+   * One answered ask on the worker's own model outside its turn (the
+   * interview): worker spend, counted into the session meter like a step.
+   */
+  | "worker_ask"
   /** The independent review of a verified claim: a label, never a gate. */
   | "review"
   | "dispute"
@@ -404,6 +409,11 @@ export class Journal {
           out.push(
             `${t}  judge ${d.model}${d.what ? ` (${d.what})` : ""} · ${e}${d.promptTokens} in${cached} / ${e}${d.completionTokens} out${cost}`,
           );
+          break;
+        }
+        case "worker_ask": {
+          const e = d.estimated ? "~" : "";
+          out.push(`${t}  ask ${d.model}${d.what ? ` (${d.what})` : ""} · ${e}${d.promptTokens} in / ${e}${d.completionTokens} out`);
           break;
         }
         case "tool_call":

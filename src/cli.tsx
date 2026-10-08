@@ -30,6 +30,7 @@ import { draftMission, missionStatus, runMission, writePlan, type MissionSummary
 import { parseDuration } from "./session-commands.js";
 import { jobEndWords } from "./tiers.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
+import { JudgeMeter } from "./judge-meter.js";
 import { commandsHere, draftCriteriaCritiqued, drafterInputsHash, drafterSnapshot, preflightCriteria, taskChecksFrom, type Draft, type DrafterInputs } from "./criteria.js";
 import { listProject, removeNew } from "./leftovers.js";
 import { projectScripts } from "./interview.js";
@@ -1202,13 +1203,26 @@ async function cmdMission(args: Args): Promise<number> {
         process.stderr.write("maat: no model selected — pass --model <id> or set MOLT_MODEL\n");
         return 2;
       }
-      const brief = await buildBrief({ cwd: args.cwd }).catch(() => ({ text: "" }));
+      // The plan is asked of the worker's own model, so it is worker spend:
+      // metered with the worker's prices (hand-set, or the provider's list,
+      // looked up beside the brief) and said as the worker's below.
+      const key = keyForUrl(args.url, args.key);
+      const byHand = args.priceIn !== undefined && args.priceOut !== undefined;
+      const [brief, listed] = await Promise.all([
+        buildBrief({ cwd: args.cwd }).catch(() => ({ text: "" })),
+        byHand ? Promise.resolve(null) : fetchPricing(args.url, args.model, key).catch(() => null),
+      ]);
+      const pricing = byHand
+        ? { in: args.priceIn!, out: args.priceOut!, ...(args.priceCachedIn !== undefined ? { cached: args.priceCachedIn } : {}), source: "set by hand" }
+        : listed;
+      const planMeter = new JudgeMeter(() => ({ baseUrl: args.url, model: args.model, pricing }));
       const r = await draftMission({
         goal,
         context: brief.text,
         scripts: projectScripts(args.cwd),
-        ask: { baseUrl: args.url, apiKey: keyForUrl(args.url, args.key), model: args.model, cwd: args.cwd, reasoningEffort: args.reasoningChecks ?? args.reasoning },
+        ask: { baseUrl: args.url, apiKey: key, model: args.model, cwd: args.cwd, reasoningEffort: args.reasoningChecks ?? args.reasoning, meter: planMeter },
       });
+      if (planMeter.mark()) process.stdout.write(`${judgeSpendLine(planMeter.total(), fmtCost, "worker (planning)")}\n`);
       if (!r.ok) {
         process.stderr.write(`maat: ${r.error}\n`);
         return 1;
