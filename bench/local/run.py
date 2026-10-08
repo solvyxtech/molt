@@ -587,8 +587,11 @@ def claim_of(ev: dict) -> str | None:
 
 
 def run_molt(d: Path, prompt: str, log: Path) -> dict:
+    # The api2 lane: host and key variable from BENCH_API2_HOST / BENCH_API2_KEYVAR (run-in-container.sh).
+    api2_host = os.environ.get("BENCH_API2_HOST") or ""
+    api2_var = os.environ.get("BENCH_API2_KEYVAR") or "ANTHROPIC_API_KEY"
     key = (openrouter_key() if "openrouter.ai" in URL
-           else KEYS.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_API_KEY", "") if "api.anthropic.com" in URL
+           else KEYS.get(api2_var) or os.environ.get(api2_var, "") if api2_host and api2_host in URL
            else "local")
     env = os.environ | KEYS | {"MOLT_API_KEY": key, "MOLT_JUDGMENT": "0"}  # nobody rules on a benchmark run
     cmd = [

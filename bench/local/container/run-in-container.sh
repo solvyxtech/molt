@@ -73,13 +73,16 @@ url=${url//127.0.0.1/host.docker.internal}; url=${url//localhost/host.docker.int
 # Maat on a pipe (MAAT_KEYS_FD), so it is in no environment at all.
 envf=$(mktemp); chmod 600 "$envf"; trap 'rm -f "$envf"' EXIT
 printf 'OPENROUTER_API_KEY=%s\n' "$key" > "$envf"
-# The api2 lane (a second provider's API as the worker or the judge; BENCH_URL or an ARMS
-# judge URL on that provider's host): the key comes from the Keychain item maat-bench-api2
-# (paste it with container/set-api2-key.sh), never from the command line. It is handed to
-# Maat under the provider's own variable name, which is what Maat reads.
-if [[ "$url" == *api.anthropic.com* || "${ARMS:-}" == *api.anthropic.com* ]]; then
+# The api2 lane (a second provider's API as the worker or the judge): its host and the key's
+# variable name live in the untracked bench/local/.api2.env (BENCH_API2_HOST=...,
+# BENCH_API2_KEYVAR=...; the variable defaults to ANTHROPIC_API_KEY, the provider's own
+# documented name, which is what Maat reads). The key comes from the Keychain item
+# maat-bench-api2 (paste it with container/set-api2-key.sh), never from the command line.
+[ -f "$local_dir/.api2.env" ] && . "$local_dir/.api2.env"
+api2_keyvar=${BENCH_API2_KEYVAR:-ANTHROPIC_API_KEY}
+if [[ -n "${BENCH_API2_HOST:-}" && ( "$url" == *"$BENCH_API2_HOST"* || "${ARMS:-}" == *"$BENCH_API2_HOST"* ) ]]; then
   akey=$(security find-generic-password -s maat-bench-api2 -w 2>/dev/null) || { echo "no Keychain item maat-bench-api2: run bench/local/container/set-api2-key.sh" >&2; exit 1; }
-  printf 'ANTHROPIC_API_KEY=%s\n' "$akey" >> "$envf"
+  printf '%s=%s\n' "$api2_keyvar" "$akey" >> "$envf"
 fi
 # The graders and reference solutions are mounted where only root can reach (/root is 700),
 # copied to a root-only /opt/bench, and run.py runs from there as root; it runs the agent
@@ -131,5 +134,5 @@ docker run --rm --name "maat-bench-$name" --cpus "$cpus" --memory "$mem" ${=caps
   -v "$local_dir":/root/bench-src:ro -v "$out":/root/bench-results -v "$work":/root/bench-export ${=credmount} \
   -v "$envf":/root/bench-keys/keys:ro -e BENCH_KEYS_FILE=/root/bench-keys/keys -e REFERENCE="${REFERENCE:-0}" -e BENCH_MODEL="${BENCH_MODEL:-}" \
   -e ARMS="${ARMS:-}" -e BENCH_TASKS="${BENCH_TASKS:-}" -e BENCH_URL="$url" -e BENCH_LIMIT="${BENCH_LIMIT:-600}" -e BENCH_REASONING="${BENCH_REASONING:-}" -e BENCH_GATE="${BENCH_GATE:-}" -e RESULTS="${RESULTS:-results.jsonl}" \
-  -e MAAT_BUILD="$sha" -e PYTHONDONTWRITEBYTECODE=1 -e BENCH_CPUS="$cpus" -e BENCH_MEMORY="$mem" -e BENCH_PRIVSEP="$privsep" \
+  -e MAAT_BUILD="$sha" -e PYTHONDONTWRITEBYTECODE=1 -e BENCH_API2_HOST="${BENCH_API2_HOST:-}" -e BENCH_API2_KEYVAR="$api2_keyvar" -e BENCH_CPUS="$cpus" -e BENCH_MEMORY="$mem" -e BENCH_PRIVSEP="$privsep" \
   "$img" sh -c "$startcmd" run "$@"
