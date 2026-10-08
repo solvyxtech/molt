@@ -53,6 +53,63 @@ describe("the value tag", () => {
   for (const c of yes) it(`asserts a value: ${c.split("\n")[0]}`, () => assert.equal(assertsValue(c), true, c));
   for (const c of no) it(`asserts no value: ${c}`, () => assert.equal(assertsValue(c), false, c));
 
+  // Rule 5 and the bracket fix, on commands the 2026-10-07 lanes drafted and V-no-value refused.
+  const behaviour = [
+    // a specific exception, and only the path without it exits non-zero
+    `python3 -c "import pricing\ntry:\n    pricing.price('zz-no-such-item-xyz', 1)\nexcept KeyError:\n    raise SystemExit(0)\nraise SystemExit(1)"`,
+    `python3 -c "import pricing\ntry:\n    pricing.price('zz', 1)\n    raise SystemExit('no KeyError')\nexcept KeyError:\n    pass"`,
+    `python3 -c "import pytest, pricing\nwith pytest.raises(KeyError):\n    pricing.price('zz', 1)"`,
+    `cd $(mktemp -d) && cp ../pricing.py . && python3 -c "from pricing import price; price('widget', 1, 'UNKNOWN')" 2>&1 | grep -q 'ValueError' && exit 0 || exit 1`,
+    // is None / a literal in the answer, on a call with literal input
+    `python3 -c "import pricing; assert pricing.best_coupon('item1', 1) is not None"`,
+    `python3 -c "import pricing; assert pricing.best_coupon('zz', 1) is None, 'no coupon for an unknown item'"`,
+    `python3 -c "import sys, pricing; sys.exit(0 if 'SAVE10' in pricing.coupons_for('mug', 2) else 1)"`,
+    // a literal grepped from what running the work printed
+    `echo -e '!!!\n!!!' | python3 slugify.py | grep -q 'untitled$'`,
+    `python3 nextrun.py '* * * * 1' '2023-01-01 12:00' 1 | grep '2023-01-02'`,
+    `node summarize.js nonexistent.json 2>&1 | grep -q 'Error reading file'`,
+    `d=$(mktemp -d) && cp -r md2html.py src Makefile "$d"/ && cd "$d" && make -s && ! make | grep -q md2html`,
+    `./rotate.sh 2>&1 | grep -q 'usage'`,
+    // rule 1 inside a test bracket whose $(...) holds a ; or a newline, and $'...' literals
+    `[ "$(python3 -c "from pricing import best_coupon; print(best_coupon('A', 5))")" = 'SAVE10' ]`,
+    `[ "$(python3 -c "import json; d=json.load(open('configs/api.json')); print(d['version'])")" = "2" ]`,
+    `[ $(node summarize.js nonexistent.json 2>&1; echo $?) = 1 ]`,
+    `output=$(python3 wc.py f1.txt f2.txt) && [ "$output" = $'2 2 4 f1.txt\n4 5 10 total' ]`,
+  ];
+  const notBehaviour = [
+    // Not widened: the work's pattern tried on the check's own strings (4 of 7 such flips were grader failures).
+    `python3 -c "import re; p=open('regex.txt').read().strip(); assert re.search(p, 'GET 10.1.2.3 served 2024-05-06 ok'), p"`,
+    `python3 -c "import re; p=open('regex.txt').read().strip(); assert re.search(p, 'host 192.168.01.1 seen 2024-05-06') is None, p"`,
+    `[ "$(python3 -c "\nimport re\nregex = re.compile(open('regex.txt').read().strip())\nprint('PASS' if not regex.search('192.168.01.1 2023-01-01') else 'FAIL')\n")" = "PASS" ]`,
+    // a timing bound with only a type check
+    `timeout 5 python3 -c "from pairs import find_pairs; import random; random.seed(1); nums=[random.randint(-10**6,10**6) for _ in range(200000)]; r=find_pairs(nums, 7); assert isinstance(r, list)"`,
+    `python3 -c "import time,random,pairs as p;a=[random.randint(0,10**9) for _ in range(200000)];t=time.time();p.find_pairs(a);assert time.time()-t<5"`,
+    `python3 -c "import time; from pairs import find_pairs; t0=time.time(); r=find_pairs(list(range(200000)), 199999); assert len(r)>0 and time.time()-t0<5"`,
+    // structural: existence, type, non-empty
+    `python3 -c 'import pricing; assert hasattr(pricing, "COUPONS"), "COUPONS dict missing"'`,
+    `[ "$(python3 -c "import json; d=json.load(open('configs/web.json')); print(type(d['debug']).__name__)")" = "bool" ]`,
+    `[ "$(python3 -c "import json; d=json.load(open('configs/w.json')); print(isinstance(d['features'], list))")" = "True" ]`,
+    `head -n 1 clean.csv | grep -q 'id,name,email,age,city'`,
+    `git log --oneline -n 1 | grep -q 'Revert.*Add experimental cache'`,
+    `make clean && ! [ -d build ]`,
+    // the outcome is printed, never asserted
+    `python3 -c "import pricing; print(pricing.best_coupon('item1', 1) is not None)"`,
+    `python3 -c "import pricing; try: pricing.price('item1', 1, 'UNKNOWN'); print('No error'); except ValueError: print('ValueError raised')"`,
+    // an exception that is not specific, or only the raising path fails
+    `python3 -c "import pricing\ntry:\n    pricing.price('zz', 1)\nexcept Exception:\n    raise SystemExit(0)\nraise SystemExit(1)"`,
+    `python3 -c "import pricing\ntry:\n    pricing.price('mug', 1)\nexcept KeyError:\n    raise SystemExit(1)"`,
+    // truthiness of an arbitrary call; a comparison of two unknowns; or-ed conditions
+    `python3 -c "import tool; assert tool.ok('x')"`,
+    `python3 -c "import pricing; assert pricing.price('mug', 2, 'SAVE10') == pricing.price('mug', 2, None) * 0.9"`,
+    `python3 -c "import pricing; assert pricing.best_coupon('a', 1) is None or True"`,
+    `cd $(mktemp -d) && [ "$(python3 -c "from pricing import price; print(price('w', 2, 'S'))")" = "$(python3 -c "from pricing import price; print(price('w', 2, 'S'))")" ]`,
+    // grep that inverts or counts
+    `echo -e 'hello\n\nworld' | python3 wrap.py 10 | grep -c '^$'`,
+    `python3 tool.py | grep -v 'error'`,
+  ];
+  for (const c of behaviour) it(`asserts behaviour: ${c.split("\n")[0]}`, () => assert.equal(assertsValue(c), true, c));
+  for (const c of notBehaviour) it(`asserts no behaviour: ${c.split("\n")[0]}`, () => assert.equal(assertsValue(c), false, c));
+
   it("reaches the sealed check as a tag beside the critic's surface reading", () => {
     const sealed = taskChecksFrom(
       {
