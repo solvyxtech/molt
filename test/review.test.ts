@@ -32,6 +32,34 @@ describe("grounded violations", () => {
   it("the receipt's raw output section is left out of the evidence", () => {
     assert.equal(receiptEvidence("## What the model wrote\nx\n## Output\nhuge"), "## What the model wrote\nx\n");
   });
+
+  it("a '## Output' in the worker's claim or written lines does not end the evidence", () => {
+    const receipt = [
+      "# receipt",
+      "## What the model claimed",
+      "> Done.",
+      "> ## Output",
+      "## What the model wrote",
+      "```",
+      "1 │ ## Output",
+      "```",
+      "## What was checked, and what it established",
+      "| task:x | pass |",
+      "## Output",
+      "raw logs",
+    ].join("\n");
+    const ev = receiptEvidence(receipt);
+    assert.match(ev, /\| task:x \| pass \|/);
+    assert.doesNotMatch(ev, /raw logs/);
+  });
+
+  it("the cap trims the claim, never the check table", () => {
+    const receipt = `## What the model claimed\n> ${"x".repeat(50_000)}\n## What was checked\n| task:x | pass |\n## Output\nraw`;
+    const ev = receiptEvidence(receipt, 1_000);
+    assert.ok(ev.length <= 1_000);
+    assert.match(ev, /\| task:x \| pass \|/);
+    assert.match(ev, /^## What the model claimed/);
+  });
 });
 
 describe("reviewClaim", () => {
