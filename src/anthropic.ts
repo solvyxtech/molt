@@ -65,7 +65,11 @@ export function outputCeiling(body: string): number | null {
   const m =
     /max_tokens:\s*\d+\s*>\s*(\d+)/i.exec(body) ??
     /maximum allowed number of output tokens[^\d]{0,40}(\d+)/i.exec(body) ??
-    /max_tokens\D{0,40}(?:less than or equal to|at most|maximum of)\D{0,10}(\d+)/i.exec(body);
+    /max_tokens\D{0,40}(?:less than or equal to|at most|maximum of)\D{0,10}(\d+)/i.exec(body) ??
+    // OpenAI: "max_tokens is too large: 32768. This model supports at most 16384 completion tokens".
+    /max_tokens is too large[\s\S]{0,80}?supports at most (\d+) completion tokens/i.exec(body) ??
+    // DeepSeek: "the valid range of max_tokens is [1, 8192]".
+    /valid range of max_tokens is \[\d+,\s*(\d+)\]/i.exec(body);
   if (!m) return null;
   const n = Number(m[1]);
   return Number.isFinite(n) && n > 0 ? n : null;
