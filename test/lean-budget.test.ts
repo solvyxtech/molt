@@ -127,7 +127,10 @@ function within(name: string, m: Measured, c: Ceiling): void {
 const CEILINGS = {
   small: { largest: 11_700, total: 34_000, steps: 5 }, // 7,805 / 22,690 / 3
   bigRead: { largest: 62_000, total: 195_000, steps: 6 }, // 41,234 / 130,307 / 4
-  reread: { largest: 61_000, total: 173_000, steps: 14 }, // 40,732 / 115,399 / 9
+  // 2026-10-08: was 40,732 / 115,399 / 9, but only because the original copy was
+  // elided under its own "already shown" pointer, leaving the model no copy at
+  // all (Grok #51 item 3). One kept 40k copy per step is the honest cost.
+  reread: { largest: 61_000, total: 420_000, steps: 14 }, // 44,725 / 348,643 / 9
   longShed: { largest: 390_000, total: 10_900_000, steps: 92 }, // 259,597 / 7,262,564 / 61
   malformedRaw: { largest: 18_700, total: 104_000, steps: 11 }, // 12,450 / 69,197 / 7
   malformedAct: { largest: 14_100, total: 73_000, steps: 11 }, // 9,384 / 48,455 / 7
