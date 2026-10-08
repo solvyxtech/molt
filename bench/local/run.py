@@ -627,7 +627,7 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
     write_private(log, out)
     # Maat's own notices (criteria not drafted, dropped checks, refusals) go to stderr.
     write_private(log.with_suffix(".err"), err or "")
-    steps = 0; per = []; outcome = None; spend = {}; review = None; disagree = []; extra = {}
+    steps = 0; per = []; outcome = None; spend = {}; judge = None; review = None; disagree = []; extra = {}
     for line in out.splitlines():
         if not line.startswith("{"):
             continue
@@ -641,6 +641,9 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
         elif ev.get("kind") == "job_end":
             outcome = claim_of(ev)
             spend = ev.get("spend") or {}
+            # The judge's asks (drafting, critic, review, audit), metered apart from
+            # the worker's. Absent on builds before judge metering, or when no judge ran.
+            judge = ev.get("judge")
             review = ev.get("review")
             disagree = ev.get("checksDisagree") or []
             # Only what job_end carried; absent keys stay absent (older builds).
@@ -651,7 +654,9 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
     return {
         "provider_capped": capped,
         "secs": round(secs), "turns": steps, "calls": sum(per), "multi": sum(1 for x in per if x > 1),
-        "tokens_in": spend.get("promptTokens"), "cost_usd": spend.get("costUsd"), "claim": outcome, "timed_out": timed_out,
+        "tokens_in": spend.get("promptTokens"), "cost_usd": spend.get("costUsd"),
+        **judge_columns(judge),
+        "claim": outcome, "timed_out": timed_out,
         "said_done": (outcome or "").startswith("verified"),
         # The reviewer's label: a verified claim it did not confirm.
         "review": review,
@@ -659,6 +664,24 @@ def run_molt(d: Path, prompt: str, log: Path) -> dict:
         "checks_disagree": disagree,
         "said_done_reviewed": (outcome or "").startswith("verified") and not (review and not review.get("confirmed")),
         **extra,
+    }
+
+
+def judge_columns(judge: dict | None) -> dict:
+    """The judge's tokens and $, next to the worker's `tokens_in` / `cost_usd`.
+
+    Only when the run output carried them (job_end.judge, Maat's judge meter): None
+    otherwise, so an older build is never read as a free judge. `judge_cost_usd` is
+    None when the judge's model had no price ("$ unknown"), never 0."""
+    if not isinstance(judge, dict):
+        return {}
+    return {
+        "judge_calls": judge.get("calls"),
+        "judge_tokens_in": judge.get("promptTokens"),
+        "judge_tokens_out": judge.get("completionTokens"),
+        "judge_cache_read": judge.get("cacheReadTokens"),
+        "judge_cache_write": judge.get("cacheWriteTokens"),
+        "judge_cost_usd": judge.get("costUsd"),
     }
 
 

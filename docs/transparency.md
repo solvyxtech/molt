@@ -152,6 +152,48 @@ The bottom line is the session meter and only ever climbs. **Per-job** figures
 — what one question cost — live in the view, measured as a delta against the
 session meter rather than by resetting it.
 
+### The judge's spend
+
+The worker's requests are not the only ones a run pays for. Around the work,
+Maat asks the judge: it drafts the hidden checks, a critic reads the draft, a
+reference check is written (`--reference`), the independent review votes
+(`--review`), the post-work audit drafts its checks, and the arbiter rules on a
+dispute. With `--judge` (`MAAT_JUDGE_MODEL`) those asks go to another model,
+often on another provider. Each one is metered on the **judge's meter**
+(`src/judge-meter.ts`), apart from the worker's:
+
+- **Tokens** — input, output, cache read and cache write — come from the
+  judge's own usage block, per call. A reply with no usage is counted from its
+  length and marked `~`, as on the worker side.
+- **Prices** come from the same table as the worker's (`providers.ts`), keyed
+  on the judge's model id: its provider's published list (xAI, OpenRouter),
+  Anthropic's rates on Anthropic's API, or the worker's own prices when the
+  judge is the worker's model. A provider-reported dollar figure is used as
+  is. A model with no known price shows its tokens and **`$ unknown`**, never
+  `$0`. A judge on a subscription (Grok Build, OpenCode) is paid by the plan
+  and gets no dollar figure.
+- **Where it shows:** a `judge_usage` journal entry per call; `judge` on
+  `job_end` (every judge call since the previous job, so the drafting before a
+  turn is counted with that turn); a `judge ...` line under the CLI's job line
+  and under the session totals, followed by `total $x (worker $a + judge $b)`
+  when both are priced; and the receipt, which carries the judge's spend so far
+  when the claim is made, with the index row (`judge`) brought up to date when
+  the job ends, since the review and the audit run after the receipt is written.
+
+The worker's figures (`spend`, `sessionTokens`, the step lines, `costUsd` on a
+receipt) stay the worker's: the lean-budget suite measures the worker's
+requests, and the judge's are not among them.
+
+**A budget counts both.** `--budget` / `/budget <tokens>` is checked against
+the worker's tokens plus the judge's, and the per-turn ceiling in tokens or
+dollars counts the judge's spend in that turn too: a budget is what you are
+willing to spend, and the judge's tokens are billed like any others. When a
+budget is hit with judge spend in it, the message says how much was the
+judge's. A judge with no known price adds its tokens to a token budget and
+nothing to a dollar ceiling (its spend there is unknown, and said so). The
+budget is checked before every worker step; a judge ask already under way is
+not cut off.
+
 ## Work that goes nowhere
 
 A tool call that returns exactly what it returned before has taught the model

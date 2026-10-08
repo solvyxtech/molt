@@ -83,7 +83,12 @@ part of this.
 
 After each run, run.py reads the run's cost (`spend.costUsd`) and prompt
 tokens (`spend.promptTokens`) from Maat's `job_end` event, and records the cost
-in the row as `cost_usd`. The run trips the alarm when:
+in the row as `cost_usd`. The judge's spend, when `job_end` carries it
+(`judge`, see transparency.md), goes in the same row beside the worker's:
+`judge_calls`, `judge_tokens_in`, `judge_tokens_out`, `judge_cache_read`,
+`judge_cache_write` and `judge_cost_usd` (null when the judge's model has no
+price, never 0). The alarm below is on the worker's cost and tokens. The run
+trips the alarm when:
 
 - its cost exceeds **max(5x the lane's running median cost, $0.10)**. The
   median is over the lane's earlier runs that reported a cost (resumed rows
