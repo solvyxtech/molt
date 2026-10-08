@@ -23,7 +23,9 @@
  *    which is adjudicated by running them. It is never asked to decide.
  *  - Attempts made by a provider whose terms bar using its output to develop
  *    machine learning models are left out entirely — not in records.jsonl,
- *    not in a split. See EXCLUDED_PROVIDERS below.
+ *    not in a split. That covers the judge as well as the worker: a run whose
+ *    checks were drafted or whose claim was reviewed by such a model carries
+ *    its output too. See EXCLUDED_PROVIDERS below.
  *
  * Usage:
  *   node finetune/extract.mjs [--out finetune/data/<date>] [--valid 0.15]
@@ -56,8 +58,28 @@ import { basename, join, resolve } from "node:path";
  */
 const EXCLUDED_PROVIDERS = new Set(["xai", "x.ai", "api.x.ai", "grok-build", "grok build"]);
 const EXCLUDED_MODEL = /(^|\/)grok-/iu;
-function isExcluded(provider, model) {
-  return EXCLUDED_PROVIDERS.has(String(provider ?? "").trim().toLowerCase()) || EXCLUDED_MODEL.test(String(model ?? ""));
+/** An endpoint that is xAI's, directly or through the Grok Build CLI. */
+const EXCLUDED_URL = /^grok-build:\/\/|^https?:\/\/([^/]*\.)?x\.ai(\/|:|$)/iu;
+/**
+ * The receipt's `- judge: <model> at <url>` line (src/receipts.ts), or the
+ * index row's `judge` / `judgeUrl`, as { model, url }. No judge line: the
+ * worker judged itself, and the worker is checked already.
+ */
+function judgeOf(meta, idx) {
+  const line = String(meta["judge"] ?? "").trim();
+  const at = line.lastIndexOf(" at ");
+  const model = (at >= 0 ? line.slice(0, at) : line).trim() || String(idx.judge ?? "").trim();
+  const url = (at >= 0 ? line.slice(at + 4) : "").trim() || String(idx.judgeUrl ?? "").trim();
+  return { model, url };
+}
+function isExcluded(provider, model, judge = { model: "", url: "" }) {
+  return (
+    EXCLUDED_PROVIDERS.has(String(provider ?? "").trim().toLowerCase()) ||
+    EXCLUDED_MODEL.test(String(model ?? "")) ||
+    EXCLUDED_MODEL.test(judge.model) ||
+    EXCLUDED_URL.test(judge.url) ||
+    EXCLUDED_PROVIDERS.has(judge.url.toLowerCase())
+  );
 }
 
 const args = process.argv.slice(2);
@@ -192,7 +214,7 @@ for (const { root, state } of sources) {
     const idx = index.filter((x) => x.file === f).at(-1) ?? {};
     // Left out before anything is built from it, so no field of an excluded
     // attempt reaches records.jsonl either.
-    if (isExcluded(r.meta["provider"] ?? idx.provider, r.meta["model"] ?? idx.model)) { excludedIds.add(id); continue; }
+    if (isExcluded(r.meta["provider"] ?? idx.provider, r.meta["model"] ?? idx.model, judgeOf(r.meta, idx))) { excludedIds.add(id); continue; }
     // Which session: the index row says, or a journal names this receipt.
     let session = idx.session ?? null;
     if (!session) for (const [sid, es] of journals) if (es.some((e) => e.kind === "receipt" && basename(String(e.data.file ?? "")) === f)) { session = sid; break; }
@@ -303,6 +325,6 @@ const manifest = {
 };
 writeFileSync(join(out, "manifest.json"), JSON.stringify(manifest, null, 2) + "\n");
 console.log(`${all.length} unique receipts from ${seenFiles} files across ${roots.length} root(s) → ${out}`);
-if (excludedIds.size) console.log(`left out ${excludedIds.size} receipt(s) from providers whose terms bar training on their output`);
+if (excludedIds.size) console.log(`left out ${excludedIds.size} receipt(s) whose worker or judge was a provider whose terms bar training on their output`);
 console.log(`train ${train.length} · valid ${valid.length} (${validSessions.size} held-out session(s)) · with journal turn ${manifest.withJournalTurn}`);
 console.log(`verdicts ${JSON.stringify(manifest.verdicts)} · failing checks ${JSON.stringify(manifest.failingChecks)}`);

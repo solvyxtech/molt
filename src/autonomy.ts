@@ -318,6 +318,58 @@ export function deletesOnlyCreated(
   return true;
 }
 
+/** `tee [-flags] file...` with plain-word targets; the rest of the line is not matched. */
+const TEE_TARGETS =
+  /\btee((?:[ \t]+-[a-zA-Z]+)*)((?:[ \t]+(?:"[^"$`\\\s]+"|'[^'\s]+'|[^\s;&|<>$`*?{}()'"\\-][^\s;&|<>$`*?{}()'"\\]*))+)/g;
+
+/**
+ * The command with the body of every `cat`/`tee` heredoc taken out.
+ *
+ * `cat << 'EOF' > report.csv … EOF` is a file being written from text, and the
+ * text is not run. But the same body fed to `bash` or `python` is a program,
+ * so only a heredoc line that starts with cat or tee, has no second command
+ * on it, and (when its delimiter is unquoted, so the shell expands it) holds
+ * no `$(` or backtick is stripped. Anything else — an unterminated body, a
+ * different consumer — is returned untouched, and the ordinary rules ask.
+ */
+function withoutHeredocData(command: string): string {
+  const lines = command.split("\n");
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const m = /<<(-?)[ \t]*(['"]?)([A-Za-z_]\w*)\2/.exec(line);
+    if (!m) {
+      out.push(line);
+      continue;
+    }
+    let end = -1;
+    for (let j = i + 1; j < lines.length; j++) {
+      if ((m[1] ? lines[j]!.trim() : lines[j]) === m[3]) {
+        end = j;
+        break;
+      }
+    }
+    const body = end < 0 ? [] : lines.slice(i + 1, end);
+    const readable =
+      end >= 0 &&
+      /^\s*(cat|tee)\b/.test(line) &&
+      !/;|&&|\|\|/.test(line) &&
+      (m[2] !== "" || !body.some((b) => /\$\(|`/.test(b)));
+    if (!readable) return command;
+    out.push(line.replace(m[0], " "));
+    i = end;
+  }
+  return out.join("\n");
+}
+
+const ECHO_ARG = `(?:'[^']*'|"(?:[^"$\`\\\\]|\\\\[nt\\\\"])*"|[^\\s;&|<>'"\`$()\\\\])+`;
+const ECHO_DATA = new RegExp(`(^|[;&|\\n]\\s*)(?:echo|printf)(?:[ \\t]+${ECHO_ARG})*`, "g");
+
+/** `echo`/`printf` and their literal arguments reduced to `echo`: text is not a command. */
+function withoutEchoData(command: string): string {
+  return command.replace(ECHO_DATA, (_m, lead: string) => `${lead}echo`);
+}
+
 /** Would this command do something no later step could undo? */
 /**
  * Does this command's only irreversible act write files that did not exist?
@@ -343,14 +395,35 @@ export function overwritesOnlyNew(
   cwd: string,
   tmp: string = tmpdir(),
 ): boolean {
-  const bare = command.replace(HARMLESS_REDIRECT, " ");
-  // Every `> target` and `N> target`. `>>` never reached the list, and `>&2`
+  // Heredoc bodies and echo/printf arguments are text being written, not
+  // commands: a script whose body mentions `rm` is not an rm. Both strips
+  // are all-or-nothing and leave anything they cannot read exactly as it was.
+  const prepared = withoutEchoData(withoutHeredocData(command));
+  // A heredoc that was not stripped is one whose body could not be read.
+  if (/<</.test(prepared)) return false;
+  const teed: string[] = [];
+  const text = prepared.replace(TEE_TARGETS, (_m, _flags: string, list: string) => {
+    for (const w of list.trim().split(/[ \t]+/)) teed.push(w);
+    return " ";
+  });
+  const bare = text.replace(HARMLESS_REDIRECT, " ");
+  // Every `> target` and `N> target`.  `>>` never reached the list, and `>&2`
   // style duplications are not files.
   const re = /(?<![>&])\d?>(?![>&])\s*(\S+)/g;
   const targets: string[] = [];
   // Quotes off, and the shell punctuation a target can run into (`> out;`).
   for (const m of bare.matchAll(re)) targets.push(m[1].replace(/[;&|)]+$/, "").replace(/^['"]|['"]$/g, ""));
-  if (!targets.length) return false;
+  for (const w of teed) targets.push(w.replace(/^['"]|['"]$/g, ""));
+  // `>> file` loses nothing, but it is what `echo 'rm -- "$f"' >> rotate.sh`
+  // is written with, so the stripped text above has to be allowed to stand on
+  // its own. Only a plain path inside the project counts.
+  const appended = [...bare.matchAll(/>>\s*(\S+)/g)].map((m) => m[1].replace(/[;&|)]+$/, "").replace(/^['"]|['"]$/g, ""));
+  if (!targets.length && !appended.length) return false;
+  for (const t of appended) {
+    if (/[*?$`{}]/.test(t) || !insideProject(cwd, t)) return false;
+    const abs = resolve(cwd, t);
+    if (existsSync(abs) && statSync(abs).isDirectory()) return false;
+  }
   // What is left must be reversible on its own: `rm a > log` is still an rm.
   if (isIrreversible(bare.replace(re, " "))) return false;
   for (const t of targets) {
@@ -494,11 +567,17 @@ export function insideProject(cwd: string, p: unknown): boolean {
 const READING_TOOLS = new Set(["read_file", "list_dir", "grep", "inspect"]);
 
 /**
- * Tools that touch nothing at all. `plan` writes a note into the model's own
+ * Tools that touch nothing at all. `act` is here for the case where it reaches
+ * the gate as itself: a readable batch is expanded into its inner actions
+ * (each gated on its own) before it gets here, so the one that arrives whole
+ * is the one whose action list could not be parsed, and the dispatcher only
+ * answers it with the shape error. Refusing it instead told the model "User
+ * denied this action" (39/72/31 times per bench arm) for a call that ran
+ * nothing, and it never learned the real problem. `plan` writes a note into the model's own
  * conversation and nowhere else; there is no disk, no process and no network
  * on its code path, so no autonomy level has anything to say about it.
  */
-const INERT_TOOLS = new Set(["plan"]);
+const INERT_TOOLS = new Set(["plan", "act"]);
 
 /** Tools that write, and are gated exactly like write_file. */
 const WRITING_TOOLS = new Set(["write_file", "edit_file"]);

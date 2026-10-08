@@ -9,7 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { ASK_MAX_TOKENS, ASK_RETRY_FACTOR, askModel, jsonIn, notJson } from "../src/ask.js";
+import { ASK_MAX_TOKENS, ASK_RETRY_FACTOR, ASK_RETRY_MAX_TOKENS, askModel, jsonIn, notJson } from "../src/ask.js";
 
 type Reply = { content: string | null; finish?: string; status?: number };
 
@@ -61,17 +61,46 @@ describe("askModel", () => {
     assert.deepEqual(p.ceilings, [100, 400]);
   });
 
-  it("does not retry a reply that was cut off mid-answer: that one is the caller's to report", async () => {
-    const p = replying([{ content: '{"a":', finish: "length" }]);
+  it("asks once more, with room, when a reply was cut off mid-answer", async () => {
+    // A draft of exact, edge-case checks outgrew the ceiling: half a JSON reply proposes nothing.
+    const p = replying([{ content: '{"a":', finish: "length" }, { content: '{"a":1}' }]);
     const r = await ask(p.fetchFn);
-    assert.deepEqual(r, { ok: true, text: '{"a":', cutOff: true });
-    assert.equal(p.ceilings.length, 1);
+    assert.deepEqual(r, { ok: true, text: '{"a":1}', cutOff: false });
+    assert.equal(p.ceilings.length, 2);
+    assert.ok(p.ceilings[1]! > p.ceilings[0]!);
   });
 
-  it("reports an HTTP failure with what was being asked", async () => {
-    const p = replying([{ content: null, status: 429 }]);
+  it("reports the second cut-off when the bigger ceiling is cut off too", async () => {
+    const p = replying([{ content: '{"a":', finish: "length" }, { content: '{"a":[1,', finish: "length" }]);
     const r = await ask(p.fetchFn);
-    assert.deepEqual(r, { ok: false, error: "HTTP 429 drafting" });
+    assert.deepEqual(r, { ok: true, text: '{"a":[1,', cutOff: true });
+    assert.equal(p.ceilings.length, 2);
+  });
+
+  it("caps the retry's ceiling, and does not retry a caller already at the cap", async () => {
+    const p = replying([{ content: '{"a":', finish: "length" }, { content: '{"a":1}' }]);
+    await ask(p.fetchFn, { maxTokens: 6_000 });
+    assert.deepEqual(p.ceilings, [6_000, ASK_RETRY_MAX_TOKENS]);
+    const q = replying([{ content: '{"a":', finish: "length" }]);
+    const r = await ask(q.fetchFn, { maxTokens: 16_000 });
+    assert.deepEqual(q.ceilings, [16_000]);
+    assert.deepEqual(r, { ok: true, text: '{"a":', cutOff: true });
+  });
+
+  it("keeps the first cut-off reply when the retry fails outright", async () => {
+    const p = replying([{ content: '{"a":', finish: "length" }, { content: null, status: 400 }]);
+    const r = await ask(p.fetchFn);
+    assert.deepEqual(r, { ok: true, text: '{"a":', cutOff: true });
+    assert.equal(p.ceilings.length, 2);
+  });
+
+  it("reports an HTTP failure with what was being asked, and marks a rate limit worth asking again", async () => {
+    const p = replying([{ content: null, status: 429 }]);
+    const r = await ask(p.fetchFn, { overloadBackoffMs: [] });
+    assert.deepEqual(r, { ok: false, error: "HTTP 429 drafting", transient: true });
+    const q = replying([{ content: null, status: 400 }]);
+    assert.deepEqual(await ask(q.fetchFn, { overloadBackoffMs: [0] }), { ok: false, error: "HTTP 400 drafting" });
+    assert.equal(q.ceilings.length, 1, "a request the provider called wrong is not asked again");
   });
 });
 

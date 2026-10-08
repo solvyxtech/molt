@@ -9,7 +9,7 @@ import { changesSomething, criteriaWaitMs, Engine } from "../src/engine.js";
 import type { Check, EngineEvent } from "../src/types.js";
 import { allowAll, drain, scriptedProvider, workspace } from "./helpers.js";
 
-const check: Check = { name: "made", kind: "command", run: "test -f out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true };
+const check: Check = { name: "made", kind: "command", run: "grep -qx y out.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true, author: { kind: "judge", model: "judge-j" } };
 const later = <T>(v: T, ms: number) => new Promise<T>((r) => setTimeout(() => r(v), ms));
 const sealedAt = (ev: EngineEvent[]) => ev.findIndex((e) => e.kind === "info" && /sealed for this turn/.test(e.text));
 const toolAt = (ev: EngineEvent[], name: string) => ev.findIndex((e) => e.kind === "tool" && e.name === name);

@@ -428,13 +428,188 @@ export function isCatastrophic(pattern: string): boolean {
 /**
  * A file whose job is to pin behaviour down.
  *
- * Anything under a `test/` or `tests/` directory, or named `*.test.*` /
- * `*.spec.*`. The distinction matters because editing a line of source is
- * ordinary work, and editing the line that says what the source must do is a
- * change to the specification — a different act, needing a different answer.
+ * Anything under a `test/`, `tests/`, `spec/` or `__tests__/` directory, or
+ * named by a test runner's own convention: `*.test.*` / `*.spec.*` (JS),
+ * `test_*.py` / `*_test.py` and pytest's `conftest.py`, `*_test.go`,
+ * `*_spec.rb`, `*Test.java` and its kin. The distinction matters because
+ * editing a line of source is ordinary work, and editing the line that says
+ * what the source must do is a change to the specification — a different
+ * act, needing a different answer. A Python project's `test_count.py` at the
+ * root used to read as source, so a rewritten assertion in it was ordinary
+ * work to `spec-intact`.
  */
 export function isTestPath(path: string): boolean {
-  return /(^|\/)tests?\//.test(path) || /\.(test|spec)\.[cm]?[jt]sx?$/.test(path);
+  return (
+    /(^|\/)(?:tests?|spec|__tests__)\//.test(path) ||
+    /\.(test|spec)\.[cm]?[jt]sx?$/.test(path) ||
+    /(^|\/)(?:test_[^/]+\.py|[^/]+_test\.(?:py|go)|conftest\.py|[^/]+_spec\.rb|[^/]+Tests?\.(?:java|kt|cs|swift))$/.test(path)
+  );
+}
+
+/**
+ * A line that turns a test off: a skip, an expected failure, or a `.only`
+ * that silently drops every test beside it.
+ *
+ * Deleting an assertion is one way to make a specification stop speaking;
+ * leaving it in place and skipping the test around it is the same act with
+ * the text intact, and `spec-intact` compared text. Matched on the trimmed
+ * line, test files only.
+ */
+const SKIP_MARKER = new RegExp(
+  [
+    // Python: unittest and pytest decorators, calls and raises.
+    String.raw`^@(?:unittest\.)?(?:skip|skipIf|skipUnless|expectedFailure)\b`,
+    String.raw`^@(?:pytest\.)?mark\.(?:skip|skipif|xfail)\b`,
+    String.raw`\bpytest\.(?:skip|xfail)\s*\(`,
+    String.raw`\bself\.skipTest\s*\(`,
+    String.raw`\braise\s+(?:unittest\.)?SkipTest\b`,
+    // JS runners: it.skip / test.only / describe.todo, xit, node:test's { skip } / t.skip().
+    String.raw`\b(?:it|test|describe|context|suite|specify)\.(?:skip|only|todo|fixme)\b`,
+    String.raw`^(?:xit|xtest|xdescribe|xcontext|xspecify)\s*\(`,
+    String.raw`[{,]\s*(?:skip|todo)\s*:(?!\s*(?:false|undefined)\b)`,
+    String.raw`\bt\.(?:skip|todo)\s*\(`,
+    // Go, Rust, JUnit, RSpec.
+    String.raw`\bt\.Skip(?:f|Now)?\s*\(`,
+    String.raw`^#\[ignore\b`,
+    String.raw`^@(?:Disabled|Ignore)\b`,
+    String.raw`^(?:skip|pending)(?:\s*\(|\s+["']|$)`,
+  ].join("|"),
+);
+
+/** The lines of a test file that turn a test off (see SKIP_MARKER), normalised. */
+export function skipsIn(text: string): string[] {
+  const out: string[] = [];
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t || (t.startsWith("#") && !t.startsWith("#[")) || t.startsWith("//")) continue;
+    if (SKIP_MARKER.test(t)) out.push(t.replace(/\s+/g, " "));
+  }
+  return out;
+}
+
+/** Skip lines in `after` beyond those `before` already had, counted as a multiset. */
+export function addedSkips(before: string[], after: string[]): string[] {
+  const had = new Map<string, number>();
+  for (const s of before) had.set(s, (had.get(s) ?? 0) + 1);
+  const out: string[] = [];
+  for (const s of after) {
+    const n = had.get(s) ?? 0;
+    if (n > 0) had.set(s, n - 1);
+    else out.push(s);
+  }
+  return out;
+}
+
+/**
+ * Everything a change takes away from a test file's specification: the
+ * assertions it removed (or rewrote — a rewritten assertion is the old one
+ * removed), and the skips it added. Each skip reads as what it is.
+ */
+export function specWeakened(before: string, after: string): string[] {
+  // A skip on a test the turn added (a new file, or a new test with a
+  // platform skip) turns nothing off that was promised before: adding tests,
+  // skipped where they cannot run, is free. Only a skip on a test that
+  // existed before the turn, or one Maat cannot tie to a test, counts.
+  const had = testNames(before);
+  const fresh = new Set<string>();
+  if (before.trim()) {
+    // A renamed test with an unconditional skip is still the old test turned
+    // off, so only a conditional skip (a platform or tool check) is free there.
+    // Nor is a "new" test whose assertions were already in the file: that is
+    // an old test renamed, and skipping it turns the old test off.
+    const old = new Set(assertionsIn(before));
+    for (const { skip, test } of skipsWithTests(after)) {
+      if (test === undefined || had.has(test) || !conditionalSkip(skip)) continue;
+      if (assertionsIn(testBody(after, test)).some((a) => old.has(a))) continue;
+      fresh.add(skip);
+    }
+  }
+  const added = before.trim() ? addedSkips(skipsIn(before), skipsIn(after)).filter((s) => !fresh.has(s)) : [];
+  return [...removedAssertions(before, after), ...added.map((s) => `${s}  (turns a test off)`)];
+}
+
+/** Literals that are always true or always false in a skip condition. */
+const ALWAYS_TRUE = /^(?:True|true|1|-?[1-9]\d*|not\s+(?:0|False|None|""|'')|!\s*(?:0|false|null|undefined|""|'')|!!\s*1|(["'`])[^"'`]+\1)$/;
+const ALWAYS_FALSE = /^(?:False|false|0|None|null|undefined|""|''|not\s+(?:1|True)|!\s*(?:1|true))$/;
+
+/**
+ * A skip that depends on where it runs: skipif / skipIf / skipUnless, or
+ * `{ skip: <expression> }`, whose condition is not a literal. `skipIf(True,
+ * ...)`, `skipUnless(False, ...)` and `{ skip: 1 }` always skip.
+ */
+export function conditionalSkip(line: string): boolean {
+  const py = /\b(skipif|skipIf|skipUnless)\s*\(\s*([^,)]*)/.exec(line);
+  if (py) {
+    const cond = py[2]!.trim();
+    if (py[1] === "skipUnless" ? ALWAYS_FALSE.test(cond) : ALWAYS_TRUE.test(cond)) return false;
+    return cond !== "";
+  }
+  const js = /[{,]\s*skip\s*:\s*([^,}]+)/.exec(line);
+  if (!js) return false;
+  const cond = js[1]!.trim();
+  return !ALWAYS_TRUE.test(cond) && !ALWAYS_FALSE.test(cond);
+}
+
+/** The lines of test `name` in `text`: from its title or def to the next test or decorator. */
+function testBody(text: string, name: string): string {
+  const lines = text.split("\n");
+  const start = lines.findIndex((l) => {
+    const t = l.trim();
+    return JS_TEST.exec(t)?.[2] === name || PY_TEST.exec(t)?.[1] === name;
+  });
+  if (start < 0) return "";
+  let end = start + 1;
+  while (end < lines.length) {
+    const t = lines[end]!.trim();
+    if (JS_TEST.test(t) || PY_TEST.test(t) || t.startsWith("@")) break;
+    end++;
+  }
+  return lines.slice(start, end).join("\n");
+}
+
+const JS_TEST = /\b(?:it|test|describe|context|suite|specify|xit|xtest|xdescribe)(?:\.\w+)?\s*\(\s*(["'`])((?:(?!\1)[^\\]|\\.)*)\1/;
+const PY_TEST = /^(?:async\s+)?(?:def|class)\s+(\w+)/;
+
+/** The names of the tests a file defines: a JS test's title, a Python test function or class. */
+export function testNames(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    const js = JS_TEST.exec(t);
+    if (js) out.add(js[2]!);
+    const py = PY_TEST.exec(t);
+    if (py) out.add(py[1]!);
+  }
+  return out;
+}
+
+/** Each skip line (normalised as skipsIn) with the test it is on, when it can be told: the same line's title, or the def/class a decorator sits on. */
+export function skipsWithTests(text: string): { skip: string; test?: string }[] {
+  const lines = text.split("\n");
+  const out: { skip: string; test?: string }[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i]!.trim();
+    if (!t || (t.startsWith("#") && !t.startsWith("#[")) || t.startsWith("//") || !SKIP_MARKER.test(t)) continue;
+    const skip = t.replace(/\s+/g, " ");
+    const js = JS_TEST.exec(t);
+    if (js) {
+      out.push({ skip, test: js[2]! });
+      continue;
+    }
+    if (t.startsWith("@")) {
+      let test: string | undefined;
+      for (let j = i + 1; j < lines.length && j < i + 20; j++) {
+        const n = lines[j]!.trim();
+        if (!n || n.startsWith("@") || n.startsWith("#")) continue;
+        test = PY_TEST.exec(n)?.[1];
+        break;
+      }
+      out.push(test !== undefined ? { skip, test } : { skip });
+      continue;
+    }
+    out.push({ skip });
+  }
+  return out;
 }
 
 /**
@@ -449,7 +624,15 @@ export function assertionsIn(text: string): string[] {
   const out: string[] = [];
   for (const line of text.split("\n")) {
     const t = line.trim();
-    if (!/^(?:await\s+)?(?:assert|expect|chai|should)\b|\bexpect\(|\bassert\(/.test(t)) continue;
+    // `assert x`, `assert.equal(`, `expect(`, and the method forms every
+    // xUnit family uses — `self.assertEqual(`, `assertEquals(`, `assert_eq!(`,
+    // `t.assert.ok(` — which the first rule missed, so a Python test's
+    // `self.assertEqual(out, '3')` could be rewritten into a tautology and
+    // `spec-intact` saw no assertion leave.
+    if (
+      !/^(?:await\s+)?(?:assert|expect|chai|should)\b|\bexpect\(|\bassert\(/.test(t) &&
+      !/^(?:await\s+)?(?:[\w$]+\.)*assert[A-Z_]\w*!?\s*\(/.test(t)
+    ) continue;
     out.push(t.replace(/\s+/g, " "));
   }
   return out;
@@ -505,6 +688,8 @@ export type TreeSnapshot = {
   files: Map<string, string>;
   /** test path -> its assertions, normalised, at snapshot time. */
   assertions: Map<string, string[]>;
+  /** test path -> the lines in it that turn a test off (`skipsIn`), at snapshot time. */
+  skips?: Map<string, string[]>;
   /**
    * test path -> its text at snapshot time, for files under TEST_TEXT_CAP.
    *
@@ -529,6 +714,7 @@ export function snapshotTree(root: string): TreeSnapshot {
     takenAt: Date.now(),
     files: new Map(),
     assertions: new Map(),
+    skips: new Map(),
     testTexts: new Map(),
     truncated: false,
     examined: 0,
@@ -554,6 +740,7 @@ export function snapshotTree(root: string): TreeSnapshot {
       if (isTestPath(e.path) && isText(buf)) {
         const text = buf.toString("utf8");
         out.assertions.set(e.path, assertionsIn(text));
+        out.skips?.set(e.path, skipsIn(text));
         if (buf.length <= TEST_TEXT_CAP) out.testTexts?.set(e.path, text);
       }
     } catch {

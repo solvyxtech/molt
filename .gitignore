@@ -40,3 +40,8 @@ out-cli/
 *.tgz
 .molt/out/
 bench/local/work/
+bench/local/.api2.env
+
+# raw model output from bench probes stays local (xAI's AUP forbids using Grok
+# output to develop ML models, so transcripts are never committed)
+bench/local/ambiguity-results/

@@ -133,8 +133,33 @@ export function readSummary(output: string): RunnerSummary | null {
 const SWALLOW_TAIL = /(?:\|\|\s*(?:true|:|exit\s+0)|;\s*(?:true|:|exit\s+0))\s*$/;
 
 export function swallowsExit(run: string): string | null {
-  const m = SWALLOW_TAIL.exec(run.trim());
-  return m ? m[0].trim() : null;
+  const cmd = run.trim();
+  const m = SWALLOW_TAIL.exec(cmd);
+  if (!m) return null;
+  // `cond && exit 1 || exit 0` is `! cond`: the `exit 1` ends the shell
+  // before the `||` is reached. A redact-secrets check of exactly this shape
+  // was dropped on 2026-10-07 as one that could not fail.
+  const steps = topLevelCommands(cmd);
+  const before = steps.at(-2);
+  if (steps.at(-1)?.op === "||" && before?.op === "&&" && /^exit\s+[1-9]\d*$/.test(before.text)) return null;
+  // `for f in …; do … || exit 1; done; exit 0`: an earlier `exit N` in this
+  // same shell can still end the check non-zero; the tail only names the
+  // success path. Not one inside `( … )`, `$( … )` or a quoted `sh -c`.
+  if (/^;/.test(m[0].trim()) && exitsEarlier(cmd.slice(0, m.index))) return null;
+  return m[0].trim();
+}
+
+/** An `exit N` (N > 0) at the top level of the shell, outside quotes, heredocs and subshells. */
+function exitsEarlier(head: string): boolean {
+  const masked = maskShell(head);
+  let depth = 0;
+  for (let i = 0; i < masked.length; i++) {
+    const c = masked[i]!;
+    if (c === "(") depth++;
+    else if (c === ")") depth = Math.max(0, depth - 1);
+    else if (depth === 0 && c === "e" && /^exit\s+[1-9]/.test(masked.slice(i, i + 8)) && !/[\w$-]/.test(masked[i - 1] ?? "")) return true;
+  }
+  return false;
 }
 
 /** A top-level pipe (`a | b`, not `a || b`), without pipefail in force. */
@@ -241,4 +266,106 @@ export function judgePass(run: string, output: string, emptyAllowed = false): Pa
     };
   }
   return { ok: true, summary };
+}
+
+/** Mask quoted text so operators inside strings are not read as the shell's. */
+export function maskQuotes(s: string): string {
+  return s.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, (m) => "_".repeat(m.length));
+}
+
+/** Mask heredoc bodies (and quotes) so a script's own `;` and newlines are not the shell's. */
+export function maskShell(s: string): string {
+  let m = maskQuotes(s);
+  for (const h of s.matchAll(/<<-?\s*(['"]?)(\w+)\1/g)) {
+    const bodyStart = s.indexOf("\n", (h.index ?? 0) + h[0].length);
+    if (bodyStart < 0) continue;
+    const end = new RegExp(String.raw`\n[ \t]*${h[2]}[ \t]*(?:\n|$)`).exec(s.slice(bodyStart));
+    const stop = end ? bodyStart + end.index + end[0].trimEnd().length : s.length;
+    m = m.slice(0, bodyStart) + "_".repeat(stop - bodyStart) + m.slice(stop);
+  }
+  return m;
+}
+
+type Segment = { text: string; op: string };
+
+/**
+ * The top-level commands of a shell command, each with the operator before
+ * it (`;`, newline, `&&`, `||`, `|`, `&`, or "" for the first). Quotes,
+ * heredoc bodies, `( )`, `{ }`, `$( )` and `[[ ]]` are not split.
+ */
+export function topLevelCommands(run: string): Segment[] {
+  const m = maskShell(run);
+  const out: Segment[] = [];
+  let depth = 0;
+  let from = 0;
+  let op = "";
+  for (let i = 0; i < m.length; i++) {
+    const c = m[i]!;
+    const two = m.slice(i, i + 2);
+    if (two === "[[") { depth++; i++; continue; }
+    if (two === "]]") { depth = Math.max(0, depth - 1); i++; continue; }
+    if (c === "(" || c === "{") { depth++; continue; }
+    if (c === ")" || c === "}") { depth = Math.max(0, depth - 1); continue; }
+    if (depth > 0) continue;
+    let sep = "";
+    if (two === "&&" || two === "||") sep = two;
+    else if (c === ";" || c === "\n" || c === "|" || (c === "&" && m[i - 1] !== ">" && m[i + 1] !== ">")) sep = c;
+    if (!sep) continue;
+    const text = run.slice(from, i).trim();
+    if (text) out.push({ text, op });
+    op = sep;
+    from = i + sep.length;
+    i += sep.length - 1;
+  }
+  const text = run.slice(from).trim();
+  if (text) out.push({ text, op });
+  return out;
+}
+
+/**
+ * The step whose exit status is the check's, when that step prints its
+ * verdict instead of exiting with it: an inline program (`python3 -c`,
+ * `node -e`, a heredoc), `jq` without `-e`, `awk`, or `echo`/`printf`
+ * (`… || echo fail`, `…; echo $?`). Null when the deciding step is anything
+ * else, such as `grep`, `test`, `jq -e` or `find`: their own output (jq
+ * printing false inside `find -exec`) is not the check's verdict.
+ */
+export function verdictPrinter(run: string): string | null {
+  const steps = topLevelCommands(run.trim());
+  let d = steps.at(-1);
+  if (!d) return null;
+  if (steps.length > 1 && d.op === "||" && /^(?:exit\s+[1-9]\d*|false)\s*$/.test(d.text)) d = steps.at(-2)!;
+  const t = d.text;
+  if (/^(?:\w+=\S*\s+)*(?:timeout\s+\S+\s+)?(?:python3?|node|ruby|perl|php)\b/.test(t) && /\s-(?:c|e|E)\b|<<|\s-\s*$/.test(t)) return t;
+  if (/^jq\b/.test(t) && !/\s(?:-e|--exit-status)\b|\s-[a-zA-Z]*e[a-zA-Z]*\s/.test(` ${t} `)) return t;
+  if (/^awk\b/.test(t)) return t;
+  if (/^(?:echo|printf)\b/.test(t)) return t;
+  return null;
+}
+
+/**
+ * Did a check that exited 0 say, in words, that it failed?
+ *
+ * `python3 -c "print(rows == [['a'], ['b']])"` exits 0 whether it printed
+ * True or False, and so does `jq '.n == 3'`, `…; echo $?` and a script that
+ * prints FAIL. The exit code of such a check does not depend on what it
+ * asserted. Its own last line does: a check whose last line on stdout is
+ * False, FAIL(ED) or NO, or whose `echo $?` tail printed something other
+ * than 0, reported a failure and is read as one, when the step that decides
+ * the exit is the one that printed (verdictPrinter): `find … -exec sh -c
+ * 'jq -e …'` prints jq's `false` for files that rightly do not match, and
+ * that is not the check's verdict. Only for task checks (the drafted and
+ * approved criteria), never a project's own commands.
+ */
+export function reportsFailure(run: string, stdout: string): string | null {
+  // Only when the step that decides the exit prints the verdict instead.
+  if (!verdictPrinter(run)) return null;
+  const lines = stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const lastLine = lines.at(-1);
+  if (lastLine === undefined) return null;
+  if (/^(?:false|fail(?:ed|ure)?|no)$/i.test(lastLine)) return `it printed \`${lastLine}\` and exited 0: a check that reports a failure in words has failed`;
+  if (/(?:^|[;\n&]\s*)echo\s+["']?\$\?["']?\s*$/.test(run.trim()) && lastLine !== "0") {
+    return `it ends in \`echo $?\`, which printed ${lastLine}: the step before it failed`;
+  }
+  return null;
 }

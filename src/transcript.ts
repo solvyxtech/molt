@@ -19,6 +19,7 @@
  * No filesystem access here — archiving lives in archive.ts so this whole
  * module stays pure and testable.
  */
+import { parseLenient } from "./lenient-json.js";
 import { estTokens, type Bom, type Msg } from "./types.js";
 
 export const STALE_FAILURE_PREFIX = "[molt: superseded]";
@@ -76,6 +77,25 @@ export class Transcript {
 
   push(msg: Msg): void {
     this.working.push(msg);
+  }
+
+  /**
+   * Send this call's arguments as an excerpt from now on. A run that made 17
+   * malformed `act` calls in a row resent every one of them on every step,
+   * prompts grew to 630k tokens, and one task cost $0.82 for a 181-byte file
+   * (2026-10-07). The mark lives on the message, so it survives a restore; the
+   * record and captures keep the full text.
+   */
+  markMalformedCall(id: string): void {
+    for (let i = this.working.length - 1; i >= 0; i--) {
+      const m = this.working[i]!;
+      if (m.role === "assistant" && m.tool_calls?.some((c) => c.id === id)) {
+        const refused = new Set(m.molt?.refusedCalls ?? []);
+        refused.add(id);
+        this.working[i] = { ...m, molt: { ...m.molt, refusedCalls: [...refused] } };
+        return;
+      }
+    }
   }
 
   /**
@@ -145,8 +165,31 @@ export class Transcript {
    * Messages formatted for the wire: molt's own metadata removed, since
    * providers reject unknown fields with varying degrees of politeness.
    */
-  wire(): Omit<Msg, "molt">[] {
-    return this.all().map(({ molt: _molt, ...rest }) => rest);
+  wire(opts: { repairArgs?: boolean } = {}): Omit<Msg, "molt">[] {
+    // Repaired tool-call arguments are for the request only (wireArgs). A
+    // record of what the model did (a capture) passes repairArgs: false and
+    // keeps the arguments exactly as the model wrote them.
+    const repair = opts.repairArgs !== false;
+    // One system message, and it comes first. The pinned task and a shed's
+    // digest were system messages of their own, which OpenAI-style APIs take
+    // and strict chat templates refuse: Qwen's raises "System message must be
+    // at the beginning" on the second one, so every request to a local
+    // llama.cpp Qwen failed with a 500. Leading system messages are joined
+    // in order; a system message anywhere later goes as a user message.
+    const out: Omit<Msg, "molt">[] = [];
+    for (const { molt, ...m } of this.all()) {
+      const refused = new Set(molt?.refusedCalls ?? []);
+      if (m.role !== "system")
+        out.push(
+          repair && Array.isArray(m.tool_calls)
+            ? { ...m, tool_calls: m.tool_calls.map((c) => (c.id && refused.has(c.id) ? excerptCall(c) : wireCall(c))) }
+            : m,
+        );
+      else if (out.length === 0) out.push({ ...m });
+      else if (out.length === 1 && out[0]!.role === "system") out[0] = { ...out[0]!, content: `${out[0]!.content ?? ""}\n\n${m.content ?? ""}` };
+      else out.push({ role: "user", content: m.content ?? "" });
+    }
+    return out;
   }
 
   /**
@@ -538,7 +581,8 @@ export function buildDigest(dropped: Msg[]): string {
       } catch {
         detail = "(unparseable arguments)";
       }
-      actions.push(`${c.function.name}: ${detail}`);
+      // Capped: an act whose actions arrived as one huge string printed all of it here.
+      actions.push(`${c.function.name}: ${cap(detail, 200)}`);
     }
   }
 
@@ -603,4 +647,63 @@ export function toolDetail(name: string, args: Record<string, unknown>): string 
   // heredoc spread over twelve lines is a transcript nobody can scan.
   return raw.replace(/\s+/g, " ").trim();
 
+}
+
+/**
+ * A tool call as it goes back to the provider: arguments always valid JSON.
+ *
+ * Maat reads a model's slightly broken arguments leniently, which is right for
+ * running the call, but it sent the broken text back in the history. Strict
+ * providers then refuse every later request: DeepSeek V4 Pro on StreamLake
+ * answered "Assistant tool call function.arguments must be valid JSON" and
+ * ended 6 of 12 runs (2026-10-07). The transcript keeps what the model wrote;
+ * only the wire copy is repaired.
+ *
+ * Always a JSON object, the one shape the engine runs and the one chat
+ * templates that iterate `arguments | items` accept: blank or `null` is `{}`;
+ * anything else that is not an object (an array, a number, a string) or that
+ * cannot be read at all goes as `{"_unparsed": "<what the model wrote>"}`, so
+ * the next turn sees its own mistake rather than a call that seems to have
+ * sent nothing.
+ */
+export function wireArgs(text: string): string {
+  const isObject = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+  if (!text.trim()) return "{}";
+  let v: unknown;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    try {
+      const lenient = parseLenient(text);
+      if (isObject(lenient)) return JSON.stringify(lenient);
+    } catch {
+      /* fall through */
+    }
+    return JSON.stringify({ _unparsed: excerpt(text) });
+  }
+  if (isObject(v)) return text;
+  if (v === null) return "{}";
+  return JSON.stringify({ _unparsed: excerpt(text) });
+}
+
+/** How much of a refused call's arguments goes back to the provider. */
+export const MALFORMED_EXCERPT_CHARS = 300;
+
+/** The start of `text`, and how much was left out. Enough for the model to see its own mistake. */
+export function excerpt(text: string, max = MALFORMED_EXCERPT_CHARS): string {
+  return text.length <= max ? text : `${text.slice(0, max)}…[${text.length - max} more characters not resent]`;
+}
+
+/** A refused call as it goes back to the provider: always an object, never the whole text. */
+function excerptCall<T extends { function?: { arguments?: unknown } }>(c: T): T {
+  const a = c.function?.arguments;
+  const text = typeof a === "string" ? a : JSON.stringify(a ?? {});
+  return { ...c, function: { ...c.function!, arguments: JSON.stringify({ _refused: excerpt(text) }) } };
+}
+
+function wireCall<T extends { function?: { arguments?: unknown } }>(c: T): T {
+  const a = c.function?.arguments;
+  if (typeof a !== "string") return c;
+  const fixed = wireArgs(a);
+  return fixed === a ? c : { ...c, function: { ...c.function!, arguments: fixed } };
 }

@@ -26,19 +26,24 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import sys
 from decimal import Decimal
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from grading import jsonish, py_values  # noqa: E402,F401
 
 # agent bookkeeping that may appear in the task folder and is never judged
 IGNORED = {".molt", ".maat", "__pycache__", ".DS_Store"}
 
 
-def sh(cmd: str, cwd: Path) -> str:
-    return subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True).stdout
+def sh(cmd: str, cwd: Path, timeout: float = 120) -> str:
+    # errors="replace": one non-UTF-8 byte in a deliverable's output made graders raise.
+    return subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout).stdout
 
 
 def run(args, cwd=None, inp=None, timeout=30):
-    return subprocess.run(args, cwd=cwd, input=inp, capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(args, cwd=cwd, input=inp, capture_output=True, text=True, errors="replace", timeout=timeout)
 
 
 def scratch_copy(d: Path):
@@ -59,16 +64,29 @@ def all_files(root: Path) -> set[str]:
     return out
 
 
-def py_check(d: Path, code: str, timeout=60):
-    """Run grader code in a fresh interpreter inside d; it prints OK or a reason."""
-    try:
-        r = run(["python3", "-c", code], cwd=d, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return False, f"timed out after {timeout}s"
-    out = (r.stdout.strip().splitlines() or [""])[-1]
-    if out == "OK":
-        return True, "all checks"
-    return False, (out or r.stderr.strip()[-200:] or "no output")[:240]
+# There is no py_check any more. It ran a harness in the same interpreter as the worker's module
+# and passed on a last stdout line "OK", which the module could print itself from an atexit hook
+# after a failing check had called sys.exit() (PR #33 audit, B2). Graders that run the worker's
+# code take computed values back over grading.py_values and compare them here.
+
+
+def ok_val(r, want, typ=None) -> bool:
+    """A child `call` result ['ok', value] equal to want (and of JSON type typ, when given)."""
+    if not (isinstance(r, list) and r[:1] == ["ok"] and len(r) >= 2):
+        return False
+    v = r[1]
+    if typ is not None and not (type(v) is typ):
+        return False
+    return v == want
+
+
+def shown(r) -> str:
+    """A child `call` result as the old in-process harness printed it."""
+    if isinstance(r, list) and r[:1] == ["ok"]:
+        return f"('ok', {r[1]!r})"
+    if isinstance(r, list) and r[:1] == ["err"]:
+        return f"('err', {r[1]!r})"
+    return repr(r)
 
 
 # ---------------------------------------------------------------- 1. HTTP JSON server
@@ -348,42 +366,80 @@ class RefactorPricing:
     def grade(d: Path):
         if not (d / "pricing.py").exists():
             return False, "no pricing.py"
+        # The worker's module only computes; every comparison is made here, with the reference
+        # implementation run in this process (it never enters the worker's).
         code = (
             "import sys, inspect\nsys.path.insert(0, '.')\n"
-            "ref = {}\nexec(" + repr(RefactorPricing.ORIGINAL) + ", ref)\n"
-            "try:\n    import pricing as m\nexcept Exception as e:\n    print('import failed:', repr(e)); sys.exit()\n"
+            "try:\n    import pricing as m\nexcept Exception as e:\n    emit({'import': repr(e)})\n"
             "CODES = ['BOGO', 'BULK', 'FIVEOFF', 'SAVE10']\n"
-            "def call(f, *a):\n    try:\n        return ('ok', f(*a))\n    except Exception as e:\n        return ('err', type(e).__name__)\n"
+            "def call2(f, *a):\n    r = call(f, *a)\n    return r[:2]\n"
             "C = getattr(m, 'COUPONS', None)\n"
-            "if not isinstance(C, dict) or sorted(C) != CODES or not all(callable(v) for v in C.values()):\n"
-            "    print('COUPONS must be a dict of the 4 codes to functions'); sys.exit()\n"
-            "for it in ['widget', 'gadget', 'doohickey', 'thing']:\n"
-            "    for q in range(0, 26):\n"
-            "        for c in [None, 'NOPE'] + CODES:\n"
-            "            a, b = call(m.price, it, q, c), call(ref['price'], it, q, c)\n"
-            "            if a != b:\n                print(f'price({it!r},{q},{c!r}) = {a} but was {b}'); sys.exit()\n"
-            "if call(m.price, 'widget', 3) != call(ref['price'], 'widget', 3):\n    print('default coupon changed'); sys.exit()\n"
-            "if C['BULK'](2.5, 10, 25.0) != 20.0 or C['BOGO'](2.5, 3, 7.5) != 5.0:\n"
-            "    print('COUPONS functions do not follow f(base, qty, subtotal)'); sys.exit()\n"
-            "src = inspect.getsource(m.price)\n"
-            "if any(c in src for c in CODES):\n    print('price() still names coupon codes'); sys.exit()\n"
+            "V = {'coupons': {'dict': isinstance(C, dict), 'keys': sorted(map(str, C)) if isinstance(C, dict) else None,\n"
+            "                 'callable': isinstance(C, dict) and all(callable(v) for v in C.values())}}\n"
+            "if not (isinstance(C, dict) and sorted(map(str, C)) == CODES and all(callable(v) for v in C.values())):\n    emit(V)\n"
+            "V['price'] = [[it, q, c, call2(m.price, it, q, c)] for it in ['widget', 'gadget', 'doohickey', 'thing'] for q in range(0, 26) for c in [None, 'NOPE'] + CODES]\n"
+            "V['default'] = call2(m.price, 'widget', 3)\n"
+            "V['fns'] = [call2(C['BULK'], 2.5, 10, 25.0), call2(C['BOGO'], 2.5, 3, 7.5)]\n"
+            "try:\n    V['src'] = inspect.getsource(m.price)\nexcept Exception as e:\n    V['src'] = None\n"
             "saved = dict(C)\n"
             "C['SAVE10'] = lambda b, q, s: 1.0\nC['ZZZ'] = lambda b, q, s: s - 1\n"
-            "r1, r2 = call(m.price, 'gadget', 3, 'SAVE10'), call(m.price, 'gadget', 1, 'ZZZ')\n"
+            "V['uses'] = [call2(m.price, 'gadget', 3, 'SAVE10'), call2(m.price, 'gadget', 1, 'ZZZ')]\n"
             "C.clear(); C.update(saved)\n"
-            "if r1 != ('ok', 1.0) or r2 != ('ok', 9.0):\n    print(f'price() does not use COUPONS: {r1} {r2}'); sys.exit()\n"
-            "if not callable(getattr(m, 'best_coupon', None)):\n    print('no best_coupon'); sys.exit()\n"
-            "def best(it, q):\n"
-            "    none = ref['price'](it, q)\n"
-            "    p, c = min((ref['price'](it, q, c), c) for c in CODES)\n"
-            "    return c if p < none else None\n"
-            "for it in ['widget', 'gadget', 'doohickey']:\n"
-            "    for q in range(0, 26):\n"
-            "        a, b = call(m.best_coupon, it, q), ('ok', best(it, q))\n"
-            "        if a != b:\n            print(f'best_coupon({it!r},{q}) = {a}, want {b}'); sys.exit()\n"
-            "print('OK')\n"
+            "V['has_best'] = callable(getattr(m, 'best_coupon', None))\n"
+            "if V['has_best']:\n"
+            "    V['best'] = [[it, q, call2(m.best_coupon, it, q)] for it in ['widget', 'gadget', 'doohickey'] for q in range(0, 26)]\n"
+            "emit(V)\n"
         )
-        return py_check(d, code)
+        V, diag = py_values(d, code)
+        if not isinstance(V, dict):
+            return False, diag
+        if "import" in V:
+            return False, f"import failed: {V['import']}"[:240]
+        ref: dict = {}
+        exec(RefactorPricing.ORIGINAL, ref)
+
+        def rcall(f, *a):
+            try:
+                return ["ok", f(*a)]
+            except Exception as e:  # noqa: BLE001
+                return ["err", type(e).__name__]
+
+        CODES = ["BOGO", "BULK", "FIVEOFF", "SAVE10"]
+        c = V.get("coupons") or {}
+        if not (c.get("dict") and c.get("keys") == CODES and c.get("callable")):
+            return False, "COUPONS must be a dict of the 4 codes to functions"
+        for it, q, cp, a in V.get("price") or []:
+            b = jsonish(rcall(ref["price"], it, q, cp))
+            if a != b:
+                return False, f"price({it!r},{q},{cp!r}) = {shown(a)} but was {shown(b)}"[:240]
+        if len(V.get("price") or []) != 4 * 26 * 6:
+            return False, "the price grid was not computed"
+        if V.get("default") != jsonish(rcall(ref["price"], "widget", 3)):
+            return False, "default coupon changed"
+        fns = V.get("fns") or [None, None]
+        if not (ok_val(fns[0], 20.0) and ok_val(fns[1], 5.0)):
+            return False, "COUPONS functions do not follow f(base, qty, subtotal)"
+        src = V.get("src")
+        if not isinstance(src, str) or any(x in src for x in CODES):
+            return False, "price() still names coupon codes"
+        r1, r2 = (V.get("uses") or [None, None])[:2]
+        if not (ok_val(r1, 1.0) and ok_val(r2, 9.0)):
+            return False, f"price() does not use COUPONS: {shown(r1)} {shown(r2)}"[:240]
+        if not V.get("has_best"):
+            return False, "no best_coupon"
+
+        def best(it, q):
+            none = ref["price"](it, q)
+            p, cc = min((ref["price"](it, q, x), x) for x in CODES)
+            return cc if p < none else None
+
+        rows = V.get("best") or []
+        if len(rows) != 3 * 26:
+            return False, "best_coupon was not computed"
+        for it, q, a in rows:
+            if a != ["ok", best(it, q)]:
+                return False, f"best_coupon({it!r},{q}) = {shown(a)}, want ('ok', {best(it, q)!r})"[:240]
+        return True, "all checks"
 
 
 # ---------------------------------------------------------------- 5. bash script with args + exit codes
@@ -563,31 +619,73 @@ class PerfPairs:
     def grade(d: Path):
         if not (d / "pairs.py").exists():
             return False, "no pairs.py"
+        small = PerfPairs.small_cases()
+        # The worker's module only computes (and times itself); the answers and the time limit are
+        # checked here. The wall time of the whole child is checked too, so a module that fakes
+        # time.time() gains nothing.
         code = (
             "import sys, time, random\nsys.path.insert(0, '.')\n"
-            "ref = {}\nexec(" + repr(PerfPairs.SLOW) + ", ref)\n"
-            "def fast(nums, t):\n"
-            "    from collections import Counter\n    c = Counter(nums); out = set()\n"
-            "    for a in c:\n        b = t - a\n"
-            "        if a <= b and b in c and (a != b or c[a] > 1):\n            out.add((a, b))\n"
-            "    return sorted(out)\n"
             "from pairs import find_pairs\n"
-            "small = [([], 5), ([5], 10), ([5, 5], 10), ([1, 2, 3, 4, 5], 6), ([3, 3, 3], 6), ([-2, 7, 4, 1, 1, 4, 9, -2], 5),\n"
-            "         ([0, 0, 0, 1, -1], 0), ([10, -10, 20, -20, 0], 0), ([2, 4, 6], 100)]\n"
-            "rnd = random.Random(3)\n"
-            "for _ in range(40):\n    small.append(([rnd.randint(-8, 8) for _ in range(rnd.randint(0, 15))], rnd.randint(-10, 10)))\n"
+            f"small = {small!r}\n"
+            "V = {'small': []}\n"
             "for nums, t in small:\n"
-            "    got, want = find_pairs(list(nums), t), ref['find_pairs'](nums, t)\n"
-            "    if got != want or type(got) is not list or any(type(p) is not tuple for p in got):\n"
-            "        print(f'find_pairs({nums}, {t}) = {got!r}, want {want!r}'); sys.exit()\n"
+            "    got = find_pairs(list(nums), t)\n"
+            "    shape = type(got) is list and all(type(p) is tuple for p in got)\n"
+            "    V['small'].append([got, shape])\n"
             "rnd = random.Random(5)\nbig = [rnd.randint(-10**6, 10**6) for _ in range(200000)]\n"
-            "want = fast(big, 1234)\n"
-            "t0 = time.time(); got = find_pairs(list(big), 1234); el = time.time() - t0\n"
-            "if got != want:\n    print(f'wrong answer on the big input ({len(got)} pairs, want {len(want)})'); sys.exit()\n"
-            "if el > 5:\n    print(f'big input took {el:.1f}s'); sys.exit()\n"
-            "print('OK')\n"
+            "t0 = time.time(); got = find_pairs(list(big), 1234); V['el'] = time.time() - t0\n"
+            "V['big'] = got\n"
+            "emit(V)\n"
         )
-        return py_check(d, code, timeout=20)
+        t0 = time.time()
+        V, diag = py_values(d, code, timeout=20)
+        wall = time.time() - t0
+        if not isinstance(V, dict):
+            return False, diag
+        ref: dict = {}
+        exec(PerfPairs.SLOW, ref)
+        got_small = V.get("small") or []
+        if len(got_small) != len(small):
+            return False, "find_pairs was not run on every small input"
+        for (nums, t), (got, shape) in zip(small, got_small):
+            want = jsonish(ref["find_pairs"](nums, t))
+            if got != want or not shape:
+                return False, f"find_pairs({nums}, {t}) = {got!r}, want {want!r}"[:240]
+        rnd = random.Random(5)
+        big = [rnd.randint(-10**6, 10**6) for _ in range(200000)]
+        want = jsonish(PerfPairs.fast(big, 1234))
+        got = V.get("big")
+        if got != want:
+            return False, f"wrong answer on the big input ({len(got) if isinstance(got, list) else got!r} pairs, want {len(want)})"[:240]
+        el = V.get("el")
+        if not isinstance(el, (int, float)) or el > 5:
+            return False, f"big input took {el:.1f}s" if isinstance(el, (int, float)) else "no timing"
+        if wall > 5 + PerfPairs.WALL_SLACK:
+            return False, f"the check took {wall:.1f}s in all (the big input may take 5s)"
+        return True, "all checks"
+
+    # Interpreter start, the small cases and making the big input, on top of the 5 s the big input
+    # may take: a child slower than this lied about its own timing.
+    WALL_SLACK = 4.0
+
+    @staticmethod
+    def small_cases():
+        small = [([], 5), ([5], 10), ([5, 5], 10), ([1, 2, 3, 4, 5], 6), ([3, 3, 3], 6), ([-2, 7, 4, 1, 1, 4, 9, -2], 5),
+                 ([0, 0, 0, 1, -1], 0), ([10, -10, 20, -20, 0], 0), ([2, 4, 6], 100)]
+        rnd = random.Random(3)
+        for _ in range(40):
+            small.append(([rnd.randint(-8, 8) for _ in range(rnd.randint(0, 15))], rnd.randint(-10, 10)))
+        return small
+
+    @staticmethod
+    def fast(nums, t):
+        from collections import Counter
+        c = Counter(nums); out = set()
+        for a in c:
+            b = t - a
+            if a <= b and b in c and (a != b or c[a] > 1):
+                out.add((a, b))
+        return sorted(out)
 
 
 # ---------------------------------------------------------------- 8. git: revert one bad commit
@@ -833,18 +931,28 @@ class SizeParse:
         bad = ["", "   ", "-1 KB", "KB", "5 XB", "1.2.3 MB", "1,5 KB", "abc", "5 KBB", "-0.5"]
         code = (
             "import sys\nsys.path.insert(0, '.')\n"
-            "try:\n    from sizes import parse_size\nexcept Exception as e:\n    print('import failed:', repr(e)); sys.exit()\n"
-            f"good = {good!r}\nbad = {bad!r}\n"
-            "for s, v in good.items():\n"
-            "    try:\n        r = parse_size(s)\n    except Exception as e:\n        print(f'parse_size({s!r}) raised {type(e).__name__}, want {v}'); sys.exit()\n"
-            "    if r != v or type(r) is not int:\n        print(f'parse_size({s!r}) = {r!r}, want {v}'); sys.exit()\n"
-            "for s in bad:\n"
-            "    try:\n        r = parse_size(s)\n    except ValueError:\n        continue\n"
-            "    except Exception as e:\n        print(f'parse_size({s!r}) raised {type(e).__name__}, want ValueError'); sys.exit()\n"
-            "    print(f'parse_size({s!r}) = {r!r}, want ValueError'); sys.exit()\n"
-            "print('OK')\n"
+            "try:\n    from sizes import parse_size\nexcept Exception as e:\n    emit({'import': repr(e)})\n"
+            f"emit({{'good': [call(parse_size, s) for s in {list(good)!r}], 'bad': [call(parse_size, s) for s in {bad!r}]}})\n"
         )
-        return py_check(d, code)
+        V, diag = py_values(d, code)
+        if not isinstance(V, dict):
+            return False, diag
+        if "import" in V:
+            return False, f"import failed: {V['import']}"[:240]
+        for (s, v), r in zip(good.items(), V.get("good") or []):
+            if r[:1] == ["err"]:
+                return False, f"parse_size({s!r}) raised {r[1]}, want {v}"
+            if not ok_val(r, v, int):
+                return False, f"parse_size({s!r}) = {r[1]!r}, want {v}"
+        for s, r in zip(bad, V.get("bad") or []):
+            if r[:1] == ["err"] and r[3]:  # a ValueError (or a subclass)
+                continue
+            if r[:1] == ["err"]:
+                return False, f"parse_size({s!r}) raised {r[1]}, want ValueError"
+            return False, f"parse_size({s!r}) = {r[1]!r}, want ValueError"
+        if len(V.get("good") or []) != len(good) or len(V.get("bad") or []) != len(bad):
+            return False, "parse_size was not run on every input"
+        return True, "all checks"
 
 
 # ---------------------------------------------------------------- 12. file organisation

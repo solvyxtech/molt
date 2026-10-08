@@ -75,6 +75,7 @@ class Molt(BaseInstalledAgent):
         steps: int = 300,
         batch: bool | str = False,
         reveal_stuck: bool | str = False,
+        reference: bool | str = False,
         reasoning_checks: str | None = None,
         reasoning_retry: str | None = None,
         review: int | str | None = None,
@@ -104,6 +105,8 @@ class Molt(BaseInstalledAgent):
         # Batch mode: one act call per reply carrying a list of actions.
         self._batch = str(batch).lower() in ("1", "true", "yes", "on")
         self._reveal_stuck = str(reveal_stuck).lower() in ("1", "true", "yes", "on")
+        # An independent reference check (src/reference.ts); needs python3 in the image.
+        self._reference = str(reference).lower() in ("1", "true", "yes", "on")
         # Effort for drafting checks only, and for steps after a refusal.
         self._reasoning_checks = reasoning_checks
         self._reasoning_retry = reasoning_retry
@@ -230,10 +233,14 @@ class Molt(BaseInstalledAgent):
             flags.append("--criteria auto")
         if self._for:
             flags.append(f"--for {shlex.quote(str(self._for))}")
-        elif self._pace:
+        else:
+            # Every run gets a deadline: a run the harness kills at its limit
+            # ends with no verdict, while one stopped by --for is judged on the
+            # tree it left. Paced runs keep a 15% margin; the rest stop a
+            # minute before the limit, enough to run the sealed checks.
             limit = self._task_timeout_sec()
             if limit:
-                flags.append(f"--for {max(60, int(limit * 0.85) - 60)}s")
+                flags.append(f"--for {max(60, int(limit * 0.85) - 60) if self._pace else max(60, int(limit) - 60)}s")
         if self._map_tokens is not None:
             flags.append("--no-map" if int(self._map_tokens) <= 0 else f"--map {int(self._map_tokens)}")
         if self._max_tokens is not None:
@@ -247,6 +254,8 @@ class Molt(BaseInstalledAgent):
         flags.append(f"--steps {self._steps}")
         if self._batch:
             flags.append("--batch")
+        if self._reference:
+            flags.append("--reference")
         if self._reveal_stuck:
             flags.append("--reveal-stuck")
         if self._reasoning_checks:

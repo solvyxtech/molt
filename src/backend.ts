@@ -52,7 +52,26 @@ export type BackendEvent<H> =
       /** Cumulative for the session. The engine takes the delta. */
       cumulativeCostUsd: number;
       error?: string;
+      /**
+       * Maat stopped waiting: the turn's clock ran out (`deadline`), or the
+       * agent said nothing at all for the stall allowance (`stall`). The agent
+       * was told to cancel and its process tree was ended; the session is gone.
+       */
+      stopped?: "deadline" | "stall";
+      /** For `stall`: how long the agent had been silent. */
+      silentMs?: number;
     };
+
+/**
+ * Bounds on one `send`. Every wait on the agent is cut at `deadlineAt`, and a
+ * silence longer than `stallMs` (outside Maat's own tool calls) is a stall.
+ */
+export type SendLimits = {
+  /** Epoch ms after which nothing more is waited for. */
+  deadlineAt?: number;
+  /** Silence from the agent, in ms, that counts as a stalled provider. 0 or absent: none. */
+  stallMs?: number;
+};
 
 /**
  * The three methods the engine needs from a subprocess backend.
@@ -62,7 +81,7 @@ export type BackendEvent<H> =
  * and neither should the loop.
  */
 export interface BackendSession<H> {
-  send(messages: readonly string[]): AsyncGenerator<BackendEvent<H>>;
+  send(messages: readonly string[], limits?: SendLimits): AsyncGenerator<BackendEvent<H>>;
   close(): Promise<void>;
   costSoFarUsd(): number;
   /**

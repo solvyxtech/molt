@@ -130,36 +130,23 @@ it requires owning both compaction and verification in one harness.
 
 ## Long-horizon work
 
-**Factory Missions** (Factory AI, 2026). A frontier-model orchestrator
-interviews the user, writes a validation contract of prose assertions with
-stable ids, decomposes the goal into `features.json`, designs worker skills,
-then runs a worker session per feature and injects model "validators" at each
-milestone. Workers update their own skills when they hit an environment trap.
-The shape of `molt mission` — a contract with ids, a feature list that claims
-them, a worker per feature, milestones that seal, a library workers write to
-— is taken from it, and named as such. Three things are different on
-purpose: the contract here is executable (an assertion is a command or it is
-a note), the orchestrator is a loop rather than a model, and milestones are
-sealed by running the assertions again rather than by asking a model whether
-the work looks done. Their CTO's own account of what a model does when it
-cannot run something — "it will validate this by just looking at it, and it
-will fundamentally make a mistake" — is the argument for all three.
+**`molt mission`** is a contract with stable ids, a feature list that claims
+them, a worker per feature, and milestones that seal. The contract is
+executable (an assertion is a command or it is a note), the orchestrator is a
+loop rather than a model, and milestones are sealed by running the assertions
+again rather than by asking a model whether the work looks done. See
+`docs/missions.md`.
 
-**Ralph loops.** The pattern Factory credits as prior: run an agent in a
-`while true` against a fixed prompt until a condition holds. molt's proof
-loop is the same idea with the condition made mechanical and the claim
+**Ralph loops.** Run an agent in a `while true` against a fixed prompt until
+a condition holds. molt's proof loop is the same idea with the condition made mechanical and the claim
 refused rather than the loop merely continued.
 
 ## Terminal-Bench harness engineering
 
-**Factory's Terminal-Bench write-up** lists what moved their score with the
-same model: a small tool repertoire, bootstrapping each session with system
-information, short default timeouts the agent may raise, a planning tool that
-leans on recency bias, a controlled background-execution primitive, and
-reporting tool runtime back to the model. The environment brief (`src/brief.ts`),
-`timeout_s` and `background` on the bash tool, the `plan` tool, and the
-`[molt: ran 12s]` line on slow commands are those ideas, each cited where it is
-implemented.
+**Harness engineering.** The environment brief (`src/brief.ts`), `timeout_s`
+and `background` on the bash tool, the `plan` tool, and the `[molt: ran 12s]`
+line on slow commands are common harness-engineering ideas, each explained
+where it is implemented.
 
 **LangChain, "Improving Deep Agents with harness engineering"** (2026): 52.8
 to 66.5 on Terminal-Bench 2.0 with the same model by adding upfront directory

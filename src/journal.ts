@@ -30,6 +30,7 @@ import {
 import { join } from "node:path";
 import { MIN_SECRET_CHARS, redactData } from "./redact.js";
 import { stateDir } from "./statedir.js";
+import { maskDeep } from "./withhold.js";
 
 export const GENESIS = "0".repeat(64);
 
@@ -57,6 +58,17 @@ export type JournalKind =
    * unfinished, and a reader must be able to tell those apart later.
    */
   | "deadline"
+  /**
+   * Unattended, hidden checks: a file tool refused a path outside the task
+   * (outside the project, or Maat's own `.maat/`), or a bash command named
+   * one. Bash is not blocked; it is recorded (src/scope.ts).
+   */
+  | "outside_task"
+  /**
+   * Unattended: tool calls that changed no file in the project. The first
+   * entry is the nudge, the second the stop (`action`).
+   */
+  | "no_progress"
   /** A verified change was committed. Carries the sha and the receipt. */
   | "git_commit"
   /** An unverified change was put back. Carries what was restored, removed, kept. */
@@ -156,6 +168,25 @@ export class Journal {
     this.path = join(this.dir, `${sessionId}.jsonl`);
   }
 
+  /**
+   * Hidden check commands, masked in every entry until `release` (src/withhold.ts).
+   * The worker can read this file; while it works, the journal names a hidden
+   * check and never quotes it.
+   */
+  private withheld: string[] = [];
+
+  /** Mask these commands in every entry from here until `release()`. */
+  withhold(commands: readonly string[]): void {
+    for (const c of commands) if (c && !this.withheld.includes(c)) this.withheld.push(c);
+  }
+
+  /** Stop masking. Returns what was masked, so the caller can record it in full. */
+  release(): string[] {
+    const out = this.withheld;
+    this.withheld = [];
+    return out;
+  }
+
   /** Register a value to mask everywhere it appears. Idempotent. */
   protect(...values: (string | undefined)[]): void {
     for (const v of values) {
@@ -176,7 +207,7 @@ export class Journal {
       // read many times, often by something that is not molt — `cat`, a CI
       // artifact viewer, a git diff — so the only place a filter can be
       // trusted is before the bytes hit the file.
-      data: redactData(data, this.secrets),
+      data: maskDeep(redactData(data, this.secrets), this.withheld),
       prev: this.prev,
     };
     const entry: JournalEntry = { ...base, hash: hashEntry(base) };
@@ -394,6 +425,16 @@ export class Journal {
           break;
         case "deadline":
           out.push(`${t}  deadline · ${Math.round(Number(d.spentMs ?? 0) / 1000)}s of ${Math.round(Number(d.limitMs ?? 0) / 1000)}s — stopped on the clock, not on a failure`);
+          break;
+        case "outside_task":
+          out.push(
+            d.refused
+              ? `${t}  outside the task · ${d.tool} refused ${d.path} (${d.reach})`
+              : `${t}  outside the task · bash named ${[...(d.stateDir ? [".maat/"] : []), ...((d.outside as unknown as string[] | undefined) ?? [])].join(", ")}`,
+          );
+          break;
+        case "no_progress":
+          out.push(`${t}  no progress · ${d.calls} tool call(s) changed no file · ${d.action}`);
           break;
         case "git_commit":
           out.push(`${t}  commit ${String(d.sha ?? "").slice(0, 8)} · ${d.files} file(s) · receipt ${d.receipt || "(none)"}`);

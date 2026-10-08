@@ -9,16 +9,19 @@
  * Nothing here asks a model anything. A bar result is an exit code.
  */
 import { DISPUTE_HINT } from "./dispute.js";
-import { judgePass } from "./evidence.js";
+import { judgePass, reportsFailure } from "./evidence.js";
+import { REFERENCE_SENTINEL, referenceComparedAll } from "./reference.js";
 import { testsRealFor } from "./tests-real.js";
-import { runCommand } from "./run.js";
+import { runCommand, draftedShell } from "./run.js";
 import { parseLcov, coverageFor, coverageCouldSpeak, unprovenIn, type Unproven } from "./coverage.js";
 import { planMutations, applyMutation, negateComparison, type Mutation } from "./mutate.js";
 import { proposeBar, type Detected } from "./detect.js";
-import { assertionsIn, fingerprint, isTestPath, treeChanges, type TreeSnapshot } from "./files.js";
+import { addedSkips, assertionsIn, fingerprint, isTestPath, skipsIn, treeChanges, type TreeSnapshot } from "./files.js";
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { copyTreeOrWhy, runsInCopy } from "./scratch.js";
+import { maskText } from "./withhold.js";
+import { gitSync, privSep } from "./privsep.js";
 import { dirname, join, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { ArchiveLike } from "./archive.js";
@@ -624,6 +627,15 @@ export function diagnoseFailure(
       hint: "the command was not found, so nothing ran and nothing was established",
     };
   }
+  // dash (Debian's and Ubuntu's /bin/sh) exits 2, not 127, for `sh tool.sh`
+  // when tool.sh is missing. Read the same way on every platform: on macOS,
+  // where sh is bash, the same check exits 127.
+  if (exitCode === 2 && /^\S*sh: \d+: (?:cannot open|Can't open) [^\n]*(?:No such file|nonexistent)/im.test(stderr)) {
+    return {
+      didNotRun: true,
+      hint: "the script it runs was not found, so nothing ran and nothing was established",
+    };
+  }
   if (exitCode === 126) {
     return {
       didNotRun: true,
@@ -1004,7 +1016,8 @@ async function mutationCheck(
     };
   }
   if (!prior) {
-    const baseline = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal });
+    // Mutation runs are in the worker's own tree: with a check account they run as the worker.
+    const baseline = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal, asCheck: "in-place", hideCommand: true });
     if (baseline.code !== 0) {
       return {
         ok: false,
@@ -1037,6 +1050,8 @@ async function mutationCheck(
         cwd: ctx.cwd,
         timeoutMs,
         signal: ctx.signal,
+        asCheck: "in-place",
+        hideCommand: true,
       });
       // A mutation the command still passes is a line nothing checks — unless
       // it was a boundary nudge and negating the same condition is caught.
@@ -1050,7 +1065,7 @@ async function mutationCheck(
         let negKilled = false;
         if (neg && negText !== null && negText !== file.text) {
           writeFileSync(file.abs, negText, "utf8");
-          const rn = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal });
+          const rn = await runCommand(run, { cwd: ctx.cwd, timeoutMs, signal: ctx.signal, asCheck: "in-place", hideCommand: true });
           negKilled = rn.code !== 0;
         }
         if (negKilled) boundaryOnly.push(`${m.path}:${m.line} (${m.operator}) — ${m.before.trim()}`);
@@ -1644,11 +1659,8 @@ function importsTracked(ctx: BarContext): {
 } {
   let tracked: Set<string>;
   try {
-    const out = execFileSync("git", ["ls-files", "-z"], {
-      cwd: ctx.cwd,
-      encoding: "utf8",
-      maxBuffer: 8 * 1024 * 1024,
-    });
+    // As the worker under privilege separation: never Maat's git on the worker's repository.
+    const out = gitSync(["ls-files", "-z"], ctx.cwd);
     tracked = new Set(out.split("\0").filter(Boolean));
   } catch {
     return {
@@ -1893,13 +1905,20 @@ function runBuiltin(
       for (const [path, before] of ctx.treeBefore.assertions) {
         if (ledgered.has(path)) continue;
         let now: string[] = [];
+        let skipsNow: string[] = [];
         try {
-          now = assertionsIn(readFileSync(resolve(ctx.cwd, path), "utf8"));
+          const text = readFileSync(resolve(ctx.cwd, path), "utf8");
+          now = assertionsIn(text);
+          skipsNow = skipsIn(text);
         } catch {
           now = []; // deleted or unreadable: every assertion it held is gone
         }
         const kept = new Set(now);
-        const removed = before.filter((a) => !kept.has(a));
+        // A skip added around an assertion silences it as surely as deleting it.
+        const removed = [
+          ...before.filter((a) => !kept.has(a)),
+          ...addedSkips(ctx.treeBefore.skips?.get(path) ?? [], skipsNow).map((s) => `${s}  (turns a test off)`),
+        ];
         if (removed.length) rewritten.push({ path, removed, route: "disk" });
       }
     }
@@ -1941,9 +1960,9 @@ function runBuiltin(
     const byTool = rewritten.some((e) => e.route !== "disk");
     const byDisk = rewritten.some((e) => e.route === "disk");
     const headline = byTool
-      ? `This turn deleted ${lines.length} assertion(s) from ${rewritten.length} test file(s):`
-      : `${lines.length} assertion(s) are gone from ${rewritten.length} test file(s) since this ` +
-        `turn began, none of them removed through a tool:`;
+      ? `This turn deleted or turned off ${lines.length} assertion(s) in ${rewritten.length} test file(s):`
+      : `${lines.length} assertion(s) are gone or turned off in ${rewritten.length} test file(s) since this ` +
+        `turn began, none of them through a tool:`;
     return {
       ok: false,
       output:
@@ -2175,20 +2194,43 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
 
   let exitCode = 0;
   let output = "";
+  let stdout = "";
   let diagnosis: CommandDiagnosis = { didNotRun: false };
+  let timedOut = false;
+  // A task check runs in a throwaway copy of the tree, so a check that writes,
+  // commits or deletes cannot change the work it judges (src/scratch.ts).
+  const tried = runsInCopy(check) ? await copyTreeOrWhy(ctx.cwd) : null;
+  const copy = tried && !("why" in tried) ? tried : null;
+  // Said on the result (and so in the receipt and the journal's bar_run), not
+  // left silent: this check ran on the work itself.
+  const ranInPlace = tried && "why" in tried ? tried.why : undefined;
   try {
     // Not execSync: a bar check is the longest thing molt runs (`npm test`,
     // two minutes by default) and running it synchronously froze the terminal
     // for its whole duration — including the ctrl+C that would have stopped it.
-    const r = await runCommand(check.run, {
-      cwd: ctx.cwd,
+    // A check that names the project by its absolute path reads the copy
+    // too: otherwise `cd /app && git checkout …` reaches past the copy into
+    // the work, and the seal-time try (criteria.ts preflightCriteria), which
+    // points the same path at its own copy, judged a different tree.
+    const r = await runCommand(copy ? copy.map(check.run) : check.run, {
+      cwd: copy?.dir ?? ctx.cwd,
+      shell: draftedShell(check),
+      // Never in argv: a hidden check's text there is readable by every
+      // process of this user, the deliverable it runs included (src/run.ts).
+      hideCommand: true,
       timeoutMs: check.timeoutMs,
       maxBuffer: 8 * 1024 * 1024,
       signal: ctx.signal,
+      // With a check account (--check-user): a check in its copy runs as that
+      // account; one in the project itself (a project check, or a task check
+      // whose tree was too large to copy) runs as the worker, whose tree it is.
+      asCheck: copy ? "copy" : "in-place",
     });
-    output = `${r.stdout}${r.stderr}`;
+    output = copy ? copy.unmap(`${r.stdout}${r.stderr}`) : `${r.stdout}${r.stderr}`;
+    stdout = r.stdout;
     exitCode = r.code ?? 1;
     if (r.timedOut) {
+      timedOut = true;
       output = `timed out after ${check.timeoutMs}ms\n` + output;
       exitCode = 124;
     } else if (exitCode !== check.expectExit) {
@@ -2197,6 +2239,8 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
   } catch (e) {
     exitCode = 1;
     output = String(e);
+  } finally {
+    await copy?.cleanup();
   }
   let passed = exitCode === check.expectExit;
   if (!passed && diagnosis.hint) {
@@ -2213,12 +2257,31 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
       if (judged.broken) diagnosis = { didNotRun: true, hint: judged.why };
       output = `[molt] ${judged.why}\n\n${output}`;
     }
+    // The reference driver (src/reference.ts) ends by saying it compared
+    // every input it judged. An exit 0 without that line is something ending
+    // the driver early (the work's code, once, with os._exit(0)), not a pass.
+    if (passed && check.tags.includes("reference") && !referenceComparedAll(output)) {
+      passed = false;
+      output =
+        "[molt] the reference check exited 0 without reporting that it compared every input " +
+        `(no \`${REFERENCE_SENTINEL} n/n\` line), so nothing was shown to match\n\n${output}`;
+    }
+    // A task check whose exit code does not carry its verdict (`print(x == y)`,
+    // `jq '…'` without -e, `…; echo $?`) is read by its own words: one that
+    // printed False or FAIL failed, whatever it exited.
+    const said = passed && check.tags.includes("task") ? reportsFailure(check.run, stdout) : null;
+    if (said) {
+      passed = false;
+      output = `[molt] ${said}\n\n${output}`;
+    }
   }
   return {
     name: check.name,
     ...(check.advisory ? { advisory: true } : {}),
     ...(check.hidden ? { hidden: true } : {}),
     ...(diagnosis.didNotRun ? { didNotRun: true } : {}),
+    ...(timedOut ? { timedOut: true } : {}),
+    ...(ranInPlace ? { ranInPlace } : {}),
     tags: check.tags,
     kind: "command",
     detail: check.run,
@@ -2229,8 +2292,13 @@ export async function runCheck(check: Check, ctx: BarContext): Promise<CheckResu
     // command, this exit code, this long. A failure keeps its real output,
     // which is the whole point of a failure.
     output: passed
-      ? `\`${check.run}\` exited ${exitCode} in ${Date.now() - t0}ms`
-      : truncate(output),
+      ? // A hidden check is named, not quoted: this line is cut to fit a receipt's
+        // table, and a cut command is a prefix no mask can match (src/withhold.ts).
+        `\`${check.hidden ? check.name : check.run}\` exited ${exitCode} in ${Date.now() - t0}ms`
+      : // A failing hidden check whose output echoes its own command (a shell's
+        // `line 1: …`, `set -x`, a runner printing its argv) is masked before
+        // the cut, for the same reason.
+        truncate(check.hidden ? maskText(output, [check.run]) : output),
     durationMs: Date.now() - t0,
   };
 }
@@ -2287,6 +2355,19 @@ export class CheckCache {
 }
 
 export async function runBar(bar: Bar, ctx: BarContext): Promise<BarResult> {
+  try {
+    return await runBarAs(bar, ctx);
+  } finally {
+    // Without a check account, checks run as Maat. Under privilege
+    // separation, whatever one left in the project (a build in place, a
+    // cache) goes back to the worker, so the worker can still edit its own
+    // tree (src/privsep.ts). With one, checks in the project run as the
+    // worker and this finds nothing of Maat's to hand back.
+    privSep()?.handBack(ctx.cwd);
+  }
+}
+
+async function runBarAs(bar: Bar, ctx: BarContext): Promise<BarResult> {
   const t0 = Date.now();
   // In order, one at a time. Checks share a working directory and routinely
   // build into it; running them concurrently would have them tripping over
@@ -2430,6 +2511,7 @@ export function formatBarFailure(result: BarResult, attempt: number, maxAttempts
   if (failed.some((r) => r.hidden)) lines.push(DISPUTE_HINT, "");
   for (const r of failed) {
     lines.push(`--- FAILED: ${r.name} (${r.hidden ? "command withheld" : r.detail})`);
+    if (r.tags?.includes("guard")) lines.push("a guard: this held on the project before the work, and it does not now.");
     if (r.exitCode !== undefined) lines.push(`exit code: ${r.exitCode}`);
     lines.push(r.output.trim() || "(no output)");
     lines.push("");

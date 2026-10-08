@@ -9,7 +9,10 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { assertionsIn, isTestPath, removedAssertions } from "../src/files.js";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { addedSkips, assertionsIn, isTestPath, removedAssertions, skipsIn, snapshotTree, specWeakened } from "../src/files.js";
 import { parseBar, runBar, BUILTINS } from "../src/bar.js";
 import { SYSTEM_PROMPT } from "../src/engine.js";
 import type { BarContext } from "../src/bar.js";
@@ -33,6 +36,18 @@ describe("what counts as a specification", () => {
       "});",
     ].join("\n");
     assert.deepEqual(assertionsIn(text), ["assert.equal(x, 3);", "expect(x).toBe(3);"]);
+  });
+
+  it("knows each runner's own test-file names, not only test/ folders and *.test.js", () => {
+    for (const p of ["test_count.py", "pkg/count_test.py", "conftest.py", "net/dial_test.go", "spec/models/user_spec.rb", "src/__tests__/a.js", "src/FooTest.java"]) {
+      assert.equal(isTestPath(p), true, p);
+    }
+    for (const p of ["count.py", "contest.py", "testing.py", "src/attest.go", "latest_tests_report.md"]) assert.equal(isTestPath(p), false, p);
+  });
+
+  it("reads xUnit-style assertion methods as assertions", () => {
+    const text = ["        self.assertEqual(out, '3')", "    assertEquals(4, f(2));", "    assert_eq!(x, 2);", "        self.helper(out)"].join("\n");
+    assert.deepEqual(assertionsIn(text), ["self.assertEqual(out, '3')", "assertEquals(4, f(2));", "assert_eq!(x, 2);"]);
   });
 
   it("is not fooled by reindentation", () => {
@@ -59,6 +74,58 @@ describe("rewriting the specification to agree with the code", () => {
     const before = "describe('a', () => {\n  assert.ok(x);\n});";
     const after = "describe('b', () => {\n  assert.ok(x);\n});";
     assert.deepEqual(removedAssertions(before, after), []);
+  });
+});
+
+describe("turning a test off is weakening it", () => {
+  it("rewriting an assertion into a tautology removes the one that was there", () => {
+    assert.deepEqual(specWeakened("        self.assertEqual(out, '3')", "        self.assertEqual('3', '3')"), ["self.assertEqual(out, '3')"]);
+  });
+
+  it("finds the skips each runner knows", () => {
+    const lines = [
+      "@unittest.skip('flaky')",
+      "@pytest.mark.xfail(reason='x')",
+      "    pytest.skip('later')",
+      "        self.skipTest('no')",
+      "it.skip('does a thing', () => {",
+      "test.only('just me', () => {",
+      "xit('off', () => {",
+      "it('opts', { skip: true }, () => {",
+      "\tt.Skip(\"slow\")",
+      "#[ignore]",
+      "@Disabled",
+    ];
+    assert.equal(skipsIn(lines.join("\n")).length, lines.length);
+    assert.deepEqual(skipsIn("# @unittest.skip in a comment\nskip_count = 3\nit('runs', { skip: false }, () => {})\n// it.skip('x')"), []);
+  });
+
+  it("an added skip is a weakening; one that was already there, or moved, is not", () => {
+    const before = "class T:\n    def test_a(self):\n        self.assertEqual(f(), 3)\n";
+    const after = "class T:\n    @unittest.skip('flaky')\n    def test_a(self):\n        self.assertEqual(f(), 3)\n";
+    assert.deepEqual(specWeakened(before, after), ["@unittest.skip('flaky')  (turns a test off)"]);
+    assert.deepEqual(specWeakened(after, after), []);
+    assert.deepEqual(addedSkips(["it.skip('a')"], ["it.skip('a')", "it.skip('a')"]), ["it.skip('a')"], "counted, not deduplicated");
+  });
+
+  it("a conditional skip on a test the turn added is free; on an existing test, or unconditional on a renamed one, it is not", () => {
+    // A new file: adding tests, skipped where they cannot run, takes nothing away.
+    assert.deepEqual(specWeakened("", "@pytest.mark.skipif(sys.platform == 'win32', reason='posix')\ndef test_new():\n    assert f() == 3\n"), []);
+    assert.deepEqual(specWeakened("", "it('posix', { skip: process.platform === 'win32' }, () => {\n  assert.equal(f(), 3);\n});\n"), []);
+    // A new test in an existing file.
+    const js = "it('old', () => {\n  assert.equal(f(), 3);\n});\n";
+    assert.deepEqual(specWeakened(js, js + "it('posix', { skip: !hasPython && 'needs python3' }, () => {\n  assert.equal(g(), 4);\n});\n"), []);
+    const py = "def test_old():\n    assert f() == 3\n";
+    assert.deepEqual(specWeakened(py, py + "@pytest.mark.skipif(sys.platform == 'win32', reason='posix')\ndef test_new():\n    assert g() == 4\n"), []);
+    // The same skip on the existing test still counts.
+    assert.equal(specWeakened(js, "it('old', { skip: !hasPython }, () => {\n  assert.equal(f(), 3);\n});\n").length, 1);
+    // An always-true condition is no condition.
+    assert.equal(specWeakened(py, py + "@unittest.skipIf(True, 'posix')\ndef test_new():\n    assert g() == 4\n").length, 1);
+    assert.equal(specWeakened(js, js + "it('n', { skip: 1 }, () => {\n  assert.equal(g(), 4);\n});\n").length, 1);
+    // A renamed test is the old one, whatever its skip's condition.
+    assert.equal(specWeakened(py, "@pytest.mark.skipif(sys.platform == 'win32', reason='x')\ndef test_old_posix():\n    assert f() == 3\n").length, 1);
+    // An unconditional skip on a renamed test is the old test turned off.
+    assert.equal(specWeakened(py, "@unittest.skip('flaky')\ndef test_old_renamed():\n    assert f() == 3\n").length, 1);
   });
 });
 
@@ -132,5 +199,23 @@ describe("the rules every run is told", () => {
     assert.match(SYSTEM_PROMPT, /tests that pinned the old behaviour/);
     assert.match(SYSTEM_PROMPT, /not an obstacle to be removed/);
     assert.match(SYSTEM_PROMPT, /decision for a person/);
+  });
+});
+
+describe("spec-intact on disk", () => {
+  const bar = parseBar("version: 1\nchecks:\n  - name: spec\n    builtin: spec-intact\n");
+
+  it("refuses a skip added outside the tools", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "spec-skip-"));
+    try {
+      writeFileSync(join(dir, "test_count.py"), "import unittest\n\nclass T(unittest.TestCase):\n    def test_a(self):\n        self.assertEqual(1, 1)\n");
+      const treeBefore = snapshotTree(dir);
+      writeFileSync(join(dir, "test_count.py"), "import unittest\n\nclass T(unittest.TestCase):\n    @unittest.skip('flaky')\n    def test_a(self):\n        self.assertEqual(1, 1)\n");
+      const r = await runBar(bar, { cwd: dir, record: [], ledger: [], archivedBatches: 0, treeBefore } as unknown as BarContext);
+      assert.equal(r.ok, false);
+      assert.match(r.results[0]!.output, /test_count\.py: @unittest\.skip\('flaky'\) {2}\(turns a test off\)/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

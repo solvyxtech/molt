@@ -36,6 +36,20 @@ Useful xAI references (check the live pages for current text):
 - [Terms of Service — Enterprise](https://x.ai/legal/terms-of-service-enterprise)
 - [Acceptable Use Policy](https://x.ai/legal/acceptable-use-policy)
 
+## OpenCode Zen (`opencode://zen`)
+
+Maat can run the official `opencode` CLI as a worker or judge, for **OpenCode
+Zen models only** (`opencode/...`, e.g. the free Big Pickle). The owner has
+confirmed the OpenCode free tier (Big Pickle and the other free `opencode/*`
+Zen models) is OK for Maat as worker or judge, and for fine-tune data.
+
+OpenCode can also sign in to other vendors' consumer plans (Anthropic, GitHub
+Copilot, Gemini, ...). Maat never routes through them: any model id that is
+not `opencode/...` is refused at parse time and at run time, the config Maat
+hands the CLI enables only the `opencode` provider, and other providers'
+credentials are scrubbed from its environment. `opencode://subscription` is
+the deprecated old name, accepted for one release.
+
 ## Subscription CLIs that are not supported
 
 Claude Code, Gemini CLI, and Antigravity subscription backends have been

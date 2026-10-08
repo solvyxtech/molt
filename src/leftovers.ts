@@ -8,11 +8,11 @@
  * the checks ran go — never a file that existed before them — and nothing at
  * all when the project could not be listed in full either time.
  */
-import { execFileSync } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, rmdirSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { TREE_SKIP, walk } from "./files.js";
 import { STATE_DIRS } from "./statedir.js";
+import { gitSync, privSep } from "./privsep.js";
 
 export type ProjectListing = { files: Set<string>; dirs: Set<string> };
 
@@ -66,21 +66,53 @@ export function removeNew(root: string, before: ProjectListing | null): string[]
  */
 export function excludeMoltFromGit(cwd: string): boolean {
   try {
-    const path = execFileSync("git", ["rev-parse", "--git-path", "info/exclude"], {
-      cwd,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 5_000,
-    }).trim();
+    const path = gitSync(["rev-parse", "--git-path", "info/exclude"], cwd, { timeout: 5_000 }).trim();
     if (!path) return false;
     const file = isAbsolute(path) ? path : join(cwd, path);
-    const text = existsSync(file) ? readFileSync(file, "utf8") : "";
+    const ps = privSep();
+    // Under privilege separation the repository is the worker's: the file is
+    // read and appended to as the worker, never by Maat through a path the
+    // worker controls.
+    const text = ps
+      ? (() => {
+          const r = ps.workerSync("/bin/sh", ["-c", 'cat -- "$1" 2>/dev/null || true', "sh", file], cwd);
+          return r.status === 0 ? r.stdout : "";
+        })()
+      : existsSync(file)
+        ? readFileSync(file, "utf8")
+        : "";
     const missing = STATE_DIRS.filter((d) => !new RegExp(`^\\/?\\${d}\\/?$`, "m").test(text));
     if (!missing.length) return false;
+    const add = `${text && !text.endsWith("\n") ? "\n" : ""}# Maat Agent's own records\n${missing.map((d) => `${d}/`).join("\n")}\n`;
+    if (ps) {
+      const r = ps.workerSync("/bin/sh", ["-c", 'mkdir -p -- "$(dirname -- "$1")" && printf %s "$2" >> "$1"', "sh", file, add], cwd);
+      return r.status === 0;
+    }
     mkdirSync(dirname(file), { recursive: true });
-    appendFileSync(file, `${text && !text.endsWith("\n") ? "\n" : ""}# Maat Agent's own records\n${missing.map((d) => `${d}/`).join("\n")}\n`);
+    appendFileSync(file, add);
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * Files that appeared since `before` which the task text never names — by
+ * path, by file name, or by a folder they sit in ("sorted/" covers
+ * sorted/a/b.txt). The likely leftovers: a helper script, a copy, a test
+ * file the worker made for itself. On local redact-secrets the work was right
+ * and failed only on the redact.py left beside it, against "create no other
+ * files"; organize-files the same with organize.py.
+ */
+export function unnamedNewFiles(before: ProjectListing | null, after: ProjectListing | null, task: string): string[] {
+  if (!before || !after) return [];
+  const out: string[] = [];
+  for (const f of after.files) {
+    if (before.files.has(f)) continue;
+    const parts = f.split("/");
+    const names = [f, parts.at(-1)!, ...parts.slice(0, -1).map((_, i) => parts.slice(0, i + 1).join("/"))];
+    if (names.some((n) => n && task.includes(n))) continue;
+    out.push(f);
+  }
+  return out.sort();
 }

@@ -40,6 +40,7 @@ import { desktopSurfaces } from "./theme-surfaces.js";
 import { barInitText, parseJournal, mutatesSession } from "./limits.js";
 import { resolvePath, PATH_PROBE, type PathFixReport } from "./login-path.js";
 import { Engine, MAX_STEPS } from "../src/engine.js";
+import { captureSecrets } from "../src/secrets.js";
 import { Archive } from "../src/archive.js";
 import { Receipts, receiptName } from "../src/receipts.js";
 import { Journal } from "../src/journal.js";
@@ -1062,6 +1063,11 @@ function fixPath(): PathFixReport {
   if (report.outcome !== "already-usable" && report.path) process.env.PATH = report.path;
   return report;
 }
+
+// Credentials out of the environment and into memory before any session,
+// check or backend is spawned (src/secrets.ts). A refused keys source is
+// reported, not fatal: the window still opens and keys can be entered there.
+for (const p of captureSecrets().problems) console.error(`maat: ${p}`);
 
 const pathFix = fixPath();
 

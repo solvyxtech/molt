@@ -1,5 +1,152 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`--review-executable`** (experimental, also `MAAT_REVIEW_EXECUTABLE=1`):
+  every `--review` objection must carry a read-only command that demonstrates
+  it. Maat runs it on a throwaway copy of the tree, with no API keys, tokens or
+  provider variables in its environment; an objection counts only when its
+  command reads the work (names a project path, or runs the project's tests or
+  build) and exits non-zero, or prints the value it named without that value
+  being in the command itself. A demonstrated objection shows the command
+  failed, not that it tested what the objection says. With no copy of the tree
+  available the command is not run. Each objection is recorded as counted,
+  refuted (the reviewer was wrong) or unchecked (it could not be run).
+- **Lean-budget guards.** `test/lean-budget.test.ts` runs seven scripted
+  scenarios (small task, 400 KB read, repeated re-reads, a long session that
+  sheds, malformed calls with huge arguments on the tool and `act` paths, a
+  command printing 1 MB) with hard ceilings on the largest request, the total
+  request characters and the steps of the turn; the build before the malformed
+  excerpt fix fails it by 20-60x. `bench/local/run.py` stops the lane with a
+  `STOPPED` row (`reason: "cost alarm"`) and exit code 3 when one run costs
+  more than max(5x the lane's running median, $0.10) or sends more than 1.5M
+  prompt tokens (`BENCH_COST_ALARM_X`, `BENCH_COST_ALARM_USD`,
+  `BENCH_TOKEN_ALARM`). See `docs/lean.md`.
+
+### Changed
+
+- **"Verified" needs a check the worker model did not write.** Each task
+  check now records who wrote it (the worker, a separate judge, a person, the
+  reference writer). A run is `verified` only when a passing check that ran
+  the work and asserted a value came from another model (`--judge`,
+  `MAAT_JUDGE_*`, compared by provider-normalised id), or a person wrote or
+  approved a passing command check (done.yml, a mission, criteria approved in
+  the window, `--criterion`). Otherwise the tier is the new
+  **`passed-own-checks`**: outcome `unverified`, **exit code 3**.
+  **This changes headless `--criteria auto` without `--judge` (or with a judge
+  that is the worker model under another name): it used to exit 0 and now
+  exits 3.** CI jobs and bench scripts that read exit 0 as success should
+  pass `--judge <another model>` or approve the checks.
+- **Builtins never make a run verified.** `work-landed`, `record-intact`,
+  `claims-grounded`, `work-accounted`, `spec-intact` and every other builtin
+  or `session` check say the turn was well-formed, not that the task is
+  right. A bar of builtins alone now ends `passed-checks` (unverified, exit 3)
+  where it used to end `verified`, and receipts say these checks are Maat's,
+  not "a person (your check)".
+- **An expected file counts only if it predates the work.** `diff out.txt
+  expected.txt` (or a golden/want/baseline/answer file) asserts a value only
+  when that file was in the project before the first step and is unchanged
+  at the claim. A worker that writes both files no longer earns "verified".
+- **The reference check runs the deliverable out of process.** Maat's driver
+  used to import an import-style deliverable into its own process, so a
+  module that called `os._exit(0)` ended the check with exit 0 before any
+  comparison, and it passed. Each input now runs in a fresh child; a child
+  that ends without a result is a mismatch, `reference()` is removed from the
+  module the work's code can reach, and expected values never leave the
+  driver's memory. A pass also needs the driver's final `REFERENCE COMPARED
+  n/n` line: an exit 0 without it is a failure.
+- **Drafted checks that pass before the work are redrafted, then dropped.**
+  With `--criteria auto` each drafted check is tried on a copy of the project
+  taken before the first step. One that already passes there cannot show the
+  task was done: it goes back to the drafter once, and is dropped if the
+  redraft still passes (journal: `check-lint-dropped`, rule
+  `P1-passes-before-work`). An always-on lint (L16) does the same for checks
+  that cannot fail by construction: `|| echo …`, `|| true`, `; exit 0`,
+  `…; echo $?`, `find … -exec … \;`, an `if … fi` with no failing branch,
+  and inline programs whose exit code does not depend on what they assert
+  (`python3 -c "print(x == y)"`, `node -e "console.log(a === b)"`, `jq`
+  without `-e`, `awk` with no `exit`, a printed PASS/FAIL).
+- **A task check that prints its failure has failed.** A drafted or approved
+  check that exits 0 but whose last line of output is `False`, `FAIL`,
+  `FAILED` or `NO` (or whose `echo $?` tail printed non-zero) is read as a
+  failure at the bar and before the work. `print(rows == expected)` printing
+  False on wrong work used to pass and earn "verified".
+- **`--require-discriminating`** (`MAAT_REQUIRE_DISCRIMINATING=1`, off by
+  default; `--review-advisory` implies it): "verified" needs an independent
+  value check that failed on the tree before the work and passes now.
+  Otherwise the new tier **`passed-untested`** ("passed checks that did not
+  test this work, not verified"): outcome `unverified`, exit code 3. Each
+  receipt row says how its check fared before the work.
+- **Checks are tried before the work under the shell the bar runs them
+  with** (bash for drafted checks), so a bashism no longer "fails before the
+  work" under dash and passes at the bar. dash's exit 2 for a missing
+  `sh script` is read like bash's 127. A try that timed out counts as not
+  tried, not as failing.
+- **The pre-work copy is checked before it is trusted.** Late checks (drafts
+  past the time cut, the reference check) are tried on a copy taken at turn
+  start. Its digest is taken when it is made and compared around every try;
+  a copy that changed during the work, or a check that names the project's
+  absolute path, counts as not tried. The copy's size and timing are
+  journalled (`pre-work-copy`).
+- **Checks that pass before the work are kept as refuse-only guards.** A
+  drafted check the pre-work screen drops (P1) is still sealed, tagged
+  `guard`: it runs at the bar and a failure refuses the claim, but it never
+  counts toward "verified", and receipts label it "refuse-only guard". Up to
+  four, beside (not inside) the four-check cap. Not kept: a duplicate of a
+  sealed check, and one that pins today's output of the project's program on
+  the project's own data (`node summarize.js transactions.json | jq -e
+  '.zoe == "-3.50"'`, `sqlite3 app.db 'PRAGMA user_version' | grep -q '^1$'`),
+  which on the 2026-10-07 lanes failed 13 finished trees the grader accepted.
+- **Fewer good drafted checks dropped before sealing** (measured with
+  `bench/local/drop_audit.py` over the 2026-10-07 lanes):
+  - the absolute-path rule reads what each program opens (a shell parser,
+    `src/shellwords.ts`), not the raw text: a sed program's `/g`, an awk
+    program, a grep pattern, a jq filter, printf's data and `sys.argv[1] +
+    "/old.py"` are not paths. Its four drops that day were all wrong.
+  - `./rotate.sh …` before rotate.sh exists is the deliverable missing:
+    tried before the work it now counts as failing there (it discriminates),
+    not as a command that could not run. A tool missing from PATH is still
+    broken.
+  - the mutation rule (L15) skips the value of `touch -d/-t/-r` and
+    `mkdir -m`, follows variables built on a mktemp directory
+    (`f="$d/x"; echo > "$f"`), and lets `> "$(mktemp -d)/out"` through.
+  - the cannot-fail rule (L16) no longer flags `…; exit 0` after an earlier
+    `exit 1` in the same shell, or `cond && exit 1 || exit 0`.
+  - a check that names the project by its absolute path is tried on the
+    pre-work copy, and run in the bar's throwaway copy, instead of reaching
+    the live folder.
+- **Claims say who stood behind them** on the terminal, the window, job_end's
+  `claim`, the receipt index and the receipt: `verified (independent checks:
+  <judge>)`, `verified (your checks)`, `passed own checks (<worker>), not
+  verified`. With `--review-advisory`, a review that contradicted the task or
+  did not run appends `, unconfirmed` / `, unreviewed`.
+
+- **OpenCode runs OpenCode Zen models only.** The OpenCode backend (worker and
+  judge) accepts `opencode/<model>` (e.g. `opencode/big-pickle`) and refuses
+  any other provider at parse time and at run time; the CLI is handed a config
+  that enables only the `opencode` provider, and no other provider's
+  credentials.
+- **`opencode://zen`** is the OpenCode endpoint (short name `opencode`). The old
+  `opencode://subscription` still works for this release, with a deprecation
+  notice.
+- **Unattended runs stop when they stop advancing** (`MAAT_NO_PROGRESS_CALLS`,
+  default 30, `0` turns it off; on for every unattended run on an HTTP
+  backend, not on ACP backends yet). A call advances when it changes a file
+  in the project, reads something not read before, runs a command not run
+  before, or gets output from a command that differs from every earlier run
+  of it (timings aside), wherever the work happens: a build into `dist/`, a
+  venv, a config under `/etc`. After N calls in a row that advance nothing the
+  model is told once to finish or stop; after N more the turn ends, the work
+  on disk is judged, and the receipt says `ended: no progress` (never
+  verified: the model did not say it was done).
+- **While an unattended job with hidden checks runs, the file tools stay in
+  the task.** `read_file`, `list_dir`, `grep` and `inspect` refuse paths
+  outside the project and under `.maat/` (except spilled output and
+  background logs, and paths the task names). bash is not blocked; this is a
+  budget control, not isolation.
+
 ## 0.2.2 — subscription backends removed
 
 ### Removed
@@ -9,8 +156,8 @@
   written. Stale `claude-code://`, `antigravity://`, `agy://`, and
   `gemini-cli://` configs now fail with a clear removal message. Grok Build
   (ACP) and the metered xAI API provider remain.
-- **Droid benchmarking** from the harbor/local bench path, and **xAI rows**
-  from the committed fine-tune dataset (provider-terms alignment). See
+- **xAI rows** from the committed fine-tune dataset, and third-party agent
+  adapters from the bench path (provider-terms alignment). See
   `docs/provider-terms.md`.
 
 ### Changed

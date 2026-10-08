@@ -120,7 +120,7 @@ describe("the contract", () => {
     const c = parseContract(CONTRACT);
     const checks = assertionChecks(c, ["VAL-A-001", "VAL-UI-001", "nope"]);
     assert.deepEqual(checks, [
-      { name: "VAL-A-001", kind: "command", run: "test -f a.txt", timeoutMs: 120_000, expectExit: 0, tags: ["mission"], hidden: true },
+      { name: "VAL-A-001", kind: "command", run: "test -f a.txt", timeoutMs: 120_000, expectExit: 0, tags: ["mission"], hidden: true, author: { kind: "person" } },
     ]);
     assert.deepEqual(assertionNotes(c, ["VAL-A-001", "VAL-UI-001"]), ["VAL-UI-001: a person judges the layout"]);
   });

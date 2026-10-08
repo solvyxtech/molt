@@ -11,8 +11,25 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, write
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { MIN_SECRET_CHARS, redact } from "./redact.js";
-import type { BarResult } from "./types.js";
+import type { BarResult, CheckAuthor } from "./types.js";
+import { authorWords, claimLabel, noteCoverage, resultAuthorWords, UNTESTED_CLAIM, type Tier } from "./tiers.js";
 import { stateDir } from "./statedir.js";
+import { WITHHELD, maskDeep, maskText } from "./withhold.js";
+import type { Objection } from "./review.js";
+import { isolationLine } from "./privsep.js";
+
+
+/**
+ * A path as a receipt prints it: line breaks and other control characters
+ * escaped (`\n`), and a backtick or pipe neutralised, so a file name the
+ * worker chose cannot start a line of its own (a planted "## Output") or
+ * break out of its table cell.
+ */
+export function shownPath(p: string): string {
+  return p.replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]/g, (c) => (c === "\n" ? "\\n" : c === "\r" ? "\\r" : c === "\t" ? "\\t" : `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`)).replace(/`/g, "'").replace(/\|/g, "\\|");
+}
+/** Where a receipt's full text goes when hidden commands were masked in it (src/withhold.ts). */
+export const FULL_DIR = "full";
 
 export type Receipt = {
   path: string;
@@ -55,6 +72,8 @@ export type ReceiptRecord = {
    * questions before this field existed.
    */
   ask?: boolean;
+  /** Set when the model was stopped and the tree judged as it stood. */
+  endedBy?: "deadline" | "provider" | "no-progress" | "malformed";
   /** True when the cost rests on molt's own token estimate anywhere in the session. */
   costEstimated?: boolean;
   /**
@@ -70,6 +89,27 @@ export type ReceiptRecord = {
   /** The commit the judged tree sat on; `dirty` when it differed from it. */
   head?: string;
   dirty?: boolean;
+  /** Hidden checks whose commands were shown to the model after a repeat failure. */
+  revealed?: string[];
+  /**
+   * What the passing checks earned (src/tiers.ts): "verified", or
+   * "passed-checks" with `tierReason` saying why not. Set on accepted claims;
+   * the independent review can lower it after the receipt is written
+   * (`amendTier`), so the index row is the last word and the receipt file,
+   * hash-bound when it was written, is never rewritten.
+   */
+  tier?: Tier;
+  tierReason?: string;
+  /** The claim in words (src/tiers.ts claimLabel), e.g. "verified (independent checks: m)". */
+  claim?: string;
+  /** The strongest evidence class among the passing checks. */
+  evidence?: string;
+  /**
+   * `--review-executable`: each reviewer objection, the command that came with
+   * it and what running it showed (src/review.ts). Added after the receipt is
+   * written (`amendReview`), like the tier.
+   */
+  objections?: Objection[];
 };
 
 /** What `repair()` changed, and what it left alone. */
@@ -202,7 +242,7 @@ function wroteSection(
     try {
       text = readFileSync(join(cwd, c.path), "utf8");
     } catch {
-      out.push(`\`${c.path}\` — gone from disk; nothing to show.`, "");
+      out.push(`\`${shownPath(c.path)}\` — gone from disk; nothing to show.`, "");
       continue;
     }
     /**
@@ -216,7 +256,7 @@ function wroteSection(
      */
     if (sha256(text) !== c.after) {
       out.push(
-        `\`${c.path}\` — changed since Maat wrote it, so its lines are not shown; the hashes ` +
+        `\`${shownPath(c.path)}\` — changed since Maat wrote it, so its lines are not shown; the hashes ` +
           "above are what can still be proven.",
         "",
       );
@@ -227,7 +267,7 @@ function wroteSection(
     const show = want.slice(0, Math.min(WROTE_MAX_PER_FILE, budget));
     budget -= show.length;
     const width = String(show.at(-1) ?? 0).length;
-    out.push(`\`${c.path}\``, "", "```");
+    out.push(`\`${shownPath(c.path)}\``, "", "```");
     let prev = 0;
     for (const n of show) {
       // A gap in the numbers is a gap in the file; say so rather than letting
@@ -271,6 +311,62 @@ export class Receipts {
     this.indexPath = join(this.dir, "index.jsonl");
   }
 
+  /**
+   * Hidden check commands, masked in every receipt written until `release`
+   * (src/withhold.ts). The full text of each receipt written meanwhile is
+   * held here, in memory, and written to `full/` when the job ends: the
+   * worker can read this folder while it works.
+   */
+  private withheld: string[] = [];
+  private pending: { file: string; full: string }[] = [];
+
+  /** Mask these commands in every receipt from here until `release()`. */
+  withhold(commands: readonly string[]): void {
+    for (const c of commands) if (c && !this.withheld.includes(c)) this.withheld.push(c);
+  }
+
+  /**
+   * Stop masking, and write the full text of every receipt that was masked to
+   * `full/<file>`. Each receipt on disk stays byte for byte as written (it is
+   * hash-bound in the integrity ledger); the full twin is a new file. Returns
+   * what was written, relative to the receipts folder.
+   */
+  release(): { file: string; of: string; path: string }[] {
+    const out: { file: string; of: string; path: string }[] = [];
+    if (this.pending.length) {
+      const dir = join(this.dir, FULL_DIR);
+      mkdirSync(dir, { recursive: true });
+      for (const p of this.pending) {
+        const path = join(dir, p.file);
+        const [title, ...rest] = p.full.split("\n");
+        const text = [
+          title,
+          "",
+          `> The full text of \`${p.file}\`, written when the job ended. While the job ran, that file`,
+          `> carried each hidden check's command as \`${WITHHELD}\`; nothing else differs.`,
+          ...rest,
+        ].join("\n");
+        try {
+          writeFileSync(path, text, "utf8");
+          out.push({ file: `${FULL_DIR}/${p.file}`, of: p.file, path });
+        } catch {
+          // A full twin that could not be written leaves the masked receipt and
+          // the journal's released commands; the record is thinner, not wrong.
+        }
+      }
+    }
+    this.pending = [];
+    this.withheld = [];
+    return out;
+  }
+
+  /** The full twin of a receipt, once released; otherwise the receipt itself. */
+  fullPath(receiptPath: string): string {
+    const name = receiptPath.replace(/^.*[\\/]/, "");
+    const twin = join(this.dir, FULL_DIR, name);
+    return existsSync(twin) ? twin : receiptPath;
+  }
+
   /** Register a value to mask in every receipt from here on. */
   protect(...values: (string | undefined)[]): void {
     for (const v of values) {
@@ -293,8 +389,18 @@ export class Receipts {
     costUsd?: number;
     /** True when that figure rests on molt's own token estimate. */
     costEstimated?: boolean;
+    /** The tier the passing checks earned, before any independent review (src/tiers.ts). */
+    tier?: { tier: Tier; reason?: string; evidence: string; basis?: "person" | "independent" | "own"; by?: string[]; worker?: string };
+    /**
+     * Who wrote each check, by check name, recorded at seal time: the worker
+     * model, a separate judge, a person, or the reference writer. A check not
+     * named here is printed as unrecorded.
+     */
+    authors?: Record<string, CheckAuthor>;
     /** True for a question: the bar ran advisory and could not refuse. */
     ask?: boolean;
+    /** The model was stopped (clock, provider) and the tree was judged as it stood. */
+    endedBy?: "deadline" | "provider" | "no-progress" | "malformed";
     /**
      * Every file the turn changed, with the hashes that prove it — and which
      * lines it wrote, so the receipt can show the work rather than describe it.
@@ -312,8 +418,16 @@ export class Receipts {
      * work out which is which.
      */
     task?: { seal: string; checks: string[]; notes: string[] };
+    /**
+     * Hidden checks whose commands were shown to the model after they failed
+     * the same way twice. A pass after that is a pass against a check the
+     * model had read, and the receipt says so.
+     */
+    revealed?: string[];
     /** What the model ran and read, in order, as one line each. */
     did?: string[];
+    /** The requirement sign-out put to the model before this claim (src/signout.ts). */
+    signout?: { requirements: string[]; matched: { requirement: string; calls: string[] }[]; unexercised: string[] };
     /**
      * The commit the tree sat on when the bar ran, and whether the tree
      * differed from it.
@@ -335,7 +449,7 @@ export class Receipts {
     // believe it finished?" — so it answers in that order. It used to open
     // with a provider name and a token count, which answer neither question,
     // and put the work itself nowhere at all.
-    const verdictLine =
+    let verdictLine =
       args.verdict === "accepted" && args.ask
         ? "Maat recorded this answer. A question runs the bar advisory — a turn that wrote " +
           "nothing cannot have broken anything — so no check could refuse it, and nothing " +
@@ -348,6 +462,26 @@ export class Receipts {
             ? "Maat did not accept this claim: every check that ran passed, but checks " +
               "done.yml requires were not run. Nothing failed, and nothing established the rest."
             : "Maat reported failure: the attempt limit was reached with checks still failing.";
+
+    if (args.verdict === "accepted" && !args.ask && args.tier) {
+      verdictLine += args.tier.tier === "verified"
+        ? `\n\nEvidence: ${args.tier.evidence}. A passing check of this class earns the word "verified".`
+        : args.tier.tier === "passed-own-checks"
+          ? `\n\nPassed own checks, not verified: ${args.tier.reason}. A model never judges its own work; a check from a person or another model is needed for "verified".`
+          : args.tier.tier === "passed-untested"
+            ? `\n\nPassed checks that did not test this work, not verified: ${args.tier.reason}. A check that passes on the tree as it was before the work cannot tell this work from none; "verified" needs one that failed before the work and passes now.`
+            : `\n\nPassed its checks, not verified: ${args.tier.reason}. The strongest passing check is ${args.tier.evidence}.`;
+      verdictLine += `\n\nClaim: ${
+        args.tier.tier === "passed-checks"
+          ? "passed its checks, not verified"
+          : args.tier.tier === "passed-untested"
+            ? UNTESTED_CLAIM
+            : claimLabel("verified", args.tier)
+      }.`;
+    }
+    if (args.revealed?.length) {
+      verdictLine += `\n\nThe command of ${args.revealed.map((n) => `\`${n}\``).join(", ")} was shown to the model after it failed the same way twice; the work was judged against a check the model had read.`;
+    }
 
     const changed = args.changed ?? [];
     // The task's own criteria go above what changed, because they are what the
@@ -365,7 +499,12 @@ export class Receipts {
       );
       if (task.checks.length) {
         asked.push("**Machine-checked.** These ran with the bar and could refuse the claim:", "");
-        for (const c of task.checks) asked.push(`- \`${c}\``);
+        for (const c of task.checks) {
+          const name = c.slice(0, c.indexOf(": ") >= 0 ? c.indexOf(": ") : c.length);
+          const a = args.authors?.[name] ?? args.authors?.[`task:${name}`];
+          const guard = args.result.results.some((r) => (r.name === name || r.name === `task:${name}`) && r.tags?.includes("guard"));
+          asked.push(`- \`${c}\` — written by ${authorWords(a)}${guard ? " · refuse-only guard: it can refuse this claim, never verify it" : ""}`);
+        }
         asked.push("");
       }
       if (task.notes.length) {
@@ -374,8 +513,29 @@ export class Receipts {
           "because they were asked for, and Maat will not report them as met:",
           "",
         );
-        for (const n of task.notes) asked.push(`- ${n}`);
-        asked.push("");
+        // Coverage, display only: which of these a check that failed before
+        // the work and passes now plausibly speaks to, matched by shared words.
+        const disc = args.result.results.filter((r) => r.ok && r.beforeWork === "failed");
+        const commandOf = (name: string) => {
+          const bare = name.replace(/^task:/, "");
+          const line = task.checks.find((c) => c === bare || c.startsWith(`${bare}: `) || c === name || c.startsWith(`${name}: `));
+          return line ? line.slice(line.indexOf(": ") + 2) : "";
+        };
+        const cover = noteCoverage(task.notes, disc.map((r) => ({ name: r.name, text: `${commandOf(r.name)} ${r.detail ?? ""}` })));
+        for (const c of cover) {
+          asked.push(
+            `- ${c.note} — ${
+              c.by.length
+                ? `plausibly covered by ${c.by.map((b) => `\`${b}\``).join(", ")}, which failed before the work and passes now`
+                : "not matched to any check that failed before the work and passes now"
+            }`,
+          );
+        }
+        asked.push(
+          "",
+          "Coverage is matched by shared words, for the reader only; it gates nothing.",
+          "",
+        );
       }
     }
 
@@ -386,7 +546,7 @@ export class Receipts {
       work.push("| file | before | after |", "|---|---|---|");
       for (const c of changed) {
         work.push(
-          `| \`${c.path}\` | ${c.before === null ? "did not exist" : `\`${c.before.slice(0, 12)}\``} | ` +
+          `| \`${shownPath(c.path)}\` | ${c.before === null ? "did not exist" : `\`${c.before.slice(0, 12)}\``} | ` +
             `\`${c.after.slice(0, 12)}\` |`,
         );
       }
@@ -397,6 +557,21 @@ export class Receipts {
         "",
       );
       work.push(...wroteSection(args.cwd ?? process.cwd(), changed));
+    }
+
+    const so = args.signout;
+    if (so && so.requirements.length) {
+      work.push("## Requirement sign-out", "");
+      work.push(
+        "Before this claim was judged, each stated requirement was put to the model beside the",
+        "commands it ran that touch it. Matching is by keyword and path, not proof.",
+        "",
+      );
+      for (const r of so.requirements) {
+        const calls = so.matched.find((m) => m.requirement === r)?.calls;
+        work.push(calls ? `- "${r}" — ran: ${calls.slice(-3).map((c) => `\`${c.slice(0, 110)}\``).join("; ")}` : `- "${r}" — not run before the sign-out`);
+      }
+      work.push("");
     }
 
     const did = args.did ?? [];
@@ -412,9 +587,26 @@ export class Receipts {
       "",
       verdictLine,
       "",
+      ...(args.endedBy
+        ? [
+            args.endedBy === "deadline"
+              ? "The turn's time budget ran out before the model said it was done; the sealed checks ran on the tree as it stood."
+              : args.endedBy === "no-progress"
+                ? "ended: no progress — the model kept calling tools without changing any file in the project, past a nudge to finish or stop; the sealed checks ran on the tree as it stood."
+                : args.endedBy === "malformed"
+                  ? "The model sent malformed tool calls several times in a row, so Maat ended the turn; the sealed checks ran on the tree as it stood."
+                : "The provider failed after work had been done; the sealed checks ran on the tree as it stood.",
+            "",
+          ]
+        : []),
+      // Under --worker-user, the isolation that was actually in effect while
+      // this was judged: which uid ran the worker and the checks, and whether
+      // there was a PID namespace (src/privsep.ts). Absent when nobody asked.
+      ...(isolationLine() ? [isolationLine()!, ""] : []),
       "## What the model claimed",
       "",
-      "> " + (args.claim.trim() || "(no final message)").split("\n").join("\n> "),
+      // Every kind of line break is quoted, so no text of the worker's can start a line of its own.
+      "> " + (args.claim.trim() || "(no final message)").split(/\r\n|[\r\n\u2028\u2029\u0085\v\f]/).join("\n> "),
       "",
       ...work,
       "## What was checked, and what it established",
@@ -426,7 +618,9 @@ export class Receipts {
     const rows = args.result.results.map((r) => {
       // The finding, not the label. "pass" is a header; "2 files modified and
       // verified byte-for-byte on disk" is the reason to believe it.
-      const finding = r.output.trim().split("\n")[0]?.slice(0, 90) ?? "";
+      // Masked before it is cut and escaped: a cut command is a prefix, and an
+      // escaped `\|` is not the command's `|`; neither matches the mask after.
+      const finding = maskText(r.output.trim(), this.withheld).split("\n")[0]?.slice(0, 90) ?? "";
       // "did not run" is not a softer FAIL, it is a different fact: the
       // command was never executed, so this row is evidence of nothing. A
       // receipt that prints it as a failure invites the reader to believe
@@ -475,7 +669,23 @@ export class Receipts {
         "",
         `check: ${r.name}`,
         `kind: ${r.kind}`,
+        `written by: ${resultAuthorWords(r, args.authors?.[r.name])}`,
+        ...(r.tags?.includes("guard")
+          ? ["role: refuse-only guard (it passed before the work: it can refuse this claim, never count toward verified)"]
+          : []),
+        ...(r.beforeWork
+          ? [
+              `before the work: ${
+                r.beforeWork === "failed"
+                  ? "failed (this check can tell the work from none)"
+                  : r.beforeWork === "passed"
+                    ? "passed (a guard: it cannot tell the work from none)"
+                    : "not tried (it could not run then, or joined later), so it cannot tell the work from none"
+              }`,
+            ]
+          : []),
         `command: ${r.detail}`,
+        ...(r.ranInPlace ? [`ran in place: no throwaway copy of the tree — ${r.ranInPlace}`] : []),
         `exit: ${r.exitCode ?? "n/a"}`,
         `result: ${
           r.skipped
@@ -516,6 +726,8 @@ export class Receipts {
       `- attempt: ${args.attempt}`,
       `- provider: ${args.provider}`,
       `- model: ${args.model}`,
+      // Who wrote and reviewed the checks, when that is not the worker (judge.ts).
+      ...(process.env.MAAT_JUDGE_MODEL?.trim() ? [`- judge: ${process.env.MAAT_JUDGE_MODEL.trim()}${process.env.MAAT_JUDGE_URL?.trim() ? ` at ${process.env.MAAT_JUDGE_URL.trim()}` : ""}`] : []),
       `- session tokens: ${args.sessionTokens}`,
       ...(args.costUsd === undefined
         ? []
@@ -537,7 +749,20 @@ export class Receipts {
     // claim, a command, and a check's stdout are three different ways for the
     // same key to arrive, and a filter with three entry points has three
     // chances to miss one.
-    writeFileSync(p, redact([...head, ...rows, ...detail, ...foot].join("\n"), this.secrets), "utf8");
+    const full = redact([...head, ...rows, ...detail, ...foot].join("\n"), this.secrets);
+    const shown = maskText(full, this.withheld);
+    if (shown !== full) {
+      this.pending.push({ file, full });
+      writeFileSync(
+        p,
+        shown +
+          `\nHidden check commands are withheld from this file while the job runs; the seal above is a\n` +
+          `hash over them. The full receipt is written to \`${FULL_DIR}/${file}\` when the job ends.\n`,
+        "utf8",
+      );
+    } else {
+      writeFileSync(p, full, "utf8");
+    }
 
     const record: ReceiptRecord = {
       seq,
@@ -551,6 +776,16 @@ export class Receipts {
       ...(args.costUsd === undefined ? {} : { costUsd: args.costUsd }),
       ...(args.costEstimated ? { costEstimated: true } : {}),
       ...(args.ask ? { ask: true } : {}),
+      ...(args.revealed?.length ? { revealed: [...args.revealed] } : {}),
+      ...(args.endedBy ? { endedBy: args.endedBy } : {}),
+      ...(args.verdict === "accepted" && !args.ask && args.tier
+        ? {
+            tier: args.tier.tier,
+            evidence: args.tier.evidence,
+            ...(args.tier.reason ? { tierReason: args.tier.reason } : {}),
+            ...(args.tier.tier !== "passed-checks" ? { claim: claimLabel("verified", args.tier) } : {}),
+          }
+        : {}),
       // Only when the caller said what changed. A row with no count is
       // unknown, and unknown is not zero — it is counted as a change, which is
       // what every row written before this field existed already was.
@@ -562,9 +797,78 @@ export class Receipts {
       ...(args.head ? { head: args.head.sha, ...(args.head.dirty ? { dirty: true } : {}) } : {}),
       file,
     };
-    appendFileSync(this.indexPath, redact(JSON.stringify(record), this.secrets) + "\n", "utf8");
+    appendFileSync(this.indexPath, redact(JSON.stringify(maskDeep(record, this.withheld)), this.secrets) + "\n", "utf8");
 
     return { path: p, attempt: args.attempt, verdict: args.verdict };
+  }
+
+  /**
+   * Lower a receipt's recorded tier once the whole turn has been judged.
+   *
+   * The independent review reads the receipt, so it cannot be in it: a claim
+   * that passed on strong checks and was then contradicted would otherwise sit
+   * in the index as "verified". Only the index row changes; the receipt file
+   * is hash-bound and stays byte for byte as written. A row that is not
+   * there, or an index that cannot be read, is left alone.
+   */
+  amendTier(file: string, tier: { tier: Tier; reason?: string; claim?: string }): boolean {
+    try {
+      if (!existsSync(this.indexPath)) return false;
+      let hit = false;
+      const out = readFileSync(this.indexPath, "utf8")
+        .split("\n")
+        .map((l) => {
+          if (!l.trim()) return l;
+          try {
+            const r = JSON.parse(l) as ReceiptRecord;
+            if (r.file !== file) return l;
+            hit = true;
+            const { tierReason: _drop, claim: _was, ...rest } = r;
+            return JSON.stringify({
+              ...rest,
+              tier: tier.tier,
+              ...(tier.reason ? { tierReason: redact(tier.reason, this.secrets) } : {}),
+              ...(tier.claim ? { claim: tier.claim } : {}),
+            });
+          } catch {
+            return l;
+          }
+        });
+      if (hit) writeFileSync(this.indexPath, out.join("\n"), "utf8");
+      return hit;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Record the independent review's objections on a receipt's index row: each
+   * with its command and result (`--review-executable`). Masked like every
+   * other write while hidden commands are withheld. The receipt file itself,
+   * hash-bound when it was written, is never rewritten.
+   */
+  amendReview(file: string, objections: readonly Objection[]): boolean {
+    try {
+      if (!existsSync(this.indexPath)) return false;
+      let hit = false;
+      const out = readFileSync(this.indexPath, "utf8")
+        .split("\n")
+        .map((l) => {
+          if (!l.trim()) return l;
+          try {
+            const r = JSON.parse(l) as ReceiptRecord;
+            if (r.file !== file) return l;
+            hit = true;
+            return redact(JSON.stringify({ ...r, objections: maskDeep([...objections], this.withheld) }), this.secrets);
+          } catch {
+            return l;
+          }
+        });
+      if (hit) writeFileSync(this.indexPath, out.join("\n"), "utf8");
+      return hit;
+    } catch {
+      return false;
+    }
   }
 
   /**

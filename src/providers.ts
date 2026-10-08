@@ -11,7 +11,9 @@
  * tool whose whole pitch is an auditable record never writes a credential
  * into one.
  */
+import { env } from "./env.js";
 import { ACP_AGENTS, acpAgentFor, isAcp } from "./acp.js";
+import { isOpencode } from "./opencode.js";
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { windowAround } from "./commands.js";
@@ -309,6 +311,7 @@ export function anthropicPricing(model: string): Pricing | null {
  * invent one, for a run that costs no money at all.
  */
 export function planFor(baseUrl: string): string | undefined {
+  if (isOpencode(baseUrl)) return "OpenCode";
   return acpAgentFor(baseUrl)?.label;
 }
 
@@ -467,16 +470,27 @@ export function isSelfHosted(baseUrl: string): boolean {
    * wrong for a frontier model: with the map it won 3 of 3 paired runs and
    * cost 23% less. Said first, before the address is parsed at all.
    */
-  if (isAcp(baseUrl)) return false;
+  if (isAcp(baseUrl) || isOpencode(baseUrl)) return false;
   let host = "";
   try {
     host = new URL(baseUrl).hostname.toLowerCase();
   } catch {
     return false;
   }
+  // Said outright, for a private name no rule below can know.
+  const told = env("SELF_HOSTED");
+  if (told === "1" || told === "0") return told === "1";
   if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
+  // Private names. host.docker.internal is how a container reaches its own
+  // Mac: the local benchmark ran Qwen there for a night with every
+  // self-hosted rule off — thinking on (10,000 thought events, no step taken
+  // in 14 minutes), no one-at-a-time gate, cloud timeouts. A Tailscale name
+  // or address is a machine on the owner's own network too.
+  if (/\.(internal|lan|home\.arpa|ts\.net)$/.test(host) || host === "host.containers.internal") return true;
   // IPv6 loopback, with or without the brackets a URL puts round it.
   if (host === "::1" || host === "[::1]") return true;
+  // IPv6 unique-local (fc00::/7), which Tailscale also hands out.
+  if (/^\[?f[cd][0-9a-f]{2}:/.test(host)) return true;
   const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
   if (v4) {
     const [a, b] = [Number(v4[1]), Number(v4[2])];
@@ -485,6 +499,7 @@ export function isSelfHosted(baseUrl: string): boolean {
     if (a === 192 && b === 168) return true; // 192.168.0.0/16
     if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
     if (a === 169 && b === 254) return true; // link-local
+    if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10: Tailscale, carrier-grade NAT
     return false;
   }
   // A bare name with no dots is a LAN hostname, not a public one.
@@ -622,3 +637,51 @@ export function windowRows(
   return windowAround(rows, index, size).map(({ item, i }) => ({ row: item, i }));
 }
 
+
+/**
+ * The extra request fields that turn a self-hosted model's thinking off, for
+ * a configured reasoning effort. Empty for every other endpoint and effort.
+ *
+ * `reasoning: { effort }` is OpenRouter's shape and llama.cpp ignores it. On
+ * the NUC's Qwen3.8-27B (about 10 tokens/s) one drafting question thought for
+ * 5,700 tokens, ten minutes of the server's only slot, whatever `--reasoning
+ * none` said. llama.cpp's OpenAI endpoint does take `chat_template_kwargs` per
+ * request, and `{"enable_thinking": false}` is the switch the Qwen3-family
+ * chat templates read. That is all this sends, and only for `none`:
+ *
+ *  - `reasoning_effort` is not sent. Whether a given llama.cpp build reads it
+ *    is not established, and a field a server does not know is a risk for no
+ *    measured gain.
+ *  - `low` is not mapped to anything. "Think a little" has no template switch
+ *    here; turning thinking off outright would be stronger than what was
+ *    asked, so `low` keeps the model's own thinking and the ceiling on the
+ *    answer is what bounds it.
+ *  - A cloud endpoint gets nothing: its bodies stay exactly as they were.
+ *
+ * The caller still sends `reasoning: { effort }` as before; this is added to it.
+ */
+export function selfHostedThinking(baseUrl: string, effort: string | undefined): { chat_template_kwargs?: { enable_thinking: false } } {
+  return effort === "none" && isSelfHosted(baseUrl) ? { chat_template_kwargs: { enable_thinking: false } } : {};
+}
+
+/**
+ * OpenRouter provider pinning, per model: MAAT_OPENROUTER_PROVIDER="minimax/minimax-m3=gmicloud/fp8"
+ * (several separated by ";"). The pinned model is sent only to that provider, with no fallback,
+ * so a cheaper or better endpoint is not silently swapped for another. Other models, such as a
+ * judge on the same key, route as usual.
+ */
+export function openRouterProvider(
+  baseUrl: string,
+  model: string,
+  spec: string | undefined = process.env.MAAT_OPENROUTER_PROVIDER,
+): { provider?: { only: string[]; allow_fallbacks: false } } {
+  if (!spec || !/^https:\/\/openrouter\.ai\//.test(baseUrl)) return {};
+  for (const pair of spec.split(";")) {
+    const at = pair.lastIndexOf("=");
+    if (at <= 0) continue;
+    const m = pair.slice(0, at).trim();
+    const only = pair.slice(at + 1).split(",").map((s) => s.trim()).filter(Boolean);
+    if (m === model && only.length) return { provider: { only, allow_fallbacks: false } };
+  }
+  return {};
+}

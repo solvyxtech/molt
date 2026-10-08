@@ -14,7 +14,7 @@
  * and that process authenticates itself. molt is the client on the other end
  * of a documented protocol the vendor shipped for exactly this.
  *
- * Grok Build is the only CLI driven this way. The Claude Code, Antigravity
+ * Grok Build and OpenCode are the CLIs driven this way. The Claude Code, Antigravity
  * and Gemini CLI backends were removed over those vendors' terms on running
  * a third-party harness on a plan; see `docs/provider-terms.md`.
  *
@@ -71,6 +71,7 @@
  * `unaccountedTools()` reports anything that got through, and the session
  * surfaces it as an `info` event rather than discovering it in a receipt.
  */
+import { withSecrets } from "./secrets.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
@@ -78,13 +79,18 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
+import { privSep } from "./privsep.js";
 import { promisify } from "node:util";
 
 import { errorText } from "./format.js";
+import { env as readEnv } from "./env.js";
+import { PROBE_TIMEOUT_MS } from "./watchdog.js";
 import { RpcPeer, type RpcMessage } from "./jsonrpc.js";
-import type { BackendEvent, MoltTool, ToolRunner } from "./backend.js";
-import { GROK_BUILD_URL } from "./endpoint.js";
+import type { BackendEvent, MoltTool, SendLimits, ToolRunner } from "./backend.js";
+import { GROK_BUILD_URL, OPENCODE_URL } from "./endpoint.js";
+import { OPENCODE_CONFIG, OPENCODE_DEFAULT_MODEL, opencodeChildEnv, opencodeModel, opencodeModelProblem } from "./opencode.js";
 import { estTokens } from "./types.js";
+import { groupSpawn, killTree, trackGroup } from "./proctree.js";
 
 const exec = promisify(execFile);
 
@@ -103,12 +109,37 @@ export type AcpAgentSpec = {
   readonly url: string;
   readonly bin: string;
   readonly args: readonly string[];
+  /** Extra environment for the child, on top of the process's own. */
+  readonly env?: Readonly<Record<string, string>>;
+  /**
+   * The child's environment built from the process's own, when the agent
+   * must not inherit all of it (OpenCode: other providers' credentials are
+   * scrubbed). `env` is still applied on top.
+   */
+  readonly childEnv?: (base: NodeJS.ProcessEnv) => NodeJS.ProcessEnv;
+  /**
+   * Why a model id may not run on this agent, or null. Checked before the
+   * CLI is spawned and again against the model the session reports, so a
+   * refused model never runs, as worker or judge.
+   */
+  readonly modelProblem?: (model: string) => string | null;
+  /** The model asked for when none is named, for an agent with `modelProblem`. */
+  readonly defaultModel?: string;
   /** Aliases the CLI resolves itself against whatever the account can reach. */
   readonly models: readonly string[];
   readonly installHint: string;
   readonly loginHint: string;
   /** Where the CLI keeps the credential, so health can say "logged out". */
   readonly credentialPath: string;
+  /**
+   * Environment variables that carry this agent's own login. Under privilege
+   * separation (src/privsep.ts) the worker's environment loses every
+   * credential-looking name; these, and only for this agent's process when it
+   * is the worker, pass through. Anything else (another provider's key, a
+   * token the worker's shell commands would see) stays out. An agent without
+   * one must find its login in the worker user's HOME.
+   */
+  readonly workerCredentialEnv?: readonly string[];
   /**
    * How this agent can be handed Maat's tool server.
    *
@@ -122,6 +153,13 @@ export type AcpAgentSpec = {
    * rather than being optional, so the call site has no branch.
    */
   readonly sessionMeta: (o: { systemPrompt: string }) => Record<string, unknown>;
+  /**
+   * The session meta for a pre-turn question (acpAsk), where no MCP server is
+   * offered. Defaults to `sessionMeta`; Grok needs its own, because its
+   * session meta tells it every tool lives on an MCP server `molt` that a
+   * question never has, and the model went looking for it instead of answering.
+   */
+  readonly askMeta?: (o: { systemPrompt: string }) => Record<string, unknown>;
 };
 
 /**
@@ -129,6 +167,55 @@ export type AcpAgentSpec = {
  * the documented way to say "these builtins and no others". Empty means none:
  * everything the model can do arrives over molt's MCP server.
  */
+/**
+ * Grok 1.0.46 does not list MCP tools to the model at all. Every MCP tool is
+ * reached through two of its own meta-tools: `search_tool` (discovery, never
+ * asks permission) and `use_tool` with `{tool_name: "molt__grep", tool_input}`.
+ * Measured against the real CLI over ACP: the `tool_call` announcement is
+ * titled `use_tool`, and the permission request carries
+ * `rawInput: {variant: "UseTool", tool_name: "molt__grep", ...}` with
+ * `_meta["x.ai/tool"].name === "use_tool"` and no `toolName`. Judging by the
+ * title therefore saw "use_tool" for every Maat call and refused all of them,
+ * so the model never got a single tool and the turn ended with nothing done.
+ *
+ * The real identity of such a call is the tool it targets. A `use_tool` whose
+ * target is not a fully-qualified Maat tool (another MCP server, a target
+ * hidden in an arguments file, a bare name that could belong to anyone) keeps
+ * the name `use_tool` and is refused like any other builtin.
+ */
+export function useToolTarget(raw: unknown, title?: string, metaName?: string): string | undefined {
+  const o = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const wrapped = title === "use_tool" || metaName === "use_tool" || o.variant === "UseTool";
+  if (!wrapped) return undefined;
+  const target = o.tool_name;
+  return typeof target === "string" && target ? target : "use_tool";
+}
+
+/** Grok's discovery meta-tool: lists tool names and schemas, changes nothing. */
+const GROK_DISCOVERY_TOOL = "search_tool";
+
+/**
+ * Said to Grok because it cannot be inferred from its tool list: that list has
+ * no Maat tools in it (see `useToolTarget`), so a model told only "use your
+ * tools" reaches for `run_terminal_command`, is refused, and stops.
+ */
+export const GROK_TOOL_ROUTE = [
+  "TOOL ROUTING (mandatory). Every tool you may use is served by the MCP server `molt`.",
+  "They are not in your direct tool list. Call `search_tool` with query `molt` to list them with their schemas,",
+  "then call each one through `use_tool` with `tool_name` set to the fully-qualified name `molt__<tool>`",
+  "(for example `molt__grep`) and `tool_input` set to its arguments.",
+  "Never call run_terminal_command, read_file, search_replace, write, list_dir, grep or any other built-in tool directly: they are refused.",
+].join(" ");
+
+/**
+ * A pre-turn question has no tools at all. Without this Grok, still believing
+ * the routing text above, spent 65 s "looking through the project" and answered
+ * in prose, so the drafted checks never arrived (bench grok1, 29 of 29 runs).
+ */
+export const GROK_ASK_NO_TOOLS =
+  "You have NO tools in this conversation: do not search for tools, do not read files, do not run anything. " +
+  "Everything you need is in the message. Answer immediately, in text, in exactly the format the message asks for.";
+
 const GROK_MOLT_PROFILE = { name: "molt", description: "Maat drives every tool", tools: "" };
 
 export const ACP_AGENTS: readonly AcpAgentSpec[] = [
@@ -149,9 +236,37 @@ export const ACP_AGENTS: readonly AcpAgentSpec[] = [
     credentialPath: ".grok/auth.json",
     mcpTransport: "http",
     sessionMeta: ({ systemPrompt }) => ({
-      systemPromptOverride: systemPrompt,
+      systemPromptOverride: `${systemPrompt}\n\n${GROK_TOOL_ROUTE}`,
       agentProfile: GROK_MOLT_PROFILE,
     }),
+    askMeta: ({ systemPrompt }) => ({
+      systemPromptOverride: `${systemPrompt}\n\n${GROK_ASK_NO_TOOLS}`,
+      agentProfile: GROK_MOLT_PROFILE,
+    }),
+  },
+  {
+    name: "opencode",
+    label: "OpenCode",
+    url: OPENCODE_URL,
+    bin: "opencode",
+    args: ["acp"],
+    // Every permission is "ask": a deny breaks the free tier (see opencode.ts), and an ask
+    // reaches `session/request_permission`, where Maat refuses all but its own tools.
+    // Only the Zen provider is enabled (OPENCODE_CONFIG), only Zen model ids are accepted,
+    // and other providers' credentials never reach the child: OpenCode can sign in to
+    // other vendors' consumer plans, and Maat does not route through them.
+    env: { OPENCODE_CONFIG_CONTENT: OPENCODE_CONFIG },
+    childEnv: opencodeChildEnv,
+    modelProblem: opencodeModelProblem,
+    defaultModel: OPENCODE_DEFAULT_MODEL,
+    models: [OPENCODE_DEFAULT_MODEL],
+    installHint: "npm install -g opencode-ai",
+    loginHint: "opencode auth login",
+    credentialPath: ".local/share/opencode/auth.json",
+    // The Zen account's key, when it arrives through the environment rather than auth.json.
+    workerCredentialEnv: ["OPENCODE_API_KEY"],
+    mcpTransport: "http",
+    sessionMeta: () => ({}),
   },
 ];
 
@@ -162,7 +277,23 @@ export function isAcp(baseUrl: string | undefined): boolean {
 
 export function acpAgentFor(baseUrl: string | undefined): AcpAgentSpec | undefined {
   const url = (baseUrl ?? "").trim().toLowerCase();
-  return ACP_AGENTS.find((a) => url.startsWith(a.url.replace(/subscription$/u, "")));
+  // By scheme: `opencode://zen` and the deprecated `opencode://subscription` are one agent.
+  return ACP_AGENTS.find((a) => url.startsWith(a.url.slice(0, a.url.indexOf("://") + 3)));
+}
+
+/**
+ * The model to ask this agent for, or why it may not run. An agent with a
+ * `modelProblem` gets its `defaultModel` when none is named, so the CLI's own
+ * default (which the user's config may point at another provider) is never
+ * what runs.
+ */
+export function acpModelFor(spec: AcpAgentSpec, model: string | undefined): { model?: string; problem?: string } {
+  const m = (model ?? "").trim();
+  if (!spec.modelProblem) return m ? { model: m } : {};
+  const problem = spec.modelProblem(m);
+  if (problem) return { problem };
+  if (!m) return spec.defaultModel ? { model: spec.defaultModel } : {};
+  return { model: spec.name === "opencode" ? opencodeModel(m) : m };
 }
 
 /** Every model any ACP backend offers, for a picker that has not chosen yet. */
@@ -307,18 +438,30 @@ export async function acpHealth(
  */
 async function probeAuth(spec: AcpAgentSpec): Promise<{ authenticated: boolean; detail?: string }> {
   const conn = new AcpConnection(spec);
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await conn.start();
-    await conn.request("initialize", {
-      protocolVersion: 1,
-      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+    // Bounded like every other probe: an agent that takes the handshake and
+    // never answers must not hold `doctor` or the picker for ever.
+    const expired = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${spec.label} did not answer within ${PROBE_TIMEOUT_MS / 1000}s`)), PROBE_TIMEOUT_MS);
+      timer.unref?.();
     });
-    await conn.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+    const handshake = (async () => {
+      await conn.start();
+      await conn.request("initialize", {
+        protocolVersion: 1,
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+      });
+      await conn.request("session/new", { cwd: process.cwd(), mcpServers: [] });
+    })();
+    handshake.catch(() => {});
+    await Promise.race([handshake, expired]);
     return { authenticated: true };
   } catch (e) {
     const text = errorText(e);
     return { authenticated: false, detail: /auth/iu.test(text) ? "not signed in" : text };
   } finally {
+    if (timer) clearTimeout(timer);
     await conn.close();
   }
 }
@@ -329,6 +472,22 @@ async function probeAuth(spec: AcpAgentSpec): Promise<{ authenticated: boolean; 
 
 /** A method the agent calls on molt, and what molt answers. */
 export type ClientHandler = (method: string, params: unknown) => Promise<unknown>;
+
+/** How long an agent told `session/cancel` gets to end its turn before it is killed. */
+export const CANCEL_GRACE_MS = 500;
+
+/**
+ * Silence from an ACP agent, in ms, after which its provider is taken to have
+ * stalled: `MAAT_BACKEND_STALL_MS`, default five minutes, 0 for never. Maat's
+ * own tool calls do not count as the agent's silence.
+ */
+export const BACKEND_STALL_MS = 5 * 60_000;
+
+export function backendStallMs(raw: string | undefined = readEnv("BACKEND_STALL_MS")): number {
+  if (raw === undefined || raw.trim() === "") return BACKEND_STALL_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : BACKEND_STALL_MS;
+}
 
 /**
  * Newline-delimited JSON-RPC over a child process's stdio.
@@ -351,6 +510,10 @@ export class AcpConnection {
       spawnFn?: typeof spawn;
       onNotify?: (method: string, params: unknown) => void;
       onRequest?: ClientHandler;
+      /** Anything at all arrived from the agent: the stall watchdog's clock. */
+      onActivity?: () => void;
+      /** The agent is the worker: under privilege separation it runs as the worker user (src/privsep.ts). */
+      asWorker?: boolean;
     } = {},
   ) {
     const onRequest = opts.onRequest;
@@ -373,17 +536,34 @@ export class AcpConnection {
 
   async start(): Promise<void> {
     const spawnFn = this.opts.spawnFn ?? spawn;
-    const child = spawnFn(this.spec.bin, [...this.spec.args], {
-      cwd: this.opts.cwd ?? process.cwd(),
+    const cwd = this.opts.cwd ?? process.cwd();
+    // The subprocess environment REPLACES rather than merges, so the spread
+    // is load-bearing: without it a Finder-launched molt hands the CLI an
+    // empty PATH and it cannot find its own helpers.
+    // `electron/login-path.ts` has already repaired process.env.PATH by the
+    // time anything gets here.
+    const env = {
+      // The backend is the model's own client and needs its credentials,
+      // which captureSecrets() took out of process.env (src/secrets.ts).
+      ...(this.spec.childEnv ? this.spec.childEnv(withSecrets(process.env)) : withSecrets(process.env)),
+      ...this.spec.env,
+      ...(this.spec.env ? { PWD: cwd } : {}),
+    };
+    // The worker's agent, and every tool it runs itself, as the worker user:
+    // its own reads (Grok auto-approves read_file, grep, list_dir) never
+    // reach Maat, so only the uid can bound them.
+    const ps = this.opts.asWorker ? privSep() : undefined;
+    const spec = ps?.execSpec(this.spec.bin, this.spec.args, cwd, env, this.spec.workerCredentialEnv);
+    const child = spawnFn(spec?.file ?? this.spec.bin, spec?.args ?? [...this.spec.args], {
+      cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      // The subprocess environment REPLACES rather than merges, so the spread
-      // is load-bearing: without it a Finder-launched molt hands the CLI an
-      // empty PATH and it cannot find its own helpers.
-      // `electron/login-path.ts` has already repaired process.env.PATH by the
-      // time anything gets here.
-      env: { ...process.env },
+      env: spec?.env ?? env,
+      ...(spec?.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
+      // Its own process group, so ending it ends what it started (src/proctree.ts).
+      ...groupSpawn(),
     });
     this.child = child;
+    trackGroup(child);
     // A write to a child that has died raises EPIPE as an 'error' event on its
     // stdin, and an 'error' event nobody listens for is thrown — in the window,
     // from Electron's main process. It is the same fact as the exit below.
@@ -413,6 +593,7 @@ export class AcpConnection {
   }
 
   private feed(chunk: string): void {
+    this.opts.onActivity?.();
     this.peer.feed(chunk);
   }
 
@@ -428,7 +609,9 @@ export class AcpConnection {
   async close(): Promise<void> {
     this.fail(new Error("session closed"));
     this.child?.stdin?.end();
-    this.child?.kill();
+    // The agent and everything it started: a helper left running holds the
+    // job's directory and the machine's cores after the job has ended.
+    killTree(this.child);
   }
 }
 
@@ -592,6 +775,9 @@ export class McpToolServer<H> {
     await new Promise<void>((resolve) => {
       if (!this.server) return resolve();
       this.server.close(() => resolve());
+      // An agent killed mid-call leaves its connection open; waiting for it
+      // to drain is waiting on a process that no longer exists.
+      this.server.closeAllConnections?.();
     });
   }
 }
@@ -666,9 +852,20 @@ export type AcpOptions<H> = {
   systemPrompt: string;
   tools: readonly MoltTool[];
   runTool: ToolRunner<H>;
+  /**
+   * Stop whatever Maat tool call is running for the agent. Called when a
+   * deadline or a stall ends the agent's turn: the agent is gone, and a
+   * `bash` it asked for must not go on changing the tree being judged.
+   */
+  abortTools?: () => void;
   /** Injected in tests, which drive a scripted agent rather than a real one. */
   spawnFn?: typeof spawn;
+  /** This agent is the worker (not a judge): run it as the worker user when privilege separation is on. */
+  asWorker?: boolean;
 };
+
+/** How long an interrupted turn waits for its aborted tool calls to end. */
+export const TOOL_ABORT_WAIT_MS = 5_000;
 
 /**
  * An ACP session, alive for as long as molt's is.
@@ -750,7 +947,28 @@ export class AcpSession<H> {
   }
 
   private async start(): Promise<void> {
-    const { spec, cwd, systemPrompt, tools, runTool } = this.opts;
+    const { spec, cwd, systemPrompt, tools } = this.opts;
+    // A model this agent may not run is refused before anything is spawned.
+    const pick = acpModelFor(spec, this.opts.model);
+    if (pick.problem) throw new Error(pick.problem);
+    this.want = pick.model;
+    // A tool Maat is running is Maat's time, not the agent's silence: a test
+    // suite that takes ten minutes is not a stalled provider.
+    const runTool: ToolRunner<H> = async (...a) => {
+      // The agent was interrupted; nothing it asks for now may run.
+      if (this.interrupted) return "[molt: the turn was stopped. No more tools.]";
+      this.busy += 1;
+      const run = this.opts.runTool(...a);
+      const settled = run.then(() => {}, () => {});
+      this.running.add(settled);
+      try {
+        return await run;
+      } finally {
+        this.running.delete(settled);
+        this.busy -= 1;
+        this.touch();
+      }
+    };
     const mcp = new McpToolServer<H>(tools, runTool, (event) =>
       this.events.push({ kind: "host", event }),
     );
@@ -763,8 +981,10 @@ export class AcpSession<H> {
     const conn = new AcpConnection(spec, {
       cwd,
       ...(this.opts.spawnFn ? { spawnFn: this.opts.spawnFn } : {}),
+      ...(this.opts.asWorker ? { asWorker: true } : {}),
       onNotify: (method, params) => this.onNotify(method, params),
       onRequest: (method, params) => this.onRequest(method, params),
+      onActivity: () => this.touch(),
     });
     this.conn = conn;
     await conn.start();
@@ -832,8 +1052,13 @@ export class AcpSession<H> {
     return this.ran;
   }
 
+  /** The model to ask for: `opts.model`, or the agent's default (see `acpModelFor`). */
+  private want?: string;
+
   private async chooseModel(conn: AcpConnection, state: AcpModelState | undefined): Promise<void> {
-    const want = this.opts.model;
+    // For an agent with `modelProblem`, `want` is always set and already allowed, so the
+    // agent's own default (which its config may point at another provider) never runs.
+    const want = this.want ?? this.opts.model;
     const offered = (state?.availableModels ?? []).map((m) => m.modelId).filter(Boolean);
     if (state?.currentModelId && (!want || want === state.currentModelId)) {
       this.ran = state.currentModelId;
@@ -863,6 +1088,15 @@ export class AcpSession<H> {
     }
   }
 
+  /**
+   * OpenCode names an MCP tool `<server>_<tool>` (`molt_write_file`) where the others say
+   * `molt__write_file`. Its own builtins have no `molt_` prefix, so the rewrite cannot
+   * promote one of them into a Maat tool.
+   */
+  private canon(name: string): string {
+    return this.opts.spec.name === "opencode" ? name.replace(/^molt_(?=[a-z])/u, "molt__") : name;
+  }
+
   /** Notifications: the streamed reply, thoughts, tool calls, plans. */
   private onNotify(method: string, params: unknown): void {
     if (method !== "session/update" && method !== "x.ai/session/update") return;
@@ -881,7 +1115,7 @@ export class AcpSession<H> {
       const name = String(u.title ?? (u as { toolCallId?: string }).toolCallId ?? "");
       const raw = (u.rawInput ?? {}) as Record<string, unknown>;
       const id = String((u as { toolCallId?: string }).toolCallId ?? `acp_${Date.now().toString(36)}`);
-      const called = String((u as { toolName?: string }).toolName ?? name);
+      const called = this.canon(useToolTarget(raw, name) ?? String((u as { toolName?: string }).toolName ?? name));
       this.toolCallNames.set(id, called);
       if (McpToolServer.isMoltTool(called)) {
         // The transcript records the call Maat is about to run — the handler
@@ -892,6 +1126,9 @@ export class AcpSession<H> {
           text: "",
           toolCalls: [{ id, name: McpToolServer.bareName(called), args: raw }],
         });
+      } else if (called === GROK_DISCOVERY_TOOL) {
+        // Discovery of Maat's own catalogue: nothing to account for.
+        return;
       } else {
         /**
          * A builtin, announced. Nothing is concluded yet.
@@ -941,24 +1178,33 @@ export class AcpSession<H> {
       throw new Error(`maat does not implement ${method}`);
     }
     const p = (params ?? {}) as {
-      toolCall?: { toolCallId?: string; title?: string; toolName?: string };
+      toolCall?: {
+        toolCallId?: string;
+        title?: string;
+        toolName?: string;
+        rawInput?: unknown;
+        _meta?: Record<string, { name?: string } | undefined>;
+      };
       options?: { optionId?: string; kind?: string }[];
     };
-    const called = String(
-      p.toolCall?.toolName ??
-        this.toolCallNames.get(String(p.toolCall?.toolCallId ?? "")) ??
-        p.toolCall?.title ??
-        "",
+    const called = this.canon(
+      String(
+        useToolTarget(p.toolCall?.rawInput, p.toolCall?.title, p.toolCall?._meta?.["x.ai/tool"]?.name) ??
+          p.toolCall?.toolName ??
+          this.toolCallNames.get(String(p.toolCall?.toolCallId ?? "")) ??
+          p.toolCall?.title ??
+          "",
+      ),
     );
     const options = p.options ?? [];
-    if (McpToolServer.isMoltTool(called)) {
+    if (McpToolServer.isMoltTool(called) || called === GROK_DISCOVERY_TOOL) {
       const allow =
         options.find((o) => o.kind === "allow_always") ?? options.find((o) => o.kind === "allow_once");
       if (allow?.optionId) return { outcome: { outcome: "selected", optionId: allow.optionId } };
     }
     const reject =
       options.find((o) => o.kind === "reject_always") ?? options.find((o) => o.kind === "reject_once");
-    if (!McpToolServer.isMoltTool(called)) {
+    if (!McpToolServer.isMoltTool(called) && called !== GROK_DISCOVERY_TOOL) {
       for (const [id, name] of this.inFlight) if (name === called) this.inFlight.delete(id);
       if (!this.refused.has(called)) {
         this.refused.add(called);
@@ -973,19 +1219,137 @@ export class AcpSession<H> {
       : { outcome: { outcome: "cancelled" } };
   }
 
+  /** When the agent last said anything, or Maat last finished a tool for it. */
+  private lastActivity = Date.now();
+  /** Maat tool calls running for the agent right now. */
+  private busy = 0;
+  /** Those calls, settled or not, so an interrupt can wait for them to end. */
+  private running = new Set<Promise<void>>();
+  /** Set by an interrupt: no tool call starts after it. */
+  private interrupted = false;
+
+  private touch(): void {
+    this.lastActivity = Date.now();
+  }
+
+  /**
+   * Wait for `p`, but never past the deadline, and never through a stall.
+   *
+   * An ACP prompt turn has no clock of its own: a bench run given 540 s sat in
+   * one `session/prompt` for an hour, because nothing bounded the wait for
+   * its reply. Whatever the agent does, Maat keeps its own deadline here.
+   */
+  private async bounded<T>(
+    p: Promise<T>,
+    limits: SendLimits,
+  ): Promise<{ ok: true; value: T } | { ok: false; stop: "deadline" | "stall"; silentMs: number }> {
+    const settled = p.then((value) => ({ ok: true as const, value }));
+    // Abandoned on a stop; a late rejection is nobody's to handle.
+    settled.catch(() => {});
+    const stallMs = limits.stallMs && limits.stallMs > 0 ? limits.stallMs : 0;
+    if (limits.deadlineAt === undefined && !stallMs) return settled;
+    for (;;) {
+      const now = Date.now();
+      if (limits.deadlineAt !== undefined && now >= limits.deadlineAt) {
+        return { ok: false, stop: "deadline", silentMs: now - this.lastActivity };
+      }
+      // Silence while a tool runs is not a stall: Maat's own tools (busy), or
+      // the agent's own builtins it announced and has not finished (inFlight;
+      // GROK_OWN_TOOLS runs a test suite that way with no ACP traffic). The
+      // deadline still bounds both.
+      const working = this.busy > 0 || this.inFlight.size > 0;
+      const stallAt = stallMs ? (working ? now + stallMs : this.lastActivity + stallMs) : Infinity;
+      if (now >= stallAt) return { ok: false, stop: "stall", silentMs: now - this.lastActivity };
+      const wake = Math.min(limits.deadlineAt ?? Infinity, stallAt) - now;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const woke = await Promise.race([
+        settled,
+        new Promise<null>((r) => {
+          timer = setTimeout(() => r(null), Math.max(1, wake));
+        }),
+      ]);
+      clearTimeout(timer);
+      if (woke) return woke;
+    }
+  }
+
+  /**
+   * Stop the agent: `session/cancel` (the protocol's own way to end a prompt
+   * turn), a moment for it to answer, then the whole process tree.
+   *
+   * The kill is not optional. An agent that ignores the cancel — or is hung
+   * past hearing it — is exactly the one that must not outlive the job.
+   */
+  private async interrupt(answered?: Promise<unknown>): Promise<void> {
+    this.interrupted = true;
+    if (this.conn && this.sessionId) {
+      try {
+        this.conn.notify("session/cancel", { sessionId: this.sessionId });
+      } catch {
+        // A dead pipe; the kill below is what counts.
+      }
+      if (answered) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          answered.catch(() => {}),
+          new Promise<void>((r) => {
+            timer = setTimeout(r, CANCEL_GRACE_MS);
+          }),
+        ]);
+        clearTimeout(timer);
+      }
+    }
+    await this.close();
+    // The agent is gone, but a Maat tool call it started (a build, a script
+    // that rewrites files) would go on changing the tree the judge is about
+    // to read. Stop it, and wait for it to end, within reason.
+    if (this.running.size) {
+      this.opts.abortTools?.();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.allSettled([...this.running]),
+        new Promise<void>((r) => {
+          timer = setTimeout(r, TOOL_ABORT_WAIT_MS);
+        }),
+      ]);
+      clearTimeout(timer);
+    }
+  }
+
+  /** The `done` for a wait Maat cut short. The session is closed by then. */
+  private stoppedEvent(stop: "deadline" | "stall", silentMs: number): BackendEvent<H> {
+    const label = this.opts.spec.label;
+    const error =
+      stop === "deadline"
+        ? `the time budget ran out while ${label} was still working — its turn was cancelled`
+        : `${label} sent nothing for ${Math.round(silentMs / 1000)}s — provider stall, its turn was cancelled`;
+    return { ...this.finish(error), stopped: stop, ...(stop === "stall" ? { silentMs } : {}) };
+  }
+
   /**
    * Send messages and read back everything until the model stops.
    *
    * Returns at `session/prompt`'s reply, which is the same boundary molt's own
    * loop uses: the model has stopped calling tools and produced an answer, so
-   * the bar can run.
+   * the bar can run. With `limits`, it also returns — with a `done` that says
+   * `stopped` — when the deadline passes or the agent stalls; by then the agent
+   * has been cancelled and its process tree ended.
    */
-  async *send(messages: readonly string[]): AsyncGenerator<BackendEvent<H>> {
+  async *send(messages: readonly string[], limits: SendLimits = {}): AsyncGenerator<BackendEvent<H>> {
+    this.touch();
     if (!this.started) {
+      const starting = this.start();
+      starting.catch(() => {});
+      let got;
       try {
-        await this.start();
+        got = await this.bounded(starting, limits);
       } catch (e) {
         yield doneEvent("", errorText(e));
+        return;
+      }
+      if (!got.ok) {
+        await this.interrupt();
+        yield { ...doneEvent<H>("", `${this.opts.spec.label} did not start before the ${got.stop === "deadline" ? "time budget ran out" : "stall allowance ran out"}`), stopped: got.stop };
         return;
       }
     }
@@ -1016,7 +1380,14 @@ export class AcpSession<H> {
 
     this.reader ??= this.events.drain();
     for (;;) {
-      const next = await this.reader.next();
+      const got = await this.bounded(this.reader.next(), limits);
+      if (!got.ok) {
+        const ev = this.stoppedEvent(got.stop, got.silentMs);
+        await this.interrupt(answered);
+        yield ev;
+        return;
+      }
+      const next = got.value;
       if (next.done) break;
       yield next.value;
       if (next.value.kind === "done") break;
@@ -1025,7 +1396,7 @@ export class AcpSession<H> {
   }
 
   /** The step's `done`, with molt's own count of what went over the wire. */
-  private finish(error?: string): BackendEvent<H> {
+  private finish(error?: string): Extract<BackendEvent<H>, { kind: "done" }> {
     const prompt = estTokens(this.conversation);
     this.conversation += this.reply;
     return {
@@ -1065,7 +1436,7 @@ export class AcpSession<H> {
  * Zero tokens is the truth here and only here: nothing was sent, so there is
  * nothing to have counted. Once a session exists, `finish` estimates instead.
  */
-function doneEvent<H>(text: string, error?: string): BackendEvent<H> {
+function doneEvent<H>(text: string, error?: string): Extract<BackendEvent<H>, { kind: "done" }> {
   return {
     kind: "done",
     text,
@@ -1111,6 +1482,10 @@ export type AcpAskOptions = {
 export async function acpAsk(
   opts: AcpAskOptions,
 ): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+  // A model this agent may not run is refused before anything is spawned.
+  const pick = acpModelFor(opts.spec, opts.model);
+  if (pick.problem) return { ok: false, error: pick.problem };
+  opts = { ...opts, ...(pick.model !== undefined ? { model: pick.model } : {}) };
   const conn = new AcpConnection(opts.spec, {
     cwd: opts.cwd ?? process.cwd(),
     ...(opts.spawnFn ? { spawnFn: opts.spawnFn } : {}),
@@ -1126,6 +1501,7 @@ export async function acpAsk(
     onRequest: async () => ({ outcome: { outcome: "cancelled" } }),
   });
   let answer = "";
+  const askMeta = opts.spec.askMeta ?? opts.spec.sessionMeta;
   const limit = opts.timeoutMs ?? 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const expired =
@@ -1148,7 +1524,7 @@ export async function acpAsk(
     const res = (await conn.request("session/new", {
       cwd: opts.cwd ?? process.cwd(),
       mcpServers: [],
-      _meta: opts.spec.sessionMeta({ systemPrompt: opts.systemPrompt }),
+      _meta: askMeta({ systemPrompt: opts.systemPrompt }),
     })) as { sessionId?: string; models?: AcpModelState };
     if (!res?.sessionId) return { ok: false, error: `${opts.spec.bin} opened no session` };
     // The same choice the session makes, for the same reason: a draft written
@@ -1165,7 +1541,7 @@ export async function acpAsk(
         if (offered.length) throw e;
       });
     }
-    const prompt = ("systemPromptOverride" in opts.spec.sessionMeta({ systemPrompt: opts.systemPrompt })
+    const prompt = ("systemPromptOverride" in askMeta({ systemPrompt: opts.systemPrompt })
       ? opts.prompt
       : `${opts.systemPrompt}\n\n${opts.prompt}`);
     await conn.request("session/prompt", {

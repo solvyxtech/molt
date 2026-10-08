@@ -56,6 +56,9 @@ async function git(cwd: string, args: string[]): Promise<GitRun> {
   const r = await runCommand(`git ${args.map(shellQuote).join(" ")}`, {
     cwd,
     timeoutMs: GIT_TIMEOUT_MS,
+    // Under privilege separation the repository is the worker's, and so is
+    // its config: git runs as the worker, never as Maat (src/privsep.ts).
+    asWorker: true,
   });
   return { ok: r.code === 0, stdout: r.stdout.trim(), stderr: r.stderr.trim() };
 }
@@ -220,7 +223,7 @@ export async function restore(cwd: string, ref: string, plan: RevertPlan): Promi
     else out.failed.push({ path, reason: r.stderr || "checkout failed" });
   }
   for (const path of plan.remove) {
-    const r = await runCommand(`rm -f -- ${shellQuote(path)}`, { cwd, timeoutMs: GIT_TIMEOUT_MS });
+    const r = await runCommand(`rm -f -- ${shellQuote(path)}`, { cwd, timeoutMs: GIT_TIMEOUT_MS, asWorker: true });
     if (r.code === 0) out.removed.push(path);
     else out.failed.push({ path, reason: (r.stderr || "").trim() || "could not remove" });
   }

@@ -29,6 +29,12 @@ export type Msg = {
 };
 
 export type MsgMeta = {
+  /**
+   * Ids of this assistant message's tool calls that Maat refused as malformed.
+   * Their arguments go back to the provider as an excerpt (transcript.ts). Kept
+   * on the message so a restored transcript keeps sending the excerpt.
+   */
+  refusedCalls?: string[];
   /** True for a mechanically-generated digest of shed context. */
   digest?: true;
   /** True for context deliberately re-attached from the archive. */
@@ -115,7 +121,24 @@ export type Advisory = {
    * back on failure; only the text of the command is withheld.
    */
   hidden?: boolean;
+  /**
+   * Who wrote this check, recorded when it is sealed. "verified" needs a
+   * passing check that ran the work and asserted a value from someone other
+   * than the worker model (src/tiers.ts). Absent: a visible check is a
+   * person's, a hidden one the worker's.
+   */
+  author?: CheckAuthor;
 };
+
+/**
+ * The author of a check. `worker`: the model doing the work drafted it.
+ * `judge`: a separate judge model (`--judge`, MAAT_JUDGE_MODEL) drafted it.
+ * `person`: done.yml, a mission contract, or criteria a person approved.
+ * `reference`: the reference check (src/reference.ts), written by `model`.
+ * Independence is decided by comparing `model` to the worker's, never by kind
+ * alone: a judge that is the worker model is not independent.
+ */
+export type CheckAuthor = { kind: "worker" | "judge" | "person" | "reference"; model?: string };
 
 export type Check = Advisory &
   (
@@ -301,6 +324,12 @@ export type CheckResult = {
   /** Carried from the check: the command is withheld from the model. */
   hidden?: boolean;
   /**
+   * A task check that should have run in a throwaway copy of the tree ran in
+   * the project itself, and why (src/scratch.ts). What it wrote, it wrote to
+   * the work.
+   */
+  ranInPlace?: string;
+  /**
    * True when this result was reused rather than re-run.
    *
    * Surfaced everywhere a result is, because a reused pass presented as a
@@ -319,6 +348,14 @@ export type CheckResult = {
    */
   didNotRun?: boolean;
   /**
+   * True when the command was killed at its own time limit.
+   *
+   * A drafted check that hangs says nothing about the work, and a bar that
+   * waits on it is how a run reached the runner's kill with no verdict at all.
+   * The engine retires such a check for the run, like one that errs in its own code.
+   */
+  timedOut?: boolean;
+  /**
    * False when the check passed without establishing anything.
    *
    * A builtin can pass for two very different reasons: it looked and found
@@ -333,6 +370,13 @@ export type CheckResult = {
    * displayed as though it had proven something.
    */
   established?: boolean;
+  /**
+   * How this sealed task check fared on the tree before the work began:
+   * "failed" (it discriminates: it cannot pass on the untouched tree),
+   * "passed" (a guard: it passes with or without the work), or "untried"
+   * (broken then, or joined after the work began). Absent for every other check.
+   */
+  beforeWork?: "failed" | "passed" | "untried";
   /**
    * Why this check was not run at all, when it was not.
    *
@@ -389,7 +433,8 @@ export type BarResult = {
 export type LedgerEntry = {
   path: string;
   /**
-   * Assertions this write deleted from a test file.
+   * Assertions this write deleted (or rewrote) in a test file, and skips it
+   * added there (`specWeakened`, files.ts).
    *
    * Read by `spec-intact`. Present only when a test file lost an assertion,
    * which is rare and always worth a person's attention: it is the difference
@@ -598,18 +643,81 @@ export type EngineEvent =
        */
       selfChecked?: boolean;
       /**
+       * The claim passed its checks but the independent review was not run:
+       * the turn's clock had too little left for it. Said as "passed its
+       * checks, unreviewed", never as reviewed.
+       */
+      unreviewed?: boolean;
+      /**
        * The turn was refused only by checks the model drafted itself, and is
        * reported unverified rather than "not proven": names of those checks.
        */
       checksDisagree?: string[];
       /**
+       * Hidden checks whose commands were shown to the model after they failed
+       * the same way twice. A claim verified after that stays verified, said
+       * as what it is: the model had read the check it then met.
+       */
+      revealed?: string[];
+      /**
        * The independent review of a verified claim, when one ran. Not
        * confirmed means "passed its checks, unconfirmed": a majority of
        * reviews found a violation quoted from the task text.
        */
-      review?: { confirmed: boolean; votes: string; violations: { quote: string; evidence: string }[] };
+      review?: {
+        confirmed: boolean;
+        votes: string;
+        violations: { quote: string; evidence: string }[];
+        /** `--review-executable`: every objection, its command and what running it showed. */
+        objections?: import("./review.js").Objection[];
+      };
       /** The judgment case this job opened: the scale did not settle it, a person will (judgment.ts). */
       case?: number;
+      /**
+       * Why the model stopped before it said done, when the turn was judged
+       * anyway: the clock ran out, or the provider gave up after work had
+       * happened. The outcome is what the sealed bar said of the tree as it
+       * stood, never a default.
+       */
+      endedBy?: "deadline" | "provider" | "no-progress" | "malformed";
+      /** The turn's wall-clock budget ended it (endedBy "deadline"). */
+      deadline?: boolean;
+      /**
+       * The sealed checks passed on the tree as it stood when the model was
+       * stopped. Recorded, but the outcome is unverified: the model never
+       * said the work was done.
+       */
+      passedAtEnd?: boolean;
+      /**
+       * A subprocess backend sent nothing for the stall allowance
+       * (MAAT_BACKEND_STALL_MS) and its turn was cancelled: a provider issue,
+       * not a verdict on the work.
+       */
+      providerStall?: boolean;
+      /**
+       * What a passing turn earned (src/tiers.ts): "verified" only when a
+       * check ran the deliverable and asserted a value (or a person wrote the
+       * check) and no reviewer contradicted it. "passed-checks" is the outcome
+       * "unverified" with `tierReason` saying why the word was not earned.
+       */
+      tier?: "verified" | "passed-checks" | "passed-own-checks" | "passed-untested" | "verified-audit";
+      tierReason?: string;
+      /**
+       * The claim in words, the same on every surface and in the bench's
+       * `claim` field: "verified (independent checks: <judge>)", "verified
+       * (your checks)", "passed own checks (<worker>), not verified", or the
+       * outcome word.
+       */
+      claim?: string;
+      /** Who wrote each sealed check, by name: "worker <model>", "judge <model>", "person", "reference <model>". */
+      checkAuthors?: Record<string, string>;
+      /**
+       * The post-work audit (`--post-work-audit`, src/post-audit.ts), when it
+       * ran: the judge, how many checks it drafted, how many quoted the task,
+       * and which cleared every gate. Absent when the flag is off or the run
+       * was already verified.
+       */
+      audit?: { judge: string; drafted: number; grounded: number; accepted: string[]; error?: string };
     }
   | {
       kind: "step_summary";
@@ -639,6 +747,11 @@ export type EngineEvent =
   | { kind: "receipt"; path: string }
   | { kind: "shed"; before: number; after: number; dropped: number; path: string }
   | { kind: "info"; text: string }
+  /**
+   * The hidden checks' commands, released once the work is over (src/withhold.ts).
+   * Until this event nothing Maat writes or prints quotes them.
+   */
+  | { kind: "checks_released"; seal: string; checks: { name: string; run: string }[]; receipts: string[] }
   | {
       kind: "error";
       text: string;

@@ -31,10 +31,50 @@ const REMOVED_SHORTHANDS = [
   "gemini-cli",
 ] as const;
 
-/** The one subscription CLI molt still spawns: Grok Build over ACP. */
+/** A subscription CLI molt still spawns: Grok Build over ACP. */
 const GROK_BUILD_SCHEME = "grok-build://";
+/** The OpenCode CLI (ACP), driven only for OpenCode Zen's own `opencode/...` models. */
+const OPENCODE_SCHEME = "opencode://";
 
 export const GROK_BUILD_URL = `${GROK_BUILD_SCHEME}subscription`;
+export const OPENCODE_URL = `${OPENCODE_SCHEME}zen`;
+/** The old name for `OPENCODE_URL`: accepted for one release, with a deprecation notice. */
+export const OPENCODE_LEGACY_URL = `${OPENCODE_SCHEME}subscription`;
+
+/** Is this endpoint the OpenCode CLI (either spelling)? */
+export function isOpencodeUrl(baseUrl: string | undefined): boolean {
+  return (baseUrl ?? "").trim().toLowerCase().startsWith(OPENCODE_SCHEME);
+}
+
+/**
+ * Why `model` cannot run on the OpenCode backend, or null when it can.
+ *
+ * OpenCode can sign in to other vendors' consumer plans (Anthropic, GitHub
+ * Copilot, Gemini, ...) and would route `anthropic/...` through them. Maat
+ * drives it only for OpenCode Zen, OpenCode's own models: `opencode/<id>`, or
+ * a bare `<id>` meaning the same. Everything else is refused, for the worker
+ * and the judge alike. An empty model is the backend's default (Big Pickle).
+ */
+export function opencodeModelProblem(model: string | undefined): string | null {
+  const m = (model ?? "").trim();
+  if (!m) return null;
+  if (/^(?:opencode\/)?[a-z0-9][a-z0-9._:-]*$/iu.test(m)) return null;
+  return (
+    `'${m}' is not an OpenCode Zen model. The OpenCode backend runs only OpenCode's own ` +
+    `models ('opencode/<model>', e.g. opencode/big-pickle); Maat does not pass other ` +
+    `providers or subscription plans through OpenCode. Use that provider's HTTP API with ` +
+    `your own key instead.`
+  );
+}
+
+/** A notice for an endpoint spelling that still works but is going away, or null. */
+export function endpointDeprecation(raw: string | undefined): string | null {
+  const v = (raw ?? "").trim().toLowerCase();
+  if (v === OPENCODE_LEGACY_URL) {
+    return `'${OPENCODE_LEGACY_URL}' is deprecated and will stop working in the next release; use '${OPENCODE_URL}' (or just 'opencode').`;
+  }
+  return null;
+}
 
 /**
  * What someone types, and the sentinel it stands for.
@@ -46,6 +86,7 @@ export const GROK_BUILD_URL = `${GROK_BUILD_SCHEME}subscription`;
 const SHORTHAND: Readonly<Record<string, string>> = {
   "grok-build": GROK_BUILD_URL,
   grok: GROK_BUILD_URL,
+  opencode: OPENCODE_URL,
 };
 
 /** Why a removed subscription backend cannot be used. */
@@ -78,6 +119,9 @@ function removedBackendMessage(name: string): string {
  */
 export function expandEndpointShorthand(value: string): string {
   const v = (value ?? "").trim();
+  // The old OpenCode spelling becomes the new one, so receipts and stored
+  // configs only ever carry `opencode://zen` (see `endpointDeprecation`).
+  if (v.toLowerCase() === OPENCODE_LEGACY_URL) return OPENCODE_URL;
   return SHORTHAND[v.toLowerCase()] ?? v;
 }
 
@@ -107,7 +151,10 @@ export function endpointProblem(baseUrl: string): string | null {
       `/login, or 'grok-build' to run your own logged-in Grok Build CLI.`
     );
   }
-  const allowed = ["http:", "https:", GROK_BUILD_SCHEME.replace(/\/\/$/u, "")];
+  const allowed = ["http:", "https:", ...[GROK_BUILD_SCHEME, OPENCODE_SCHEME].map((s) => s.replace(/\/\/$/u, ""))];
+  if (isOpencodeUrl(url) && ![OPENCODE_URL, OPENCODE_LEGACY_URL].includes(url.toLowerCase())) {
+    return `'${url}' is not an OpenCode endpoint Maat knows; use '${OPENCODE_URL}' (or just 'opencode').`;
+  }
   if (!allowed.includes(parsed.protocol)) {
     return (
       `'${url}' uses the scheme '${parsed.protocol.replace(":", "")}', which Maat cannot ` +

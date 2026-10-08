@@ -25,7 +25,7 @@ import {
   historyBudget,
   keepForRound,
   keepRecentForRound,
-  NETWORK_RETRIES,
+  NETWORK_RETRIES, OVERLOAD_RETRIES,
   SYSTEM_PROMPT,
 } from "../src/engine.js";
 import { Transcript } from "../src/transcript.js";
@@ -91,7 +91,7 @@ describe("a turn that ends badly still says what it found", () => {
       const p = refusingProvider(
         429,
         "I read three files and found one bug; I did not verify it.",
-        NETWORK_RETRIES + 1,
+        OVERLOAD_RETRIES + 1,
       );
       const engine = engineWith(ws.dir, { fetchFn: p.fetchFn, stream: false });
       const events = await drain(engine.run("look for bugs", allowAll));
@@ -104,7 +104,7 @@ describe("a turn that ends badly still says what it found", () => {
       // And the turn closes with what it had rather than with nothing.
       assert.equal(
         p.bodies.length,
-        NETWORK_RETRIES + 2,
+        OVERLOAD_RETRIES + 2,
         "every attempt, and then exactly one salvage request",
       );
       assert.equal(p.bodies.at(-1)!.tool_choice, "none", "the salvage may not call more tools");
@@ -222,7 +222,7 @@ describe("a turn that ends badly still says what it found", () => {
 
       assert.equal(
         calls,
-        NETWORK_RETRIES + 2,
+        OVERLOAD_RETRIES + 2,
         "every attempt, one failed salvage, and then it stops",
       );
       const told = events.some((e) => e.kind === "info" && /could not write a closing summary/.test(e.text));
@@ -438,7 +438,7 @@ describe("the ceiling asks before it gives up", () => {
   
     /**
      * `/budget $5` was the advice whatever the unit. Where no price is known —
-     * every Claude Code turn, since a subscription run has no dollar figure —
+     * every subscription (ACP) turn, since a subscription run has no dollar figure —
      * the money ceiling is not what stopped anything, so that command changes a
      * number nothing reads and the turn hits the same wall.
      */
@@ -832,6 +832,17 @@ describe("an endpoint too small for the conversation", () => {
     // would destroy a working conversation to fix something else.
     assert.equal(contextOverflow(`{"error":"invalid api key"}`), null);
     assert.equal(contextOverflow(`{"error":"unsupported tool_choice value"}`), null);
+    // Mentioning context is not refusing for size: a pinned provider's 400 after a
+    // rate-limit retry ended a 2,476-token run as "too large" (2026-10-07).
+    assert.equal(
+      contextOverflow(`{"error":{"message":"No endpoints available for the requested provider and context","code":400}}`),
+      null,
+    );
+    assert.equal(contextOverflow(`{"error":"invalid message: context field missing"}`), null);
+    // Real overflow wordings still count.
+    assert.notEqual(contextOverflow(`{"error":"Prompt exceeds the maximum context of 131072 tokens"}`), null);
+    assert.notEqual(contextOverflow(`{"error":{"message":"prompt is too long: 210000 tokens > 200000 maximum"}}`), null);
+    assert.notEqual(contextOverflow(`{"error":"context_length_exceeded"}`), null);
   });
 
   it("measures how wrong its own token estimate is", () => {

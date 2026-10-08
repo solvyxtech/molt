@@ -7,8 +7,9 @@
  * bar is not met, so molt can sit in CI, in a script, or in a benchmark
  * harness without a human watching.
  */
+import { captureSecrets } from "./secrets.js";
 import { acpAgentFor, acpHealth } from "./acp.js";
-import { expandEndpointShorthand } from "./endpoint.js";
+import { endpointDeprecation, expandEndpointShorthand, isOpencodeUrl, opencodeModelProblem } from "./endpoint.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { formatWithOptions } from "node:util";
 import { resolve } from "node:path";
@@ -27,7 +28,9 @@ import { buildRepoMap, DEFAULT_MAP_TOKENS } from "./repomap.js";
 import { buildBrief, DEFAULT_BRIEF_TOKENS } from "./brief.js";
 import { draftMission, missionStatus, runMission, writePlan, type MissionSummary } from "./mission.js";
 import { parseDuration } from "./session-commands.js";
-import { commandsHere, draftCriteriaCritiqued, preflightCriteria, taskChecksFrom, type Draft } from "./criteria.js";
+import { jobEndWords } from "./tiers.js";
+import { judgeEffort, judgeTarget } from "./judge.js";
+import { commandsHere, draftCriteriaCritiqued, drafterInputsHash, drafterSnapshot, preflightCriteria, taskChecksFrom, type Draft, type DrafterInputs } from "./criteria.js";
 import { listProject, removeNew } from "./leftovers.js";
 import { projectScripts } from "./interview.js";
 import {
@@ -47,9 +50,13 @@ import {
   type StoredEndpoint,
 } from "./providers.js";
 import { Receipts } from "./receipts.js";
-import type { BarResult, EngineEvent } from "./types.js";
+import type { BarResult, Check, CheckAuthor, EngineEvent } from "./types.js";
 import { stateDir } from "./statedir.js";
+import { draftReference, snapshotProject } from "./reference.js";
 import { env } from "./env.js";
+import { fileURLToPath } from "node:url";
+import { checkUserFrom, defaultWorkerUser, disablePrivSep, disposableRun, enablePrivSep, setIsolationLine, workerUserFrom, type PrivSep } from "./privsep.js";
+import { preWorkCopy } from "./scratch.js";
 
 /**
  * The version, from the manifest that npm actually publishes.
@@ -146,13 +153,63 @@ options
                      the task and the receipt; a majority-backed violation quoted
                      from the task labels the work "passed its checks,
                      unconfirmed". A label only: nothing is refused or redone.
+  --reference        a second model writes an independent reference from the task
+                     text and the project as it was before the work, and a hidden
+                     check compares the deliverable with it on the task's
+                     examples, edge cases and random inputs (needs python3)
   --reveal-stuck     experimental: when its own hidden checks fail the same way
                      twice, show the model their commands once instead of
-                     stopping
+                     stopping (off by default: it let the model bend correct
+                     work to wrong checks, 37/60 vs 44/60)
+  --no-reveal        stop at the repeat failure (the default)
+  --review-advisory  experimental: the --review verdict is recorded but does not
+                     gate; "verified" then needs a drafted check that asserts a
+                     value, ran the work, and failed before the work began
+                     (also MAAT_REVIEW_ADVISORY=1)
+  --review-executable  experimental: every --review objection must carry a
+                     read-only command that demonstrates it; Maat runs it on a
+                     copy of the tree and an objection whose command is missing,
+                     mutates, or passes on the work is a note, not a veto. A
+                     failure counts only from a command that reads the work
+                     (names a project path or runs its tests); it shows the
+                     command failed, not that it tested what the objection
+                     says. Commands run without Maat's credentials, and with
+                     no throwaway copy of the tree they are not run and do not
+                     count (also MAAT_REVIEW_EXECUTABLE=1)
+  --require-discriminating
+                     "verified" needs an independent value check that failed
+                     on the tree before the work and passes now; otherwise
+                     "passed checks that did not test this work", exit 3
+                     (also MAAT_REQUIRE_DISCRIMINATING=1; off by default)
+  --post-work-audit  when the checks sealed before the work did not verify a
+                     claim, the --judge model drafts checks from the task and
+                     the work's interface (never its transcript or outputs);
+                     one that quotes the task, passes on the work, fails
+                     before it and fails on a mutant of the changed code earns
+                     "verified (post-work audit: <judge>)". Needs --judge
+                     (also MAAT_POST_WORK_AUDIT=1; off by default)
+  --signout          before an unattended claim is judged, put each stated
+                     requirement to the model once beside the commands it ran
+                     (off by default: 60 rounds rescued no task)
+  --arbiter-model M  a different model rules on DISPUTE lines (same endpoint).
+                     Without one, a dispute is rejected: the worker model as
+                     its own arbiter shares the misreading
+  --dispute-votes N  arbiter asks per dispute (default 1)
   --batch            batch mode: every reply is one act call carrying a plan and
                      a list of actions, for models that make one tool call per
                      reply. Each action is still approved, recorded and checked
                      as its own call. HTTP endpoints only.
+  --judge <model>    draft the hidden checks and review the claim on a different
+                     model than the worker (same endpoint unless --judge-url).
+                     A separate judge does not share the worker's misreadings;
+                     it raised verified-on-correct-work on every worker tested
+                     with no wrong verifieds. Same as MAAT_JUDGE_MODEL.
+                     Without one (or with the worker's own model), drafted
+                     checks are the worker's and the most a run earns is
+                     "passed own checks", never "verified".
+  --judge-url <url>  where the judge runs, e.g. grok-build://subscription,
+                     opencode://zen (OpenCode Zen models only, e.g.
+                     opencode/big-pickle), or an OpenAI-style URL.
   --reasoning-checks <e>  effort for drafting checks and planning a mission only
                      (single calls outside the work loop). Defaults to --reasoning.
   --reasoning-retry <e>   effort for every step after the checks refuse a claim.
@@ -204,6 +261,23 @@ options
                      what high autonomy would still ask about runs (rm, sudo,
                      python -c, a write outside the directory). For a container
                      or a throwaway VM, never for a machine you keep.
+  --worker-user <u>  run the worker's tools as user <u> (Linux; Maat runs as
+                     root or with passwordless sudo to <u>). Maat's records go
+                     to a private state dir (MAAT_STATE_DIR) and are copied
+                     into .maat/ when the job ends. For containers and
+                     unattended runs. Unset, an unattended run as root on
+                     Linux uses maat-worker (made if missing); "none" keeps
+                     the tools as Maat's own user. (MAAT_WORKER_USER)
+  --check-user <u>   with --worker-user: task checks (hidden, drafted, mission)
+                     run as user <u> in their copy of the tree, with only PATH,
+                     a fresh HOME, LANG and TERM, and (root with CAP_SYS_ADMIN)
+                     their own PID namespace and /tmp. Checks that run in the
+                     project itself, and mutation runs, run as the worker.
+                     (MAAT_CHECK_USER)
+  --worker-strict    with --worker-user: refuse to start unless the worker
+                     account, the check account and the PID namespace can all
+                     be set up. Without it Maat carries on and every receipt
+                     and the journal say which isolation was in effect.
   --json             machine-readable output (run/prove/stats/receipts)
   --version          print the version and exit
   --no-stream        disable token streaming (default: streaming on)
@@ -235,6 +309,10 @@ type Args = {
   maxTokens?: number;
   /** `--reasoning low`: a reasoning model's effort, sent only when set. */
   reasoning?: string;
+  /** `--judge <model>`: the model that drafts checks and reviews (MAAT_JUDGE_MODEL). */
+  judge?: string;
+  /** `--judge-url <url>`: where the judge runs (MAAT_JUDGE_URL). */
+  judgeUrl?: string;
   /** `--reasoning-checks high`: effort for drafting checks and planning only. */
   reasoningChecks?: string;
   /** `--reasoning-retry high`: effort after the checks refuse a claim. */
@@ -243,8 +321,23 @@ type Args = {
   steps?: number;
   /** `--batch`: the model's only tool is act — a plan and a list of actions per reply. */
   batch?: boolean;
-  /** `--reveal-stuck`: see EngineConfig.revealOnStuck. Experimental. */
+  /** `--reveal-stuck` (opt-in) / `--no-reveal`: see EngineConfig.revealOnStuck. */
   revealStuck?: boolean;
+  /** `--review-advisory`: see EngineConfig.reviewAdvisory. */
+  reviewAdvisory?: boolean;
+  /** `--review-executable`: see EngineConfig.reviewExecutable. */
+  reviewExecutable?: boolean;
+  /** `--require-discriminating`: see EngineConfig.requireDiscriminating. */
+  requireDiscriminating?: boolean;
+  /** `--post-work-audit`: see EngineConfig.postWorkAudit. */
+  postWorkAudit?: boolean;
+  /** `--signout`: see EngineConfig.signOut. */
+  signout?: boolean;
+  /** `--arbiter-model` / `--dispute-votes`: see EngineConfig.dispute. */
+  arbiterModel?: string;
+  disputeVotes?: number;
+  /** `--reference`: an independent reference check (src/reference.ts). */
+  reference?: boolean;
   /** `--review [n]`: independent review of a verified claim, n votes (default 3). A label, not a gate. */
   review?: number;
   attempts?: number;
@@ -265,6 +358,12 @@ type Args = {
    * boundary, and approves every gated call instead of refusing it.
    */
   sandbox?: boolean;
+  /** `--worker-user <name>`: the worker's tools run as that user (src/privsep.ts). */
+  workerUser?: string;
+  /** `--check-user <name>`: task checks run as that account (src/privsep.ts). */
+  checkUser?: string;
+  /** `--worker-strict`: refuse to start unless worker account, check account and PID namespace are all in place. */
+  workerStrict?: boolean;
   /** `molt mission run --features n`: stop after n worker runs. */
   features?: number;
   /** Files the model may read and never write. `--read`, repeatable. */
@@ -339,6 +438,15 @@ function positiveNum(flag: string, raw: string | undefined): number {
  * a local endpoint whether or not anything was running there — a claim it
  * had not checked, in a status line whose job is to be trustworthy.
  */
+/** Says once, on stderr, that an endpoint spelling is going away. */
+const deprecationsSaid = new Set<string>();
+function noteDeprecated(raw: string | undefined): void {
+  const note = endpointDeprecation(raw);
+  if (!note || deprecationsSaid.has(note)) return;
+  deprecationsSaid.add(note);
+  process.stderr.write(`maat: ${note}\n`);
+}
+
 export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
   const out: Args = {
     cmd: "",
@@ -407,6 +515,7 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
          * `endpointProblem`, so the engine and the window expand the same word
          * this flag does rather than each learning it separately.
          */
+        noteDeprecated(given);
         out.url = expandEndpointShorthand(given);
         /**
          * Refused here, not four retries later.
@@ -458,6 +567,33 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
       case "--reveal-stuck":
         out.revealStuck = true;
         break;
+      case "--no-reveal":
+        out.revealStuck = false;
+        break;
+      case "--review-advisory":
+        out.reviewAdvisory = true;
+        break;
+      case "--review-executable":
+        out.reviewExecutable = true;
+        break;
+      case "--require-discriminating":
+        out.requireDiscriminating = true;
+        break;
+      case "--post-work-audit":
+        out.postWorkAudit = true;
+        break;
+      case "--signout":
+        out.signout = true;
+        break;
+      case "--arbiter-model":
+        out.arbiterModel = next();
+        break;
+      case "--dispute-votes":
+        out.disputeVotes = positiveInt("--dispute-votes", next());
+        break;
+      case "--reference":
+        out.reference = true;
+        break;
       case "--review": {
         // Optional count: `--review` alone is three votes.
         const peek = argv[i + 1];
@@ -474,6 +610,20 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         const n = Number(raw);
         if (!Number.isInteger(n) || n < 0) throw new Error(`--steps takes a whole number (0 for none); got ${raw}`);
         out.steps = n;
+        break;
+      }
+      case "--judge":
+        out.judge = next();
+        break;
+      case "--judge-url": {
+        // Same words as --url (`grok`, `opencode`), and refused here rather
+        // than when the first check is drafted.
+        const givenJudgeUrl = next();
+        noteDeprecated(givenJudgeUrl);
+        const judgeUrl = expandEndpointShorthand(givenJudgeUrl);
+        const wrong = endpointProblem(judgeUrl);
+        if (wrong) throw new Error(`--judge-url: ${wrong}`);
+        out.judgeUrl = judgeUrl;
         break;
       }
       case "--reasoning-checks":
@@ -603,6 +753,15 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
         out.sandbox = true;
         out.yes = true;
         break;
+      case "--worker-user":
+        out.workerUser = next();
+        break;
+      case "--check-user":
+        out.checkUser = next();
+        break;
+      case "--worker-strict":
+        out.workerStrict = true;
+        break;
       case "--json":
         out.json = true;
         break;
@@ -619,6 +778,24 @@ export function parseArgs(argv: string[], stored: StoredEndpoint = {}): Args {
 
   out.cmd = positional[0] ?? "";
   out.task = positional.slice(1).join(" ") || undefined;
+
+  // A stored or MAAT_BASE_URL endpoint in the old OpenCode spelling still works, for one release.
+  noteDeprecated(out.url);
+  out.url = expandEndpointShorthand(out.url);
+  // OpenCode runs only OpenCode Zen models, as worker and as judge, refused here
+  // rather than when the CLI is spawned (where it is refused again).
+  if (isOpencodeUrl(out.url)) {
+    const wrong = opencodeModelProblem(out.model);
+    if (wrong) throw new Error(`--model: ${wrong}`);
+  }
+  const envJudgeUrl = process.env.MAAT_JUDGE_URL?.trim();
+  if (out.judgeUrl === undefined && envJudgeUrl) noteDeprecated(envJudgeUrl);
+  const judgeModel = out.judge ?? process.env.MAAT_JUDGE_MODEL?.trim();
+  const judgeUrl = out.judgeUrl ?? (envJudgeUrl ? expandEndpointShorthand(envJudgeUrl) : out.url);
+  if (judgeModel && isOpencodeUrl(judgeUrl)) {
+    const wrong = opencodeModelProblem(judgeModel);
+    if (wrong) throw new Error(`--judge: ${wrong}`);
+  }
 
   // Prices come last, because a stored price belongs to the model it was
   // fetched for and the model is not final until every flag has been read.
@@ -719,7 +896,13 @@ function engineFor(args: Args, session = false, extra: { files?: FileAccess } = 
     retryReasoningEffort: args.reasoningRetry,
     maxSteps: args.steps,
     batch: args.batch === true,
-    ...(args.revealStuck ? { revealOnStuck: true } : {}),
+    ...(args.revealStuck === true ? { revealOnStuck: true } : args.revealStuck === false ? { revealOnStuck: false } : {}),
+    ...(args.reviewAdvisory || env("REVIEW_ADVISORY") === "1" ? { reviewAdvisory: true } : {}),
+    ...(args.reviewExecutable || env("REVIEW_EXECUTABLE") === "1" ? { reviewExecutable: true } : {}),
+    ...(args.requireDiscriminating || env("REQUIRE_DISCRIMINATING") === "1" ? { requireDiscriminating: true } : {}),
+    ...(args.postWorkAudit || env("POST_WORK_AUDIT") === "1" ? { postWorkAudit: true } : {}),
+    ...(args.signout ? { signOut: true } : {}),
+    ...(args.arbiterModel || args.disputeVotes ? { dispute: { model: args.arbiterModel, votes: args.disputeVotes } } : {}),
     ...(args.review ? { review: { votes: args.review, reasoningEffort: args.reasoningChecks ?? args.reasoning } } : {}),
     // MAAT_JUDGMENT=0: no judgment cases (benchmarks, where no person will ever rule).
     ...(env("JUDGMENT") === "0" ? { judgment: false } : {}),
@@ -1085,6 +1268,15 @@ async function cmdMission(args: Args): Promise<number> {
   }
 }
 
+/** What the criteria drafter may read, taken before the turn's first step. */
+function drafterSnapshotFor(args: Args): DrafterInputs {
+  return drafterSnapshot(args.task ?? "", args.cwd, {
+    commands: commandsHere(args.cwd),
+    scripts: projectScripts(args.cwd),
+    lessons: new Judgments(args.cwd).lessons(),
+  });
+}
+
 /**
  * `--criteria auto`: the model writes the exam, and is then held to it.
  *
@@ -1100,55 +1292,170 @@ async function cmdMission(args: Args): Promise<number> {
 async function autoDraft(
   engine: Engine,
   args: Args,
-  soFar?: { draft?: Draft },
+  soFar?: { draft?: Draft; sealed?: boolean; late?: boolean },
+  inputs?: { snapshot: DrafterInputs; used: string[] },
+  deadlineAt?: number,
+): Promise<ReturnType<typeof taskChecksFrom>> {
+  // Taken once, now, before the first step: the second try below and every
+  // stage of each draft read this and never the folder the work is changing.
+  const snapshot = inputs?.snapshot ?? drafterSnapshotFor(args);
+  // And a copy of the project as it is now, before the first step: each
+  // drafted check is tried on it, and one that already passes there cannot
+  // show this task was done, so it is sent back to the drafter once and
+  // dropped if it still passes (criteria.ts screen). Null when the project is
+  // too big to copy: the checks are then not tried here.
+  // Fingerprinted: the drafting can outlive the start of the work (a late
+  // draft), and the worker runs as this uid, so every try checks the copy is
+  // still as taken (src/scratch.ts preWorkCopy).
+  const preWork = args.cwd ? await preWorkCopy(args.cwd) : null;
+  try {
+    return await autoDraftFrom(engine, args, snapshot, preWork ? { dir: preWork.dir, intact: preWork.intact } : undefined, soFar, inputs, deadlineAt);
+  } finally {
+    await preWork?.cleanup();
+  }
+}
+
+async function autoDraftFrom(
+  engine: Engine,
+  args: Args,
+  snapshot: DrafterInputs,
+  preWork: { dir: string; intact: () => Promise<boolean> } | undefined,
+  soFar?: { draft?: Draft; sealed?: boolean; late?: boolean },
+  inputs?: { snapshot: DrafterInputs; used: string[] },
+  deadlineAt?: number,
 ): Promise<ReturnType<typeof taskChecksFrom>> {
   const none: ReturnType<typeof taskChecksFrom> = { taskChecks: [], taskNotes: [] };
+  // Under --for, no draft, critique or retry waits past the run's budget
+  // (the job's own deadline, taken once by the caller: runDeadlineAt).
   // Drafted, then read cold by a critic against the task text: a check that
   // invents or guesses is dropped (with a task quote), and a draft where
   // nothing runs the deliverable is asked for once more. See criteria.ts.
-  const r = await draftCriteriaCritiqued({
-    commands: commandsHere(args.cwd),
-    lessons: new Judgments(args.cwd).lessons(),
+  const draftOnce = () =>
+    draftCriteriaCritiqued({
+      snapshot,
+      ...(snapshot.commands ? { commands: snapshot.commands } : {}),
+      lessons: [...snapshot.lessons],
+      task: args.task ?? "",
+      scripts: [...snapshot.scripts],
+      onInputs: (sha) => inputs?.used.push(sha),
+      barChecks: (engine.cfg.bar?.checks ?? []).map((c) => c.name),
+      ...judgeTarget({ baseUrl: args.url, apiKey: args.key, model: args.model }),
+      cwd: args.cwd,
+      ...(preWork ? { preWorkDir: preWork.dir, preWorkIntact: preWork.intact } : {}),
+      reasoningEffort: judgeEffort(args.reasoningChecks ?? args.reasoning),
+      latency: engine.askLatency,
+      deadlineAt,
+      // What is ready when a time budget stops the wait (RunOptions.criteriaSoFar).
+      onProgress: (d) => {
+        if (soFar) soFar.draft = d;
+      },
+    });
+  let r = await draftOnce();
+  // One unlucky reply (an overloaded provider, JSON that does not parse) leaves
+  // a run with no checks, and so no verdict worth the name. Asked
+  // once more; a second failure is journalled as `no-checks`, not left silent.
+  if (!r.ok && !soFar?.sealed) {
+    process.stderr.write(`maat: criteria not drafted — ${r.error}; asking once more\n`);
+    engine.cfg.journal?.append("note", { kind: "draft-failed", text: `criteria draft failed once: ${r.error}` });
+    r = await draftOnce();
+  }
+  if (!r.ok) {
+    process.stderr.write(`maat: criteria not drafted — ${r.error}; running against the project bar only\n`);
+    engine.cfg.journal?.append("note", { kind: "no-checks", text: `no-checks: criteria could not be drafted after two tries — ${r.error}` });
+    return none;
+  }
+  for (const line of r.critique) process.stderr.write(`maat: criteria review — ${line}\n`);
+  // A check the seal-time lint retired is never sealed; the record says which and why.
+  for (const d of r.lint ?? []) {
+    engine.cfg.journal?.append("note", {
+      kind: "check-lint-dropped",
+      text: `drafted check ${d.name} dropped by lint ${d.rule}: ${d.why}`,
+      name: d.name,
+      run: d.run,
+      rule: d.rule,
+      redraft: d.redraft,
+    });
+  }
+  // A time budget already sealed what was ready (criteriaSoFar), and the work
+  // has begun in this folder. Sealing again would run the preflight a second
+  // time — and its cleanup removes every file that appeared while it ran,
+  // which by now includes the model's.
+  if (soFar?.sealed) return none;
+  return sealDraft(r.draft, args, soFar?.late);
+}
+
+/**
+ * Snapshot the project now, before the first step, and write a reference
+ * check from it in the background (src/reference.ts). Null — said once — when
+ * there is no python3, the project is too large to copy, or no reference
+ * applies.
+ */
+function startReference(args: Args, deadlineAt?: number): Promise<{ check: Check; note: Record<string, unknown> } | null> | undefined {
+  const here = commandsHere(args.cwd);
+  if (!here.present.includes("python3")) {
+    process.stderr.write("maat: no reference check — python3 is not installed here\n");
+    return undefined;
+  }
+  const snapshot = snapshotProject(args.cwd);
+  if (!snapshot) {
+    process.stderr.write("maat: no reference check — the project is too large to snapshot\n");
+    return undefined;
+  }
+  return draftReference({
     task: args.task ?? "",
-    scripts: projectScripts(args.cwd),
-    barChecks: (engine.cfg.bar?.checks ?? []).map((c) => c.name),
+    snapshot,
     baseUrl: args.url,
     apiKey: args.key,
     model: args.model,
     cwd: args.cwd,
     reasoningEffort: args.reasoningChecks ?? args.reasoning,
-    // What is ready when a time budget stops the wait (RunOptions.criteriaSoFar).
-    onProgress: (d) => {
-      if (soFar) soFar.draft = d;
-    },
+    ...(deadlineAt !== undefined ? { deadlineAt } : {}),
+  }).then((r) => {
+    if (!r.ok) {
+      process.stderr.write(`maat: no reference check — ${r.why}\n`);
+      return null;
+    }
+    process.stderr.write(`maat: reference check ready — ${r.reason}\n`);
+    return {
+      check: r.check,
+      note: { snapshot: r.snapshot.hash, files: r.snapshot.files, reason: r.reason, source: r.source },
+    };
+  }).catch((e: unknown) => {
+    // A throw here (a file gone mid-copy) was an unhandled rejection whenever
+    // no claim was waiting on the reference — enough to end the process.
+    process.stderr.write(`maat: no reference check — ${e instanceof Error ? e.message : String(e)}\n`);
+    return null;
   });
-  if (!r.ok) {
-    process.stderr.write(`maat: criteria not drafted — ${r.error}; running against the project bar only\n`);
-    return none;
-  }
-  for (const line of r.critique) process.stderr.write(`maat: criteria review — ${line}\n`);
-  return sealDraft(r.draft, args);
 }
 
 /** A draft as sealed, hidden checks, with the ones that break before any work dropped. */
-async function sealDraft(draft: Draft, args: Args): Promise<ReturnType<typeof taskChecksFrom>> {
+async function sealDraft(draft: Draft, args: Args, late = false): Promise<ReturnType<typeof taskChecksFrom>> {
   // Hidden: the model wrote these, and a model shown its own exam makes the
   // work equal the check. It gets the names, and the output on failure.
-  const sealed = taskChecksFrom(draft, { hidden: true });
+  // Who wrote them, recorded with the seal: the judge when one is set, else the
+  // worker itself. Whether that judge is really another model is tierOf's call.
+  const drafter = judgeTarget({ baseUrl: args.url, apiKey: args.key, model: args.model }).model;
+  const author: CheckAuthor = process.env.MAAT_JUDGE_MODEL?.trim() ? { kind: "judge", model: drafter } : { kind: "worker", model: args.model };
+  const sealed = taskChecksFrom(draft, { hidden: true, author });
   // Headless, the checks' own side effects are cleaned up (src/leftovers.ts).
-  const beforeTry = listProject(args.cwd);
-  const broken = await preflightCriteria(sealed.taskChecks, { cwd: args.cwd });
-  removeNew(args.cwd, beforeTry);
+  // A draft that joins at a claim (RunOptions.pendingCriteria, cut with no
+  // checks ready) lands after the work began: trying it in the live folder
+  // would be meaningless, and the cleanup after the try removes every file
+  // that appeared meanwhile, the model's included. It joins untried.
+  const beforeTry = late ? null : listProject(args.cwd);
+  const broken = late ? [] : await preflightCriteria(sealed.taskChecks, { cwd: args.cwd, stray: { task: args.task ?? "" } });
+  if (!late) removeNew(args.cwd, beforeTry);
   const drop = new Set(broken.map((b) => b.name));
   for (const b of broken) {
     process.stderr.write(`maat: dropped drafted criterion ${b.name} (${b.run}) — ${b.why}\n`);
   }
   const taskChecks = sealed.taskChecks.filter((c) => !drop.has(c.name));
   if (!args.json) {
-    for (const c of taskChecks) process.stdout.write(`· criterion ${c.name}: ${c.run}\n`);
+    // Names only: the commands are printed when the job releases them (checks_released).
+    for (const c of taskChecks) process.stdout.write(`· ${c.tags.includes("guard") ? "guard" : "criterion"} ${c.name} (command withheld until the job ends)\n`);
     for (const n of sealed.taskNotes) process.stdout.write(`· note ${n}\n`);
   }
-  return { taskChecks, taskNotes: sealed.taskNotes };
+  return { taskChecks, taskNotes: sealed.taskNotes, ...(sealed.requirements ? { requirements: sealed.requirements } : {}) };
 }
 
 async function cmdRun(args: Args, ask = false): Promise<number> {
@@ -1181,7 +1488,11 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   // break the line before saying anything of molt's own.
   let midLine = false;
 
-  const emit = (ev: EngineEvent) => {
+  const emit = (raw: EngineEvent) => {
+    // Hidden check commands stay out of the stream until the job releases
+    // them: a harness that tees this into a file the worker can read
+    // (bench/harbor) would otherwise hand them over (src/withhold.ts).
+    const ev = engine.maskEvent(raw);
     if (args.json) {
       process.stdout.write(JSON.stringify(ev) + "\n");
       return;
@@ -1239,16 +1550,7 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
         // the same books.
         const sp = ev.spend;
         const cached = sp.cachedTokens > 0 ? ` (${sp.cachedTokens} cached)` : "";
-        const said =
-          ev.outcome === "verified" && ev.review && !ev.review.confirmed
-            ? "passed its checks, unconfirmed"
-            : ev.outcome === "verified" && ev.review?.confirmed
-              ? "verified, independently reviewed"
-              : ev.outcome === "verified" && ev.selfChecked
-                ? "passed its own checks"
-                : ev.outcome === "unverified" && ev.checksDisagree?.length
-                  ? "unverified, its own drafted checks disagree"
-                  : ev.outcome;
+        const said = jobEndWords(ev);
         process.stdout.write(
           `· job ${said} · ${ev.steps} step(s) · ${sp.promptTokens} in${cached} · ` +
             `${sp.completionTokens} out · ${fmtDuration(ev.durationMs)}` +
@@ -1309,6 +1611,10 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
       case "info":
         process.stdout.write(`· ${ev.text}\n`);
         break;
+      case "checks_released":
+        for (const c of ev.checks) process.stdout.write(`· criterion ${c.name}: ${c.run}\n`);
+        for (const r of ev.receipts) process.stdout.write(`· full receipt ${r}\n`);
+        break;
       case "error":
         process.stderr.write(`maat: ${ev.text}\n`);
         break;
@@ -1334,15 +1640,35 @@ async function cmdRun(args: Args, ask = false): Promise<number> {
   const { taskChecks, taskNotes } = criteriaFromArgs(args);
   // Drafted while the model starts reading: the engine seals them before the
   // first change or claim, so they still predate the work (see RunOptions).
-  const soFar: { draft?: Draft } = {};
-  const pendingCriteria = args.autoCriteria && !ask ? autoDraft(engine, args, soFar) : undefined;
-  const criteriaSoFar = pendingCriteria
-    ? () => (soFar.draft ? sealDraft(soFar.draft, args) : Promise.resolve({ taskChecks: [], taskNotes: [] }))
+  const soFar: { draft?: Draft; sealed?: boolean; late?: boolean } = {};
+  // The drafter's inputs, frozen here; the engine journals their hash at turn
+  // start and compares it with what each drafter stage actually used.
+  const drafterInputs = args.autoCriteria && !ask ? { snapshot: drafterSnapshotFor(args), used: [] as string[] } : undefined;
+  // One deadline for everything this job starts before its turn, taken once:
+  // the drafter and the reference each used to take their own Date.now(), a
+  // little later than the job's, and could wait that much past --for.
+  const runDeadlineAt = args.forMs ? Date.now() + args.forMs : undefined;
+  const pendingCriteria = drafterInputs ? autoDraft(engine, args, soFar, drafterInputs, runDeadlineAt) : undefined;
+  const draftInputs = drafterInputs
+    ? { sha: drafterInputsHash(drafterInputs.snapshot), used: () => [...drafterInputs.used] }
     : undefined;
+  const criteriaSoFar = pendingCriteria
+    ? () => {
+        // Nothing reviewed yet: leave the draft running to join at the claim
+        // (it is then sealed without the preflight, see sealDraft).
+        if (soFar.draft?.checks.length) soFar.sealed = true;
+        else soFar.late = true;
+        return soFar.draft?.checks.length ? sealDraft(soFar.draft, args) : Promise.resolve({ taskChecks: [], taskNotes: [] });
+      }
+    : undefined;
+  const referenceCheck = args.reference && !ask ? startReference(args, runDeadlineAt) : undefined;
   let undetermined = false;
   /** The turn's own verdict, from job_end. */
   let outcome: string | undefined;
-  for await (const ev of engine.run(args.task, confirm, { ask, taskChecks, taskNotes, pendingCriteria, criteriaSoFar })) {
+  // How long a timed turn waits for its drafted checks; for tests and debugging.
+  const waitEnv = Number(env("CRITERIA_WAIT_MS"));
+  const criteriaWait = Number.isFinite(waitEnv) && waitEnv > 0 ? { criteriaWaitMs: waitEnv } : {};
+  for await (const ev of engine.run(args.task, confirm, { ask, taskChecks, taskNotes, pendingCriteria, criteriaSoFar, referenceCheck, ...(draftInputs ? { draftInputs } : {}), ...criteriaWait })) {
     emit(ev);
     if (ev.kind === "proof_exhausted" && ev.result.undetermined?.length) undetermined = true;
     // The sentence that explains an undetermined bar arrives as an error, so
@@ -1964,6 +2290,14 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   // (Terminal-Bench kv-store-grpc, rstan-to-pystan: exit 143, no verdict).
   // A plain title keeps the task out of `ps`, `pgrep -f` and `pkill -f`.
   if (argv.length > 1) process.title = "maat";
+  // Credentials out of the environment and into memory before anything is
+  // spawned, so no child inherits one (src/secrets.ts). MAAT_KEYS_FD and
+  // MAAT_KEYS_FILE deliver keys that were never in the environment at all.
+  const keys = captureSecrets();
+  if (keys.problems.length) {
+    process.stderr.write(keys.problems.map((p) => `maat: ${p}\n`).join(""));
+    return 2;
+  }
   let args: Args;
   try {
     args = parseArgs(argv, storedEndpoint());
@@ -1976,6 +2310,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     process.stdout.write(USAGE + "\n");
     return 0;
   }
+  // The judge is read where checks are drafted and claims reviewed (judge.ts).
+  if (args.judge) process.env.MAAT_JUDGE_MODEL = args.judge;
+  if (args.judgeUrl) process.env.MAAT_JUDGE_URL = args.judgeUrl;
   if (args.version) {
     process.stdout.write(VERSION + "\n");
     return 0;
@@ -1988,6 +2325,80 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   // Before anything else can print: from here on stdout is the protocol.
   if (args.acp || args.cmd === "acp") return cmdAcp(args);
 
+  // Privilege separation, when asked for: before any record is opened, so
+  // every one of them is made in the private state dir (src/privsep.ts).
+  const named = workerUserFrom(args.workerUser);
+  const checker = checkUserFrom(args.checkUser);
+  const separates = args.cmd === "run" || args.cmd === "ask" || (args.cmd === "mission" && (args.task ?? "").split(" ")[0] === "run");
+  // `none` keeps the worker's tools as Maat's own user. Unnamed, an unattended
+  // run as root on Linux separates by default (privsep.ts defaultWorkerUser);
+  // anywhere else nothing changes, and the notice says which account it is.
+  let worker = named === "none" ? undefined : named;
+  let defaulted = false;
+  if (!named && separates && !checker && !args.workerStrict) {
+    const d = defaultWorkerUser();
+    process.stderr.write(`maat: ${d.notice}\n`);
+    worker = d.user;
+    defaulted = worker !== undefined;
+    // Separation was the default here and could not be set up: every receipt
+    // and the journal say so, not only stderr (bench and CI rows read them).
+    if (!worker && process.platform === "linux" && process.geteuid?.() === 0 && disposableRun().disposable) {
+      setIsolationLine(`isolation: none (separation is the default here but could not be set up: ${d.notice.replace(/^running as root[^:]*: /, "")})`);
+    }
+  }
+  if (!worker && separates && (checker || args.workerStrict)) {
+    process.stderr.write(`maat: ${args.workerStrict ? "--worker-strict" : "--check-user"} needs --worker-user (MAAT_WORKER_USER)\n`);
+    return 2;
+  }
+  if (worker && separates) {
+    let ps: PrivSep | undefined;
+    try {
+      ps = enablePrivSep({
+        user: worker,
+        project: args.cwd,
+        helper: fileURLToPath(new URL("./fs-helper.js", import.meta.url)),
+        notice: (t) => process.stderr.write(`maat: ${t}\n`),
+        ...(checker ? { checkUser: checker } : {}),
+        strict: args.workerStrict === true,
+      });
+    } catch (e) {
+      // --worker-strict, or MAAT_WORKER_PIDNS=1, means refuse. Otherwise the
+      // job goes on unseparated, and every receipt and the journal say so.
+      if (args.workerStrict || process.env.MAAT_WORKER_PIDNS === "1") {
+        process.stderr.write(`maat: ${(e as Error).message}\n`);
+        return 2;
+      }
+      process.stderr.write(`maat: ${(e as Error).message}; carrying on WITHOUT privilege separation (--worker-strict refuses instead)\n`);
+      setIsolationLine(`isolation: none (worker tools and checks run as Maat, uid ${process.getuid?.() ?? "?"}: ${(e as Error).message})`);
+    }
+    // Separated by default: the project is the run's own (a container's,
+    // a CI checkout's), so what root owns in it is handed to the worker,
+    // which could not edit it otherwise. Named with --worker-user, the
+    // person has set the ownership up.
+    if (ps && defaulted) ps.handBack();
+    if (ps) {
+      process.stderr.write(
+        `maat: worker tools run as ${ps.worker.name} (uid ${ps.worker.uid})` +
+          `${ps.pidns ? " in their own PID namespace" : ""}` +
+          `${ps.check ? `; task checks run as ${ps.check.name} (uid ${ps.check.uid})` : ""}; Maat's records are in ${ps.stateRoot} until the job ends\n` +
+          `maat: ${ps.isolation()}\n`,
+      );
+    }
+    try {
+      return args.cmd === "mission" ? await cmdMission(args) : await cmdRun(args, args.cmd === "ask");
+    } finally {
+      if (ps) {
+        try {
+          const dest = ps.publish();
+          process.stderr.write(`maat: records copied to ${dest}\n`);
+        } catch (e) {
+          process.stderr.write(`maat: could not copy the records from ${ps.stateRoot} into the project: ${(e as Error).message}\n`);
+        }
+      }
+      disablePrivSep();
+      setIsolationLine(undefined);
+    }
+  }
   switch (args.cmd) {
     case "run":
       return cmdRun(args);

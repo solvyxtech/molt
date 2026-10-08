@@ -56,7 +56,7 @@ async function provider(): Promise<string> {
  * criteria drafter gets one check that the work satisfies, and the critic
  * judges it a real run of the deliverable.
  */
-async function draftingProvider(): Promise<string> {
+async function draftingProvider(check = "[ \"$(cat a.txt)\" = \"a\" ]"): Promise<string> {
   let n = 0;
   const server: Server = createServer((req, res) => {
     let body = "";
@@ -67,7 +67,7 @@ async function draftingProvider(): Promise<string> {
         res.end(JSON.stringify({ choices: [{ message: content, finish_reason: "stop" }], usage: { prompt_tokens: 10, completion_tokens: 5 } }));
       };
       if (body.includes("You draft acceptance criteria")) {
-        return reply({ role: "assistant", content: JSON.stringify({ checks: [{ name: "made", run: "test -f a.txt" }], notes: [] }) });
+        return reply({ role: "assistant", content: JSON.stringify({ checks: [{ name: "made", run: check }], notes: [] }) });
       }
       if (body.includes("You review acceptance checks")) {
         return reply({ role: "assistant", content: JSON.stringify({ checks: [{ name: "made", verdict: "runs", quote: "" }] }) });
@@ -149,11 +149,30 @@ describe("molt run's exit code", () => {
   it("is 0 when checks drafted while the model read were met (--criteria auto)", async () => {
     // Drafted criteria arrive while the model reads, so none are passed in up
     // front. The exit code read that as "no criteria" and a verified turn
-    // exited 3. It is decided by the turn's own outcome now.
+    // exited 3. It is decided by the turn's own outcome now. Drafted by a
+    // separate judge: checks the worker drafts for itself never verify.
+    const url = await draftingProvider();
+    const code = await molt(["run", "write a.txt", "--url", url, "--model", "m", "--key", "k",
+      "--cwd", project(), "--no-stream", "--yes", "--criteria", "auto", "--judge", "j"]);
+    assert.equal(code, 0);
+  });
+
+  it("is 3 when the only checks met were drafted by the worker itself (passed own checks)", async () => {
     const url = await draftingProvider();
     const code = await molt(["run", "write a.txt", "--url", url, "--model", "m", "--key", "k",
       "--cwd", project(), "--no-stream", "--yes", "--criteria", "auto"]);
-    assert.equal(code, 0);
+    assert.equal(code, 3);
+    // A judge that is the worker under a provider's spelling is the worker.
+    const same = await molt(["run", "write a.txt", "--url", url, "--model", "m", "--key", "k",
+      "--cwd", project(), "--no-stream", "--yes", "--criteria", "auto", "--judge", "openrouter/m:free"]);
+    assert.equal(same, 3);
+  });
+
+  it("is 3 when the only drafted check already passes before the work: it is redrafted, then dropped", async () => {
+    const url = await draftingProvider("[ \"$(echo a)\" = \"a\" ]");
+    const code = await molt(["run", "write a.txt", "--url", url, "--model", "m", "--key", "k",
+      "--cwd", project(), "--no-stream", "--yes", "--criteria", "auto", "--judge", "j"]);
+    assert.equal(code, 3);
   });
 
   it("is 3 when required checks were left out, not 1 as though something failed", async () => {

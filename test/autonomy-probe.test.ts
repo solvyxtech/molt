@@ -39,7 +39,9 @@ const MUST_ASK = [
   "find . -name '*.log' -delete",
   "find . -type f -exec rm {} +",
   "truncate -s 0 notes.md",
-  "tee notes.md",
+  // A tee into a new project file runs at high (overwritesOnlyNew), so the
+  // probe names one that cannot be new-and-inside: outside the project.
+  "tee ../notes.md",
   // A redirect asks when its target exists (it would be replaced) or lies
   // outside the project. A new file inside the project runs at high since
   // 2026-09-29 — see overwritesOnlyNew — so the probe names targets that

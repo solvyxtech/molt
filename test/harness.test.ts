@@ -487,14 +487,16 @@ describe("self-checked work", () => {
   it("is marked on job_end when every judging check was drafted by the model, and not otherwise", async () => {
     const ws = workspace();
     try {
-      const hidden = { name: "own", kind: "command" as const, run: "true", timeoutMs: 5_000, expectExit: 0, tags: ["task"], hidden: true };
-      const shown = { ...hidden, name: "chosen", hidden: undefined };
+      const hidden = { name: "own", kind: "command" as const, run: "grep -qx x x.txt", timeoutMs: 5_000, expectExit: 0, tags: ["task", "value", "exact"], hidden: true, author: { kind: "judge" as const, model: "judge-j" } };
       const a = engineFor(ws.dir, [{ calls: [{ name: "write_file", args: { path: "x.txt", content: "x" } }] }, { text: "done" }]);
       const ea = await drain(a.engine.run("make x", allowAll, { taskChecks: [hidden] }));
       const ja = ea.find((e) => e.kind === "job_end");
       assert.ok(ja && ja.kind === "job_end" && ja.outcome === "verified" && ja.selfChecked === true);
+      // Checks on y.txt, the file this turn makes: x.txt is left over from the
+      // turn before, and a check that reads only it is not evidence of this one.
+      const onY = { ...hidden, run: "grep -qx y y.txt" };
       const b = engineFor(ws.dir, [{ calls: [{ name: "write_file", args: { path: "y.txt", content: "y" } }] }, { text: "done" }]);
-      const eb = await drain(b.engine.run("make y", allowAll, { taskChecks: [hidden, shown] }));
+      const eb = await drain(b.engine.run("make y", allowAll, { taskChecks: [onY, { ...onY, name: "chosen", hidden: undefined, author: { kind: "person" as const } }] }));
       const jb = eb.find((e) => e.kind === "job_end");
       assert.ok(jb && jb.kind === "job_end" && jb.outcome === "verified" && jb.selfChecked === undefined, "a person's check makes it verification");
     } finally {
@@ -635,13 +637,34 @@ describe("the cached prefix", () => {
       ]);
       await drain(engine.run("write two files", allowAll, { ask: true }));
       const reqs = provider.requests() as { messages: { role: string; content: string }[] }[];
-      const pins = reqs.map((r) => r.messages[1]!.content);
+      // The pin travels in the one system message (transcript.wire), after the system prompt.
+      const pins = reqs.map((r) => r.messages[0]!.content);
       assert.ok(pins.length >= 3);
       assert.ok(pins.every((p) => p === pins[0]), "byte-identical on every request of the turn");
       assert.match(pins[0]!, /Files changed so far: none/);
       await drain(engine.run("and now?", allowAll, { ask: true }));
       const later = provider.requests() as { messages: { role: string; content: string }[] }[];
-      assert.match(later[later.length - 1]!.messages[1]!.content, /Files you have changed: a\.txt, b\.txt/);
+      assert.match(later[later.length - 1]!.messages[0]!.content, /Files you have changed: a\.txt, b\.txt/);
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  // Qwen's chat template on a local llama.cpp raised "System message must be
+  // at the beginning" on the pinned task, a second system message: every
+  // request failed with a 500.
+  it("goes out as exactly one system message, first", async () => {
+    const ws = workspace();
+    try {
+      const { engine, provider } = engineFor(ws.dir, [
+        { calls: [{ name: "write_file", args: { path: "a.txt", content: "a" } }] },
+        { text: "done" },
+      ]);
+      await drain(engine.run("write a file", allowAll, { ask: true }));
+      for (const r of provider.requests() as { messages: { role: string }[] }[]) {
+        assert.equal(r.messages[0]!.role, "system");
+        assert.equal(r.messages.filter((m) => m.role === "system").length, 1);
+      }
     } finally {
       ws.cleanup();
     }
@@ -685,6 +708,62 @@ describe("batch mode", () => {
     assert.deepEqual(e!.subs.map((x) => [x.id, x.name, x.rawArgs]), [["c1~0", "bash", '{"command":"ls"}'], ["c1~1", "read_file", '{"path":"x"}']]);
     assert.equal(expandAct({ id: "c", function: { name: "bash", arguments: "{}" } }), null);
     assert.equal(expandAct({ id: "c", function: { name: "act", arguments: "{not json" } }), null);
+  });
+
+  it("expandAct reads the shapes models drift into, and counts what it cannot read", async () => {
+    const { expandAct } = await import("../src/engine.js");
+    const one = (actions: unknown) => expandAct({ id: "c", function: { name: "act", arguments: JSON.stringify({ analysis: "a", actions }) } })!;
+    const write = { path: "out.txt", content: "x" };
+    // actions as a JSON string; name/arguments; arguments as a JSON string; function-call style; a lone object.
+    assert.deepEqual(one(JSON.stringify([{ tool: "write_file", args: write }])).subs.map((x) => x.name), ["write_file"]);
+    assert.deepEqual(one([{ name: "write_file", arguments: write }]).subs.map((x) => x.rawArgs), [JSON.stringify(write)]);
+    assert.deepEqual(one([{ tool: "write_file", args: JSON.stringify(write) }]).subs.map((x) => x.rawArgs), [JSON.stringify(write)]);
+    assert.deepEqual(one([{ type: "function", function: { name: "write_file", arguments: JSON.stringify(write) } }]).subs.map((x) => x.name), ["write_file"]);
+    assert.deepEqual(one({ tool: "bash", args: { command: "ls" } }).subs.map((x) => x.name), ["bash"]);
+    // Unreadable: nothing names a tool, or args that are not JSON.
+    assert.deepEqual([one([{ write: write }]).subs.length, one([{ write: write }]).unusable], [0, 1]);
+    assert.equal(one([{ tool: "write_file", args: "{not json" }]).unusable, 1);
+    assert.equal(one([]).unusable, 0);
+  });
+
+  // Nemotron on local csv-clean: a long write arrived as an act Maat could not
+  // read, nothing was read as an action, and the act was taken as "finished" —
+  // a claim with no clean.csv, refused, and the turn stopped.
+  it("an act whose actions cannot be read is answered with the expected shape, never taken as the answer", async () => {
+    const ws = workspace();
+    try {
+      const { engine } = engineFor(ws.dir, [
+        { calls: [{ name: "act", args: { analysis: "writing it", actions: [{ write: { path: "a.txt", content: "A\n" } }] } }] },
+        act("now properly", [{ tool: "write_file", args: { path: "a.txt", content: "A\n" } }]),
+        act("a.txt is written.", []),
+      ], { batch: true, autonomy: "high" });
+      const events = await drain(engine.run("write a.txt", allowAll));
+      const results = events.filter((e) => e.kind === "tool").map((e) => JSON.stringify(e));
+      assert.ok(results.some((r) => /nothing ran, because at least one of its actions could not be read/.test(r)), "the model was told what was wrong");
+      const summaries = events.filter((e) => e.kind === "step_summary").map((e) => (e as { outcome: string }).outcome);
+      assert.equal(summaries[0], "tools", "the unreadable act was not a claim");
+      assert.ok(existsSync(join(ws.dir, "a.txt")));
+    } finally {
+      ws.cleanup();
+    }
+  });
+
+  it("an act with one unreadable action among readable ones runs none of them", async () => {
+    const ws = workspace();
+    try {
+      const { engine } = engineFor(ws.dir, [
+        { calls: [{ name: "act", args: { analysis: "writing", actions: [{ tool: "write_file", args: { path: "a.txt", content: "A\n" } }, { write: "oops" }] } }] },
+        act("now properly", [{ tool: "write_file", args: { path: "b.txt", content: "B\n" } }]),
+        act("done.", []),
+      ], { batch: true, autonomy: "high" });
+      const events = await drain(engine.run("write a and b", allowAll));
+      const results = events.filter((e) => e.kind === "tool").map((e) => JSON.stringify(e));
+      assert.ok(results.some((r) => /nothing ran, because at least one of its actions could not be read/.test(r)), "the model was told");
+      assert.equal(existsSync(join(ws.dir, "a.txt")), false, "the readable action was not run without its neighbour");
+      assert.ok(existsSync(join(ws.dir, "b.txt")));
+    } finally {
+      ws.cleanup();
+    }
   });
 
   it("offers only act, runs every action as a real call, folds the results, and an empty act is the answer", async () => {

@@ -200,7 +200,12 @@ molt acp                                    # serve ACP on stdio, for an editor'
 
 Exit codes: `0` the bar was met · `1` it was not · `2` usage · `3` finished
 without a verdict (no bar, or `--only`/`--skip` left required checks unrun, which
-is never reported as a pass).
+is never reported as a pass), or passed without earning "verified": every check
+that could prove the work was written by the worker model itself
+(`passed-own-checks`), with `--require-discriminating` none of them failed
+before the work (`passed-untested`), or nothing but builtins passed. "Verified" needs a
+passing check from another model (`--judge`) or a command check you wrote or
+approved; builtins never carry it.
 
 ## The bar
 
@@ -401,9 +406,19 @@ loop, and the judge is the commands. `docs/missions.md` has the whole thing.
 
 `bench/harbor/molt_agent.py` runs molt under harbor on Terminal-Bench 2.0,
 installing this tree's CLI into each task container. `bench/harbor/README.md`
-has the recipe. Headless runs get `--criteria auto`: the model drafts
-acceptance checks for the task before the work, they are sealed, and it is
-held to them.
+has the recipe. Headless runs get `--criteria auto`: acceptance checks for
+the task are drafted before the work, they are sealed, and the worker is held
+to them. Passing checks the worker model drafted for itself are never
+"verified": without `--judge <another model>` (or checks a person approved)
+the best a run earns is `passed own checks (<model>), not verified`, exit 3.
+Drafted checks are tried on a copy of the project before the work: one that
+already passes there, or cannot fail by construction, is sent back to the
+drafter once and dropped if the redraft is no better; one that already
+passed is still sealed as a refuse-only guard, which can fail the claim but
+never makes it verified. `--require-discriminating`
+goes further: "verified" then needs an independent value check that failed
+before the work, and anything less is `passed checks that did not test this
+work, not verified` (exit 3).
 
 ## Docs
 

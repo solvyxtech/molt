@@ -17,6 +17,8 @@
  * process gets to keep breathing while it waits.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
+import { privSep } from "./privsep.js";
 
 export type RunOptions = {
   cwd: string;
@@ -25,9 +27,58 @@ export type RunOptions = {
   /** Cap on captured output, per stream. */
   maxBuffer?: number;
   env?: NodeJS.ProcessEnv;
+  /** The shell to run it with: `true` is the platform's `sh` (the default); a path runs `<path> -c command`. */
+  shell?: string | true;
   /** Kills the command when it aborts, so a turn can be cancelled mid-command. */
   signal?: AbortSignal;
+  /**
+   * The worker asked for it: under privilege separation (src/privsep.ts) it
+   * runs as the worker user. Without privilege separation this changes nothing.
+   */
+  asWorker?: boolean;
+  /**
+   * This is a check run. Under privilege separation with a check account
+   * (`--check-user`): "copy" runs it as the check account (it is in a copy of
+   * the tree Maat made for it), "in-place" runs it as the worker (it runs in
+   * the worker's own tree: a project check, a mutation run). Either way it
+   * gets its own PID namespace and private /tmp when Maat can make them
+   * (`PrivSep.checkSpec`). Without a check account this changes nothing:
+   * checks run as Maat, as before.
+   */
+  asCheck?: "copy" | "in-place";
+  /**
+   * Keep the command text out of every process's argv and environment. The
+   * shell is started with a fixed wrapper (`HIDDEN_WRAPPER`) as its only
+   * script; the command arrives on fd 3, which the wrapper reads to the end
+   * and closes before it runs a word of it. Used for every check run: a
+   * hidden check's text in `/proc/<pid>/cmdline` was readable by any process
+   * of the same user, including the worker's own deliverable when the check
+   * runs it (`/proc/$PPID/cmdline`).
+   */
+  hideCommand?: boolean;
+  /**
+   * When the shell exits, kill whatever it left running in its process group
+   * (a server started with `&`). Used where runs follow one another on the
+   * same ports (src/post-audit.ts): a server left by the run on the work would
+   * otherwise answer for the pre-work copy and for every mutant.
+   */
+  killGroupOnExit?: boolean;
 };
+
+/**
+ * The only script a hidden-command shell is given. Fixed text: nothing of the
+ * command is in it. It reads the command from fd 3 (a socket, which another
+ * process cannot reopen through /proc/<pid>/fd), closes fd 3 so nothing the
+ * command starts inherits it, and evals the text with the holding variable
+ * unset first: the variable is never exported, and it is gone before the
+ * first command of the check runs.
+ */
+export const HIDDEN_WRAPPER = '__maat_c=$(cat <&3) || exit 125; exec 3<&-; eval "unset __maat_c; $__maat_c"';
+
+/** The shell binary a `shell` option names: `true` is the platform's sh. */
+function shellFile(shell: string | true | undefined): string {
+  return shell === undefined || shell === true ? "/bin/sh" : shell;
+}
 
 export type RunResult = {
   stdout: string;
@@ -55,6 +106,28 @@ const KILL_GRACE_MS = 2_000;
  */
 export const DRAIN_GRACE_MS = 1_000;
 
+let bashFound: string | null | undefined;
+
+/**
+ * Where bash is, or null. Drafted checks run under it rather than `sh`: on a
+ * Debian image `/bin/sh` is dash, which has no job control (`kill %1` after a
+ * backgrounded server), no `[[`, no `<<<`. Replayed under bash, every
+ * `kill %1` check that dash refused passed (reports/checkquality-2026-10-06).
+ * `MAAT_CHECK_SHELL=sh` turns it off.
+ */
+export function bashPath(): string | null {
+  if (process.platform === "win32") return null;
+  if ((process.env.MAAT_CHECK_SHELL ?? process.env.MOLT_CHECK_SHELL) === "sh") return null;
+  if (bashFound !== undefined) return bashFound;
+  bashFound = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash", "/opt/homebrew/bin/bash"].find((p) => existsSync(p)) ?? null;
+  return bashFound;
+}
+
+/** The shell a drafted (hidden, task-tagged) check runs under; anything else keeps `sh`. */
+export function draftedShell(check: { hidden?: boolean; tags?: readonly string[] }): string | true {
+  return check.hidden === true && check.tags?.includes("task") ? (bashPath() ?? true) : true;
+}
+
 /**
  * Run a command through the shell and resolve with what it did.
  *
@@ -65,19 +138,66 @@ export const DRAIN_GRACE_MS = 1_000;
 export function runCommand(command: string, opts: RunOptions): Promise<RunResult> {
   return new Promise<RunResult>((resolve, reject) => {
     let child: ChildProcess;
+    let cleanup: (() => void) | undefined;
+    // With hideCommand the shell is given only HIDDEN_WRAPPER, and the command
+    // arrives on fd 3; that holds on every path below, privilege separation included.
+    const hide = opts.hideCommand === true && process.platform !== "win32";
+    const script = hide ? HIDDEN_WRAPPER : command;
+    const stdio: ("ignore" | "pipe")[] = hide ? ["ignore", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"];
     try {
-      child = spawn(command, {
-        cwd: opts.cwd,
-        shell: true,
-        env: opts.env,
-        stdio: ["ignore", "pipe", "pipe"],
-        // Its own process group, so a timeout can kill everything the command
-        // started and not just the shell (see `kill`).
-        detached: process.platform !== "win32",
-      });
+      const sep = privSep();
+      const ps = opts.asWorker ? sep : undefined;
+      if (opts.asCheck && sep?.check) {
+        const made = sep.checkSpec(script, opts.shell ?? true, opts.cwd, opts.asCheck === "copy" ? "check" : "worker", opts.env ?? process.env);
+        cleanup = made.cleanup;
+        const spec = made.spec;
+        child = spawn(spec.file, spec.args, {
+          cwd: opts.cwd,
+          env: spec.env,
+          stdio,
+          detached: true,
+          ...(spec.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
+        });
+      } else if (ps) {
+        const spec = ps.commandSpec(script, opts.shell ?? true, opts.cwd, opts.env);
+        child = spawn(spec.file, spec.args, {
+          cwd: opts.cwd,
+          env: spec.env,
+          stdio,
+          detached: true,
+          ...(spec.uid !== undefined ? { uid: spec.uid, gid: spec.gid } : {}),
+        });
+      } else if (hide) {
+        child = spawn(shellFile(opts.shell), ["-c", HIDDEN_WRAPPER], {
+          cwd: opts.cwd,
+          env: opts.env,
+          stdio,
+          detached: true,
+        });
+      } else {
+        child = spawn(command, {
+          cwd: opts.cwd,
+          shell: opts.shell ?? true,
+          env: opts.env,
+          stdio,
+          // Its own process group, so a timeout can kill everything the command
+          // started and not just the shell (see `kill`).
+          detached: process.platform !== "win32",
+        });
+      }
     } catch (e) {
+      cleanup?.();
       reject(e as Error);
       return;
+    }
+    if (hide) {
+      const feed = child.stdio[3] as import("node:stream").Duplex | null | undefined;
+      // A shell that died before reading (or a wrapper that failed) closes
+      // its end: EPIPE here is the same fact as its exit, reported there.
+      feed?.on("error", () => {});
+      // Written, then dropped: data already sent stays readable by the shell
+      // after this end closes, and an open end would hold "close" back.
+      feed?.end(command, () => feed.destroy());
     }
 
     const cap = opts.maxBuffer ?? Infinity;
@@ -156,6 +276,7 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
       if (killTimer) clearTimeout(killTimer);
       if (drainTimer) clearTimeout(drainTimer);
       opts.signal?.removeEventListener("abort", onAbort);
+      cleanup?.();
       if (heldOpen) {
         child.stdout?.destroy();
         child.stderr?.destroy();
@@ -170,6 +291,7 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
     // "close" is bounded.
     child.on("close", (code, signal) => finish(code, signal));
     child.on("exit", (code, signal) => {
+      if (opts.killGroupOnExit) signalAll("SIGKILL");
       drainTimer ??= setTimeout(() => finish(code, signal, true), DRAIN_GRACE_MS);
     });
     child.on("error", (e) => {
@@ -179,6 +301,7 @@ export function runCommand(command: string, opts: RunOptions): Promise<RunResult
       if (killTimer) clearTimeout(killTimer);
       if (drainTimer) clearTimeout(drainTimer);
       opts.signal?.removeEventListener("abort", onAbort);
+      cleanup?.();
       reject(e);
     });
   });
