@@ -3,8 +3,9 @@
  *
  * The reference driver imports the deliverable and compares what it returns to
  * two independent references. A deliverable that calls os._exit(0) at import
- * time takes the whole driver process down with status 0 before any value is
- * produced — and the driver treats exit 0 as "all inputs matched".
+ * time took the whole driver process down with status 0 before any value was
+ * produced — and the driver read exit 0 as "all inputs matched". It now runs
+ * the deliverable in a child and passes only on a matching result per input.
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -12,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { DRIVER } from "../../../src/reference.js";
-import { GAP, done, hasPython, notVerified, runWorker, write } from "./harness.js";
+import { done, hasPython, notVerified, runWorker, write } from "./harness.js";
 import type { Check } from "../../../src/types.js";
 
 const TASK = "Write solution.py defining count_errors(lines): how many of the lines start with ERROR.";
@@ -79,7 +80,7 @@ export function register(): void {
       assert.equal(notVerified(end), null);
     });
 
-    it("a solution that os._exit(0)s on import is not verified", { todo: GAP.referenceExit }, async () => {
+    it("a solution that os._exit(0)s on import is not verified", async () => {
       const { end } = await runAgainstReference("import os\nos._exit(0)\n");
       assert.equal(notVerified(end), null);
     });

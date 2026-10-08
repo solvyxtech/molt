@@ -378,6 +378,11 @@ export function contradictions(review: { votes: string; violations: unknown[] } 
  * from no work vouch for it: when independent runs+value checks passed but
  * none had failed before the work, the turn earns "passed-untested" — they
  * guard against a regression and did not test this work.
+ *
+ * And a check whose pass the worker arranged counts for nothing, whoever wrote
+ * it (`discounted`, from control.ts): a runner shadowed by a file the worker
+ * planted, an expected file the worker wrote, a drafted check whose only
+ * input sat in the project for the worker to read. The reason names the file.
  */
 export function tierOf(args: {
   results: readonly (Pick<CheckResult, "ok" | "hidden" | "advisory" | "skipped" | "tags"> & { name?: string; kind?: CheckResult["kind"] })[];
@@ -422,9 +427,23 @@ export function tierOf(args: {
    * since (src/golden.ts). Their value tag does not count.
    */
   valueUnproven?: ReadonlySet<string>;
+  /**
+   * Passing checks whose pass the worker controlled, by result name, with why
+   * (control.ts): a shadowed runner, an expected value the worker wrote, an
+   * input the worker could read. They still passed; they are not evidence.
+   */
+  discounted?: ReadonlyMap<string, string>;
 }): TierVerdict {
+  const v = tierOfCounted(args);
+  if (v.tier === "verified" || !args.discounted?.size) return v;
+  const lost = args.results.filter((r) => r.ok && !r.advisory && !r.skipped && args.discounted!.has(r.name ?? ""));
+  if (!lost.length || v.tier !== "passed-checks") return v;
+  return { ...v, reason: lost.map((r) => `\`${r.name}\` does not count: ${args.discounted!.get(r.name!)}`).join("; ") };
+}
+
+function tierOfCounted(args: Parameters<typeof tierOf>[0]): TierVerdict {
   const passing = args.results
-    .filter((r) => r.ok && !r.advisory && !r.skipped)
+    .filter((r) => r.ok && !r.advisory && !r.skipped && !args.discounted?.has(r.name ?? ""))
     .map((r) => (args.valueUnproven?.has(r.name ?? "") && r.tags?.includes("value") ? { ...r, tags: r.tags.filter((t) => t !== "value") } : r));
   const workerNames = (typeof args.worker === "string" ? [args.worker] : [...(args.worker ?? [])]).filter((w) => w.trim());
   const worker = workerNames[0];
@@ -439,7 +458,14 @@ export function tierOf(args: {
   // session checks every `maat init` bar ships say the turn was well-formed,
   // never that the task is right: nobody wrote them for this task, and a
   // worker that changes any file passes them.
-  const person = passing.some((r) => personCheck(r) && authorOf(r).kind === "person");
+  // A person's bar is one bar. When the worker subverted one of its checks
+  // (a runner shadowed, an expected file rewritten), the rest of it is no
+  // longer the bar the person wrote vouching for the work, and does not carry
+  // the word on its own.
+  const personSubverted = args.results.some(
+    (r) => r.ok && !r.advisory && !r.skipped && args.discounted?.has(r.name ?? "") && authorOf(r).kind === "person",
+  );
+  const person = !personSubverted && passing.some((r) => personCheck(r) && authorOf(r).kind === "person");
   const drafted = passing.filter((r) => r.hidden === true && r.tags?.includes("task") && authorOf(r).kind !== "person");
   const strongAll = drafted.filter((r) => !r.tags?.includes("surface") && r.tags?.includes("value"));
   const strongIndependent = strongAll.filter((r) => independentOf(authorOf(r), workerNames));

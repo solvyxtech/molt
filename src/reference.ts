@@ -37,6 +37,10 @@
  *    reference fails, the pair disagrees, or run_deliverable raises (it is
  *    told never to). Tried once on the untouched snapshot, a 3 there drops
  *    it; a 3 at a claim retires it (engine.ts).
+ *  - The work cannot end the comparison early: the deliverable runs in a
+ *    child of the driver, and the driver exits 0 only when every agreed
+ *    input has a result from that child that matches (see DRIVER). A
+ *    deliverable that exits on import fails, by any exit code.
  *  - It is withheld from the model like every drafted check, and lives
  *    outside the project, so a task that walks the tree never meets it.
  */
@@ -235,19 +239,19 @@ export const DRIVER = [
   "    traceback.print_exc(); own('a reference could not be loaded')",
   "if not inputs: own('the reference defines no inputs')",
   "agreed, disagreed = [], []",
-  "for x in inputs:",
+  "for i, x in enumerate(inputs):",
   "    try: ea = a.reference(x)",
   "    except BaseException: traceback.print_exc(); own('the first reference failed on input %r' % (x,))",
   "    try: eb = b.reference(x)",
   "    except BaseException as e: eb = ('<the second reference failed>', repr(e))",
-  "    (agreed if key(ea) == key(eb) else disagreed).append((x, ea, eb))",
+  "    (agreed if key(ea) == key(eb) else disagreed).append((x, ea, eb, i))",
   "need = len(inputs) if len(inputs) < 3 else max(3, (len(inputs) + 1) // 2)",
   "if len(agreed) < need:",
-  "    x, ea, eb = disagreed[0]",
+  "    x, ea, eb, _ = disagreed[0]",
   "    own('the two independent references agree on only %d of %d inputs; first disagreement, input %r: %r vs %r' % (len(agreed), len(inputs), x, ea, eb))",
   "same = getattr(a, 'same', None)",
   "compared = 0",
-  "for x, e, _ in agreed:",
+  "for x, e, _, _ in agreed:",
   "    how, got = deliver(x)",
   "    if how == 'raised': own('run_deliverable raised on input %r' % (x,))",
   "    try: ok = same(e, got) if same else key(e) == key(got)",

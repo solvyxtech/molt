@@ -27,6 +27,7 @@ import { credentialFreeEnv } from "./credenv.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
 import { authorKey, authorWords, claimLabel, tierOf, withAuthor, type Tier } from "./tiers.js";
 import { recordGoldens, valueUnproven } from "./golden.js";
+import { discountedChecks } from "./control.js";
 import { arbitrate, parseDisputes, type Ruling } from "./dispute.js";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, realpathSync, writeFileSync, existsSync, statSync } from "node:fs";
@@ -73,7 +74,7 @@ import {
   substanceOf,
   walkAsync,
   isTestPath,
-  removedAssertions,
+  specWeakened,
   snapshotTree,
   type TreeSnapshot,
 } from "./files.js";
@@ -3554,7 +3555,7 @@ export class Engine {
         const after = createHash("sha256").update(content, "utf8").digest("hex");
         const at = isAbsolute(rel) ? relative(this.cwd, abs) : rel;
         if (!isGenerated(at)) {
-          const specGone = isTestPath(at) ? removedAssertions(priorText, content) : [];
+          const specGone = isTestPath(at) ? specWeakened(priorText, content) : [];
           this.ledger.push({
             path: at,
             before,
@@ -3622,7 +3623,7 @@ export class Engine {
         // prove a surgical edit the same way they prove a whole-file rewrite.
         const editedAt = isAbsolute(rel) ? relative(this.cwd, abs) : rel;
         if (!isGenerated(editedAt)) {
-          const specGone = isTestPath(editedAt) ? removedAssertions(current, landed) : [];
+          const specGone = isTestPath(editedAt) ? specWeakened(current, landed) : [];
           this.ledger.push({
             path: editedAt,
             before,
@@ -4059,8 +4060,8 @@ export class Engine {
     return [...new Set([this.cfg.model, this.modelOfRecord()].filter((m): m is string => typeof m === "string" && m.trim().length > 0))];
   }
 
-  /** Everything tierOf weighs beside the results: advisory mode, the worker, who wrote each check, what the pre-work try found, and which golden files predate the work. */
-  private tierContext(): {
+  /** Everything tierOf weighs beside the results: advisory mode, the worker, who wrote each check, what the pre-work try found, which golden files predate the work, and which passes the worker arranged. */
+  private tierContext(results: readonly CheckResult[]): {
     reviewAdvisory?: true;
     requireDiscriminating?: true;
     guards: ReadonlySet<string>;
@@ -4068,14 +4069,25 @@ export class Engine {
     worker: string[];
     authors: Map<string, CheckAuthor>;
     valueUnproven: Set<string>;
+    discounted: Map<string, string>;
   } {
+    const authors = this.sealedAuthors();
+    // What of the passing checks the worker arranged rather than earned
+    // (control.ts): read off the tree as it stands at the claim.
+    const discounted = discountedChecks(results, {
+      cwd: this.cwd,
+      before: this.turnTree,
+      written: this.turnLedger().map((e) => e.path),
+      authors,
+    });
     return {
       ...this.advisoryTier(),
       guards: this.passedBeforeWork,
       failedBefore: this.failedBeforeWork,
       worker: this.workerNames(),
-      authors: this.sealedAuthors(),
+      authors,
       valueUnproven: valueUnproven(this.sealedChecks.map((c) => ({ name: c.name, run: c.kind === "command" ? c.run : undefined, tags: c.tags })), this.cwd, this.goldensBefore),
+      discounted,
     };
   }
 
@@ -4925,7 +4937,7 @@ export class Engine {
       // nudge cleared it and no re-review followed): no "verified". On v11, 6
       // of the 7 "verified" claims were unreviewed this way and 4 were wrong.
       const unreviewed = this.cfg.review !== undefined && !review;
-      const t = tierOf({ results: lastProof.results, review, unreviewed, ...this.tierContext() });
+      const t = tierOf({ results: lastProof.results, review, unreviewed, ...this.tierContext(lastProof.results) });
       tier = t.tier;
       if (t.tier === "passed-checks") {
         outcome = "unverified";
@@ -6272,7 +6284,7 @@ export class Engine {
                   notes: [...taskNotes],
                 }
               : undefined,
-          ...(verdict === "accepted" ? { tier: tierOf({ results: result.results, ...self.tierContext() }) } : {}),
+          ...(verdict === "accepted" ? { tier: tierOf({ results: result.results, ...self.tierContext(result.results) }) } : {}),
           authors: self.receiptAuthors(),
           });
           log?.append("receipt", { verdict, file: receipt.path, attempt: proofAttempts, endedBy: why });
@@ -8269,7 +8281,7 @@ export class Engine {
               }
             : undefined,
           ...(this.turnRevealed.length ? { revealed: [...this.turnRevealed] } : {}),
-          ...(verdict === "accepted" ? { tier: tierOf({ results: result.results, ...this.tierContext() }) } : {}),
+          ...(verdict === "accepted" ? { tier: tierOf({ results: result.results, ...this.tierContext(result.results) }) } : {}),
           authors: this.receiptAuthors(),
         });
         log?.append("receipt", { verdict, file: receipt.path, attempt: proofAttempts });
