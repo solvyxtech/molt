@@ -16,7 +16,9 @@ export function judgeTarget<T extends Target>(worker: T, env: NodeJS.ProcessEnv 
     env.MAAT_JUDGE_KEY?.trim() ||
     (baseUrl === worker.baseUrl ? worker.apiKey : undefined) ||
     // A CLI worker (Grok Build, OpenCode) judged on OpenRouter uses the OpenRouter key.
-    (/^https:\/\/openrouter\.ai\//.test(baseUrl) ? env.OPENROUTER_API_KEY?.trim() || undefined : undefined);
+    (/^https:\/\/openrouter\.ai\//.test(baseUrl) ? env.OPENROUTER_API_KEY?.trim() || undefined : undefined) ||
+    // A judge on Anthropic's API (e.g. a Haiku judge for an OpenRouter worker) uses the Anthropic key.
+    (/^https:\/\/api\.anthropic\.com\//.test(baseUrl) ? env.ANTHROPIC_API_KEY?.trim() || undefined : undefined);
   const { apiKey: _workerKey, ...rest } = worker;
   return { ...rest, baseUrl, model, ...(apiKey !== undefined ? { apiKey } : {}) } as T;
 }
