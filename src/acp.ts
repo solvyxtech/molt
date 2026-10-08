@@ -71,6 +71,7 @@
  * `unaccountedTools()` reports anything that got through, and the session
  * surfaces it as an `info` event rather than discovering it in a receipt.
  */
+import { withSecrets } from "./secrets.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
@@ -530,7 +531,9 @@ export class AcpConnection {
       // `electron/login-path.ts` has already repaired process.env.PATH by the
       // time anything gets here.
       env: {
-        ...(this.spec.childEnv ? this.spec.childEnv(process.env) : process.env),
+        // The backend is the model's own client and needs its credentials,
+        // which captureSecrets() took out of process.env (src/secrets.ts).
+        ...(this.spec.childEnv ? this.spec.childEnv(withSecrets(process.env)) : withSecrets(process.env)),
         ...this.spec.env,
         ...(this.spec.env ? { PWD: this.opts.cwd ?? process.cwd() } : {}),
       },

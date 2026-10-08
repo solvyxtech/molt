@@ -5,10 +5,11 @@
  * checks are not written with the same blind spots as the work they judge.
  */
 import { expandEndpointShorthand } from "./endpoint.js";
+import { withSecrets } from "./secrets.js";
 
 export type Target = { baseUrl: string; apiKey?: string; model: string };
 
-export function judgeTarget<T extends Target>(worker: T, env: NodeJS.ProcessEnv = process.env): T {
+export function judgeTarget<T extends Target>(worker: T, env: NodeJS.ProcessEnv = withSecrets(process.env)): T {
   const model = env.MAAT_JUDGE_MODEL?.trim();
   if (!model) return worker;
   const baseUrl = (env.MAAT_JUDGE_URL?.trim() && expandEndpointShorthand(env.MAAT_JUDGE_URL)) || worker.baseUrl;
