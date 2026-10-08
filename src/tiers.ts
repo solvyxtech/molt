@@ -553,6 +553,8 @@ export function assertsBehaviour(run: string): boolean {
 }
 
 export function assertsValue(run: string, goldenPredates?: (operand: string) => boolean): boolean {
+  // A Python comparison that cannot fail the command asserts nothing (pythonAssertNeverFails).
+  if (pythonAssertNeverFails(run)) return false;
   const ops = /(==|!=|(?<=\s)-eq(?=\s)|(?<=\s)-ne(?=\s)|(?<=\s)=(?=\s))/g;
   for (const m of run.matchAll(ops)) {
     const at = m.index ?? 0;
@@ -662,7 +664,21 @@ export function assertsValue(run: string, goldenPredates?: (operand: string) => 
  * which strips it.
  */
 export function pythonAssertNeverFails(cmd: string): string | null {
-  if (!/\bpython[\d.]*\b/.test(cmd) || !/\bassert\b/.test(cmd)) return null;
+  if (!/\bpython[\d.]*\b/.test(cmd)) return null;
+  // `python3 -c "import tool; tool.f('a') == 'x'"`: a comparison as a bare
+  // statement is computed and thrown away. With nothing that can fail on it
+  // (assert, exit, raise, if), the program exits 0 whatever it compared.
+  for (const m of cmd.matchAll(/\bpython[\d.]*\s+(?:-\w+\s+)*-c\s+(["'])((?:(?!\1)[^\\]|\\.)*)\1/g)) {
+    const code = m[2]!.replace(/(["'])(?:(?!\1)[^\\]|\\.)*\1/g, "''");
+    const after = cmd.slice((m.index ?? 0) + m[0].length);
+    if (!/==|!=|<=|>=|\s(?:not\s+)?in\s|\sis\s/.test(code)) continue;
+    if (/\b(?:assert|exit|raise|if|while|return|print|throw)\b|_exit|SystemExit|\bsys\.\w+\(/.test(code)) continue;
+    // Its output is not read by a later stage, and nothing after it decides the status.
+    if (/^\s*(?:\||&&|\|\||[<>])/.test(after)) continue;
+    if (after.trim() && !/^\s*(?:;|$)/.test(after)) continue;
+    return "its python compares a value as a bare statement and never asserts or exits on it, so it exits 0 whatever the comparison found";
+  }
+  if (!/\bassert\b/.test(cmd)) return null;
   if (/\bpython[\d.]*\s+(?:-\w+\s+)*-\w*O/.test(cmd) || /\bPYTHONOPTIMIZE=(?!0\b|""|''|\s)/.test(cmd)) {
     return "python runs with -O (or PYTHONOPTIMIZE), which strips every assert, so it exits 0 whatever happened";
   }

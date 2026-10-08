@@ -328,8 +328,9 @@ export function strayPath(run: string, opts: { cwd: string; task?: string }): st
  */
 export function missingDeliverable(stderr: string, cwd: string): string | null {
   const said =
-    /^(?:\S*sh|bash|dash|zsh)(?::\s*line \d+)?:\s*(?:\d+:\s*)?([^\s:]+): (?:No such file or directory|not found)\s*$/m.exec(stderr) ??
-    /^\S*sh: \d+: (?:cannot open|Can't open) ([^\s:]+)/m.exec(stderr);
+    // `eval:` is how dash names a command it ran through `eval` (the hidden-check wrapper, run.ts).
+    /^(?:\S*sh|bash|dash|zsh)(?::\s*line \d+)?:\s*(?:\d+:\s*)?(?:eval:\s*(?:line \d+:\s*)?)?([^\s:]+): (?:No such file or directory|not found)\s*$/m.exec(stderr) ??
+    /^\S*sh: \d+: (?:eval: )?(?:cannot open|Can't open) ([^\s:]+)/m.exec(stderr);
   if (!said) return null;
   const p = said[1]!;
   if (isAbsolute(p) || p.startsWith("~")) return null;

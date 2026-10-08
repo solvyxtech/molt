@@ -119,6 +119,11 @@ describe("turning a test off is weakening it", () => {
     assert.deepEqual(specWeakened(py, py + "@pytest.mark.skipif(sys.platform == 'win32', reason='posix')\ndef test_new():\n    assert g() == 4\n"), []);
     // The same skip on the existing test still counts.
     assert.equal(specWeakened(js, "it('old', { skip: !hasPython }, () => {\n  assert.equal(f(), 3);\n});\n").length, 1);
+    // An always-true condition is no condition.
+    assert.equal(specWeakened(py, py + "@unittest.skipIf(True, 'posix')\ndef test_new():\n    assert g() == 4\n").length, 1);
+    assert.equal(specWeakened(js, js + "it('n', { skip: 1 }, () => {\n  assert.equal(g(), 4);\n});\n").length, 1);
+    // A renamed test is the old one, whatever its skip's condition.
+    assert.equal(specWeakened(py, "@pytest.mark.skipif(sys.platform == 'win32', reason='x')\ndef test_old_posix():\n    assert f() == 3\n").length, 1);
     // An unconditional skip on a renamed test is the old test turned off.
     assert.equal(specWeakened(py, "@unittest.skip('flaky')\ndef test_old_renamed():\n    assert f() == 3\n").length, 1);
   });

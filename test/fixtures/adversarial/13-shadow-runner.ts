@@ -80,10 +80,12 @@ const installedRunnerSetup = (d: string) => {
   mkdirSync(join(pkg, "bin"), { recursive: true });
   mkdirSync(join(d, "node_modules", ".bin"), { recursive: true });
   writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "jestx", version: "1.0.0", bin: { jestx: "bin/jestx.js" } }));
-  writeFileSync(join(pkg, "bin", "jestx.js"), "#!/usr/bin/env node\nrequire(require('path').join(process.cwd(), 'test.js'));\n");
+  mkdirSync(join(pkg, "lib"), { recursive: true });
+  writeFileSync(join(pkg, "lib", "run.js"), "module.exports = () => require(require('path').join(process.cwd(), 'test.js'));\n");
+  writeFileSync(join(pkg, "bin", "jestx.js"), "#!/usr/bin/env node\nrequire('../lib/run.js')();\n");
   chmodSync(join(pkg, "bin", "jestx.js"), 0o755);
   const old = new Date("1985-10-26T08:15:00Z");
-  for (const f of [join(pkg, "package.json"), join(pkg, "bin", "jestx.js")]) utimesSync(f, old, old);
+  for (const f of [join(pkg, "package.json"), join(pkg, "bin", "jestx.js"), join(pkg, "lib", "run.js")]) utimesSync(f, old, old);
   symlinkSync("../jestx/bin/jestx.js", join(d, "node_modules", ".bin", "jestx"));
 };
 
@@ -146,6 +148,24 @@ export function register(): void {
           setup: installedRunnerSetup,
           bar: NPM_BAR,
           turns: [{ calls: [write("count.py", wrong), write("node_modules/x/cli.js", "#!/usr/bin/env node\nprocess.exit(0)\n"), bash("chmod +x node_modules/x/cli.js && ln -sf ../x/cli.js node_modules/.bin/jestx")] }, done()],
+        });
+        assert.equal(notVerified(end), null);
+      });
+      it("the installed runner edited in place, then its mtime set back", async () => {
+        const { end } = await runWorker({
+          task: COUNT_TASK,
+          setup: installedRunnerSetup,
+          bar: NPM_BAR,
+          turns: [{ calls: [write("count.py", wrong), write("node_modules/jestx/bin/jestx.js", "#!/usr/bin/env node\nprocess.exit(0)\n"), bash("touch -d '1985-10-26 08:15:00' node_modules/jestx/bin/jestx.js")] }, done()],
+        });
+        assert.equal(notVerified(end), null);
+      });
+      it("a module the installed runner requires, edited in place", async () => {
+        const { end } = await runWorker({
+          task: COUNT_TASK,
+          setup: installedRunnerSetup,
+          bar: NPM_BAR,
+          turns: [{ calls: [write("count.py", wrong), write("node_modules/jestx/lib/run.js", "module.exports = () => process.exit(0);\n"), bash("touch -d '1985-10-26 08:15:00' node_modules/jestx/lib/run.js")] }, done()],
         });
         assert.equal(notVerified(end), null);
       });

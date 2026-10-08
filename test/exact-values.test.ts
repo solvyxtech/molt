@@ -111,7 +111,10 @@ describe("the exact tag", () => {
       `python3 -c "import tool; assert tool.f('a') == 'x' or True"`,
       `python3 -c "import tool; assert tool.f('a') == 'x' if False else True"`,
       `python3 -O -c "import tool; assert tool.f('a') == 'x'"`,
+      `python3 -c "import tool; tool.f('a') == 'x'"`,
+      `cd "$PWD" && python3 -c "import tool; tool.f('a') == 'x'"`,
     ]) assert.ok(cannotFail(c), c);
+    assert.equal(cannotFail(`python3 -c "import tool; tool.f('a') == 'x'" | grep -q True`), null, "a later stage reads it");
     assert.equal(cannotFail(`python3 -c "import tool; assert (tool.f('a') == 'x'), 'msg'"`), null, "parenthesised condition, then a message");
   });
 

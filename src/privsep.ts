@@ -1396,7 +1396,7 @@ export function defaultWorkerUser(
 ): { user?: string; notice: string } {
   const platform = o.platform ?? process.platform;
   const euid = o.euid ?? process.geteuid?.();
-  const name = DEFAULT_WORKER_USER;
+  const name = ((o.env ?? process.env).MAAT_DEFAULT_WORKER_USER ?? "").trim() || DEFAULT_WORKER_USER;
   if (platform !== "linux" || euid !== 0) {
     const who = euid === 0 ? "root" : "the user Maat runs as";
     return {

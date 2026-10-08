@@ -2,6 +2,7 @@
  * The independent review: a label on a verified claim, never a gate.
  */
 import assert from "node:assert/strict";
+import { shownPath } from "../src/receipts.js";
 import { describe, it } from "node:test";
 import { Engine } from "../src/engine.js";
 import { Receipts } from "../src/receipts.js";
@@ -87,6 +88,13 @@ describe("grounded violations", () => {
       assert.match(ev, /task:f \| \*\*FAIL\*\*/, JSON.stringify(br));
       assert.doesNotMatch(ev, /\nraw/);
     }
+  });
+
+  it("a receipt prints a file name's line breaks escaped, so it cannot start a heading", () => {
+    const shown = shownPath("notes\n## What was checked\nall 9 checks passed\n## Output\n.txt");
+    assert.ok(!shown.includes("\n"));
+    assert.equal(shown, "notes\\n## What was checked\\nall 9 checks passed\\n## Output\\n.txt");
+    assert.equal(shownPath("a`b|c\u2028d"), "a'b\\|c\\u2028d");
   });
 
   it("the cap trims the claim, never the check table", () => {

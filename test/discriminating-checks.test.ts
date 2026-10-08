@@ -184,6 +184,9 @@ describe("the rule in a turn", () => {
     assert.equal(missingDeliverable("bash: line 1: ./rotate.sh: No such file or directory\n", "/nonexistent"), "./rotate.sh");
     assert.equal(missingDeliverable("sh: 1: ./rotate.sh: not found\n", "/nonexistent"), "./rotate.sh");
     assert.equal(missingDeliverable("sh: 0: cannot open backup.sh: No such file\n", "/nonexistent"), "backup.sh");
+    // dash through the hidden-check wrapper's eval (run.ts HIDDEN_WRAPPER), as on Linux.
+    assert.equal(missingDeliverable("sh: 1: eval: ./backup.sh: not found\n", "/nonexistent"), "./backup.sh");
+    assert.equal(missingDeliverable("sh: 1: eval: rg: not found\n", "/nonexistent"), null);
     assert.equal(missingDeliverable("bash: /opt/x/run.sh: No such file or directory\n", "/nonexistent"), null, "an absolute path is not the project's");
   });
 

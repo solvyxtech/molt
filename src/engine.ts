@@ -302,6 +302,10 @@ const CEILING_WARNINGS = [0.5, 0.8];
 export const MALFORMED_WARN = 3;
 export const MALFORMED_STOP = 6;
 
+/** A line break or other control character in a file name: no real file needs one, and in a receipt it could forge a heading. */
+const CONTROL_IN_PATH = /[\u0000-\u001f\u007f\u0085\u2028\u2029]/;
+const CONTROL_PATH_REFUSAL = "refused: a file name may not contain a line break or other control character";
+
 /**
  * When working history gets compacted, unless told otherwise.
  *
@@ -3547,6 +3551,7 @@ export class Engine {
       case "write_file": {
         const rel = String(args.path ?? "");
         const abs = resolve(this.cwd, rel);
+        if (CONTROL_IN_PATH.test(rel)) return CONTROL_PATH_REFUSAL;
         // Refused before anything is read or written. A read-only pin is a
         // promise to the person who made it, and a promise that holds only
         // when the model cooperates is not one.
@@ -3626,6 +3631,7 @@ export class Engine {
       case "edit_file": {
         const rel = String(args.path ?? "");
         const abs = resolve(this.cwd, rel);
+        if (CONTROL_IN_PATH.test(rel)) return CONTROL_PATH_REFUSAL;
         this.mustBeInside(abs, rel);
         if (this.isReadOnly(rel, abs)) return readOnlyRefusal(rel);
         if (!(await this.fileExists(abs))) return `no such file: ${rel} — write_file creates a new one`;

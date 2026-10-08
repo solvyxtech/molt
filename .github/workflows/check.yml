@@ -32,6 +32,23 @@ jobs:
           # doctor may exit >1 when default localhost endpoint is down (no Ollama in CI)
           node dist/cli.js doctor || true
 
+  # The full suite on Linux, where /bin/sh is dash: macOS's /bin/sh is bash,
+  # and a check that reads a shell's own wording (dash's "eval: x: not found")
+  # passed there and failed here (#49 status sweep, N2).
+  test-linux:
+    runs-on: ubuntu-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
   # Privilege separation (--worker-user, --check-user, --worker-strict) is
   # Linux-first and needs root to switch users: its tests skip on macOS and
   # run here, in a root container. The test creates its own worker and check

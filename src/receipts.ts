@@ -18,6 +18,16 @@ import { WITHHELD, maskDeep, maskText } from "./withhold.js";
 import type { Objection } from "./review.js";
 import { isolationLine } from "./privsep.js";
 
+
+/**
+ * A path as a receipt prints it: line breaks and other control characters
+ * escaped (`\n`), and a backtick or pipe neutralised, so a file name the
+ * worker chose cannot start a line of its own (a planted "## Output") or
+ * break out of its table cell.
+ */
+export function shownPath(p: string): string {
+  return p.replace(/[\u0000-\u001f\u007f\u0085\u2028\u2029]/g, (c) => (c === "\n" ? "\\n" : c === "\r" ? "\\r" : c === "\t" ? "\\t" : `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`)).replace(/`/g, "'").replace(/\|/g, "\\|");
+}
 /** Where a receipt's full text goes when hidden commands were masked in it (src/withhold.ts). */
 export const FULL_DIR = "full";
 
@@ -232,7 +242,7 @@ function wroteSection(
     try {
       text = readFileSync(join(cwd, c.path), "utf8");
     } catch {
-      out.push(`\`${c.path}\` — gone from disk; nothing to show.`, "");
+      out.push(`\`${shownPath(c.path)}\` — gone from disk; nothing to show.`, "");
       continue;
     }
     /**
@@ -246,7 +256,7 @@ function wroteSection(
      */
     if (sha256(text) !== c.after) {
       out.push(
-        `\`${c.path}\` — changed since Maat wrote it, so its lines are not shown; the hashes ` +
+        `\`${shownPath(c.path)}\` — changed since Maat wrote it, so its lines are not shown; the hashes ` +
           "above are what can still be proven.",
         "",
       );
@@ -257,7 +267,7 @@ function wroteSection(
     const show = want.slice(0, Math.min(WROTE_MAX_PER_FILE, budget));
     budget -= show.length;
     const width = String(show.at(-1) ?? 0).length;
-    out.push(`\`${c.path}\``, "", "```");
+    out.push(`\`${shownPath(c.path)}\``, "", "```");
     let prev = 0;
     for (const n of show) {
       // A gap in the numbers is a gap in the file; say so rather than letting
@@ -536,7 +546,7 @@ export class Receipts {
       work.push("| file | before | after |", "|---|---|---|");
       for (const c of changed) {
         work.push(
-          `| \`${c.path}\` | ${c.before === null ? "did not exist" : `\`${c.before.slice(0, 12)}\``} | ` +
+          `| \`${shownPath(c.path)}\` | ${c.before === null ? "did not exist" : `\`${c.before.slice(0, 12)}\``} | ` +
             `\`${c.after.slice(0, 12)}\` |`,
         );
       }

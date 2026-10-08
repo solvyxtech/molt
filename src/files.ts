@@ -515,15 +515,56 @@ export function specWeakened(before: string, after: string): string[] {
   if (before.trim()) {
     // A renamed test with an unconditional skip is still the old test turned
     // off, so only a conditional skip (a platform or tool check) is free there.
-    for (const { skip, test } of skipsWithTests(after)) if (test !== undefined && !had.has(test) && conditionalSkip(skip)) fresh.add(skip);
+    // Nor is a "new" test whose assertions were already in the file: that is
+    // an old test renamed, and skipping it turns the old test off.
+    const old = new Set(assertionsIn(before));
+    for (const { skip, test } of skipsWithTests(after)) {
+      if (test === undefined || had.has(test) || !conditionalSkip(skip)) continue;
+      if (assertionsIn(testBody(after, test)).some((a) => old.has(a))) continue;
+      fresh.add(skip);
+    }
   }
   const added = before.trim() ? addedSkips(skipsIn(before), skipsIn(after)).filter((s) => !fresh.has(s)) : [];
   return [...removedAssertions(before, after), ...added.map((s) => `${s}  (turns a test off)`)];
 }
 
-/** A skip that depends on where it runs: skipif / skipIf / skipUnless, or `{ skip: <expression> }`. */
+/** Literals that are always true or always false in a skip condition. */
+const ALWAYS_TRUE = /^(?:True|true|1|-?[1-9]\d*|not\s+(?:0|False|None|""|'')|!\s*(?:0|false|null|undefined|""|'')|!!\s*1|(["'`])[^"'`]+\1)$/;
+const ALWAYS_FALSE = /^(?:False|false|0|None|null|undefined|""|''|not\s+(?:1|True)|!\s*(?:1|true))$/;
+
+/**
+ * A skip that depends on where it runs: skipif / skipIf / skipUnless, or
+ * `{ skip: <expression> }`, whose condition is not a literal. `skipIf(True,
+ * ...)`, `skipUnless(False, ...)` and `{ skip: 1 }` always skip.
+ */
 export function conditionalSkip(line: string): boolean {
-  return /\b(?:skipif|skipIf|skipUnless)\b/.test(line) || /[{,]\s*skip\s*:\s*(?!true\b|["'`])\S/.test(line);
+  const py = /\b(skipif|skipIf|skipUnless)\s*\(\s*([^,)]*)/.exec(line);
+  if (py) {
+    const cond = py[2]!.trim();
+    if (py[1] === "skipUnless" ? ALWAYS_FALSE.test(cond) : ALWAYS_TRUE.test(cond)) return false;
+    return cond !== "";
+  }
+  const js = /[{,]\s*skip\s*:\s*([^,}]+)/.exec(line);
+  if (!js) return false;
+  const cond = js[1]!.trim();
+  return !ALWAYS_TRUE.test(cond) && !ALWAYS_FALSE.test(cond);
+}
+
+/** The lines of test `name` in `text`: from its title or def to the next test or decorator. */
+function testBody(text: string, name: string): string {
+  const lines = text.split("\n");
+  const start = lines.findIndex((l) => {
+    const t = l.trim();
+    return JS_TEST.exec(t)?.[2] === name || PY_TEST.exec(t)?.[1] === name;
+  });
+  if (start < 0) return "";
+  let end = start + 1;
+  while (end < lines.length) {
+    const t = lines[end]!.trim();
+    if (JS_TEST.test(t) || PY_TEST.test(t) || t.startsWith("@")) break;
+    end++;
+  }
+  return lines.slice(start, end).join("\n");
 }
 
 const JS_TEST = /\b(?:it|test|describe|context|suite|specify|xit|xtest|xdescribe)(?:\.\w+)?\s*\(\s*(["'`])((?:(?!\1)[^\\]|\\.)*)\1/;

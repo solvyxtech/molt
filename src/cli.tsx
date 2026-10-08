@@ -55,7 +55,7 @@ import { stateDir } from "./statedir.js";
 import { draftReference, snapshotProject } from "./reference.js";
 import { env } from "./env.js";
 import { fileURLToPath } from "node:url";
-import { checkUserFrom, defaultWorkerUser, disablePrivSep, enablePrivSep, setIsolationLine, workerUserFrom, type PrivSep } from "./privsep.js";
+import { checkUserFrom, defaultWorkerUser, disablePrivSep, disposableRun, enablePrivSep, setIsolationLine, workerUserFrom, type PrivSep } from "./privsep.js";
 import { preWorkCopy } from "./scratch.js";
 
 /**
@@ -2340,6 +2340,11 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     process.stderr.write(`maat: ${d.notice}\n`);
     worker = d.user;
     defaulted = worker !== undefined;
+    // Separation was the default here and could not be set up: every receipt
+    // and the journal say so, not only stderr (bench and CI rows read them).
+    if (!worker && process.platform === "linux" && process.geteuid?.() === 0 && disposableRun().disposable) {
+      setIsolationLine(`isolation: none (separation is the default here but could not be set up: ${d.notice.replace(/^running as root[^:]*: /, "")})`);
+    }
   }
   if (!worker && separates && (checker || args.workerStrict)) {
     process.stderr.write(`maat: ${args.workerStrict ? "--worker-strict" : "--check-user"} needs --worker-user (MAAT_WORKER_USER)\n`);

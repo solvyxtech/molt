@@ -67,13 +67,15 @@ describe("the interface view", () => {
   });
   after(() => t.cleanup());
 
-  it("names the new files, shows signatures and usage, and none of the outputs", async () => {
+  it("names the new files, shows signatures and how to run them, and nothing any of them prints", async () => {
     const v = await interfaceView({ preWorkDir: t.pre, workDir: t.work });
     assert.deepEqual(changedFiles(t.pre, t.work).map((c) => `${c.path}:${c.status}`), ["disk.js:new", "out.txt:new", "show.js:new", "sneaky.js:new", "sum.js:new"]);
     assert.match(v.text, /Files the work added or changed: disk\.js \(new\), out\.txt \(new\), show\.js \(new\), sneaky\.js \(new\), sum\.js \(new\)/);
     assert.match(v.text, /function total\(lines\)/);
-    assert.match(v.text, /run as: node sum\.js\n  `--help` prints:\n    usage: node sum\.js FILE/);
-    assert.match(v.text, /run as: node show\.js  \(no usage text\)/, "an answer printed in reply to --help is not usage");
+    assert.match(v.text, /run as: node sum\.js\n/);
+    assert.match(v.text, /run as: node show\.js\n/);
+    // --help text and usage strings are the work's to choose, so none is shown, even a real one.
+    assert.ok(!v.text.includes("usage:"), "no usage text reaches the judge");
     assert.match(v.text, /out\.txt: text \(contents not shown\)/);
     assert.match(v.text, /Project files \(top level\): disk\.js input\.txt out\.txt show\.js sneaky\.js sum\.js/);
     // An answer that mentions "usage", or a usage line printed beside the answer whatever the flags, is not usage text.

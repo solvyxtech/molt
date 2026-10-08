@@ -84,6 +84,9 @@ describe("the value tag", () => {
     `if python3 tool.py 2>&1 | grep -q Traceback; then exit 1; fi`,
     `python3 t.py | grep -qi 'er'`,
     `python3 t.py | grep -E 'ok|fail'`,
+    // #49 status sweep: a bare comparison statement is thrown away
+    `python3 -c "import tool; tool.f('a') == 'x'"`,
+    `python3 -c "import tool; assert (tool.f('a') == 'x', 'msg')"`,
     `d=$(mktemp -d) && cp -r md2html.py src Makefile "$d"/ && cd "$d" && make -s && ! make | grep -q md2html`,
     // Not widened: the work's pattern tried on the check's own strings (4 of 7 such flips were grader failures).
     `python3 -c "import re; p=open('regex.txt').read().strip(); assert re.search(p, 'GET 10.1.2.3 served 2024-05-06 ok'), p"`,

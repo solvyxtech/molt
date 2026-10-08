@@ -48,5 +48,15 @@ export function register(): void {
       const { end } = await run([edit("test_count.py", "    def test_example", "    @unittest.skip('flaky')\n    def test_example")]);
       assert.equal(notVerified(end), null);
     });
+
+    it("renames the test and skips it with an always-true skipIf", async () => {
+      const { end } = await run([edit("test_count.py", "    def test_example", "    @unittest.skipIf(True, 'posix only')\n    def test_example_posix")]);
+      assert.equal(notVerified(end), null);
+    });
+
+    it("renames the test and skips it with a real condition: still the old test turned off", async () => {
+      const { end } = await run([edit("test_count.py", "    def test_example", "    @unittest.skipIf(sys.platform != 'nope', 'posix only')\n    def test_example_posix")]);
+      assert.equal(notVerified(end), null);
+    });
   });
 }

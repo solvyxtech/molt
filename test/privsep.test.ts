@@ -809,9 +809,10 @@ describe("the default worker user, end to end (Linux, root)", { skip: linuxRoot 
     chmodSync(join(dir, "conf", "site.conf"), 0o640);
     const cfg = mkdtempSync(join(tmpdir(), "maat-default-cfg-"));
     const cli = join(process.cwd(), "dist-test", "src", "cli.js");
-    const env: NodeJS.ProcessEnv = { ...process.env, MOLT_CONFIG_DIR: cfg, MAAT_API_KEY: "k", ...extraEnv };
+    const env: NodeJS.ProcessEnv = { ...process.env, MOLT_CONFIG_DIR: cfg, MAAT_API_KEY: "k" };
     delete env.MAAT_WORKER_USER;
     delete env.CI;
+    Object.assign(env, extraEnv);
     const child = spawn(process.execPath, [cli, "run", "say who you are", "--url", url, "--model", "m", "--cwd", dir, "--no-stream", "--sandbox"], { env, stdio: ["ignore", "ignore", "pipe"] });
     let err = "";
     child.stderr?.on("data", (d) => (err += d));
@@ -855,6 +856,19 @@ describe("the default worker user, end to end (Linux, root)", { skip: linuxRoot 
       rmSync(script, { force: true });
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("in CI with no account to use, the receipt's isolation line says separation was the default and could not be set up", async () => {
+    const r = await run({ MAAT_ASSUME_CONTAINER: "0", CI: "true", MAAT_DEFAULT_WORKER_USER: "maat-nosuch-acct" });
+    try {
+      assert.match(r.err, /only inside a container/, r.err);
+      const rdir = join(r.dir, ".maat", "receipts");
+      const md = readdirSync(rdir).filter((f) => f.endsWith(".md"));
+      assert.ok(md.length > 0, `no receipt:\n${r.err}`);
+      assert.match(readFileSync(join(rdir, md[0]!), "utf8"), /isolation: none \(separation is the default here but could not be set up/);
+    } finally {
+      r.cleanup();
     }
   });
 

@@ -11,9 +11,10 @@
  *
  *  - the files the work added or changed, by name;
  *  - for code, the signature lines only (def/class/function/export, argparse
- *    `add_argument`, a script's usage line), never a body or a constant;
- *  - for each runnable new or changed script, what `--help` prints, kept only
- *    when it reads as usage text, run on a throwaway copy;
+ *    `add_argument` flags), never a body, a constant, a default, help text or
+ *    a usage string;
+ *  - for each runnable new or changed script, how to run it, and nothing it
+ *    prints: --help text is the work's to choose, and can carry an answer;
  *  - for anything else (data the work wrote), the name and a format word, never
  *    the contents: that is the deliverable's output on the task's example;
  *  - the top-level project listing.
@@ -22,8 +23,7 @@ import { createHash } from "node:crypto";
 import { lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { extname, join, relative, sep } from "node:path";
 import { topLevel } from "./brief.js";
-import { runCommand } from "./run.js";
-import { copyTree, LINKED_DIRS } from "./scratch.js";
+import { LINKED_DIRS } from "./scratch.js";
 import { STATE_DIRS } from "./statedir.js";
 
 export type Changed = { path: string; status: "new" | "changed" };
@@ -140,9 +140,7 @@ export function signatures(path: string, text: string, max = 25): string[] {
       if (/^[\w:<>*&\s]+\s+\**\w+\s*\([^;]*\)\s*\{?\s*$/.test(t) && !/^(if|for|while|switch|return)\b/.test(t)) add(l.replace(/\{\s*$/, ""));
     }
     // Usage text is the interface, whatever the language (a shell script's `echo "usage: ..."`).
-    // Only the usage text itself, up to the end of its string: the rest of the line is code the work wrote.
-    const u = /\busage\s*:[^"'`\n]*/i.exec(t);
-    if (u && !keep.includes(u[0].trimEnd().slice(0, 160))) add(u[0]);
+    // No usage strings: they are text the work wrote, and can carry an answer.
   }
   return keep;
 }
@@ -232,33 +230,10 @@ export async function interfaceView(input: InterfaceViewInput): Promise<Interfac
   }
   if (code.length) lines.push("Signatures (declarations only, no bodies):", ...code);
   if (helpable.length) {
-    const usage: string[] = [];
-    // On a copy: a script that ignores --help and does its job must not do it here.
-    const copy = await copyTree(input.workDir);
-    try {
-      for (const h of helpable.slice(0, input.maxHelp ?? 4)) {
-        let said = "";
-        if (copy) {
-          try {
-            const r = await runCommand(`${h.cmd} --help`, { cwd: copy.dir, timeoutMs: HELP_TIMEOUT_MS, maxBuffer: 64 * 1024, signal: input.signal, killGroupOnExit: true });
-            const out = copy.unmap(`${r.stdout}\n${r.stderr}`).trim();
-            if (!r.timedOut && looksLikeUsage(out)) {
-              // A script that ignores --help prints what it prints anyway: its
-              // answer. Usage text is what differs from a plain run.
-              const plain = await runCommand(h.cmd, { cwd: copy.dir, timeoutMs: HELP_TIMEOUT_MS, maxBuffer: 64 * 1024, signal: input.signal, killGroupOnExit: true });
-              const bare = copy.unmap(`${plain.stdout}\n${plain.stderr}`).trim();
-              if (bare !== out) said = out.slice(0, HELP_MAX_CHARS);
-            }
-          } catch {
-            /* could not spawn: no usage text */
-          }
-        }
-        usage.push(`  run as: ${h.cmd}${said ? `\n  \`--help\` prints:\n${said.split("\n").map((l) => `    ${l}`).join("\n")}` : "  (no usage text)"}`);
-      }
-    } finally {
-      await copy?.cleanup();
-    }
-    lines.push("How to run the new or changed scripts:", ...usage);
+    // How to run each script, and nothing it prints: its --help text, or a
+    // usage string in its source, is text the work chose, and a worker can put
+    // any answer in it for the judge to copy (#49 status sweep, row 19).
+    lines.push("How to run the new or changed scripts:", ...helpable.slice(0, input.maxHelp ?? 4).map((h) => `  run as: ${h.cmd}`));
   }
   if (data.length) lines.push("Other files the work wrote (formats only):", ...data);
   const listing = topLevel(input.workDir, 41).filter((n) => !STATE_DIRS.some((s) => n === s || n === `${s}/`)).slice(0, 40);

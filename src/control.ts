@@ -221,6 +221,56 @@ function tamperedTarget(cwd: string, link: string, since: number): string | null
   }
 }
 
+/**
+ * Files inside installed packages that changed after their package was
+ * installed: a runner's own code edited in place (jest/bin/jest.js, or a
+ * module it requires, jest/lib/run.js), whatever mtime the worker then set,
+ * since `touch -d` cannot set the change time. An install this turn changes a
+ * package's files and its package.json together; an edit changes a file after
+ * its package.json. Bounded: `limit` entries, then it stops looking.
+ */
+export function editedInstalled(cwd: string, since: number, limit = 200_000): string[] {
+  if (!Number.isFinite(since)) return [];
+  const modules = resolve(cwd, "node_modules");
+  const out: string[] = [];
+  let seen = 0;
+  const walk = (dir: string, pkgCtime: number | undefined): void => {
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    let here = pkgCtime;
+    if (names.includes("package.json")) {
+      try {
+        here = lstatSync(join(dir, "package.json")).ctimeMs;
+      } catch {
+        /* as the parent's */
+      }
+    }
+    for (const n of names) {
+      if (++seen > limit || out.length >= 5) return;
+      // npm's own bookkeeping and the caches runners write as they run (.cache, .vite).
+      if ((dir === modules && n.startsWith(".")) || n === ".cache" || n === ".vite") continue;
+      const p = join(dir, n);
+      let st;
+      try {
+        st = lstatSync(p);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory()) walk(p, here);
+      // Installed before the turn and changed during it; or installed this turn and changed after.
+      else if (st.isFile() && st.ctimeMs >= since && n !== "package.json" && (here === undefined || here < since || st.ctimeMs > here + 2_000)) {
+        out.push(`node_modules/${relative(modules, p).split(sep).join("/")} (changed after its package was installed)`);
+      }
+    }
+  };
+  walk(modules, undefined);
+  return out;
+}
+
 /** True when `name` is a command on PATH outside the project. */
 function onSystemPath(name: string, cwd: string): boolean {
   for (const d of (process.env.PATH ?? "").split(delimiter)) {
@@ -294,7 +344,10 @@ export function discountedChecks(
   const passing = results.filter((r) => r.ok && !r.skipped && r.kind === "command" && r.detail);
   if (!passing.length) return out;
   const touched = touchedThisTurn(t);
-  const bins = plantedBins(t.cwd, t.before?.takenAt ?? Number.POSITIVE_INFINITY);
+  let binsMemo: string[] | undefined;
+  const since = t.before?.takenAt ?? Number.POSITIVE_INFINITY;
+  // Read only when an npm-like check passed: it walks node_modules.
+  const binsFor = (): string[] => (binsMemo ??= [...plantedBins(t.cwd, since), ...editedInstalled(t.cwd, since)]);
   for (const r of passing) {
     const run = r.detail;
     const why = (() => {
@@ -302,7 +355,8 @@ export function discountedChecks(
         const hook = pythonHook(p, run, t.cwd) ?? shadowedModule(p, run) ?? nodeHook(p, run);
         if (hook) return `it passed through ${hook}, and the worker ${createdOrChanged(p, t)} it this turn`;
       }
-      if (bins.length && NPM_LIKE.test(run)) {
+      const bins = NPM_LIKE.test(run) ? binsFor() : [];
+      if (bins.length) {
         return `the worker put ${bins.join(", ")} on the PATH npm gives every script, so the command did not run what it names`;
       }
       for (const w of pathWords(run)) {
