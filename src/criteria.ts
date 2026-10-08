@@ -34,6 +34,7 @@ import { cannotFail, lintAll, readTree, type LintCtx, type Tree } from "./checkl
 import { checkMutates } from "./checkwrites.js";
 import { copyTree } from "./scratch.js";
 import { diagnoseFailure } from "./bar.js";
+import { reportsFailure } from "./evidence.js";
 import { normalizeRequirements } from "./signout.js";
 import { evidenceTags } from "./tiers.js";
 import type { CheckAuthor } from "./types.js";
@@ -290,7 +291,7 @@ export function strayPath(run: string, opts: { cwd: string; task?: string }): st
 }
 
 export async function preflightCriteria(
-  checks: readonly { name: string; kind?: string; run?: string; expectExit?: number }[],
+  checks: readonly { name: string; kind?: string; run?: string; expectExit?: number; hidden?: boolean; tags?: readonly string[] }[],
   opts: {
     cwd: string;
     timeoutMs?: number;
@@ -342,8 +343,12 @@ export async function preflightCriteria(
     try {
       const r = await runCommand(c.run, {
         cwd: copy?.dir ?? opts.cwd,
-        // Drafted checks (stray set) run under the shell the bar will use.
-        shell: draftedShell({ hidden: !!opts.stray, tags: ["task"] }),
+        // Under the shell the bar will run this check with (src/run.ts
+        // draftedShell): bash for a drafted check, sh otherwise. Tried under
+        // one shell and judged under another, a bashism (`[[ ]]`, `==` in
+        // `[ ]`, `echo -e`) failed here under dash and passed at the bar, and
+        // counted as a check that tells the work from none.
+        shell: draftedShell(c),
         timeoutMs: opts.timeoutMs ?? 5_000,
         maxBuffer: 1024 * 1024,
         signal: opts.signal,
@@ -361,11 +366,19 @@ export async function preflightCriteria(
       if (d.didNotRun) broken.push({ name: c.name, run: c.run, why: d.hint ?? "did not run" });
       else if (unparsed) {
         broken.push({ name: c.name, run: c.run, why: `the shell could not parse it: ${firstLine(copy ? copy.unmap(r.stderr) : r.stderr)}` });
-      } else if (selfError) broken.push({ name: c.name, run: c.run, why: selfError }); else if (!r.timedOut && r.code === (c.expectExit ?? 0)) {
-        opts.passed?.push(c.name);
-        if (/\bFAIL(?:ED)?\b/.test(`${r.stdout}\n${r.stderr}`)) opts.printedFail?.push(c.name);
-      }
-      else opts.failed?.push(c.name);
+      } else if (selfError) broken.push({ name: c.name, run: c.run, why: selfError });
+      else if (r.timedOut) {
+        // Out of time is not a verdict: a check slower than the try (an
+        // existing suite) that would pass on the untouched tree is not one
+        // that fails there. Neither list: not tried.
+      } else if (r.code === (c.expectExit ?? 0)) {
+        // Read as the bar reads it: a task check that printed False or FAIL
+        // and exited 0 failed (evidence.ts reportsFailure).
+        const said = (c.expectExit ?? 0) === 0 && (c.tags?.includes("task") ?? true) ? reportsFailure(c.run, r.stdout) : null;
+        if (said || /\bFAIL(?:ED)?\b/.test(`${r.stdout}\n${r.stderr}`)) opts.printedFail?.push(c.name);
+        if (said) opts.failed?.push(c.name);
+        else opts.passed?.push(c.name);
+      } else opts.failed?.push(c.name);
     } catch {
       // Failing to spawn it here is molt's problem, not the criterion's.
       // Reporting it as broken would block work for the wrong reason.
@@ -938,6 +951,8 @@ export async function draftCriteriaCritiqued(
     coverMaxMs?: number;
     /** A copy of the project taken before the work (see PreWork). Without it, no check is tried here. */
     preWorkDir?: string;
+    /** Whether that copy is still as it was taken (src/scratch.ts preWorkCopy). A copy that changed is not tried on. */
+    preWorkIntact?: () => Promise<boolean>;
   },
 ): Promise<{ ok: true; draft: Draft; critique: string[]; lint?: LintDrop[] } | { ok: false; error: string }> {
   // The critic's list of stated requirements rides on whatever draft comes
@@ -966,7 +981,7 @@ export const PASSES_BEFORE_WORK =
   "this check passes before any work, so it cannot show the task was done; make it fail on the current tree";
 /** Why a drafted check that printed FAIL and exited 0 on the pre-work copy is sent back. */
 export const PRINTS_FAIL_EXITS_0 =
-  "it printed FAIL and still exited 0 before any work, so it can never fail; make a failure exit non-zero";
+  "it printed a failure (FAIL or False) and still exited 0 before any work, so its exit code does not carry its verdict; make a failure exit non-zero (assert, sys.exit(1), jq -e, or compare in the shell)";
 
 /** A drafted check the seal-time lint retired (src/checklint.ts), for the journal. */
 export type LintDrop = { name: string; run: string; rule: string; why: string; redraft: boolean };
@@ -979,6 +994,7 @@ async function critiqued(
     /** Bound on the step that adds checks for uncovered requirements (COVER_MAX_MS). */
     coverMaxMs?: number;
     preWorkDir?: string;
+    preWorkIntact?: () => Promise<boolean>;
   },
   sink: Sink,
 ): Promise<{ ok: true; draft: Draft; critique: string[] } | { ok: false; error: string }> {
@@ -1035,14 +1051,19 @@ async function critiqued(
     if (!opts.preWorkDir || !l.ok.length) return l;
     const passed: string[] = [];
     const printedFail: string[] = [];
+    // A copy the worker changed (the draft can outlive the start of the work)
+    // is not the tree before the work: nothing tried on it decides anything.
+    if (opts.preWorkIntact && !(await opts.preWorkIntact())) return l;
     try {
       await preflightCriteria(
-        l.ok.map((c) => ({ name: c.name, kind: "command", run: c.run })),
+        // As they will be sealed: hidden task checks, so under the bar's shell.
+        l.ok.map((c) => ({ name: c.name, kind: "command", run: c.run, hidden: true, tags: ["task"] })),
         { cwd: opts.preWorkDir, passed, printedFail },
       );
     } catch {
       return l;
     }
+    if (opts.preWorkIntact && !(await opts.preWorkIntact())) return l;
     const ok: DraftedCheck[] = [];
     const bad = [...l.bad];
     for (const c of l.ok) {
