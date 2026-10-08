@@ -350,17 +350,57 @@ export type Overflow = {
  *     133526 tokens: 2454 tokens from the input messages and 131072 tokens
  *     for the completion.
  *
- * Shedding history can never fix that. Returns the window, the input and the
- * completion the server counted, or null when the body does not say all three.
+ * Shedding history can never fix that. Every server words it differently:
+ * vLLM (both its old and current wordings), OpenAI, OpenRouter, Anthropic and
+ * TGI are read below. llama.cpp never refuses for the reserve (it stops the
+ * reply when the window fills), so its refusal is always a prompt overflow.
+ * Returns the window, the input and the completion the server counted, or
+ * null when the body does not say all three.
  */
 export function completionOverflow(body: string): { window: number; input: number; completion: number } | null {
+  const ok = (window: number, input: number, completion: number) =>
+    window > 0 && input >= 0 && completion > 0 ? { window, input, completion } : null;
+
+  // Anthropic: "input length and `max_tokens` exceed context limit: 188240 + 21333 > 200000".
+  const anth = /max_tokens`?\s+exceed context limit:\s*(\d+)\s*\+\s*(\d+)\s*>\s*(\d+)/i.exec(body);
+  if (anth) return ok(Number(anth[3]), Number(anth[1]), Number(anth[2]));
+
+  // Hugging Face TGI: "`inputs` tokens + `max_new_tokens` must be <= 4096. Given: 1000 `inputs` tokens and 4000 `max_new_tokens`".
+  const tgi = /must be <= (\d+)\.\s*Given:\s*(\d+) `?inputs`? tokens and (\d+) `?max_new_tokens`?/i.exec(body);
+  if (tgi) return ok(Number(tgi[1]), Number(tgi[2]), Number(tgi[3]));
+
   const win = /maximum context length (?:is|of) (\d+)/i.exec(body);
-  const parts =
-    /(\d+) tokens? from the input messages and (\d+) tokens? for the completion/i.exec(body) ??
-    /\((\d+) in the messages,\s*(\d+) in the completion\)/i.exec(body);
-  if (!win || !parts) return null;
-  const r = { window: Number(win[1]), input: Number(parts[1]), completion: Number(parts[2]) };
-  return r.window > 0 && r.input >= 0 && r.completion > 0 ? r : null;
+  if (!win) return null;
+  const window = Number(win[1]);
+
+  // vLLM (since vllm#36197): "you requested 32768 output tokens and your prompt contains 1000 input tokens".
+  const v2 = /you requested (\d+) output tokens? and your prompt contains (\d+) input tokens?/i.exec(body);
+  if (v2) return ok(window, Number(v2[2]), Number(v2[1]));
+
+  // vLLM 0.8-0.16: "'max_tokens' or 'max_completion_tokens' is too large: 32768. This model's maximum
+  // context length is 32768 tokens and your request has 1000 input tokens (32768 > 32768 - 1000)."
+  const v1 = /is too large:\s*(\d+)[\s\S]{0,200}?your request has (\d+) input tokens?/i.exec(body);
+  if (v1) return ok(window, Number(v1[2]), Number(v1[1]));
+
+  // GMI / vLLM: "A tokens from the input messages and B tokens for the completion".
+  const gmi = /(\d+) tokens? from the input messages and (\d+) tokens? for the completion/i.exec(body);
+  if (gmi) return ok(window, Number(gmi[1]), Number(gmi[2]));
+
+  // OpenRouter: "(1000 of text input, 900 of tool input, 32768 in the output)". Every "of … input"
+  // part counts against the prompt (text, tool, image).
+  const orOut = /(\d+) in the output/i.exec(body);
+  if (orOut) {
+    const ins = [...body.matchAll(/(\d+) of [a-z ]{0,20}?input/gi)].map((m) => Number(m[1]));
+    if (ins.length) return ok(window, ins.reduce((a, b) => a + b, 0), Number(orOut[1]));
+  }
+
+  // OpenAI: "(1232 in the messages, 32768 in the completion)", sometimes with "N in the functions".
+  const oai = /\(([^)]*?(\d+) in the completion)\)/i.exec(body);
+  if (oai) {
+    const ins = [...oai[1]!.matchAll(/(\d+) in the (?!completion)\w+/gi)].map((m) => Number(m[1]));
+    if (ins.length) return ok(window, ins.reduce((a, b) => a + b, 0), Number(oai[2]));
+  }
+  return null;
 }
 
 /** The most an unasked output cap grows to after replies hit it. */
@@ -371,7 +411,7 @@ export const OUTPUT_CAP_MAX = 131_072;
  * Narrow on purpose: it must name the field and say it is unsupported.
  */
 export function refusedMaxTokens(body: string): boolean {
-  return /max_tokens/i.test(body) && /unsupported|not supported|unrecognized|unknown (field|parameter)|extra inputs are not permitted|use 'max_completion_tokens'|max_completion_tokens/i.test(body);
+  return /max_tokens/i.test(body) && /unsupported|not supported|unrecognized|unknown (field|parameter)|extra inputs are not permitted|use 'max_completion_tokens'/i.test(body);
 }
 
 /** Room left between the prompt and the window, kept free of the completion reserve. */
@@ -389,6 +429,33 @@ export function fittedCompletion(o: { window: number; input: number; completion:
   return fit >= MIN_COMPLETION && fit < o.completion ? fit : null;
 }
 
+/** The cap tried once when a window refusal names no counts molt can read. */
+export const FALLBACK_COMPLETION = 8_192;
+
+/**
+ * A smaller cap to try before shedding, for a window refusal whose wording
+ * completionOverflow does not know.
+ *
+ * Maat always sends max_tokens now, and a server that counts it against the
+ * window refuses in its own words. Shedding cannot fix a reserve overflow, so
+ * when the refusal is about the context or the length and the cap sent was
+ * large, one request with a smaller cap is cheaper than ending a turn "with
+ * nothing left to shed". `inputEst` is molt's scaled estimate of the prompt,
+ * used when the server named a window but no prompt count. Null when the
+ * prompt itself is known not to fit (shed instead), when the cap is already
+ * small, or when the body is not about the window at all.
+ */
+export function reserveFallback(body: string, cap: number, inputEst: number): number | null {
+  if (cap <= FALLBACK_COMPLETION || completionOverflow(body)) return null;
+  const over = contextOverflow(body);
+  if (!over && !(/context|length/i.test(body) && /tokens?/i.test(body))) return null;
+  if (!over || over.window <= 0) return FALLBACK_COMPLETION;
+  const input = over.sent > 0 ? over.sent : inputEst;
+  const fit = over.window - input - Math.max(COMPLETION_MARGIN, Math.round(over.window * 0.01));
+  if (fit < MIN_COMPLETION) return null;
+  return Math.min(fit, Math.floor(cap / 2));
+}
+
 export function contextOverflow(body: string): Overflow | null {
   // Overflow wording, not the bare word "context": a pinned OpenRouter provider
   // answered a rate-limit retry with a 400 that merely mentioned context, and a
@@ -399,19 +466,25 @@ export function contextOverflow(body: string): Overflow | null {
     )
   )
     return null;
+  // Where the server split the prompt from the completion, the prompt's count
+  // is what molt's estimate is compared with. Never the output count: current
+  // vLLM puts that first ("you requested 32768 output tokens and your prompt
+  // contains 1000"), and reading it as the prompt scaled every estimate 8x.
+  const co = completionOverflow(body);
+  if (co) return { window: co.window, sent: co.input };
   // Every field the common servers use, most specific first.
   const win =
     /"n_ctx"\s*:\s*(\d+)/.exec(body) ??
     /context size \((\d+)\s*tokens?\)/i.exec(body) ??
-    /maximum context length (?:is|of) (\d+)/i.exec(body);
-  // The prompt's own count where the server separates it from the completion:
-  // that is what molt's estimate is compared with.
+    /maximum context length (?:is|of) (\d+)/i.exec(body) ??
+    // Anthropic: "prompt is too long: 210000 tokens > 200000 maximum".
+    /tokens? > (\d+) maximum/i.exec(body);
   const sent =
     /"n_prompt_tokens"\s*:\s*(\d+)/.exec(body) ??
     /request \((\d+)\s*tokens?\)/i.exec(body) ??
-    /(\d+) tokens? from the input messages/i.exec(body) ??
-    /\((\d+) in the messages,/i.exec(body) ??
-    /you requested (?:a total of )?(\d+)/i.exec(body);
+    /prompt is too long:\s*(\d+)/i.exec(body) ??
+    /your (?:prompt contains|request has|messages resulted in) (\d+)/i.exec(body) ??
+    /you requested (?:a total of |about )?(\d+)(?!\d)(?! output)/i.exec(body);
   return { window: win ? Number(win[1]) : 0, sent: sent ? Number(sent[1]) : 0 };
 }
 
@@ -2041,9 +2114,15 @@ export class Engine {
   private outputCap = DEFAULT_MAX_TOKENS;
   /**
    * The completion reserve a server said fits its window beside the prompt
-   * (completionOverflow). Sticky for the session: the prompt only grows.
+   * (completionOverflow). Kept until the history is shed: the prompt grows
+   * between sheds, and after one there is room for a larger reply again.
    */
   private fittedCompletion?: number;
+  /**
+   * The fitted cap above was a guess (reserveFallback), not read from the
+   * server's own counts. A reply that is cut off at a guess drops it.
+   */
+  private fittedGuessed = false;
   /** Set once a provider refuses `max_tokens` outright; it is then not sent. */
   private maxTokensUnsupported = false;
 
@@ -2361,7 +2440,10 @@ export class Engine {
       // about this one. Discovered again on the next refusal if it matters.
       this.modelMaxTokens = undefined;
       this.fittedCompletion = undefined;
+      this.fittedGuessed = false;
       this.maxTokensUnsupported = false;
+      // A cap doubled on the last model says nothing about this one either.
+      this.outputCap = DEFAULT_MAX_TOKENS;
     }
     this.cfg.model = m;
   }
@@ -3130,6 +3212,9 @@ export class Engine {
     }
 
     this.transcript.commitShed(plan);
+    // A cap fitted beside the old prompt is too small for the new one.
+    this.fittedCompletion = undefined;
+    this.fittedGuessed = false;
 
     this.ledger = staying;
     // Journalled here, on every path. It was journalled by the two auto-shed
@@ -6321,6 +6406,7 @@ export class Engine {
               if (!co || fit === null || fit >= this.maxTokensFor()) break;
               const was = this.maxTokensFor();
               this.fittedCompletion = fit;
+              this.fittedGuessed = false;
               log?.append("note", {
                 body: body.slice(0, 600),
                 text:
@@ -6333,6 +6419,37 @@ export class Engine {
               };
               res = await send(askForUsage && !this.streamUsageUnsupported);
               body = res.ok ? "" : (await res.text().catch(() => ""));
+            }
+
+            // A window refusal in wording none of the above reads, from a
+            // request that carried a large cap. Try one smaller cap before
+            // shedding: shedding cannot fix a reserve overflow, and before
+            // max_tokens was always sent these servers fitted the reply
+            // themselves. Kept only if it works.
+            if (!res.ok && res.status === 400 && !this.maxTokensUnsupported) {
+              const was = this.maxTokensFor();
+              const guess = reserveFallback(body, was, Math.round(this.bom().requestTotalEst * this.tokenScale));
+              if (guess !== null && guess < was) {
+                const before = { fitted: this.fittedCompletion, guessed: this.fittedGuessed };
+                this.fittedCompletion = guess;
+                this.fittedGuessed = true;
+                const retry = await send(askForUsage && !this.streamUsageUnsupported);
+                if (retry.ok) {
+                  log?.append("note", {
+                    body: body.slice(0, 600),
+                    text: `window refusal with max_tokens ${was} — ${guess} was accepted, kept for the session`,
+                  });
+                  yield {
+                    kind: "info",
+                    text: `this endpoint refused a ${was}-token reply reserve — asking for at most ${guess} output tokens instead.`,
+                  };
+                } else {
+                  this.fittedCompletion = before.fitted;
+                  this.fittedGuessed = before.guessed;
+                }
+                res = retry;
+                body = res.ok ? "" : (await res.text().catch(() => ""));
+              }
             }
 
             // A provider that will not take `max_tokens` at all (OpenAI's
@@ -7191,20 +7308,29 @@ export class Engine {
       // sentence.
       if (finishReason === "length" && truncatedTurns < TRUNCATED_TURN_RETRIES) {
         truncatedTurns += 1;
+        // The cap this reply hit, before any change below: the note, the
+        // nudge and the info line report what happened, not what comes next.
+        const hit = this.maxTokensFor();
         // A reply that actually hit the default cap earns a larger one; a cap
-        // the person set, or one the server said is all that fits, stays.
-        if (this.cfg.maxTokens === undefined && this.outputCap < OUTPUT_CAP_MAX && this.maxTokensFor() === this.outputCap) {
+        // the person set, or one the server said is all that fits, stays. A
+        // fitted cap that was only a guess is dropped; if the full one is
+        // refused again, the refusal fits it again.
+        if (this.cfg.maxTokens === undefined && this.outputCap < OUTPUT_CAP_MAX && hit === this.outputCap) {
           this.outputCap = Math.min(OUTPUT_CAP_MAX, this.outputCap * 2);
+        } else if (this.fittedGuessed && hit === this.fittedCompletion) {
+          this.fittedCompletion = undefined;
+          this.fittedGuessed = false;
         }
+        const next = this.maxTokensFor();
         log?.append("note", {
-          text: `reply cut off at the ${this.maxTokensFor()}-token output ceiling`,
+          text: `reply cut off at the ${hit}-token output ceiling` + (next !== hit ? `; the next request asks for ${next}` : ""),
           step,
           attempt: truncatedTurns,
         });
         this.transcript.push({
           role: "user",
           content:
-            `[molt: that reply hit the output ceiling of ${this.maxTokensFor()} tokens and stopped ` +
+            `[molt: that reply hit the output ceiling of ${hit} tokens and stopped ` +
             `part-way through, so it is not being read as a finished answer. Continue from where ` +
             `it stops, and keep what remains short.]`,
           molt: { nudge: true },
@@ -7213,7 +7339,7 @@ export class Engine {
         yield {
           kind: "info",
           text:
-            `the reply was cut off at the ${this.maxTokensFor()}-token output ceiling — asking it ` +
+            `the reply was cut off at the ${hit}-token output ceiling — asking it ` +
             `to continue rather than running the bar on half a sentence` +
             (this.cfg.maxTokens === undefined ? " (raise it with --max-tokens)" : ""),
         };
