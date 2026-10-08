@@ -6062,7 +6062,7 @@ export class Engine {
         "never reported as verified — do not describe one as passing. You cannot",
         "edit these; attempting to is itself a failure.",
       ];
-      this.transcript.push({ role: "user", content: lines.join("\n") });
+      this.transcript.push({ role: "user", content: lines.join("\n"), molt: { criteria: true } });
     }
     };
     if (!pendingCriteria) yield* sealCriteria(opts.taskChecks ?? [], opts.taskNotes ?? []);

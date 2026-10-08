@@ -42,6 +42,11 @@ export type MsgMeta = {
   /** True for a bar-failure notice injected by the proof loop. */
   barFailure?: true;
   /**
+   * True for the acceptance-criteria note. A shed that cuts on recent
+   * messages keeps the latest one verbatim (transcript.ts planShed).
+   */
+  criteria?: true;
+  /**
    * True for a note molt wrote to the model about the model's own behaviour
    * — an empty turn, or a step that only repeated itself. Distinct from a
    * bar failure: nothing was checked, and nothing is being demanded.
