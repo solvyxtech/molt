@@ -19,7 +19,14 @@ def test_columns_from_job_end_judge():
     assert cols == {
         "judge_calls": 4, "judge_tokens_in": 12000, "judge_tokens_out": 900,
         "judge_cache_read": 3000, "judge_cache_write": 500, "judge_cost_usd": 0.0123,
+        "judge_plan": None,
     }
+
+
+def test_a_plan_paid_judge_carries_its_plan():
+    cols = run.judge_columns({"calls": 3, "promptTokens": 10, "completionTokens": 2,
+                              "cacheReadTokens": 0, "cacheWriteTokens": 0, "plan": "OpenCode"})
+    assert cols["judge_plan"] == "OpenCode" and cols["judge_cost_usd"] is None
 
 
 def test_unpriced_judge_is_none_not_zero():

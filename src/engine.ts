@@ -2473,6 +2473,18 @@ export class Engine {
    * turn starts is counted in the turn it was for.
    */
   private judgeReported = 0;
+  /**
+   * Where the judge's drafting for the next turn began: the meter's mark and
+   * what had been spent by then (draftingStarted). The budget-hit message says
+   * the drafting used the budget only when this turn's drafting is what took
+   * it over, not when earlier spend had already nearly used it up.
+   */
+  private draftStart: { mark: number; tokens: number } | undefined;
+
+  /** The caller is about to draft this turn's checks on the judge (cli.tsx). */
+  draftingStarted(): void {
+    this.draftStart ??= { mark: this.judgeMeter.mark(), tokens: this.spentTokens };
+  }
   /** Why the independent review was skipped this turn (see reviewSkipReason), if it was. */
   private reviewSkipped: string | undefined;
   /** Hidden checks whose commands were shown to the model this turn. */
@@ -5245,6 +5257,7 @@ export class Engine {
     // the review and the audit run after the receipt was written.
     const judge = this.judgeMeter.since(this.judgeReported);
     this.judgeReported = this.judgeMeter.mark();
+    this.draftStart = undefined;
     if (receiptPath && judge.calls) this.cfg.receipts?.amendJudge(basename(receiptPath), this.judgeMeter.total());
     yield {
       kind: "job_end",
@@ -6732,9 +6745,13 @@ export class Engine {
             `budget hit (${this.budgetTokens} tokens` +
             (this.spentTokens > this.sessionTokens ? `, ${this.spentTokens - this.sessionTokens} of them the judge's` : "") +
             `) — loop stopped. /budget to raise.` +
-            // Hit before the worker took a step, with the judge asked for this
-            // turn already (its drafting): say what used it up.
-            (step === 0 && this.judgeMeter.mark() > this.judgeReported
+            // Hit before the worker took a step, by this turn's drafting: the
+            // judge drafted since draftingStarted, and the spend before it was
+            // still under the budget.
+            (step === 0 &&
+            this.draftStart !== undefined &&
+            this.judgeMeter.mark() > this.draftStart.mark &&
+            this.draftStart.tokens < (this.budgetTokens ?? 0)
               ? ` The judge drafting this turn's checks used the budget before the worker's first step; ` +
                 `raise --budget to leave room for both.`
               : ""),
@@ -6758,14 +6775,24 @@ export class Engine {
       // default itself: there is nothing left to make an exception to.
       const usdCeiling = this.cfg.maxTurnUsd ?? 0;
       const tokenCeiling = this.cfg.maxTurnTokens ?? 0;
-      const priced = usdThisTurn !== undefined && usdCeiling > 0;
-      const used = priced ? usdThisTurn : spentThisTurn;
+      // A priced worker is held in dollars, as it always was. An unpriced
+      // worker with a priced judge is held by both: dollars bound the part that
+      // has a price (the judge's), tokens bound the whole turn, and whichever
+      // is nearer its ceiling is the one that speaks and stops. Without the
+      // token side, one priced judge call flipped the turn to dollars and the
+      // worker's unpriced tokens ran on unbounded.
+      const usdShare = usdThisTurn !== undefined && usdCeiling > 0 ? usdThisTurn / usdCeiling : undefined;
+      const tokenShare = tokenCeiling > 0 ? spentThisTurn / tokenCeiling : undefined;
+      const priced =
+        usdShare !== undefined &&
+        (turnStartCost !== undefined || tokenShare === undefined || usdShare >= tokenShare);
+      const used = priced ? usdThisTurn! : spentThisTurn;
       const ceiling = priced ? usdCeiling : tokenCeiling;
       // Named for what it is, and not `shown` — which is the read-coverage map
       // a few lines down, and which this quietly shadowed until the compiler
       // said so.
       const ceilingLine = priced
-        ? `${fmtUsd(usdThisTurn)} of ${fmtUsd(usdCeiling)}`
+        ? `${fmtUsd(usdThisTurn!)} of ${fmtUsd(usdCeiling)}`
         : `${spentThisTurn} of ${tokenCeiling} tokens`;
 
       // Said on the way up, not only on arrival. A limit that speaks for the

@@ -16,7 +16,7 @@ import { resolve } from "node:path";
 import { Archive } from "./archive.js";
 import { isAutonomy, type Autonomy } from "./autonomy.js";
 import { fmtCost, fmtDuration } from "./banner.js";
-import { judgeSpendLine, stepDid } from "./format.js";
+import { judgeSpendLine, askSpendLine, stepDid } from "./format.js";
 import { BarError, hasBar, loadBar, selectChecks, writeDefaultBar } from "./bar.js";
 import { Engine, type FileAccess } from "./engine.js";
 import { describeDrift, driftSince } from "./git.js";
@@ -30,7 +30,7 @@ import { draftMission, missionStatus, runMission, writePlan, type MissionSummary
 import { parseDuration } from "./session-commands.js";
 import { jobEndWords } from "./tiers.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
-import { JudgeMeter } from "./judge-meter.js";
+import { SpendMeter } from "./judge-meter.js";
 import { commandsHere, draftCriteriaCritiqued, drafterInputsHash, drafterSnapshot, preflightCriteria, taskChecksFrom, type Draft, type DrafterInputs } from "./criteria.js";
 import { listProject, removeNew } from "./leftovers.js";
 import { projectScripts } from "./interview.js";
@@ -933,17 +933,35 @@ async function priceEngine(engine: Engine, args: Args): Promise<void> {
 
 /** The worker's own price lookup (see priceEngine). */
 async function priceWorker(engine: Engine, args: Args): Promise<void> {
-  if (!needsPriceLookup(args.model, engine.pricing(), storedEndpoint())) return;
+  engine.setPricing(await workerPricing(args, engine.pricing()));
+}
+
+/**
+ * The worker's price, resolved one way for every command that spends on the
+ * worker's model (`run`, `mission plan`): a hand-set or stored price for this
+ * model stands; otherwise the provider's list is asked and the answer saved.
+ * `current` is what is in force now (args' prices, seeded from the stored one
+ * by parseArgs). Returns the prices to use, `{}` for none.
+ */
+async function workerPricing(
+  args: Args,
+  current: { in?: number; out?: number; cached?: number; source?: string } = {
+    in: args.priceIn,
+    out: args.priceOut,
+    cached: args.priceCachedIn,
+    source: args.priceSource,
+  },
+): Promise<{ in?: number; out?: number; cached?: number; source?: string }> {
+  if (!needsPriceLookup(args.model, current, storedEndpoint())) return current;
   const p = await fetchPricing(args.url, args.model, keyForUrl(args.url, args.key));
   if (!p) {
     // Nothing published. A price only stands if it was recorded for THIS
     // model; inheriting the last one is how a Claude session gets billed at
     // grok's rates.
-    if (storedEndpoint().priceModel !== args.model) engine.setPricing({});
-    return;
+    return storedEndpoint().priceModel !== args.model ? {} : current;
   }
-  engine.setPricing({ in: p.in, out: p.out, cached: p.cached, source: p.source });
   savePricing(args.model, p);
+  return { in: p.in, out: p.out, cached: p.cached, source: p.source };
 }
 
 /**
@@ -1207,22 +1225,24 @@ async function cmdMission(args: Args): Promise<number> {
       // metered with the worker's prices (hand-set, or the provider's list,
       // looked up beside the brief) and said as the worker's below.
       const key = keyForUrl(args.url, args.key);
-      const byHand = args.priceIn !== undefined && args.priceOut !== undefined;
-      const [brief, listed] = await Promise.all([
+      const [brief, prices] = await Promise.all([
         buildBrief({ cwd: args.cwd }).catch(() => ({ text: "" })),
-        byHand ? Promise.resolve(null) : fetchPricing(args.url, args.model, key).catch(() => null),
+        // Resolved exactly as `run` resolves it (workerPricing): hand-set,
+        // stored for this model, or the provider's list.
+        workerPricing(args).catch(() => ({}) as { in?: number; out?: number; cached?: number; source?: string }),
       ]);
-      const pricing = byHand
-        ? { in: args.priceIn!, out: args.priceOut!, ...(args.priceCachedIn !== undefined ? { cached: args.priceCachedIn } : {}), source: "set by hand" }
-        : listed;
-      const planMeter = new JudgeMeter(() => ({ baseUrl: args.url, model: args.model, pricing }));
+      const pricing =
+        prices.in !== undefined && prices.out !== undefined
+          ? { in: prices.in, out: prices.out, ...(prices.cached !== undefined ? { cached: prices.cached } : {}), source: prices.source ?? "stored" }
+          : null;
+      const planMeter = new SpendMeter(() => ({ baseUrl: args.url, model: args.model, pricing }));
       const r = await draftMission({
         goal,
         context: brief.text,
         scripts: projectScripts(args.cwd),
         ask: { baseUrl: args.url, apiKey: key, model: args.model, cwd: args.cwd, reasoningEffort: args.reasoningChecks ?? args.reasoning, meter: planMeter },
       });
-      if (planMeter.mark()) process.stdout.write(`${judgeSpendLine(planMeter.total(), fmtCost, "worker (planning)")}\n`);
+      if (planMeter.mark()) process.stdout.write(`${askSpendLine(planMeter.total(), fmtCost, "worker (planning)")}\n`);
       if (!r.ok) {
         process.stderr.write(`maat: ${r.error}\n`);
         return 1;
@@ -1376,6 +1396,8 @@ async function autoDraftFrom(
   // Drafted, then read cold by a critic against the task text: a check that
   // invents or guesses is dropped (with a task quote), and a draft where
   // nothing runs the deliverable is asked for once more. See criteria.ts.
+  // Where the drafting began, for the budget-hit message (Engine.draftStart).
+  engine.draftingStarted();
   const draftOnce = () =>
     draftCriteriaCritiqued({
       snapshot,
