@@ -30,7 +30,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from stats import TIERS, is_verified, no_verdict, percentile, rate, sign_test, tier_breakdown  # noqa: E402
+from stats import (TIERS, excluded, is_verified, no_verdict, paired_tasks, percentile, rate, sign_test,  # noqa: E402
+                   task_rate, tier_breakdown)
 
 LOW_POWER_N = 30  # pairs below this cannot separate a few-task difference from noise
 
@@ -45,6 +46,9 @@ def load(path: str | Path) -> list[dict]:
 
 
 def metrics(rows: list[dict]) -> dict:
+    # A grader error or a provider stall is neither a pass nor a fail: counted apart, left out of n.
+    skipped = [r for r in rows if excluded(r)]
+    rows = [r for r in rows if not excluded(r)]
     n = len(rows)
     passed = [r for r in rows if r.get("passed")]
     ver = [r for r in rows if is_verified(r.get("claim"))]
@@ -63,6 +67,9 @@ def metrics(rows: list[dict]) -> dict:
         "secs_med": percentile(secs, 50),
         "secs_p90": percentile(secs, 90),
         "tokens_med": percentile(toks, 50),
+        "grader_error": sum(1 for r in skipped if excluded(r) == "grader_error"),
+        "stall": sum(1 for r in skipped if excluded(r) == "stall"),
+        "task_rate": task_rate(rows),
     }
 
 
@@ -86,7 +93,10 @@ def tier_lines(m: dict) -> list[str]:
 def report_arm(label: str, m: dict) -> list[str]:
     return [
         f"== {label}  (n={m['n']})",
-        f"  pass rate           {rate(m['pass'], m['n'])}",
+        f"  pass rate           {rate(m['pass'], m['n'])}   (rows; repeats are not independent)",
+        *([f"  pass rate by task   {100 * m['task_rate']['mean']:.0f}% [{100 * m['task_rate']['lo']:.0f}-{100 * m['task_rate']['hi']:.0f}]"
+           f" over {m['task_rate']['tasks']} tasks (bootstrap over tasks)"] if m.get("task_rate") else []),
+        *([f"  not counted         grader_error {m['grader_error']}, provider stall {m['stall']}"] if m.get("grader_error") or m.get("stall") else []),
         f"  verified precision  {rate(m['verified_pass'], m['verified'])}   P(pass | verified)",
         f"  verified recall     {rate(m['verified_pass'], m['pass'])}   P(verified | pass)",
         f"  false-done          {m['false_done']}",
@@ -98,10 +108,23 @@ def report_arm(label: str, m: dict) -> list[str]:
     ]
 
 
+class Ambiguous(ValueError):
+    """Pooled files repeat a (task, agent, rep): which A row pairs with which B row is unknown."""
+
+
 def pair_up(a: list[dict], b: list[dict]) -> list[tuple[dict, dict]]:
+    """
+    (A, B) rows of the same (task, agent, rep), and the same lane when both rows record one.
+    Every run file starts at rep 0, so pooling two files under one label repeats keys: that used
+    to pair each B row twice (20 pairs from 10). Repeated keys now raise Ambiguous.
+    """
     key = lambda r: (r.get("task"), r.get("agent"), r.get("rep", 0))
-    bi = {key(r): r for r in b}
-    return [(r, bi[key(r)]) for r in a if key(r) in bi]
+    for side, rows in (("A", a), ("B", b)):
+        ks = [key(r) for r in rows if not excluded(r)]
+        if len(ks) != len(set(ks)):
+            raise Ambiguous(f"arm {side} repeats a (task, agent, rep): pooled runs cannot be paired row by row")
+    bi = {key(r): r for r in b if not excluded(r)}
+    return [(r, bi[key(r)]) for r in a if not excluded(r) and key(r) in bi]
 
 
 TARGETS = ("pass", "precision", "recall", "verified", "secs", "tokens", "no_verdict", "false_done")
@@ -125,8 +148,16 @@ def target_gain(target: str, ma: dict, mb: dict) -> float | None:
 
 
 def compare(la: str, lb: str, ra: list[dict], rb: list[dict], target: str, min_gain: float) -> tuple[list[str], str]:
-    pairs = pair_up(ra, rb)
     out = [f"== paired: {la} (A) vs {lb} (B)"]
+    pt = paired_tasks(ra, rb)
+    if pt:
+        out.append(f"  by task ({pt['tasks']} tasks, repeats averaged): B-A {100 * pt['mean_diff']:+.1f} points "
+                   f"[{100 * pt['lo']:+.1f}, {100 * pt['hi']:+.1f}] (bootstrap over tasks); tasks B better {pt['b_better']}, "
+                   f"A better {pt['a_better']}; sign test p = {pt['sign_p']:.3f}; permutation p = {pt['perm_p']:.3f}")
+    try:
+        pairs = pair_up(ra, rb)
+    except Ambiguous as e:
+        return out + [f"  {e}; only the by-task comparison above applies"], f"VERDICT {lb} vs {la}: NO VERDICT (pooled runs repeat keys)"
     n = len(pairs)
     if not n:
         return out + ["  no (task, rep) in both arms"], f"VERDICT {lb} vs {la}: NO VERDICT (no shared tasks)"
