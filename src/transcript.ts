@@ -24,6 +24,15 @@ import { estTokens, type Bom, type Msg } from "./types.js";
 
 export const STALE_FAILURE_PREFIX = "[molt: superseded]";
 export const ELIDED_PREFIX = "[molt: superseded tool result —";
+/** How the engine sends a repeated call whose result has not changed (see engine.ts). */
+const SAME_CALL_PREFIX = "[molt: this is the same ";
+
+/**
+ * A bash command that only prints one file: `cat f`, `head -n 40 f`,
+ * `sed -n '1,80p' f`, `nl f`, `tail f`. Anything with a pipe, a redirect or a
+ * second command is not a plain read and is left alone.
+ */
+const SIMPLE_READ = /^(?:cat|nl(?: -\S+)*|head(?: -\S+(?: \d+)?)*|tail(?: -\S+(?: \d+)?)*|sed -n ['"]?[\d,$p]+['"]?)\s+([^\s|;&<>$`*?]+)$/;
 
 /**
  * How many steps an elision has to pay for itself in, when a cache is working.
@@ -48,6 +57,12 @@ const MAX_ACTION_LINES = 25;
  * turns to cut on. Fall back to keeping this many recent messages.
  */
 const KEEP_RECENT_MESSAGES = 6;
+/**
+ * The least share of the history a shed cut on user turns must free, or the
+ * shed cuts on recent messages instead (see planShed). A shed costs the whole
+ * prompt cache, so one that frees almost nothing is worse than none.
+ */
+export const SHED_MIN_FREE = 0.25;
 /** Never bother shedding fewer than this many messages. */
 const MIN_DROPPED = 2;
 
@@ -70,6 +85,8 @@ export class Transcript {
   private archived: Msg[][] = [];
   /** What this turn is for. Sent every request, shed never. */
   private task: string | null = null;
+  /** See SHED_MIN_FREE. 0 restores the plain cut on user turns. */
+  shedMinFree = SHED_MIN_FREE;
 
   constructor(systemPrompt: string) {
     this.system = { role: "system", content: systemPrompt };
@@ -218,7 +235,7 @@ export class Transcript {
 
   bom(toolSchemaJson: string, session: { prompt: number; completion: number }): Bom {
     const historyTokens = this.working.reduce(
-      (n, m) => n + estTokens(m.content ?? "") + estTokens(JSON.stringify(m.tool_calls ?? "")),
+      (n, m) => n + msgTokens(m),
       0,
     );
     // The standing note is part of every request, so it is part of the fixed
@@ -238,7 +255,7 @@ export class Transcript {
 
   historyTokens(): number {
     return this.working.reduce(
-      (n, m) => n + estTokens(m.content ?? "") + estTokens(JSON.stringify(m.tool_calls ?? "")),
+      (n, m) => n + msgTokens(m),
       0,
     );
   }
@@ -273,6 +290,20 @@ export class Transcript {
     let cutAt: number;
     if (userIdxs.length > keepExchanges) {
       cutAt = userIdxs[userIdxs.length - keepExchanges];
+      // A cut on user turns must buy real headroom. Maat's own notes (the
+      // acceptance criteria, a bar refusal) arrive as user messages, so a
+      // single long request has three "exchanges" with nearly all of its
+      // history after the second. A real run shed 6 messages, 60,788 ->
+      // 60,387 tokens, threw away its whole prompt cache for 0.7%, and shed
+      // again one step later. With a short first exchange the digest cost
+      // more than the cut freed, the plan came back null on every step, and
+      // auto-shed never fired again that turn. Either way, cut on recent
+      // messages instead, as a turn with no user turn to cut on does.
+      const freed = this.working.slice(0, cutAt).reduce((n, m) => n + msgTokens(m), 0);
+      if (freed < this.shedMinFree * this.historyTokens()) {
+        const fallback = this.findSafeCut(this.working.length - Math.max(2, keepRecent));
+        if (fallback !== null && fallback > cutAt) cutAt = fallback;
+      }
     } else {
       // A single request can produce dozens of tool calls with no user turn
       // to cut on — which is exactly when context runs out. Fall back to
@@ -303,7 +334,7 @@ export class Transcript {
       molt: { digest: true },
     };
     const afterTokens = [digestMsg, ...kept].reduce(
-      (n, m) => n + estTokens(m.content ?? "") + estTokens(JSON.stringify(m.tool_calls ?? "")),
+      (n, m) => n + msgTokens(m),
       0,
     );
 
@@ -456,7 +487,26 @@ export class Transcript {
   elideSupersededReads(
     opts: { protectCache?: boolean } = {},
   ): { elided: number; tokensSaved: number; deferred: number } {
+    /**
+     * What is superseded is a CALL, not the step it was made in: result
+     * index -> why. Keyed by the assistant message, a write to one file
+     * elided every result of the step that read it. A real run read dur.py
+     * and test_dur.py in one step, rewrote dur.py, and lost test_dur.py with
+     * it, under a marker saying the current copy was further down. It was not.
+     */
     const supersededBy = new Map<number, string>();
+    /** A call's place in the conversation: the index of its result, or -1. */
+    type At = number;
+    const resultAt = (i: number, k: number, id: string | undefined): At => {
+      for (let j = i + 1; j < this.working.length && this.working[j].role === "tool"; j++) {
+        const r = this.working[j];
+        if (id ? r.tool_call_id === id : j === i + 1 + k) return j;
+      }
+      return -1;
+    };
+    const mark = (at: At, why: string) => {
+      if (at >= 0) supersededBy.set(at, why);
+    };
     /**
      * Reads still worth keeping, keyed by the exact window they returned.
      *
@@ -468,88 +518,122 @@ export class Transcript {
      * it back to read the same file again, forever. Two features that were
      * each correct alone.
      */
-    const lastRead = new Map<string, number>();
+    const lastRead = new Map<string, At>();
     /** Every live read of a path, so a write can invalidate all of them. */
     const readsOf = new Map<string, string[]>();
+    const noteRead = (path: string, window: string, at: At) => {
+      lastRead.set(window, at);
+      const windows = readsOf.get(path) ?? [];
+      if (!windows.includes(window)) windows.push(window);
+      readsOf.set(path, windows);
+    };
+    /** The last live run of each bash call (command and options), by result index. */
+    const lastRun = new Map<string, At>();
 
     for (let i = 0; i < this.working.length; i++) {
       const m = this.working[i];
-      for (const call of m.tool_calls ?? []) {
+      (m.tool_calls ?? []).forEach((call, k) => {
         let args: Record<string, unknown> = {};
         try {
           args = JSON.parse(call.function.arguments || "{}") as Record<string, unknown>;
         } catch {
-          continue;
+          return;
         }
-        const path = String(args.path ?? "");
-        if (!path) continue;
+        const at = resultAt(i, k, call.id);
+
+        if (call.function.name === "bash" && typeof args.command === "string") {
+          const cmd = args.command.replace(/\s+/g, " ").trim();
+          // The same call is the same command with the same options. A rerun
+          // with a longer timeout_s, or in the background, is a different
+          // call, and the earlier result (a timeout and how to avoid it) is
+          // the reason for it.
+          const key = JSON.stringify({ ...args, command: cmd });
+          const now = at >= 0 ? (this.working[at].content ?? "") : "";
+          const pointer = now.startsWith(SAME_CALL_PREFIX);
+          // A rerun that came back the same is sent as a pointer to the
+          // earlier copy, which must then stay. One that came back different
+          // makes the earlier output history.
+          const prior = lastRun.get(key);
+          if (prior !== undefined && at >= 0 && !pointer && now !== (this.working[prior]?.content ?? ""))
+            mark(prior, `rerun at step ${i}`);
+          if (!pointer && at >= 0) lastRun.set(key, at);
+          // A plain read of one file through bash is a read of that file: a
+          // later write makes it stale exactly as it does a read_file.
+          const read = SIMPLE_READ.exec(cmd);
+          if (read) noteRead(read[1]!.replace(/^\.\//, ""), `bash:${cmd}`, at);
+          return;
+        }
+
+        const path = String(args.path ?? "").replace(/^\.\//, "");
+        if (!path) return;
 
         if (call.function.name === "read_file") {
           // Identical arguments return identical bytes; anything else is a
           // different part of the file and stands on its own.
           const window = `${path}@${Number(args.offset ?? 0)}+${String(args.limit ?? "all")}`;
           const prior = lastRead.get(window);
-          if (prior !== undefined) supersededBy.set(prior, `re-read at step ${i}`);
-          lastRead.set(window, i);
-          const windows = readsOf.get(path) ?? [];
-          if (!windows.includes(window)) windows.push(window);
-          readsOf.set(path, windows);
+          if (prior !== undefined) mark(prior, `re-read at step ${i}`);
+          noteRead(path, window, at);
         } else if (call.function.name === "write_file" || call.function.name === "edit_file") {
           // A change to the file invalidates every part of it that was read,
           // whichever window it came from: what is in context is no longer
           // what is on disk.
           for (const window of readsOf.get(path) ?? []) {
             const prior = lastRead.get(window);
-            if (prior !== undefined) supersededBy.set(prior, `changed at step ${i}`);
+            if (prior !== undefined) mark(prior, `changed at step ${i}`);
             lastRead.delete(window);
           }
           readsOf.delete(path);
         }
-      }
+      });
     }
 
     let elided = 0;
     let tokensSaved = 0;
     let deferred = 0;
-    for (const [callIdx, reason] of supersededBy) {
-      // The tool result follows its assistant turn.
-      for (let j = callIdx + 1; j < this.working.length; j++) {
-        const m = this.working[j];
-        if (m.role !== "tool") break;
-        if (!m.content || m.content.startsWith(ELIDED_PREFIX)) continue;
-        const before = estTokens(m.content);
-        // Wording matters here. "Full contents remain in the archived record"
-        // reads, to a model, as an invitation to go and get them — which it
-        // can only do by re-reading the file, which is what elided this copy
-        // in the first place. Point at the newer copy instead.
-        const marker =
-          `${ELIDED_PREFIX} ${reason}. The current contents are further down this ` +
+    for (const [j, reason] of supersededBy) {
+      const m = this.working[j];
+      if (!m || m.role !== "tool") continue;
+      if (!m.content || m.content.startsWith(ELIDED_PREFIX)) continue;
+      const before = estTokens(m.content);
+      // Wording matters here. "Full contents remain in the archived record"
+      // reads, to a model, as an invitation to go and get them — which it
+      // can only do by re-reading the file, which is what elided this copy
+      // in the first place. Point at the newer copy instead.
+      const marker = reason.startsWith("rerun")
+        ? `${ELIDED_PREFIX} ${reason}. The newer output of the same command is further ` +
+          `down this conversation.`
+        : `${ELIDED_PREFIX} ${reason}. The current contents are further down this ` +
           `conversation; do not read the file again to recover this.`;
-        // A short result costs less than the notice explaining its absence.
-        // Eliding it would drop content AND grow the context — which is how
-        // the meter came to report "−-17 tokens" saved.
-        if (estTokens(marker) >= before) continue;
-        const saving = before - estTokens(marker);
-        // What this edit strands: everything after it shares a prefix that is
-        // about to change, so the next request pays full price for all of it.
-        // Elide only if the saving earns that back inside ELISION_PAYBACK_STEPS.
-        if (opts.protectCache) {
-          let stranded = 0;
-          for (let k = j + 1; k < this.working.length; k++) {
-            stranded += estTokens(this.working[k].content ?? "");
-          }
-          if (saving * ELISION_PAYBACK_STEPS < stranded) {
-            deferred++;
-            continue;
-          }
+      // A short result costs less than the notice explaining its absence.
+      // Eliding it would drop content AND grow the context — which is how
+      // the meter came to report "−-17 tokens" saved.
+      if (estTokens(marker) >= before) continue;
+      const saving = before - estTokens(marker);
+      // What this edit strands: everything after it shares a prefix that is
+      // about to change, so the next request pays full price for all of it.
+      // Elide only if the saving earns that back inside ELISION_PAYBACK_STEPS.
+      if (opts.protectCache) {
+        let stranded = 0;
+        for (let k = j + 1; k < this.working.length; k++) {
+          stranded += estTokens(this.working[k].content ?? "");
         }
-        m.content = marker;
-        tokensSaved += saving;
-        elided++;
+        if (saving * ELISION_PAYBACK_STEPS < stranded) {
+          deferred++;
+          continue;
+        }
       }
+      m.content = marker;
+      tokensSaved += saving;
+      elided++;
     }
     return { elided, tokensSaved, deferred };
   }
+}
+
+/** What a message costs in the history, in molt's token units. */
+function msgTokens(m: Msg): number {
+  return estTokens(m.content ?? "") + estTokens(JSON.stringify(m.tool_calls ?? ""));
 }
 
 /**
