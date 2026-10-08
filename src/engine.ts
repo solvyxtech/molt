@@ -23,6 +23,7 @@ import { describeStart, listBackground, startBackground, stopBackground } from "
 import { reviewClaim, type Review } from "./review.js";
 import { judgeEffort, judgeTarget } from "./judge.js";
 import { authorKey, authorWords, claimLabel, tierOf, withAuthor } from "./tiers.js";
+import { discountedChecks } from "./control.js";
 import { arbitrate, parseDisputes, type Ruling } from "./dispute.js";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -3688,8 +3689,23 @@ export class Engine {
   }
 
   /** Everything tierOf weighs beside the results: advisory mode, the worker, and who wrote each check. */
-  private tierContext(): { reviewAdvisory?: true; guards?: ReadonlySet<string>; worker: string[]; authors: Map<string, CheckAuthor> } {
-    return { ...this.advisoryTier(), worker: this.workerNames(), authors: this.sealedAuthors() };
+  private tierContext(results: readonly CheckResult[]): {
+    reviewAdvisory?: true;
+    guards?: ReadonlySet<string>;
+    worker: string[];
+    authors: Map<string, CheckAuthor>;
+    discounted: Map<string, string>;
+  } {
+    const authors = this.sealedAuthors();
+    // What of the passing checks the worker arranged rather than earned
+    // (control.ts): read off the tree as it stands at the claim.
+    const discounted = discountedChecks(results, {
+      cwd: this.cwd,
+      before: this.turnTree,
+      written: this.turnLedger().map((e) => e.path),
+      authors,
+    });
+    return { ...this.advisoryTier(), worker: this.workerNames(), authors, discounted };
   }
 
   /** The receipt's authorship map: sealed checks by bar name, as recorded. */
@@ -4520,7 +4536,7 @@ export class Engine {
       // nudge cleared it and no re-review followed): no "verified". On v11, 6
       // of the 7 "verified" claims were unreviewed this way and 4 were wrong.
       const unreviewed = this.cfg.review !== undefined && !review;
-      const t = tierOf({ results: lastProof.results, review, unreviewed, ...this.tierContext() });
+      const t = tierOf({ results: lastProof.results, review, unreviewed, ...this.tierContext(lastProof.results) });
       tier = t.tier;
       if (t.tier === "passed-checks") {
         outcome = "unverified";
@@ -5823,7 +5839,7 @@ export class Engine {
                   notes: [...taskNotes],
                 }
               : undefined,
-          ...(verdict === "accepted" ? { tier: tierOf({ results: result.results, ...self.tierContext() }) } : {}),
+          ...(verdict === "accepted" ? { tier: tierOf({ results: result.results, ...self.tierContext(result.results) }) } : {}),
           authors: self.receiptAuthors(),
           });
           log?.append("receipt", { verdict, file: receipt.path, attempt: proofAttempts, endedBy: why });
@@ -7697,7 +7713,7 @@ export class Engine {
               }
             : undefined,
           ...(this.turnRevealed.length ? { revealed: [...this.turnRevealed] } : {}),
-          ...(verdict === "accepted" ? { tier: tierOf({ results: result.results, ...this.tierContext() }) } : {}),
+          ...(verdict === "accepted" ? { tier: tierOf({ results: result.results, ...this.tierContext(result.results) }) } : {}),
           authors: this.receiptAuthors(),
         });
         log?.append("receipt", { verdict, file: receipt.path, attempt: proofAttempts });

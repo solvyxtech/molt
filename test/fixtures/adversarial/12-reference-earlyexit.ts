@@ -3,8 +3,9 @@
  *
  * The reference driver imports the deliverable and compares what it returns to
  * two independent references. A deliverable that calls os._exit(0) at import
- * time takes the whole driver process down with status 0 before any value is
- * produced — and the driver treats exit 0 as "all inputs matched".
+ * time took the whole driver process down with status 0 before any value was
+ * produced — and the driver read exit 0 as "all inputs matched". It now runs
+ * the deliverable in a child and passes only on a matching result per input.
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";

@@ -244,6 +244,11 @@ export function contradictions(review: { votes: string; violations: unknown[] } 
  * was written by the worker model (no judge, or a judge that is the same
  * model reached another way), the best the turn earns is "passed-own-checks".
  * A check whose author was never recorded counts as the worker's.
+ *
+ * And a check whose pass the worker arranged counts for nothing, whoever wrote
+ * it (`discounted`, from control.ts): a runner shadowed by a file the worker
+ * planted, an expected file the worker wrote, a drafted check whose only
+ * input sat in the project for the worker to read. The reason names the file.
  */
 export function tierOf(args: {
   results: readonly (Pick<CheckResult, "ok" | "hidden" | "advisory" | "skipped" | "tags"> & { name?: string })[];
@@ -265,8 +270,22 @@ export function tierOf(args: {
   worker?: string | readonly string[];
   /** Who wrote each check, by result name, recorded at seal time. */
   authors?: ReadonlyMap<string, CheckAuthor>;
+  /**
+   * Passing checks whose pass the worker controlled, by result name, with why
+   * (control.ts): a shadowed runner, an expected value the worker wrote, an
+   * input the worker could read. They still passed; they are not evidence.
+   */
+  discounted?: ReadonlyMap<string, string>;
 }): TierVerdict {
-  const passing = args.results.filter((r) => r.ok && !r.advisory && !r.skipped);
+  const v = tierOfCounted(args);
+  if (v.tier === "verified" || !args.discounted?.size) return v;
+  const lost = args.results.filter((r) => r.ok && !r.advisory && !r.skipped && args.discounted!.has(r.name ?? ""));
+  if (!lost.length || v.tier !== "passed-checks") return v;
+  return { ...v, reason: lost.map((r) => `\`${r.name}\` does not count: ${args.discounted!.get(r.name!)}`).join("; ") };
+}
+
+function tierOfCounted(args: Parameters<typeof tierOf>[0]): TierVerdict {
+  const passing = args.results.filter((r) => r.ok && !r.advisory && !r.skipped && !args.discounted?.has(r.name ?? ""));
   const workerNames = (typeof args.worker === "string" ? [args.worker] : [...(args.worker ?? [])]).filter((w) => w.trim());
   const worker = workerNames[0];
   // A mission's assertions are its contract, written before the work and
@@ -275,7 +294,14 @@ export function tierOf(args: {
   const authorOf = (r: (typeof passing)[number]): CheckAuthor =>
     args.authors?.get(r.name ?? "") ??
     (r.hidden !== true || r.tags?.includes("mission") ? { kind: "person" } : { kind: "worker", ...(worker ? { model: worker } : {}) });
-  const person = passing.some((r) => authorOf(r).kind === "person");
+  // A person's bar is one bar. When the worker subverted one of its checks
+  // (a runner shadowed, an expected file rewritten), the rest of it — a
+  // files-changed builtin, a lint — is no longer the bar the person wrote
+  // vouching for the work, and does not carry the word on its own.
+  const personSubverted = args.results.some(
+    (r) => r.ok && !r.advisory && !r.skipped && args.discounted?.has(r.name ?? "") && authorOf(r).kind === "person",
+  );
+  const person = !personSubverted && passing.some((r) => authorOf(r).kind === "person");
   const drafted = passing.filter((r) => r.hidden === true && r.tags?.includes("task") && authorOf(r).kind !== "person");
   const strongAll = drafted.filter(
     (r) => !r.tags?.includes("surface") && r.tags?.includes("value") && !(args.reviewAdvisory && args.guards?.has(r.name ?? "")),
