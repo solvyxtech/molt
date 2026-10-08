@@ -395,6 +395,7 @@ export class StreamAccumulator {
       promptTokens: this.promptTokens,
       completionTokens: this.completionTokens,
       cachedTokens: this.cachedTokens,
+      ...(this.cacheWriteTokens !== undefined ? { cacheWriteTokens: this.cacheWriteTokens } : {}),
       reasoningTokens: this.reasoningTokens,
       costUsd: this.costUsd,
       finishReason: this.finishReason,

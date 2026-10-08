@@ -77,6 +77,8 @@ export type Bom = {
   /** True when any part of the cost rests on molt's own token estimate. */
   costEstimated?: boolean;
   budgetTokens?: number;
+  /** The judge's session spend, apart from the worker's above (judge-meter.ts). Absent before its first call. */
+  judge?: import("./judge-meter.js").JudgeSpend;
 };
 
 /**
@@ -638,7 +640,15 @@ export type EngineEvent =
       kind: "job_end";
       job: number;
       steps: number;
+      /** The worker's spend: its own requests, step by step. */
       spend: Spend;
+      /**
+       * The judge's spend on this job, apart from the worker's: every ask made
+       * around the work (drafting, critic, reference, review, audit, arbiter)
+       * since the last job_end. `costUsd` absent means the price is unknown,
+       * never $0. Absent when the judge was not asked.
+       */
+      judge?: import("./judge-meter.js").JudgeSpend;
       durationMs: number;
       outcome: JobOutcome;
       /**

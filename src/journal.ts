@@ -86,6 +86,12 @@ export type JournalKind =
    */
   | "loop_stop"
   | "salvage"
+  /**
+   * One answered ask to the judge (drafting, critic, reference, review,
+   * audit, arbiter): its tokens and cost, apart from the worker's `response`
+   * entries. `costUsd: null` means no price is known, never $0.
+   */
+  | "judge_usage"
   /** The independent review of a verified claim: a label, never a gate. */
   | "review"
   | "dispute"
@@ -384,6 +390,19 @@ export class Journal {
           out.push(
             `${t}  ← response · ${e}${d.promptTokens} in${cached} / ${e}${d.completionTokens} out · ` +
               `${d.toolCalls} tool call(s)${cost}`,
+          );
+          break;
+        }
+        case "judge_usage": {
+          const e = d.estimated ? "~" : "";
+          const cached = Number(d.cacheReadTokens ?? 0) > 0 ? ` (${d.cacheReadTokens} cached)` : "";
+          const cost = d.plan
+            ? ` · ${d.plan} plan`
+            : d.costUsd === null || d.costUsd === undefined
+              ? " · $ unknown"
+              : ` · ${d.billed ? "" : e}$${Number(d.costUsd).toFixed(6)}`;
+          out.push(
+            `${t}  judge ${d.model}${d.what ? ` (${d.what})` : ""} · ${e}${d.promptTokens} in${cached} / ${e}${d.completionTokens} out${cost}`,
           );
           break;
         }
